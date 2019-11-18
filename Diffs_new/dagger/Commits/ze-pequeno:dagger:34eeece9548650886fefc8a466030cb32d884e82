@@ -1,0 +1,280 @@
+diff --git a/java/dagger/internal/codegen/ComponentBindingExpressions.java b/java/dagger/internal/codegen/ComponentBindingExpressions.java
+index f9c081f24..3516812b6 100644
+--- a/java/dagger/internal/codegen/ComponentBindingExpressions.java
++++ b/java/dagger/internal/codegen/ComponentBindingExpressions.java
+@@ -18,6 +18,7 @@
+ 
+ import static com.google.common.base.Preconditions.checkArgument;
+ import static com.google.common.base.Preconditions.checkNotNull;
++import static com.google.common.base.Preconditions.checkState;
+ import static dagger.internal.codegen.Accessibility.isRawTypeAccessible;
+ import static dagger.internal.codegen.Accessibility.isTypeAccessibleFrom;
+ import static dagger.internal.codegen.BindingType.MEMBERS_INJECTION;
+@@ -236,18 +237,41 @@ Expression getDependencyArgumentExpression(
+     return dependencyExpression;
+   }
+ 
+-  /** Returns the implementation of a component method. */
+-  MethodSpec getComponentMethod(ComponentMethodDescriptor componentMethod) {
++  /**
++   * Returns the implementation of a component method. Returns {@link Optional#empty} if the
++   * component method implementation should not be emitted.
++   */
++  Optional<MethodSpec> getComponentMethod(ComponentMethodDescriptor componentMethod) {
+     checkArgument(componentMethod.dependencyRequest().isPresent());
+     DependencyRequest dependencyRequest = componentMethod.dependencyRequest().get();
+-    return MethodSpec.overriding(
++    MethodSpec.Builder methodBuilder =
++        MethodSpec.overriding(
+             componentMethod.methodElement(),
+             MoreTypes.asDeclared(graph.componentType().asType()),
+-            types)
+-        .addCode(
+-            getBindingExpression(dependencyRequest.key(), dependencyRequest.kind())
+-                .getComponentMethodImplementation(componentMethod, generatedComponentModel))
+-        .build();
++            types);
++
++    ModifiableBindingType type =
++        getModifiableBindingType(dependencyRequest.key(), dependencyRequest.kind());
++    if (type.isModifiable()) {
++      generatedComponentModel.registerModifiableBindingMethod(
++          type, dependencyRequest.key(), dependencyRequest.kind(), methodBuilder.build());
++      if (!type.hasBaseClassImplementation()) {
++        // A component method should not be emitted if it encapsulates a modifiable binding that
++        // cannot be satisfied by the abstract base class implementation of a subcomponent.
++        checkState(
++            !generatedComponentModel.supermodel().isPresent(),
++            "Attempting to generate a component method in a subtype of the abstract subcomponent "
++                + "base class.");
++        return Optional.empty();
++      }
++    }
++
++    return Optional.of(
++        methodBuilder
++            .addCode(
++                getBindingExpression(dependencyRequest.key(), dependencyRequest.kind())
++                    .getComponentMethodImplementation(componentMethod, generatedComponentModel))
++            .build());
+   }
+ 
+   /**
+diff --git a/java/dagger/internal/codegen/ComponentModelBuilder.java b/java/dagger/internal/codegen/ComponentModelBuilder.java
+index b38df3e18..d3a387276 100644
+--- a/java/dagger/internal/codegen/ComponentModelBuilder.java
++++ b/java/dagger/internal/codegen/ComponentModelBuilder.java
+@@ -304,8 +304,9 @@ protected void addInterfaceMethods() {
+     for (List<ComponentMethodDescriptor> methodsWithSameSignature :
+         Multimaps.asMap(componentMethodsBySignature).values()) {
+       ComponentMethodDescriptor anyOneMethod = methodsWithSameSignature.stream().findAny().get();
+-      generatedComponentModel.addMethod(
+-          COMPONENT_METHOD, bindingExpressions.getComponentMethod(anyOneMethod));
++      bindingExpressions
++          .getComponentMethod(anyOneMethod)
++          .ifPresent(method -> generatedComponentModel.addMethod(COMPONENT_METHOD, method));
+     }
+   }
+ 
+diff --git a/java/dagger/internal/codegen/GeneratedComponentModel.java b/java/dagger/internal/codegen/GeneratedComponentModel.java
+index c50ad9c8a..6b21c5ef5 100644
+--- a/java/dagger/internal/codegen/GeneratedComponentModel.java
++++ b/java/dagger/internal/codegen/GeneratedComponentModel.java
+@@ -268,6 +268,16 @@ void addModifiableBindingMethod(
+     methodSpecsMap.put(MethodSpecKind.MODIFIABLE_BINDING_METHOD, methodSpec);
+   }
+ 
++  /**
++   * Registers a known method as encapsulating a modifiable binding without adding the method to the
++   * current component. This is relevant when a method of a different type, such as a component
++   * method, encapsulates a modifiable binding.
++   */
++  void registerModifiableBindingMethod(
++      ModifiableBindingType type, Key key, RequestKind kind, MethodSpec methodSpec) {
++    modifiableBindingMethods.addMethod(type, key, kind, methodSpec);
++  }
++
+   /** Adds the implementation for the given {@link ModifiableBindingMethod} to the component. */
+   void addImplementedModifiableBindingMethod(
+       ModifiableBindingMethod method, MethodSpec methodSpec) {
+diff --git a/java/dagger/internal/codegen/ModifiableBindingType.java b/java/dagger/internal/codegen/ModifiableBindingType.java
+index d2c5f6f0d..db8f723b4 100644
+--- a/java/dagger/internal/codegen/ModifiableBindingType.java
++++ b/java/dagger/internal/codegen/ModifiableBindingType.java
+@@ -74,6 +74,8 @@
+ 
+   private static final ImmutableSet<ModifiableBindingType> TYPES_FINALIZED_ON_MODIFICATION =
+       ImmutableSet.of(MISSING, GENERATED_INSTANCE, OPTIONAL, INJECTION);
++  private static final ImmutableSet<ModifiableBindingType> TYPES_WITH_BASE_CLASS_IMPLEMENTATIONS =
++      ImmutableSet.of(MULTIBINDING, OPTIONAL, INJECTION);
+ 
+   boolean isModifiable() {
+     return !equals(NONE);
+@@ -88,4 +90,12 @@ boolean isModifiable() {
+   boolean finalizedOnModification() {
+     return TYPES_FINALIZED_ON_MODIFICATION.contains(this);
+   }
++
++  /**
++   * Returns true if the method encapsulating the modifiable binding should have a concrete
++   * implementation in the abstract base class for a subcomponent.
++   */
++  boolean hasBaseClassImplementation() {
++    return TYPES_WITH_BASE_CLASS_IMPLEMENTATIONS.contains(this);
++  }
+ }
+diff --git a/javatests/dagger/internal/codegen/AheadOfTimeSubcomponentsTest.java b/javatests/dagger/internal/codegen/AheadOfTimeSubcomponentsTest.java
+index 70842b970..9baa04d38 100644
+--- a/javatests/dagger/internal/codegen/AheadOfTimeSubcomponentsTest.java
++++ b/javatests/dagger/internal/codegen/AheadOfTimeSubcomponentsTest.java
+@@ -115,13 +115,6 @@ public void subcomponent_MissingBinding() {
+             GENERATED_ANNOTATION,
+             "public abstract class DaggerChild implements Child {",
+             "  protected DaggerChild() {}",
+-            "",
+-            "  @Override",
+-            "  public String string() {",
+-            "    return getString();",
+-            "  }",
+-            "",
+-            "  public abstract String getString();",
+             "}");
+     Compilation compilation =
+         daggerCompiler()
+@@ -157,21 +150,6 @@ public void subcomponent_MissingBindingsSatisfiedByParentAndGrandparent() {
+             GENERATED_ANNOTATION,
+             "public abstract class DaggerGreatGrandchild implements GreatGrandchild {",
+             "  protected DaggerGreatGrandchild() {}",
+-            "",
+-            "  @Override",
+-            "  public String string() {",
+-            // TODO(b/72748365) can we merge these two methods?
+-            "    return getString();",
+-            "  }",
+-            "",
+-            "  @Override",
+-            "  public int number() {",
+-            "    return getInteger();",
+-            "  }",
+-            "",
+-            "  public abstract String getString();",
+-            "",
+-            "  public abstract Integer getInteger();",
+             "}");
+ 
+     JavaFileObject grandchild =
+@@ -215,7 +193,7 @@ public void subcomponent_MissingBindingsSatisfiedByParentAndGrandparent() {
+             "    }",
+             "",
+             "    @Override",
+-            "    public String getString() {",
++            "    public String string() {",
+             "      return GrandchildModule_ProvideStringFactory.proxyProvideString();",
+             "    }",
+             "  }",
+@@ -268,7 +246,7 @@ public void subcomponent_MissingBindingsSatisfiedByParentAndGrandparent() {
+             "      }",
+             "",
+             "      @Override",
+-            "      public Integer getInteger() {",
++            "      public int number() {",
+             "        return ChildModule.provideInt();",
+             "      }",
+             "    }",
+@@ -314,13 +292,6 @@ public void subcomponent_MissingBindingThatLeadsToNewMissingBinding() {
+             GENERATED_ANNOTATION,
+             "public abstract class DaggerGreatGrandchild implements GreatGrandchild {",
+             "  protected DaggerGreatGrandchild() {}",
+-            "",
+-            "  @Override",
+-            "  public String string() {",
+-            "    return getString();",
+-            "  }",
+-            "",
+-            "  public abstract String getString();",
+             "}");
+ 
+     JavaFileObject grandchild =
+@@ -370,7 +341,7 @@ public void subcomponent_MissingBindingThatLeadsToNewMissingBinding() {
+             "    }",
+             "",
+             "    @Override",
+-            "    public String getString() {",
++            "    public String string() {",
+             "      return DaggerGrandchild.this.getString();",
+             "    }",
+             "  }",
+@@ -470,13 +441,6 @@ public void subcomponent_MissingBindingInBothDescendentsAndSatisfiedByParent() {
+             GENERATED_ANNOTATION,
+             "public abstract class DaggerGreatGrandchild implements GreatGrandchild {",
+             "  protected DaggerGreatGrandchild() {}",
+-            "",
+-            "  @Override",
+-            "  public String string() {",
+-            "    return getString();",
+-            "  }",
+-            "",
+-            "  public abstract String getString();",
+             "}");
+ 
+     JavaFileObject grandchild =
+@@ -502,13 +466,6 @@ public void subcomponent_MissingBindingInBothDescendentsAndSatisfiedByParent() {
+             "public abstract class DaggerGrandchild implements Grandchild {",
+             "  protected DaggerGrandchild() {}",
+             "",
+-            "  @Override",
+-            "  public String string() {",
+-            "    return getString();",
+-            "  }",
+-            "",
+-            "  public abstract String getString();",
+-            "",
+             "  public abstract class GreatGrandchildImpl extends DaggerGreatGrandchild {",
+             "    protected GreatGrandchildImpl() {",
+             "      super();",
+@@ -557,7 +514,7 @@ public void subcomponent_MissingBindingInBothDescendentsAndSatisfiedByParent() {
+             "    }",
+             "",
+             "    @Override",
+-            "    public String getString() {",
++            "    public String string() {",
+             "      return ChildModule_ProvideStringFactory.proxyProvideString();",
+             "    }",
+             "",
+@@ -568,7 +525,7 @@ public void subcomponent_MissingBindingInBothDescendentsAndSatisfiedByParent() {
+             "      }",
+             "",
+             "      @Override",
+-            "      public String getString() {",
++            "      public String string() {",
+             "        return ChildModule_ProvideStringFactory.proxyProvideString();",
+             "      }",
+             "    }",
+@@ -672,13 +629,6 @@ public void subcomponent_BuilderAndGeneratedInstanceBinding() {
+             "public abstract class DaggerChild implements Child {",
+             "  protected DaggerChild() {}",
+             "",
+-            "  @Override",
+-            "  public Grandchild.Builder grandchild() {",
+-            "    return getGrandchildBuilder();",
+-            "  }",
+-            "",
+-            "  public abstract Grandchild.Builder getGrandchildBuilder();",
+-            "",
+             "  protected abstract class GrandchildBuilder extends DaggerGrandchild.Builder {",
+             "    @Override",
+             "    public GrandchildBuilder module(GrandchildModule module) {",
+@@ -786,13 +736,6 @@ public void simpleDeepComponentHierarchy() {
+             "public abstract class DaggerGrandchild implements Grandchild {",
+             "  protected DaggerGrandchild() {}",
+             "",
+-            "  @Override",
+-            "  public GreatGrandchild.Builder greatGrandchild() {",
+-            "    return getGreatGrandchildBuilder();",
+-            "  }",
+-            "",
+-            "  public abstract GreatGrandchild.Builder getGreatGrandchildBuilder();",
+-            "",
+             "  protected abstract class GreatGrandchildBuilder extends",
+             "      DaggerGreatGrandchild.Builder {",
+             "    @Override",

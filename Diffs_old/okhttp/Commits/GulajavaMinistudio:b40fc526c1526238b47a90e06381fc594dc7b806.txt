@@ -1,0 +1,1039 @@
+diff --git a/mockwebserver/src/main/java/okhttp3/mockwebserver/MockWebServer.kt b/mockwebserver/src/main/java/okhttp3/mockwebserver/MockWebServer.kt
+index 8a45e892b1..419e467d03 100644
+--- a/mockwebserver/src/main/java/okhttp3/mockwebserver/MockWebServer.kt
++++ b/mockwebserver/src/main/java/okhttp3/mockwebserver/MockWebServer.kt
+@@ -100,7 +100,9 @@ import javax.net.ssl.X509TrustManager
+  * in sequence.
+  */
+ class MockWebServer : ExternalResource(), Closeable {
+-  private val taskRunner = TaskRunner()
++  private val taskRunnerBackend = TaskRunner.RealBackend(
++      threadFactory("MockWebServer TaskRunner", true))
++  private val taskRunner = TaskRunner(taskRunnerBackend)
+   private val requestQueue = LinkedBlockingQueue<RecordedRequest>()
+   private val openClientSockets =
+       Collections.newSetFromMap(ConcurrentHashMap<Socket, Boolean>())
+@@ -463,6 +465,7 @@ class MockWebServer : ExternalResource(), Closeable {
+         throw IOException("Gave up waiting for queue to shut down")
+       }
+     }
++    taskRunnerBackend.shutdown()
+   }
+ 
+   @Synchronized override fun after() {
+diff --git a/okhttp/src/main/java/okhttp3/internal/Util.kt b/okhttp/src/main/java/okhttp3/internal/Util.kt
+index 861221b362..b05e39edd8 100644
+--- a/okhttp/src/main/java/okhttp3/internal/Util.kt
++++ b/okhttp/src/main/java/okhttp3/internal/Util.kt
+@@ -359,7 +359,7 @@ fun Source.discard(timeout: Int, timeUnit: TimeUnit): Boolean = try {
+   false
+ }
+ 
+-fun Socket.connectionName(): String {
++fun Socket.peerName(): String {
+   val address = remoteSocketAddress
+   return if (address is InetSocketAddress) address.hostName else address.toString()
+ }
+diff --git a/okhttp/src/main/java/okhttp3/internal/cache/DiskLruCache.kt b/okhttp/src/main/java/okhttp3/internal/cache/DiskLruCache.kt
+index 15ea1f8915..113d58e48f 100644
+--- a/okhttp/src/main/java/okhttp3/internal/cache/DiskLruCache.kt
++++ b/okhttp/src/main/java/okhttp3/internal/cache/DiskLruCache.kt
+@@ -168,7 +168,7 @@ class DiskLruCache internal constructor(
+   private var nextSequenceNumber: Long = 0
+ 
+   private val cleanupQueue = taskRunner.newQueue()
+-  private val cleanupTask = object : Task("OkHttp DiskLruCache", cancelable = false) {
++  private val cleanupTask = object : Task("OkHttp Cache", cancelable = false) {
+     override fun runOnce(): Long {
+       synchronized(this@DiskLruCache) {
+         if (!initialized || closed) {
+diff --git a/okhttp/src/main/java/okhttp3/internal/concurrent/Task.kt b/okhttp/src/main/java/okhttp3/internal/concurrent/Task.kt
+index 1a159374ca..9bae6e6936 100644
+--- a/okhttp/src/main/java/okhttp3/internal/concurrent/Task.kt
++++ b/okhttp/src/main/java/okhttp3/internal/concurrent/Task.kt
+@@ -48,7 +48,7 @@ package okhttp3.internal.concurrent
+  */
+ abstract class Task(
+   val name: String,
+-  val cancelable: Boolean = true
++  val cancelable: Boolean
+ ) {
+   // Guarded by the TaskRunner.
+   internal var queue: TaskQueue? = null
+@@ -65,4 +65,6 @@ abstract class Task(
+     check(this.queue === null) { "task is in multiple queues" }
+     this.queue = queue
+   }
++
++  override fun toString() = name
+ }
+diff --git a/okhttp/src/main/java/okhttp3/internal/concurrent/TaskQueue.kt b/okhttp/src/main/java/okhttp3/internal/concurrent/TaskQueue.kt
+index 148c4b91c6..b533922f52 100644
+--- a/okhttp/src/main/java/okhttp3/internal/concurrent/TaskQueue.kt
++++ b/okhttp/src/main/java/okhttp3/internal/concurrent/TaskQueue.kt
+@@ -66,6 +66,18 @@ class TaskQueue internal constructor(
+     }
+   }
+ 
++  /** Overload of [schedule] that uses a lambda for a repeating task. */
++  inline fun schedule(
++    name: String,
++    delayNanos: Long = 0L,
++    cancelable: Boolean = true,
++    crossinline block: () -> Long
++  ) {
++    schedule(object : Task(name, cancelable) {
++      override fun runOnce() = block()
++    }, delayNanos)
++  }
++
+   /** Like [schedule], but this silently discard the task if the queue is shut down. */
+   fun trySchedule(task: Task, delayNanos: Long = 0L) {
+     synchronized(taskRunner) {
+@@ -77,11 +89,41 @@ class TaskQueue internal constructor(
+     }
+   }
+ 
++  /** Executes [block] once on a task runner thread. */
++  inline fun execute(
++    name: String,
++    delayNanos: Long = 0L,
++    cancelable: Boolean = true,
++    crossinline block: () -> Unit
++  ) {
++    schedule(object : Task(name, cancelable) {
++      override fun runOnce(): Long {
++        block()
++        return -1L
++      }
++    }, delayNanos)
++  }
++
++  /** Like [execute], but this silently discard the task if the queue is shut down. */
++  inline fun tryExecute(
++    name: String,
++    delayNanos: Long = 0L,
++    cancelable: Boolean = true,
++    crossinline block: () -> Unit
++  ) {
++    trySchedule(object : Task(name, cancelable) {
++      override fun runOnce(): Long {
++        block()
++        return -1L
++      }
++    }, delayNanos)
++  }
++
+   /** Returns true if this queue became idle before the timeout elapsed. */
+   fun awaitIdle(delayNanos: Long): Boolean {
+     val latch = CountDownLatch(1)
+ 
+-    val task = object : Task("awaitIdle", cancelable = false) {
++    val task = object : Task("OkHttp awaitIdle", cancelable = false) {
+       override fun runOnce(): Long {
+         latch.countDown()
+         return -1L
+diff --git a/okhttp/src/main/java/okhttp3/internal/concurrent/TaskRunner.kt b/okhttp/src/main/java/okhttp3/internal/concurrent/TaskRunner.kt
+index a14df066fa..f5571fb484 100644
+--- a/okhttp/src/main/java/okhttp3/internal/concurrent/TaskRunner.kt
++++ b/okhttp/src/main/java/okhttp3/internal/concurrent/TaskRunner.kt
+@@ -19,6 +19,7 @@ import okhttp3.internal.addIfAbsent
+ import okhttp3.internal.notify
+ import okhttp3.internal.threadFactory
+ import java.util.concurrent.SynchronousQueue
++import java.util.concurrent.ThreadFactory
+ import java.util.concurrent.ThreadPoolExecutor
+ import java.util.concurrent.TimeUnit
+ 
+@@ -35,7 +36,7 @@ import java.util.concurrent.TimeUnit
+  * Most applications should share a process-wide [TaskRunner] and use queues for per-client work.
+  */
+ class TaskRunner(
+-  val backend: Backend = RealBackend()
++  val backend: Backend
+ ) {
+   private var coordinatorWaiting = false
+   private var coordinatorWakeUpAt = 0L
+@@ -243,13 +244,13 @@ class TaskRunner(
+     fun execute(runnable: Runnable)
+   }
+ 
+-  internal class RealBackend : Backend {
++  class RealBackend(threadFactory: ThreadFactory) : Backend {
+     private val executor = ThreadPoolExecutor(
+         0, // corePoolSize.
+         Int.MAX_VALUE, // maximumPoolSize.
+         60L, TimeUnit.SECONDS, // keepAliveTime.
+         SynchronousQueue(),
+-        threadFactory("OkHttp Task", true)
++        threadFactory
+     )
+ 
+     override fun beforeTask(taskRunner: TaskRunner) {
+@@ -286,6 +287,6 @@ class TaskRunner(
+ 
+   companion object {
+     @JvmField
+-    val INSTANCE = TaskRunner(RealBackend())
++    val INSTANCE = TaskRunner(RealBackend(threadFactory("OkHttp TaskRunner", true)))
+   }
+ }
+diff --git a/okhttp/src/main/java/okhttp3/internal/connection/RealConnectionPool.kt b/okhttp/src/main/java/okhttp3/internal/connection/RealConnectionPool.kt
+index 34bda48ab3..e7477c8293 100644
+--- a/okhttp/src/main/java/okhttp3/internal/connection/RealConnectionPool.kt
++++ b/okhttp/src/main/java/okhttp3/internal/connection/RealConnectionPool.kt
+@@ -40,7 +40,7 @@ class RealConnectionPool(
+   private val keepAliveDurationNs: Long = timeUnit.toNanos(keepAliveDuration)
+ 
+   private val cleanupQueue: TaskQueue = taskRunner.newQueue()
+-  private val cleanupTask = object : Task("OkHttp ConnectionPool") {
++  private val cleanupTask = object : Task("OkHttp ConnectionPool", cancelable = true) {
+     override fun runOnce() = cleanup(System.nanoTime())
+   }
+ 
+diff --git a/okhttp/src/main/java/okhttp3/internal/http2/Http2Connection.kt b/okhttp/src/main/java/okhttp3/internal/http2/Http2Connection.kt
+index 77f448cd0b..b4918d130f 100644
+--- a/okhttp/src/main/java/okhttp3/internal/http2/Http2Connection.kt
++++ b/okhttp/src/main/java/okhttp3/internal/http2/Http2Connection.kt
+@@ -18,13 +18,12 @@ package okhttp3.internal.http2
+ import okhttp3.internal.EMPTY_BYTE_ARRAY
+ import okhttp3.internal.EMPTY_HEADERS
+ import okhttp3.internal.closeQuietly
+-import okhttp3.internal.concurrent.Task
+ import okhttp3.internal.concurrent.TaskRunner
+-import okhttp3.internal.connectionName
+ import okhttp3.internal.http2.ErrorCode.REFUSED_STREAM
+ import okhttp3.internal.http2.Settings.Companion.DEFAULT_INITIAL_WINDOW_SIZE
+ import okhttp3.internal.ignoreIoExceptions
+ import okhttp3.internal.notifyAll
++import okhttp3.internal.peerName
+ import okhttp3.internal.platform.Platform
+ import okhttp3.internal.platform.Platform.Companion.INFO
+ import okhttp3.internal.toHeaders
+@@ -141,12 +140,10 @@ class Http2Connection internal constructor(builder: Builder) : Closeable {
+   init {
+     if (builder.pingIntervalMillis != 0) {
+       val pingIntervalNanos = TimeUnit.MILLISECONDS.toNanos(builder.pingIntervalMillis.toLong())
+-      writerQueue.schedule(object : Task("OkHttp $connectionName ping") {
+-        override fun runOnce(): Long {
+-          writePing(false, 0, 0)
+-          return pingIntervalNanos
+-        }
+-      }, pingIntervalNanos)
++      writerQueue.schedule("$connectionName ping", pingIntervalNanos) {
++        writePing(false, 0, 0)
++        return@schedule pingIntervalNanos
++      }
+     }
+   }
+ 
+@@ -318,16 +315,13 @@ class Http2Connection internal constructor(builder: Builder) : Closeable {
+     streamId: Int,
+     errorCode: ErrorCode
+   ) {
+-    writerQueue.trySchedule(object : Task("OkHttp $connectionName stream $streamId") {
+-      override fun runOnce(): Long {
+-        try {
+-          writeSynReset(streamId, errorCode)
+-        } catch (e: IOException) {
+-          failConnection(e)
+-        }
+-        return -1L
++    writerQueue.tryExecute("$connectionName[$streamId] writeSynReset") {
++      try {
++        writeSynReset(streamId, errorCode)
++      } catch (e: IOException) {
++        failConnection(e)
+       }
+-    })
++    }
+   }
+ 
+   @Throws(IOException::class)
+@@ -342,16 +336,13 @@ class Http2Connection internal constructor(builder: Builder) : Closeable {
+     streamId: Int,
+     unacknowledgedBytesRead: Long
+   ) {
+-    writerQueue.trySchedule(object : Task("OkHttp Window Update $connectionName stream $streamId") {
+-      override fun runOnce(): Long {
+-        try {
+-          writer.windowUpdate(streamId, unacknowledgedBytesRead)
+-        } catch (e: IOException) {
+-          failConnection(e)
+-        }
+-        return -1L
++    writerQueue.tryExecute("$connectionName[$streamId] windowUpdate") {
++      try {
++        writer.windowUpdate(streamId, unacknowledgedBytesRead)
++      } catch (e: IOException) {
++        failConnection(e)
+       }
+-    })
++    }
+   }
+ 
+   fun writePing(
+@@ -489,7 +480,7 @@ class Http2Connection internal constructor(builder: Builder) : Closeable {
+         writer.windowUpdate(0, (windowSize - DEFAULT_INITIAL_WINDOW_SIZE).toLong())
+       }
+     }
+-    Thread(readerRunnable, "OkHttp $connectionName").start() // Not a daemon thread.
++    Thread(readerRunnable, connectionName).start() // Not a daemon thread.
+   }
+ 
+   /** Merges [settings] into this peer's settings and sends them to the remote peer. */
+@@ -522,12 +513,15 @@ class Http2Connection internal constructor(builder: Builder) : Closeable {
+     @Throws(IOException::class) @JvmOverloads
+     fun socket(
+       socket: Socket,
+-      connectionName: String = socket.connectionName(),
++      peerName: String = socket.peerName(),
+       source: BufferedSource = socket.source().buffer(),
+       sink: BufferedSink = socket.sink().buffer()
+     ) = apply {
+       this.socket = socket
+-      this.connectionName = connectionName
++      this.connectionName = when {
++        client -> "OkHttp $peerName"
++        else -> "MockWebServer $peerName"
++      }
+       this.source = source
+       this.sink = sink
+     }
+@@ -631,20 +625,17 @@ class Http2Connection internal constructor(builder: Builder) : Closeable {
+           streams[streamId] = newStream
+ 
+           // Use a different task queue for each stream because they should be handled in parallel.
+-          val taskName = "OkHttp $connectionName stream $streamId"
+-          taskRunner.newQueue().schedule(object : Task(taskName, cancelable = false) {
+-            override fun runOnce(): Long {
+-              try {
+-                listener.onStream(newStream)
+-              } catch (e: IOException) {
+-                Platform.get().log("Http2Connection.Listener failure for $connectionName", INFO, e)
+-                ignoreIoExceptions {
+-                  newStream.close(ErrorCode.PROTOCOL_ERROR, e)
+-                }
++          val taskName = "$connectionName[$streamId] onStream"
++          taskRunner.newQueue().execute(taskName, cancelable = false) {
++            try {
++              listener.onStream(newStream)
++            } catch (e: IOException) {
++              Platform.get().log("Http2Connection.Listener failure for $connectionName", INFO, e)
++              ignoreIoExceptions {
++                newStream.close(ErrorCode.PROTOCOL_ERROR, e)
+               }
+-              return -1L
+             }
+-          })
++          }
+           return
+         }
+       }
+@@ -663,12 +654,9 @@ class Http2Connection internal constructor(builder: Builder) : Closeable {
+     }
+ 
+     override fun settings(clearPrevious: Boolean, settings: Settings) {
+-      writerQueue.trySchedule(object : Task("OkHttp $connectionName ACK Settings") {
+-        override fun runOnce(): Long {
+-          applyAndAckSettings(clearPrevious, settings)
+-          return -1L
+-        }
+-      })
++      writerQueue.tryExecute("$connectionName applyAndAckSettings") {
++        applyAndAckSettings(clearPrevious, settings)
++      }
+     }
+ 
+     /**
+@@ -709,13 +697,9 @@ class Http2Connection internal constructor(builder: Builder) : Closeable {
+ 
+           peerSettings = newPeerSettings
+ 
+-          settingsListenerQueue.trySchedule(object : Task("$connectionName Listener",
+-              cancelable = false) {
+-            override fun runOnce(): Long {
+-              listener.onSettings(this@Http2Connection, newPeerSettings)
+-              return -1L
+-            }
+-          })
++          settingsListenerQueue.tryExecute("$connectionName onSettings", cancelable = false) {
++            listener.onSettings(this@Http2Connection, newPeerSettings)
++          }
+         }
+         try {
+           writer.applyAndAckSettings(newPeerSettings)
+@@ -748,12 +732,9 @@ class Http2Connection internal constructor(builder: Builder) : Closeable {
+         }
+       } else {
+         // Send a reply to a client ping if this is a server and vice versa.
+-        writerQueue.trySchedule(object : Task("OkHttp $connectionName ping") {
+-          override fun runOnce(): Long {
+-            writePing(true, payload1, payload2)
+-            return -1L
+-          }
+-        })
++        writerQueue.tryExecute("$connectionName ping") {
++          writePing(true, payload1, payload2)
++        }
+       }
+     }
+ 
+@@ -838,20 +819,17 @@ class Http2Connection internal constructor(builder: Builder) : Closeable {
+       }
+       currentPushRequests.add(streamId)
+     }
+-    pushQueue.trySchedule(object : Task("OkHttp $connectionName Push Request[$streamId]") {
+-      override fun runOnce(): Long {
+-        val cancel = pushObserver.onRequest(streamId, requestHeaders)
+-        ignoreIoExceptions {
+-          if (cancel) {
+-            writer.rstStream(streamId, ErrorCode.CANCEL)
+-            synchronized(this@Http2Connection) {
+-              currentPushRequests.remove(streamId)
+-            }
++    pushQueue.tryExecute("$connectionName[$streamId] onRequest") {
++      val cancel = pushObserver.onRequest(streamId, requestHeaders)
++      ignoreIoExceptions {
++        if (cancel) {
++          writer.rstStream(streamId, ErrorCode.CANCEL)
++          synchronized(this@Http2Connection) {
++            currentPushRequests.remove(streamId)
+           }
+         }
+-        return -1L
+       }
+-    })
++    }
+   }
+ 
+   internal fun pushHeadersLater(
+@@ -859,20 +837,17 @@ class Http2Connection internal constructor(builder: Builder) : Closeable {
+     requestHeaders: List<Header>,
+     inFinished: Boolean
+   ) {
+-    pushQueue.trySchedule(object : Task("OkHttp $connectionName Push Headers[$streamId]") {
+-      override fun runOnce(): Long {
+-        val cancel = pushObserver.onHeaders(streamId, requestHeaders, inFinished)
+-        ignoreIoExceptions {
+-          if (cancel) writer.rstStream(streamId, ErrorCode.CANCEL)
+-          if (cancel || inFinished) {
+-            synchronized(this@Http2Connection) {
+-              currentPushRequests.remove(streamId)
+-            }
++    pushQueue.tryExecute("$connectionName[$streamId] onHeaders") {
++      val cancel = pushObserver.onHeaders(streamId, requestHeaders, inFinished)
++      ignoreIoExceptions {
++        if (cancel) writer.rstStream(streamId, ErrorCode.CANCEL)
++        if (cancel || inFinished) {
++          synchronized(this@Http2Connection) {
++            currentPushRequests.remove(streamId)
+           }
+         }
+-        return -1L
+       }
+-    })
++    }
+   }
+ 
+   /**
+@@ -889,33 +864,26 @@ class Http2Connection internal constructor(builder: Builder) : Closeable {
+     val buffer = Buffer()
+     source.require(byteCount.toLong()) // Eagerly read the frame before firing client thread.
+     source.read(buffer, byteCount.toLong())
+-    pushQueue.trySchedule(object : Task("OkHttp $connectionName Push Data[$streamId]") {
+-      override fun runOnce(): Long {
+-        ignoreIoExceptions {
+-          val cancel = pushObserver.onData(streamId, buffer, byteCount, inFinished)
+-          if (cancel) writer.rstStream(streamId, ErrorCode.CANCEL)
+-          if (cancel || inFinished) {
+-            synchronized(this@Http2Connection) {
+-              currentPushRequests.remove(streamId)
+-            }
++    pushQueue.tryExecute("$connectionName[$streamId] onData") {
++      ignoreIoExceptions {
++        val cancel = pushObserver.onData(streamId, buffer, byteCount, inFinished)
++        if (cancel) writer.rstStream(streamId, ErrorCode.CANCEL)
++        if (cancel || inFinished) {
++          synchronized(this@Http2Connection) {
++            currentPushRequests.remove(streamId)
+           }
+         }
+-        return -1L
+       }
+-    })
++    }
+   }
+ 
+   internal fun pushResetLater(streamId: Int, errorCode: ErrorCode) {
+-    pushQueue.trySchedule(object : Task("OkHttp $connectionName Push Reset[$streamId]",
+-        cancelable = false) {
+-      override fun runOnce(): Long {
+-        pushObserver.onReset(streamId, errorCode)
+-        synchronized(this@Http2Connection) {
+-          currentPushRequests.remove(streamId)
+-        }
+-        return -1L
++    pushQueue.tryExecute("$connectionName[$streamId] onReset", cancelable = false) {
++      pushObserver.onReset(streamId, errorCode)
++      synchronized(this@Http2Connection) {
++        currentPushRequests.remove(streamId)
+       }
+-    })
++    }
+   }
+ 
+   /** Listener of streams and settings initiated by the peer. */
+diff --git a/okhttp/src/main/java/okhttp3/internal/ws/RealWebSocket.kt b/okhttp/src/main/java/okhttp3/internal/ws/RealWebSocket.kt
+index 81a8f14fa6..d8627e1949 100644
+--- a/okhttp/src/main/java/okhttp3/internal/ws/RealWebSocket.kt
++++ b/okhttp/src/main/java/okhttp3/internal/ws/RealWebSocket.kt
+@@ -218,7 +218,10 @@ class RealWebSocket(
+       this.writerTask = WriterTask()
+       if (pingIntervalMillis != 0L) {
+         val pingIntervalNanos = MILLISECONDS.toNanos(pingIntervalMillis)
+-        taskQueue.schedule(PingTask(pingIntervalNanos), pingIntervalNanos)
++        taskQueue.schedule("$name ping", pingIntervalNanos) {
++          writePingFrame()
++          return@schedule pingIntervalNanos
++        }
+       }
+       if (messageAndCloseQueue.isNotEmpty()) {
+         runWriter() // Send messages that were enqueued before we were connected.
+@@ -433,9 +436,10 @@ class RealWebSocket(
+             this.taskQueue.shutdown()
+           } else {
+             // When we request a graceful close also schedule a cancel of the web socket.
+-            val cancelAfterCloseNanos =
+-                MILLISECONDS.toNanos((messageOrClose as Close).cancelAfterCloseMillis)
+-            taskQueue.schedule(CancelTask(), cancelAfterCloseNanos)
++            val cancelAfterCloseMillis = (messageOrClose as Close).cancelAfterCloseMillis
++            taskQueue.execute("$name cancel", MILLISECONDS.toNanos(cancelAfterCloseMillis)) {
++              cancel()
++            }
+           }
+         } else if (messageOrClose == null) {
+           return false // The queue is exhausted.
+@@ -531,21 +535,7 @@ class RealWebSocket(
+     val sink: BufferedSink
+   ) : Closeable
+ 
+-  private inner class PingTask(val delayNanos: Long) : Task("$name Ping") {
+-    override fun runOnce(): Long {
+-      writePingFrame()
+-      return delayNanos
+-    }
+-  }
+-
+-  private inner class CancelTask : Task("$name Cancel") {
+-    override fun runOnce(): Long {
+-      cancel()
+-      return -1L
+-    }
+-  }
+-
+-  private inner class WriterTask : Task("$name Writer") {
++  private inner class WriterTask : Task("$name writer", cancelable = true) {
+     override fun runOnce(): Long {
+       try {
+         if (writeOneFrame()) return 0L
+diff --git a/okhttp/src/test/java/okhttp3/internal/concurrent/TaskRunnerRealBackendTest.kt b/okhttp/src/test/java/okhttp3/internal/concurrent/TaskRunnerRealBackendTest.kt
+index 27dcd27779..a762daf73d 100644
+--- a/okhttp/src/test/java/okhttp3/internal/concurrent/TaskRunnerRealBackendTest.kt
++++ b/okhttp/src/test/java/okhttp3/internal/concurrent/TaskRunnerRealBackendTest.kt
+@@ -15,6 +15,7 @@
+  */
+ package okhttp3.internal.concurrent
+ 
++import okhttp3.internal.threadFactory
+ import org.assertj.core.api.Assertions.assertThat
+ import org.assertj.core.data.Offset
+ import org.junit.Test
+@@ -29,7 +30,7 @@ import java.util.concurrent.TimeUnit
+  * busiest of CI servers.
+  */
+ class TaskRunnerRealBackendTest {
+-  private val backend = TaskRunner.RealBackend()
++  private val backend = TaskRunner.RealBackend(threadFactory("TaskRunnerRealBackendTest", true))
+   private val taskRunner = TaskRunner(backend)
+   private val queue = taskRunner.newQueue()
+   private val log = LinkedBlockingDeque<String>()
+@@ -37,13 +38,11 @@ class TaskRunnerRealBackendTest {
+   @Test fun test() {
+     val t1 = System.nanoTime() / 1e6
+ 
+-    queue.schedule(object : Task("task") {
+-      val delays = mutableListOf(TimeUnit.MILLISECONDS.toNanos(1000), -1L)
+-      override fun runOnce(): Long {
+-        log.put("runOnce delays.size=${delays.size}")
+-        return delays.removeAt(0)
+-      }
+-    }, TimeUnit.MILLISECONDS.toNanos(750))
++    val delays = mutableListOf(TimeUnit.MILLISECONDS.toNanos(1000), -1L)
++    queue.schedule("task", TimeUnit.MILLISECONDS.toNanos(750)) {
++      log.put("runOnce delays.size=${delays.size}")
++      return@schedule delays.removeAt(0)
++    }
+ 
+     assertThat(log.take()).isEqualTo("runOnce delays.size=2")
+     val t2 = System.nanoTime() / 1e6 - t1
+diff --git a/okhttp/src/test/java/okhttp3/internal/concurrent/TaskRunnerTest.kt b/okhttp/src/test/java/okhttp3/internal/concurrent/TaskRunnerTest.kt
+index f0dcf91656..9fdbdf9d96 100644
+--- a/okhttp/src/test/java/okhttp3/internal/concurrent/TaskRunnerTest.kt
++++ b/okhttp/src/test/java/okhttp3/internal/concurrent/TaskRunnerTest.kt
+@@ -29,12 +29,9 @@ class TaskRunnerTest {
+   private val greenQueue = taskRunner.newQueue()
+ 
+   @Test fun executeDelayed() {
+-    redQueue.schedule(object : Task("task") {
+-      override fun runOnce(): Long {
+-        log += "run@${taskFaker.nanoTime}"
+-        return -1L
+-      }
+-    }, 100L)
++    redQueue.execute("task", 100L) {
++      log += "run@${taskFaker.nanoTime}"
++    }
+ 
+     taskFaker.advanceUntil(0L)
+     assertThat(log).containsExactly()
+@@ -49,13 +46,11 @@ class TaskRunnerTest {
+   }
+ 
+   @Test fun executeRepeated() {
+-    redQueue.schedule(object : Task("task") {
+-      val delays = mutableListOf(50L, 150L, -1L)
+-      override fun runOnce(): Long {
+-        log += "run@${taskFaker.nanoTime}"
+-        return delays.removeAt(0)
+-      }
+-    }, 100L)
++    val delays = mutableListOf(50L, 150L, -1L)
++    redQueue.schedule("task", 100L) {
++      log += "run@${taskFaker.nanoTime}"
++      return@schedule delays.removeAt(0)
++    }
+ 
+     taskFaker.advanceUntil(0L)
+     assertThat(log).containsExactly()
+@@ -77,7 +72,7 @@ class TaskRunnerTest {
+ 
+   /** Repeat with a delay of 200 but schedule with a delay of 50. The schedule wins. */
+   @Test fun executeScheduledEarlierReplacesRepeatedLater() {
+-    redQueue.schedule(object : Task("task") {
++    val task = object : Task("task", cancelable = true) {
+       val schedules = mutableListOf(50L)
+       val delays = mutableListOf(200L, -1L)
+       override fun runOnce(): Long {
+@@ -87,7 +82,8 @@ class TaskRunnerTest {
+         }
+         return delays.removeAt(0)
+       }
+-    }, 100L)
++    }
++    redQueue.schedule(task, 100L)
+ 
+     taskFaker.advanceUntil(0L)
+     assertThat(log).isEmpty()
+@@ -103,7 +99,7 @@ class TaskRunnerTest {
+ 
+   /** Schedule with a delay of 200 but repeat with a delay of 50. The repeat wins. */
+   @Test fun executeRepeatedEarlierReplacesScheduledLater() {
+-    redQueue.schedule(object : Task("task") {
++    val task = object : Task("task", cancelable = true) {
+       val schedules = mutableListOf(200L)
+       val delays = mutableListOf(50L, -1L)
+       override fun runOnce(): Long {
+@@ -113,7 +109,8 @@ class TaskRunnerTest {
+         }
+         return delays.removeAt(0)
+       }
+-    }, 100L)
++    }
++    redQueue.schedule(task, 100L)
+ 
+     taskFaker.advanceUntil(0L)
+     assertThat(log).isEmpty()
+@@ -128,12 +125,9 @@ class TaskRunnerTest {
+   }
+ 
+   @Test fun cancelReturnsTruePreventsNextExecution() {
+-    redQueue.schedule(object : Task("task") {
+-      override fun runOnce(): Long {
+-        log += "run@${taskFaker.nanoTime}"
+-        return -1L
+-      }
+-    }, 100L)
++    redQueue.execute("task", 100L) {
++      log += "run@${taskFaker.nanoTime}"
++    }
+ 
+     taskFaker.advanceUntil(0L)
+     assertThat(log).isEmpty()
+@@ -147,12 +141,9 @@ class TaskRunnerTest {
+   }
+ 
+   @Test fun cancelReturnsFalseDoesNotCancel() {
+-    redQueue.schedule(object : Task("task", cancelable = false) {
+-      override fun runOnce(): Long {
+-        log += "run@${taskFaker.nanoTime}"
+-        return -1L
+-      }
+-    }, 100L)
++    redQueue.execute("task", 100L, cancelable = false) {
++      log += "run@${taskFaker.nanoTime}"
++    }
+ 
+     taskFaker.advanceUntil(0L)
+     assertThat(log).isEmpty()
+@@ -169,13 +160,11 @@ class TaskRunnerTest {
+   }
+ 
+   @Test fun cancelWhileExecutingPreventsRepeat() {
+-    redQueue.schedule(object : Task("task") {
+-      override fun runOnce(): Long {
+-        log += "run@${taskFaker.nanoTime}"
+-        redQueue.cancelAll()
+-        return 100L
+-      }
+-    }, 100L)
++    redQueue.schedule("task", 100L) {
++      log += "run@${taskFaker.nanoTime}"
++      redQueue.cancelAll()
++      return@schedule 100L
++    }
+ 
+     taskFaker.advanceUntil(0L)
+     assertThat(log).isEmpty()
+@@ -187,13 +176,10 @@ class TaskRunnerTest {
+   }
+ 
+   @Test fun cancelWhileExecutingDoesNothingIfTaskDoesNotRepeat() {
+-    redQueue.schedule(object : Task("task") {
+-      override fun runOnce(): Long {
+-        log += "run@${taskFaker.nanoTime}"
+-        redQueue.cancelAll()
+-        return -1L
+-      }
+-    }, 100L)
++    redQueue.execute("task", 100L) {
++      log += "run@${taskFaker.nanoTime}"
++      redQueue.cancelAll()
++    }
+ 
+     taskFaker.advanceUntil(0L)
+     assertThat(log).isEmpty()
+@@ -205,14 +191,12 @@ class TaskRunnerTest {
+   }
+ 
+   @Test fun cancelWhileExecutingDoesNotStopUncancelableTask() {
+-    redQueue.schedule(object : Task("task", cancelable = false) {
+-      val delays = mutableListOf(50L, -1L)
+-      override fun runOnce(): Long {
+-        log += "run@${taskFaker.nanoTime}"
+-        redQueue.cancelAll()
+-        return delays.removeAt(0)
+-      }
+-    }, 100L)
++    val delays = mutableListOf(50L, -1L)
++    redQueue.schedule("task", 100L, cancelable = false) {
++      log += "run@${taskFaker.nanoTime}"
++      redQueue.cancelAll()
++      return@schedule delays.removeAt(0)
++    }
+ 
+     taskFaker.advanceUntil(0L)
+     assertThat(log).isEmpty()
+@@ -227,12 +211,9 @@ class TaskRunnerTest {
+   }
+ 
+   @Test fun interruptingCoordinatorAttemptsToCancelsAndSucceeds() {
+-    redQueue.schedule(object : Task("task") {
+-      override fun runOnce(): Long {
+-        log += "run@${taskFaker.nanoTime}"
+-        return -1L
+-      }
+-    }, 100L)
++    redQueue.execute("task", 100L) {
++      log += "run@${taskFaker.nanoTime}"
++    }
+ 
+     taskFaker.advanceUntil(0L)
+     assertThat(log).isEmpty()
+@@ -246,12 +227,9 @@ class TaskRunnerTest {
+   }
+ 
+   @Test fun interruptingCoordinatorAttemptsToCancelsAndFails() {
+-    redQueue.schedule(object : Task("task", cancelable = false) {
+-      override fun runOnce(): Long {
+-        log += "run@${taskFaker.nanoTime}"
+-        return -1L
+-      }
+-    }, 100L)
++    redQueue.execute("task", 100L, cancelable = false) {
++      log += "run@${taskFaker.nanoTime}"
++    }
+ 
+     taskFaker.advanceUntil(0L)
+     assertThat(log).isEmpty()
+@@ -269,26 +247,17 @@ class TaskRunnerTest {
+ 
+   /** Inspect how many runnables have been enqueued. If none then we're truly sequential. */
+   @Test fun singleQueueIsSerial() {
+-    redQueue.schedule(object : Task("task one") {
+-      override fun runOnce(): Long {
+-        log += "one:run@${taskFaker.nanoTime} parallel=${taskFaker.isParallel}"
+-        return -1L
+-      }
+-    }, 100L)
++    redQueue.execute("task one", 100L) {
++      log += "one:run@${taskFaker.nanoTime} parallel=${taskFaker.isParallel}"
++    }
+ 
+-    redQueue.schedule(object : Task("task two") {
+-      override fun runOnce(): Long {
+-        log += "two:run@${taskFaker.nanoTime} parallel=${taskFaker.isParallel}"
+-        return -1L
+-      }
+-    }, 100L)
++    redQueue.execute("task two", 100L) {
++      log += "two:run@${taskFaker.nanoTime} parallel=${taskFaker.isParallel}"
++    }
+ 
+-    redQueue.schedule(object : Task("task three") {
+-      override fun runOnce(): Long {
+-        log += "three:run@${taskFaker.nanoTime} parallel=${taskFaker.isParallel}"
+-        return -1L
+-      }
+-    }, 100L)
++    redQueue.execute("task three", 100L) {
++      log += "three:run@${taskFaker.nanoTime} parallel=${taskFaker.isParallel}"
++    }
+ 
+     taskFaker.advanceUntil(0L)
+     assertThat(log).isEmpty()
+@@ -305,26 +274,17 @@ class TaskRunnerTest {
+ 
+   /** Inspect how many runnables have been enqueued. If non-zero then we're truly parallel. */
+   @Test fun differentQueuesAreParallel() {
+-    redQueue.schedule(object : Task("task one") {
+-      override fun runOnce(): Long {
+-        log += "one:run@${taskFaker.nanoTime} parallel=${taskFaker.isParallel}"
+-        return -1L
+-      }
+-    }, 100L)
++    redQueue.execute("task one", 100L) {
++      log += "one:run@${taskFaker.nanoTime} parallel=${taskFaker.isParallel}"
++    }
+ 
+-    blueQueue.schedule(object : Task("task two") {
+-      override fun runOnce(): Long {
+-        log += "two:run@${taskFaker.nanoTime} parallel=${taskFaker.isParallel}"
+-        return -1L
+-      }
+-    }, 100L)
++    blueQueue.execute("task two", 100L) {
++      log += "two:run@${taskFaker.nanoTime} parallel=${taskFaker.isParallel}"
++    }
+ 
+-    greenQueue.schedule(object : Task("task three") {
+-      override fun runOnce(): Long {
+-        log += "three:run@${taskFaker.nanoTime} parallel=${taskFaker.isParallel}"
+-        return -1L
+-      }
+-    }, 100L)
++    greenQueue.execute("task three", 100L) {
++      log += "three:run@${taskFaker.nanoTime} parallel=${taskFaker.isParallel}"
++    }
+ 
+     taskFaker.advanceUntil(0L)
+     assertThat(log).isEmpty()
+@@ -341,19 +301,15 @@ class TaskRunnerTest {
+ 
+   /** Test the introspection method [TaskQueue.scheduledTasks]. */
+   @Test fun scheduledTasks() {
+-    redQueue.schedule(object : Task("task one") {
+-      override fun runOnce(): Long = -1L
+-
+-      override fun toString() = "one"
+-    }, 100L)
+-
+-    redQueue.schedule(object : Task("task two") {
+-      override fun runOnce(): Long = -1L
++    redQueue.execute("task one", 100L) {
++      // Do nothing.
++    }
+ 
+-      override fun toString() = "two"
+-    }, 200L)
++    redQueue.execute("task two", 200L) {
++      // Do nothing.
++    }
+ 
+-    assertThat(redQueue.scheduledTasks.toString()).isEqualTo("[one, two]")
++    assertThat(redQueue.scheduledTasks.toString()).isEqualTo("[task one, task two]")
+   }
+ 
+   /**
+@@ -361,7 +317,7 @@ class TaskRunnerTest {
+    * cumbersome to implement properly because the active task might be a cancel.
+    */
+   @Test fun scheduledTasksDoesNotIncludeRunningTask() {
+-    redQueue.schedule(object : Task("task one") {
++    val task = object : Task("task one", cancelable = true) {
+       val schedules = mutableListOf(200L)
+       override fun runOnce(): Long {
+         if (schedules.isNotEmpty()) {
+@@ -370,34 +326,28 @@ class TaskRunnerTest {
+         log += "scheduledTasks=${redQueue.scheduledTasks}"
+         return -1L
+       }
++    }
++    redQueue.schedule(task, 100L)
+ 
+-      override fun toString() = "one"
+-    }, 100L)
+-
+-    redQueue.schedule(object : Task("task two") {
+-      override fun runOnce(): Long {
+-        log += "scheduledTasks=${redQueue.scheduledTasks}"
+-        return -1L
+-      }
+-
+-      override fun toString() = "two"
+-    }, 200L)
++    redQueue.execute("task two", 200L) {
++      log += "scheduledTasks=${redQueue.scheduledTasks}"
++    }
+ 
+     taskFaker.advanceUntil(100L)
+     assertThat(log).containsExactly(
+-        "scheduledTasks=[two, one]"
++        "scheduledTasks=[task two, task one]"
+     )
+ 
+     taskFaker.advanceUntil(200L)
+     assertThat(log).containsExactly(
+-        "scheduledTasks=[two, one]",
+-        "scheduledTasks=[one]"
++        "scheduledTasks=[task two, task one]",
++        "scheduledTasks=[task one]"
+     )
+ 
+     taskFaker.advanceUntil(300L)
+     assertThat(log).containsExactly(
+-        "scheduledTasks=[two, one]",
+-        "scheduledTasks=[one]",
++        "scheduledTasks=[task two, task one]",
++        "scheduledTasks=[task one]",
+         "scheduledTasks=[]"
+     )
+ 
+@@ -410,13 +360,13 @@ class TaskRunnerTest {
+    * queues have work scheduled.
+    */
+   @Test fun activeQueuesContainsOnlyQueuesWithScheduledTasks() {
+-    redQueue.schedule(object : Task("task one") {
+-      override fun runOnce() = -1L
+-    }, 100L)
++    redQueue.execute("task one", 100L) {
++      // Do nothing.
++    }
+ 
+-    blueQueue.schedule(object : Task("task two") {
+-      override fun runOnce() = -1L
+-    }, 200L)
++    blueQueue.execute("task two", 200L) {
++      // Do nothing.
++    }
+ 
+     taskFaker.advanceUntil(0L)
+     assertThat(taskRunner.activeQueues()).containsExactly(redQueue, blueQueue)
+@@ -431,12 +381,9 @@ class TaskRunnerTest {
+   }
+ 
+   @Test fun taskNameIsUsedForThreadNameWhenRunning() {
+-    redQueue.schedule(object : Task("lucky task") {
+-      override fun runOnce(): Long {
+-        log += "run threadName:${Thread.currentThread().name}"
+-        return -1L
+-      }
+-    })
++    redQueue.execute("lucky task") {
++      log += "run threadName:${Thread.currentThread().name}"
++    }
+ 
+     taskFaker.advanceUntil(0L)
+     assertThat(log).containsExactly("run threadName:lucky task")
+@@ -445,12 +392,9 @@ class TaskRunnerTest {
+   }
+ 
+   @Test fun shutdownSuccessfullyCancelsScheduledTasks() {
+-    redQueue.schedule(object : Task("task") {
+-      override fun runOnce(): Long {
+-        log += "run@${taskFaker.nanoTime}"
+-        return -1L
+-      }
+-    }, 100L)
++    redQueue.execute("task", 100L) {
++      log += "run@${taskFaker.nanoTime}"
++    }
+ 
+     taskFaker.advanceUntil(0L)
+     assertThat(log).isEmpty()
+@@ -464,12 +408,10 @@ class TaskRunnerTest {
+   }
+ 
+   @Test fun shutdownFailsToCancelsScheduledTasks() {
+-    redQueue.schedule(object : Task("task", cancelable = false) {
+-      override fun runOnce(): Long {
+-        log += "run@${taskFaker.nanoTime}"
+-        return 50L
+-      }
+-    }, 100L)
++    redQueue.schedule("task", 100L, cancelable = false) {
++      log += "run@${taskFaker.nanoTime}"
++      return@schedule 50L
++    }
+ 
+     taskFaker.advanceUntil(0L)
+     assertThat(log).isEmpty()
+@@ -488,9 +430,9 @@ class TaskRunnerTest {
+   @Test fun scheduleDiscardsTaskWhenShutdown() {
+     redQueue.shutdown()
+ 
+-    redQueue.trySchedule(object : Task("task") {
+-      override fun runOnce() = -1L
+-    }, 100L)
++    redQueue.tryExecute("task", 100L) {
++      // Do nothing.
++    }
+ 
+     taskFaker.assertNoMoreTasks()
+   }
+@@ -499,9 +441,9 @@ class TaskRunnerTest {
+     redQueue.shutdown()
+ 
+     try {
+-      redQueue.schedule(object : Task("task") {
+-        override fun runOnce() = -1L
+-      }, 100L)
++      redQueue.execute("task", 100L) {
++        // Do nothing.
++      }
+       fail()
+     } catch (_: RejectedExecutionException) {
+     }
+diff --git a/okhttp/src/test/java/okhttp3/internal/connection/ConnectionPoolTest.java b/okhttp/src/test/java/okhttp3/internal/connection/ConnectionPoolTest.java
+index bd1a80d1ad..06e92889c5 100644
+--- a/okhttp/src/test/java/okhttp3/internal/connection/ConnectionPoolTest.java
++++ b/okhttp/src/test/java/okhttp3/internal/connection/ConnectionPoolTest.java
+@@ -196,7 +196,7 @@
+     Thread[] threads = new Thread[Thread.activeCount() * 2];
+     Thread.enumerate(threads);
+     for (Thread t: threads) {
+-      if (t != null && t.getName().equals("OkHttp Task")) {
++      if (t != null && t.getName().equals("OkHttp TaskRunner")) {
+         t.interrupt();
+       }
+     }

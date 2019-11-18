@@ -1,0 +1,1039 @@
+diff --git a/compiler/src/main/java/dagger/internal/codegen/BindingGraphValidator.java b/compiler/src/main/java/dagger/internal/codegen/BindingGraphValidator.java
+index ade56ca1e..e0f025a23 100644
+--- a/compiler/src/main/java/dagger/internal/codegen/BindingGraphValidator.java
++++ b/compiler/src/main/java/dagger/internal/codegen/BindingGraphValidator.java
+@@ -1,8 +1,10 @@
+ package dagger.internal.codegen;
+ 
+ import com.google.auto.common.MoreElements;
++import com.google.common.base.Equivalence;
+ import com.google.common.base.Function;
+ import com.google.common.base.Joiner;
++import com.google.common.base.Optional;
+ import com.google.common.collect.FluentIterable;
+ import com.google.common.collect.ImmutableList;
+ import com.google.common.collect.ImmutableListMultimap;
+@@ -18,7 +20,9 @@
+ import java.util.Formatter;
+ import java.util.LinkedList;
+ import java.util.Set;
++import javax.lang.model.element.AnnotationMirror;
+ import javax.lang.model.element.ElementKind;
++import javax.lang.model.element.ExecutableElement;
+ import javax.lang.model.element.Modifier;
+ import javax.lang.model.element.Name;
+ import javax.lang.model.element.TypeElement;
+@@ -30,6 +34,7 @@
+ import static dagger.internal.codegen.ErrorMessages.INDENT;
+ import static dagger.internal.codegen.ErrorMessages.REQUIRES_AT_INJECT_CONSTRUCTOR_OR_PROVIDER_FORMAT;
+ import static dagger.internal.codegen.ErrorMessages.REQUIRES_PROVIDER_FORMAT;
++import static dagger.internal.codegen.ErrorMessages.stripCommonTypePrefixes;
+ 
+ public class BindingGraphValidator implements Validator<BindingGraph> {
+   private final Types types;
+@@ -46,6 +51,8 @@
+         ValidationReport.Builder.about(subject);
+     ImmutableMap<Key, ResolvedBindings> resolvedBindings = subject.resolvedBindings();
+ 
++    validateComponentScope(subject, reportBuilder, resolvedBindings);
++
+     for (DependencyRequest entryPoint : subject.entryPoints()) {
+       ResolvedBindings resolvedBinding = resolvedBindings.get(entryPoint.key());
+       if (!resolvedBinding.state().equals(State.COMPLETE)) {
+@@ -84,6 +91,64 @@ boolean visitResolvedBinding(
+     return reportBuilder.build();
+   }
+ 
++  /**
++   * Validates that the scope (if any) of this component are compatible with the scopes of the
++   * bindings available in this component
++   */
++  void validateComponentScope(final BindingGraph subject,
++      final ValidationReport.Builder<BindingGraph> reportBuilder,
++      ImmutableMap<Key, ResolvedBindings> resolvedBindings) {
++    Optional<Equivalence.Wrapper<AnnotationMirror>> componentScope =
++        subject.componentDescriptor().wrappedScope();
++    ImmutableSet.Builder<String> incompatiblyScopedMethodsBuilder = ImmutableSet.builder();
++    for (ResolvedBindings bindings : resolvedBindings.values()) {
++      for (Binding binding : bindings.bindings()) {
++        if (binding instanceof ProvisionBinding) {
++          ProvisionBinding provisionBinding = (ProvisionBinding) binding;
++          if (provisionBinding.scope().isPresent()
++              && !componentScope.equals(provisionBinding.wrappedScope())) {
++            // Scoped components cannot reference bindings to @Provides methods or @Inject
++            // types decorated by a different scope annotation. Unscoped components cannot
++            // reference to scoped @Provides methods or @Inject types decorated by any
++            // scope annotation.
++            switch (provisionBinding.bindingKind()) {
++              case PROVISION:
++                ExecutableElement provisionMethod =
++                    MoreElements.asExecutable(provisionBinding.bindingElement());
++                incompatiblyScopedMethodsBuilder.add(
++                    MethodSignatureFormatter.instance().format(provisionMethod));
++                break;
++              case INJECTION:
++                incompatiblyScopedMethodsBuilder.add(
++                    stripCommonTypePrefixes(provisionBinding.scope().get().toString()) + " class "
++                        + provisionBinding.bindingTypeElement().getQualifiedName());
++                break;
++              default:
++                throw new IllegalStateException();
++            }
++          }
++        }
++      }
++    }
++    ImmutableSet<String> incompatiblyScopedMethods = incompatiblyScopedMethodsBuilder.build();
++    if (!incompatiblyScopedMethods.isEmpty()) {
++      TypeElement componentType = subject.componentDescriptor().componentDefinitionType();
++      StringBuilder message = new StringBuilder(componentType.getQualifiedName());
++      if (componentScope.isPresent()) {
++        message.append(" scoped with ");
++        message.append(stripCommonTypePrefixes(ErrorMessages.format(componentScope.get().get())));
++        message.append(" may not reference bindings with different scopes:\n");
++      } else {
++        message.append(" (unscoped) may not reference scoped bindings:\n");
++      }
++      for (String method : incompatiblyScopedMethods) {
++        message.append(ErrorMessages.INDENT).append(method).append("\n");
++      }
++      reportBuilder.addItem(message.toString(), componentType,
++          subject.componentDescriptor().componentAnnotation());
++    }
++  }
++
+   private void reportMissingBinding(
+       Deque<DependencyRequest> requestPath, ValidationReport.Builder<BindingGraph> reportBuilder) {
+     Key key = requestPath.peek().key();
+diff --git a/compiler/src/main/java/dagger/internal/codegen/ComponentDescriptor.java b/compiler/src/main/java/dagger/internal/codegen/ComponentDescriptor.java
+index 8a6c71aa3..e1f8ae142 100644
+--- a/compiler/src/main/java/dagger/internal/codegen/ComponentDescriptor.java
++++ b/compiler/src/main/java/dagger/internal/codegen/ComponentDescriptor.java
+@@ -17,6 +17,8 @@
+ 
+ import com.google.auto.common.MoreTypes;
+ import com.google.auto.value.AutoValue;
++import com.google.common.base.Equivalence;
++import com.google.common.base.Optional;
+ import com.google.common.collect.ImmutableMap;
+ import com.google.common.collect.ImmutableSet;
+ import com.google.common.collect.ImmutableSetMultimap;
+@@ -30,6 +32,9 @@
+ import javax.lang.model.util.Types;
+ 
+ import static com.google.auto.common.MoreElements.getAnnotationMirror;
++import static dagger.internal.codegen.InjectionAnnotations.getScopeAnnotation;
++import static dagger.internal.codegen.Util.unwrapOptionalEquivalence;
++import static dagger.internal.codegen.Util.wrapOptionalInEquivalence;
+ import static javax.lang.model.type.TypeKind.VOID;
+ 
+ /**
+@@ -62,6 +67,20 @@
+    */
+   abstract ImmutableMap<ExecutableElement, TypeElement> dependencyMethodIndex();
+ 
++  /**
++   * An optional annotation constraining the scope of this component.
++   */
++  Optional<AnnotationMirror> scope() {
++    return unwrapOptionalEquivalence(wrappedScope());
++  }
++
++  /**
++   * An optional annotation constraining the scope of this component wrapped in an
++   * {@link com.google.common.base.Equivalence.Wrapper} to preserve comparison semantics of
++   * {@link AnnotationMirror}.
++   */
++  abstract Optional<Equivalence.Wrapper<AnnotationMirror>> wrappedScope();
++
+   static final class Factory {
+     private final Elements elements;
+     private final Types types;
+@@ -106,11 +125,13 @@ ComponentDescriptor create(TypeElement componentDefinitionType) {
+         }
+       }
+ 
++      Optional<AnnotationMirror> scope = getScopeAnnotation(componentDefinitionType);
+       return new AutoValue_ComponentDescriptor(
+           componentMirror,
+           componentDefinitionType,
+           componentDependencyTypes,
+-          dependencyMethodIndex.build());
++          dependencyMethodIndex.build(),
++          wrapOptionalInEquivalence(AnnotationMirrors.equivalence(), scope));
+     }
+   }
+ 
+diff --git a/compiler/src/main/java/dagger/internal/codegen/ErrorMessages.java b/compiler/src/main/java/dagger/internal/codegen/ErrorMessages.java
+index 0cd4df5fc..52be09233 100644
+--- a/compiler/src/main/java/dagger/internal/codegen/ErrorMessages.java
++++ b/compiler/src/main/java/dagger/internal/codegen/ErrorMessages.java
+@@ -15,6 +15,11 @@
+  */
+ package dagger.internal.codegen;
+ 
++import dagger.Provides;
++import java.util.regex.Matcher;
++import java.util.regex.Pattern;
++import javax.lang.model.element.AnnotationMirror;
++
+ /**
+  * The collection of error messages to be reported back to users.
+  *
+@@ -151,5 +156,56 @@
+   static final String MALFORMED_MODULE_METHOD_FORMAT =
+       "Cannot generated a graph because method %s on module %s was malformed";
+ 
++  /**
++   * A regular expression to match a small list of specific packages deemed to
++   * be unhelpful to display in fully qualified types in error messages.
++   *
++   * Note: This should never be applied to messages themselves.
++   */
++  private static final Pattern COMMON_PACKAGE_PATTERN = Pattern.compile(
++      "(?:^|[^.a-z_])"     // What we want to match on but not capture.
++      + "((?:"             // Start a group with a non-capturing or part
++      + "java[.]lang"
++      + "|java[.]util"
++      + "|javax[.]inject"
++      + "|dagger"
++      + "|com[.]google[.]common[.]base"
++      + "|com[.]google[.]common[.]collect"
++      + ")[.])"            // Always end with a literal .
++      + "[A-Z]");           // What we want to match on but not capture.
++
++  /**
++   * A method to strip out common packages and a few rare type prefixes
++   * from types' string representation before being used in error messages.
++   *
++   * This type assumes a String value that is a valid fully qualified
++   * (and possibly parameterized) type, and should NOT be used with
++   * arbitrary text, especially prose error messages.
++   *
++   * TODO(user): Tighten these to take type representations (mirrors
++   *     and elements) to avoid accidental mis-use by running errors
++   *     through this method.
++   */
++  static String stripCommonTypePrefixes(String type) {
++    // Special case this enum's constants since they will be incredibly common.
++    type = type.replace(Provides.Type.class.getCanonicalName() + ".", "");
++
++    // Do regex magic to remove common packages we care to shorten.
++    Matcher matcher = COMMON_PACKAGE_PATTERN.matcher(type);
++    StringBuilder result = new StringBuilder();
++    int index = 0;
++    while (matcher.find()) {
++      result.append(type.subSequence(index, matcher.start(1)));
++      index = matcher.end(1); // Skip the matched pattern content.
++    }
++    result.append(type.subSequence(index, type.length()));
++    return result.toString();
++  }
++
++  //TODO(user): Extract Formatter and do something less stringy.
++  static String format(AnnotationMirror annotation) {
++    return stripCommonTypePrefixes(annotation.toString());
++  }
++
+   private ErrorMessages() {}
+ }
+diff --git a/compiler/src/main/java/dagger/internal/codegen/Key.java b/compiler/src/main/java/dagger/internal/codegen/Key.java
+index 0510730c4..430d66cf4 100644
+--- a/compiler/src/main/java/dagger/internal/codegen/Key.java
++++ b/compiler/src/main/java/dagger/internal/codegen/Key.java
+@@ -18,7 +18,6 @@
+ import com.google.auto.common.MoreTypes;
+ import com.google.auto.value.AutoValue;
+ import com.google.common.base.Equivalence;
+-import com.google.common.base.Function;
+ import com.google.common.base.MoreObjects;
+ import com.google.common.base.Optional;
+ import com.google.common.collect.Iterables;
+@@ -44,6 +43,8 @@
+ import static com.google.common.base.Preconditions.checkNotNull;
+ import static dagger.internal.codegen.ConfigurationAnnotations.getMapKeys;
+ import static dagger.internal.codegen.InjectionAnnotations.getQualifier;
++import static dagger.internal.codegen.Util.unwrapOptionalEquivalence;
++import static dagger.internal.codegen.Util.wrapOptionalInEquivalence;
+ import static javax.lang.model.element.ElementKind.CONSTRUCTOR;
+ import static javax.lang.model.element.ElementKind.METHOD;
+ import static javax.lang.model.type.TypeKind.DECLARED;
+@@ -98,12 +99,7 @@
+   abstract Equivalence.Wrapper<TypeMirror> wrappedType();
+ 
+   Optional<AnnotationMirror> qualifier() {
+-    return wrappedQualifier().transform(
+-        new Function<Equivalence.Wrapper<AnnotationMirror>, AnnotationMirror>() {
+-          @Override public AnnotationMirror apply(Equivalence.Wrapper<AnnotationMirror> wrapper) {
+-            return wrapper.get();
+-          }
+-        });
++    return unwrapOptionalEquivalence(wrappedQualifier());
+   }
+ 
+   TypeMirror type() {
+@@ -160,8 +156,8 @@ Key forComponentMethod(ExecutableElement componentMethod) {
+       checkNotNull(componentMethod);
+       checkArgument(componentMethod.getKind().equals(METHOD));
+       TypeMirror returnType = normalize(componentMethod.getReturnType());
+-      Optional<AnnotationMirror> qualifier = getQualifier(componentMethod);
+-      return new AutoValue_Key(Kind.PROVIDER, rewrap(qualifier),
++      return new AutoValue_Key(Kind.PROVIDER,
++          wrapOptionalInEquivalence(AnnotationMirrors.equivalence(), getQualifier(componentMethod)),
+           MoreTypes.equivalence().wrap(returnType));
+     }
+ 
+@@ -171,14 +167,15 @@ Key forProvidesMethod(ExecutableElement e) {
+       Provides providesAnnotation = e.getAnnotation(Provides.class);
+       checkArgument(providesAnnotation != null);
+       TypeMirror returnType = normalize(e.getReturnType());
+-      Optional<AnnotationMirror> qualifier = getQualifier(e);
+       switch (providesAnnotation.type()) {
+         case UNIQUE:
+-          return new AutoValue_Key(Kind.PROVIDER, rewrap(qualifier),
++          return new AutoValue_Key(Kind.PROVIDER,
++              wrapOptionalInEquivalence(AnnotationMirrors.equivalence(), getQualifier(e)),
+               MoreTypes.equivalence().wrap(returnType));
+         case SET:
+           TypeMirror setType = types.getDeclaredType(getSetElement(), returnType);
+-          return new AutoValue_Key(Kind.PROVIDER, rewrap(qualifier),
++          return new AutoValue_Key(Kind.PROVIDER,
++              wrapOptionalInEquivalence(AnnotationMirrors.equivalence(), getQualifier(e)),
+               MoreTypes.equivalence().wrap(setType));
+         case MAP:
+           AnnotationMirror mapKeyAnnotation = Iterables.getOnlyElement(getMapKeys(e));
+@@ -190,13 +187,15 @@ Key forProvidesMethod(ExecutableElement e) {
+           TypeMirror valueType = types.getDeclaredType(getProviderElement(), returnType);
+           TypeMirror mapType =
+               types.getDeclaredType(getMapElement(), keyTypeElement.asType(), valueType);
+-          return new AutoValue_Key(Kind.PROVIDER, rewrap(qualifier),
++          return new AutoValue_Key(Kind.PROVIDER,
++              wrapOptionalInEquivalence(AnnotationMirrors.equivalence(), getQualifier(e)),
+               MoreTypes.equivalence().wrap(mapType));
+         case SET_VALUES:
+           // TODO(gak): do we want to allow people to use "covariant return" here?
+           checkArgument(returnType.getKind().equals(DECLARED));
+           checkArgument(((DeclaredType) returnType).asElement().equals(getSetElement()));
+-          return new AutoValue_Key(Kind.PROVIDER, rewrap(qualifier),
++          return new AutoValue_Key(Kind.PROVIDER,
++              wrapOptionalInEquivalence(AnnotationMirrors.equivalence(), getQualifier(e)),
+               MoreTypes.equivalence().wrap(returnType));
+         default:
+           throw new AssertionError();
+@@ -228,7 +227,8 @@ Key forMembersInjectedType(TypeMirror type) {
+ 
+     Key forQualifiedType(Optional<AnnotationMirror> qualifier, TypeMirror type) {
+       return new AutoValue_Key(Kind.PROVIDER,
+-          rewrap(qualifier), MoreTypes.equivalence().wrap(normalize(type)));
++          wrapOptionalInEquivalence(AnnotationMirrors.equivalence(), qualifier),
++          MoreTypes.equivalence().wrap(normalize(type)));
+     }
+ 
+     /**
+@@ -251,12 +251,5 @@ Key forQualifiedType(Optional<AnnotationMirror> qualifier, TypeMirror type) {
+       }
+       return Optional.absent();
+     }
+-
+-    private Optional<Equivalence.Wrapper<AnnotationMirror>>
+-        rewrap(Optional<AnnotationMirror> qualifier) {
+-      return qualifier.isPresent()
+-          ? Optional.of(AnnotationMirrors.equivalence().wrap(qualifier.get()))
+-          : Optional.<Equivalence.Wrapper<AnnotationMirror>>absent();
+-    }
+   }
+ }
+diff --git a/compiler/src/main/java/dagger/internal/codegen/MethodSignatureFormatter.java b/compiler/src/main/java/dagger/internal/codegen/MethodSignatureFormatter.java
+new file mode 100644
+index 000000000..b54205990
+--- /dev/null
++++ b/compiler/src/main/java/dagger/internal/codegen/MethodSignatureFormatter.java
+@@ -0,0 +1,91 @@
++/*
++ * Copyright (C) 2014 Google, Inc.
++ *
++ * Licensed under the Apache License, Version 2.0 (the "License");
++ * you may not use this file except in compliance with the License.
++ * You may obtain a copy of the License at
++ *
++ * http://www.apache.org/licenses/LICENSE-2.0
++ *
++ * Unless required by applicable law or agreed to in writing, software
++ * distributed under the License is distributed on an "AS IS" BASIS,
++ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++ * See the License for the specific language governing permissions and
++ * limitations under the License.
++ */
++package dagger.internal.codegen;
++
++import com.google.auto.common.MoreElements;
++import com.google.auto.common.MoreTypes;
++import com.google.common.base.Optional;
++import java.util.Iterator;
++import java.util.List;
++import javax.lang.model.element.AnnotationMirror;
++import javax.lang.model.element.ExecutableElement;
++import javax.lang.model.element.TypeElement;
++import javax.lang.model.element.VariableElement;
++import javax.lang.model.type.TypeMirror;
++
++import static dagger.internal.codegen.ErrorMessages.stripCommonTypePrefixes;
++
++/**
++ * Formats the signature of an {@link ExecutableElement} suitable for use in error messages.
++ *
++ * @author Christian Gruber
++ * @since 2.0
++ */
++final class MethodSignatureFormatter extends Formatter<ExecutableElement> {
++  private static final MethodSignatureFormatter INSTANCE = new MethodSignatureFormatter();
++
++  static MethodSignatureFormatter instance() {
++    return INSTANCE;
++  }
++
++  @Override public String format(ExecutableElement method) {
++    StringBuilder builder = new StringBuilder();
++    TypeElement type = MoreElements.asType(method.getEnclosingElement());
++
++    // TODO(user): AnnotationMirror formatter.
++    List<? extends AnnotationMirror> annotations = method.getAnnotationMirrors();
++    if (!annotations.isEmpty()) {
++      Iterator<? extends AnnotationMirror> annotationIterator = annotations.iterator();
++      for (int i = 0; annotationIterator.hasNext(); i++) {
++        if (i > 0) {
++          builder.append(' ');
++        }
++        builder.append(ErrorMessages.format(annotationIterator.next()));
++      }
++      builder.append(' ');
++    }
++    builder.append(nameOfType(method.getReturnType()));
++    builder.append(' ');
++    builder.append(type.getQualifiedName());
++    builder.append('.');
++    builder.append(method.getSimpleName());
++    builder.append('(');
++    Iterator<? extends VariableElement> parameters = method.getParameters().iterator();
++    for (int i = 0; parameters.hasNext(); i++) {
++      if (i > 0) {
++        builder.append(", ");
++      }
++      appendParameter(builder, parameters.next());
++    }
++    builder.append(')');
++    return builder.toString();
++  }
++
++  private static void appendParameter(StringBuilder builder, VariableElement parameter) {
++    Optional<AnnotationMirror> qualifier = InjectionAnnotations.getQualifier(parameter);
++    if (qualifier.isPresent()) {
++      builder.append(ErrorMessages.format(qualifier.get())).append(' ');
++    }
++    builder.append(nameOfType(parameter.asType()));
++  }
++
++  private static String nameOfType(TypeMirror type) {
++    if (type.getKind().isPrimitive()) {
++      return MoreTypes.asPrimitiveType(type).toString();
++    }
++    return stripCommonTypePrefixes(MoreTypes.asDeclared(type).toString());
++  }
++}
+diff --git a/compiler/src/main/java/dagger/internal/codegen/ProvisionBinding.java b/compiler/src/main/java/dagger/internal/codegen/ProvisionBinding.java
+index d7c112a3c..46d83242a 100644
+--- a/compiler/src/main/java/dagger/internal/codegen/ProvisionBinding.java
++++ b/compiler/src/main/java/dagger/internal/codegen/ProvisionBinding.java
+@@ -17,6 +17,7 @@
+ 
+ import com.google.auto.common.MoreElements;
+ import com.google.auto.value.AutoValue;
++import com.google.common.base.Equivalence;
+ import com.google.common.base.Optional;
+ import com.google.common.collect.ImmutableListMultimap;
+ import com.google.common.collect.ImmutableSet;
+@@ -48,6 +49,8 @@
+ import static com.google.common.base.Preconditions.checkNotNull;
+ import static dagger.internal.codegen.InjectionAnnotations.getScopeAnnotation;
+ import static dagger.internal.codegen.ProvisionBinding.Kind.INJECTION;
++import static dagger.internal.codegen.Util.unwrapOptionalEquivalence;
++import static dagger.internal.codegen.Util.wrapOptionalInEquivalence;
+ import static javax.lang.model.element.ElementKind.CONSTRUCTOR;
+ import static javax.lang.model.element.ElementKind.FIELD;
+ import static javax.lang.model.element.ElementKind.METHOD;
+@@ -91,7 +94,16 @@
+   abstract Provides.Type provisionType();
+ 
+   /** The scope in which the binding declares the {@link #key()}. */
+-  abstract Optional<AnnotationMirror> scope();
++  Optional<AnnotationMirror> scope() {
++    return unwrapOptionalEquivalence(wrappedScope());
++  }
++
++  /**
++   * An optional annotation constraining the scope of this component wrapped in an
++   * {@link com.google.common.base.Equivalence.Wrapper} to preserve comparison semantics of
++   * {@link AnnotationMirror}.
++   */
++  abstract Optional<Equivalence.Wrapper<AnnotationMirror>> wrappedScope();
+ 
+   /** If this provision requires members injeciton, this will be the corresonding request. */
+   abstract Optional<DependencyRequest> memberInjectionRequest();
+@@ -247,6 +259,8 @@ ProvisionBinding forInjectConstructor(ExecutableElement constructorElement) {
+           dependencyRequestFactory.forRequiredVariables(constructorElement.getParameters());
+       Optional<DependencyRequest> membersInjectionRequest = membersInjectionRequest(
+           MoreElements.asType(constructorElement.getEnclosingElement()));
++      Optional<AnnotationMirror> scope =
++          getScopeAnnotation(constructorElement.getEnclosingElement());
+       return new AutoValue_ProvisionBinding(
+           key,
+           constructorElement,
+@@ -254,7 +268,7 @@ ProvisionBinding forInjectConstructor(ExecutableElement constructorElement) {
+           findBindingPackage(key),
+           Kind.INJECTION,
+           Provides.Type.UNIQUE,
+-          getScopeAnnotation(constructorElement.getEnclosingElement()),
++          wrapOptionalInEquivalence(AnnotationMirrors.equivalence(), scope),
+           membersInjectionRequest);
+     }
+ 
+@@ -283,6 +297,7 @@ ProvisionBinding forProvidesMethod(ExecutableElement providesMethod) {
+       Key key = keyFactory.forProvidesMethod(providesMethod);
+       ImmutableSet<DependencyRequest> dependencies =
+           dependencyRequestFactory.forRequiredVariables(providesMethod.getParameters());
++      Optional<AnnotationMirror> scope = getScopeAnnotation(providesMethod);
+       return new AutoValue_ProvisionBinding(
+           key,
+           providesMethod,
+@@ -290,7 +305,7 @@ ProvisionBinding forProvidesMethod(ExecutableElement providesMethod) {
+           findBindingPackage(key),
+           Kind.PROVISION,
+           providesAnnotation.type(),
+-          getScopeAnnotation(providesMethod),
++          wrapOptionalInEquivalence(AnnotationMirrors.equivalence(), scope),
+           Optional.<DependencyRequest>absent());
+     }
+ 
+@@ -299,6 +314,7 @@ ProvisionBinding forImplicitMapBinding(DependencyRequest explicitRequest,
+       checkNotNull(explicitRequest);
+       checkNotNull(implicitRequest);
+       ImmutableSet<DependencyRequest> dependencies = ImmutableSet.of(implicitRequest);
++      Optional<AnnotationMirror> scope = getScopeAnnotation(implicitRequest.requestElement());
+       return new AutoValue_ProvisionBinding(
+           explicitRequest.key(),
+           implicitRequest.requestElement(),
+@@ -306,7 +322,7 @@ ProvisionBinding forImplicitMapBinding(DependencyRequest explicitRequest,
+           findBindingPackage(explicitRequest.key()),
+           Kind.PROVISION,
+           Provides.Type.MAP,
+-          getScopeAnnotation(implicitRequest.requestElement()),
++          wrapOptionalInEquivalence(AnnotationMirrors.equivalence(), scope),
+           Optional.<DependencyRequest>absent());
+     }
+ 
+@@ -321,7 +337,7 @@ ProvisionBinding forComponent(TypeElement componentDefinitionType) {
+           Optional.<String>absent(),
+           Kind.COMPONENT,
+           Provides.Type.UNIQUE,
+-          Optional.<AnnotationMirror>absent(),
++          Optional.<Equivalence.Wrapper<AnnotationMirror>>absent(),
+           Optional.<DependencyRequest>absent());
+     }
+ 
+@@ -329,6 +345,7 @@ ProvisionBinding forComponentMethod(ExecutableElement componentMethod) {
+       checkNotNull(componentMethod);
+       checkArgument(componentMethod.getKind().equals(METHOD));
+       checkArgument(componentMethod.getParameters().isEmpty());
++      Optional<AnnotationMirror> scope = getScopeAnnotation(componentMethod);
+       return new AutoValue_ProvisionBinding(
+           keyFactory.forComponentMethod(componentMethod),
+           componentMethod,
+@@ -336,7 +353,7 @@ ProvisionBinding forComponentMethod(ExecutableElement componentMethod) {
+           Optional.<String>absent(),
+           Kind.COMPONENT_PROVISION,
+           Provides.Type.UNIQUE,
+-          getScopeAnnotation(componentMethod),
++          wrapOptionalInEquivalence(AnnotationMirrors.equivalence(), scope),
+           Optional.<DependencyRequest>absent());
+     }
+   }
+diff --git a/compiler/src/main/java/dagger/internal/codegen/ProvisionBindingFormatter.java b/compiler/src/main/java/dagger/internal/codegen/ProvisionBindingFormatter.java
+index 61e915704..b058f81c0 100644
+--- a/compiler/src/main/java/dagger/internal/codegen/ProvisionBindingFormatter.java
++++ b/compiler/src/main/java/dagger/internal/codegen/ProvisionBindingFormatter.java
+@@ -15,13 +15,10 @@
+  */
+ package dagger.internal.codegen;
+ 
+-import com.google.auto.common.MoreElements;
+-import javax.lang.model.element.ExecutableElement;
+-import javax.lang.model.element.TypeElement;
+-import javax.lang.model.element.VariableElement;
++import static com.google.auto.common.MoreElements.asExecutable;
+ 
+ /**
+- * Formats a {@link Key} into a {@link String} suitable for use in error messages.
++ * Formats a {@link ProvisionBinding} into a {@link String} suitable for use in error messages.
+  *
+  * @author Christian Gruber
+  * @since 2.0
+@@ -34,21 +31,10 @@ static ProvisionBindingFormatter instance() {
+   }
+ 
+   @Override public String format(ProvisionBinding binding) {
+-    StringBuilder builder = new StringBuilder();
+     switch (binding.bindingKind()) {
+       case PROVISION:
+       case COMPONENT_PROVISION:
+-        ExecutableElement method = MoreElements.asExecutable(binding.bindingElement());
+-        TypeElement type = MoreElements.asType(method.getEnclosingElement());
+-        builder.append(type.getQualifiedName());
+-        builder.append('.');
+-        builder.append(method.getSimpleName());
+-        builder.append('(');
+-        for (VariableElement parameter : method.getParameters()) {
+-          builder.append(parameter.asType()); // TODO(user): Use TypeMirrorFormatter.
+-        }
+-        builder.append(')');
+-        return builder.toString();
++        return MethodSignatureFormatter.instance().format(asExecutable(binding.bindingElement()));
+       default:
+         throw new UnsupportedOperationException(
+             "Not yet supporting " + binding.bindingKind() + " binding types.");
+diff --git a/compiler/src/main/java/dagger/internal/codegen/Util.java b/compiler/src/main/java/dagger/internal/codegen/Util.java
+index 77ea7b2f7..48df244c9 100644
+--- a/compiler/src/main/java/dagger/internal/codegen/Util.java
++++ b/compiler/src/main/java/dagger/internal/codegen/Util.java
+@@ -18,6 +18,8 @@
+ 
+ import com.google.auto.common.MoreElements;
+ import com.google.auto.common.MoreTypes;
++import com.google.common.base.Equivalence;
++import com.google.common.base.Optional;
+ import com.google.common.collect.Iterables;
+ import java.util.List;
+ import java.util.Map;
+@@ -31,6 +33,7 @@
+ import javax.lang.model.type.TypeMirror;
+ import javax.lang.model.util.Elements;
+ import javax.lang.model.util.SimpleAnnotationValueVisitor6;
++
+ import static com.google.common.base.Preconditions.checkState;
+ 
+ /**
+@@ -95,5 +98,27 @@ protected TypeElement defaultAction(Object o, Void v) {
+     return keyTypeElement;
+   }
+ 
++  /**
++   * Wraps an {@link Optional} of a type in an {@code Optional} of an {@link Equivalence.Wrapper}
++   * for that type.
++   */
++  static <T> Optional<Equivalence.Wrapper<T>> wrapOptionalInEquivalence(
++      Equivalence<T> equivalence, Optional<T> optional) {
++    return optional.isPresent()
++        ? Optional.of(equivalence.wrap(optional.get()))
++        : Optional.<Equivalence.Wrapper<T>>absent();
++  }
++
++  /**
++   * Unwraps an {@link Optional} of an {@link Equivalence.Wrapper} into an {@code Optional} of
++   * the underlying type.
++   */
++  static <T> Optional<T> unwrapOptionalEquivalence(
++      Optional<Equivalence.Wrapper<T>> wrappedOptional) {
++    return wrappedOptional.isPresent()
++        ? Optional.of(wrappedOptional.get().get())
++        : Optional.<T>absent();
++  }
++
+   private Util() {}
+ }
+diff --git a/compiler/src/test/java/dagger/internal/codegen/ComponentProcessorTest.java b/compiler/src/test/java/dagger/internal/codegen/ComponentProcessorTest.java
+index ce5631cbd..73854c5fd 100644
+--- a/compiler/src/test/java/dagger/internal/codegen/ComponentProcessorTest.java
++++ b/compiler/src/test/java/dagger/internal/codegen/ComponentProcessorTest.java
+@@ -83,7 +83,7 @@
+     assert_().about(javaSource()).that(componentFile)
+         .processedWith(new ComponentProcessor())
+         .failsToCompile()
+-        .withErrorContaining("module");
++        .withErrorContaining("is not annotated with @Module");
+   }
+ 
+   @Test public void simpleComponent() {
+diff --git a/compiler/src/test/java/dagger/internal/codegen/ErrorMessagesTest.java b/compiler/src/test/java/dagger/internal/codegen/ErrorMessagesTest.java
+new file mode 100644
+index 000000000..141d5c452
+--- /dev/null
++++ b/compiler/src/test/java/dagger/internal/codegen/ErrorMessagesTest.java
+@@ -0,0 +1,30 @@
++/*
++ * Copyright (C) 2014 Google, Inc.
++ *
++ * Licensed under the Apache License, Version 2.0 (the "License");
++ * you may not use this file except in compliance with the License.
++ * You may obtain a copy of the License at
++ *
++ * http://www.apache.org/licenses/LICENSE-2.0
++ *
++ * Unless required by applicable law or agreed to in writing, software
++ * distributed under the License is distributed on an "AS IS" BASIS,
++ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++ * See the License for the specific language governing permissions and
++ * limitations under the License.
++ */
++package dagger.internal.codegen;
++
++import org.junit.Test;
++import org.junit.runner.RunWith;
++import org.junit.runners.JUnit4;
++
++import static com.google.common.truth.Truth.assertThat;
++
++@RunWith(JUnit4.class)
++public class ErrorMessagesTest {
++  @Test public void stripCommonTypePrefixes() {
++    String typeName = "com.google.common.collect.ImmutableList<java.lang.Boolean>";
++    assertThat(ErrorMessages.stripCommonTypePrefixes(typeName)).isEqualTo("ImmutableList<Boolean>");
++  }
++}
+diff --git a/compiler/src/test/java/dagger/internal/codegen/GraphValidationTest.java b/compiler/src/test/java/dagger/internal/codegen/GraphValidationTest.java
+index d89328cf0..ee3507709 100644
+--- a/compiler/src/test/java/dagger/internal/codegen/GraphValidationTest.java
++++ b/compiler/src/test/java/dagger/internal/codegen/GraphValidationTest.java
+@@ -25,6 +25,7 @@
+ import static com.google.common.truth.Truth.assert_;
+ import static com.google.testing.compile.JavaSourceSubjectFactory.javaSource;
+ import static com.google.testing.compile.JavaSourcesSubjectFactory.javaSources;
++import static java.util.Arrays.asList;
+ 
+ @RunWith(JUnit4.class)
+ public class GraphValidationTest {
+@@ -218,8 +219,8 @@
+         "}");
+ 
+     String expectedError = "test.Outer.A is bound multiple times:\n"
+-        + "      test.Outer.Parent.getA()\n"
+-        + "      test.Outer.AModule.provideA(java.lang.String)";
++        + "      test.Outer.A test.Outer.Parent.getA()\n"
++        + "      @Provides test.Outer.A test.Outer.AModule.provideA(String)";
+ 
+     assert_().about(javaSource()).that(component)
+         .processedWith(new ComponentProcessor())
+@@ -257,8 +258,8 @@
+         "}");
+ 
+     String expectedError = "test.Outer.A is bound multiple times:\n"
+-        + "      test.Outer.Module1.provideA1()\n"
+-        + "      test.Outer.Module2.provideA2(java.lang.String)";
++        + "      @Provides test.Outer.A test.Outer.Module1.provideA1()\n"
++        + "      @Provides test.Outer.A test.Outer.Module2.provideA2(String)";
+ 
+     assert_().about(javaSource()).that(component)
+         .processedWith(new ComponentProcessor())
+@@ -294,16 +295,16 @@
+         "  static class TestModule1 {",
+         "    @Provides(type = MAP)",
+         "    @StringKey(\"foo\")",
+-        "    String provideStringMapEntry() { return \"\"; }",
++        "    String stringMapEntry() { return \"\"; }",
+         "",
+-        "    @Provides(type = SET) String provideStringSetElement() { return \"\"; }",
++        "    @Provides(type = SET) String stringSetElement() { return \"\"; }",
+         "  }",
+         "",
+         "  @Module",
+         "  static class TestModule2 {",
+-        "    @Provides Set<String> provideStringSet() { return new HashSet<String>(); }",
++        "    @Provides Set<String> stringSet() { return new HashSet<String>(); }",
+         "",
+-        "    @Provides Map<String, String> provideStringMap() {",
++        "    @Provides Map<String, String> stringMap() {",
+         "      return new HashMap<String, String>();",
+         "    }",
+         "  }",
+@@ -318,16 +319,17 @@
+     String expectedSetError =
+         "java.util.Set<java.lang.String> has incompatible bindings:\n"
+             + "      Set bindings:\n"
+-            + "          test.Outer.TestModule1.provideStringSetElement()\n"
++            + "          @Provides(type=SET) String test.Outer.TestModule1.stringSetElement()\n"
+             + "      Unique bindings:\n"
+-            + "          test.Outer.TestModule2.provideStringSet()";
++            + "          @Provides Set<String> test.Outer.TestModule2.stringSet()";
+ 
+     String expectedMapError =
+         "java.util.Map<java.lang.String,java.lang.String> has incompatible bindings:\n"
+             + "      Map bindings:\n"
+-            + "          test.Outer.TestModule1.provideStringMapEntry()\n"
++            + "          @Provides(type=MAP) @test.Outer.StringKey(\"foo\") String"
++            + " test.Outer.TestModule1.stringMapEntry()\n"
+             + "      Unique bindings:\n"
+-            + "          test.Outer.TestModule2.provideStringMap()";
++            + "          @Provides Map<String,String> test.Outer.TestModule2.stringMap()";
+ 
+     assert_().about(javaSource()).that(component)
+         .processedWith(new ComponentProcessor())
+@@ -428,16 +430,16 @@
+         "}");
+ 
+     String expectedError = "test.Outer.A is bound multiple times:\n"
+-        + "      test.Outer.Module1.provideA()\n"
+-        + "      test.Outer.Module2.provideA()\n"
+-        + "      test.Outer.Module3.provideA()\n"
+-        + "      test.Outer.Module4.provideA()\n"
+-        + "      test.Outer.Module5.provideA()\n"
+-        + "      test.Outer.Module6.provideA()\n"
+-        + "      test.Outer.Module7.provideA()\n"
+-        + "      test.Outer.Module8.provideA()\n"
+-        + "      test.Outer.Module9.provideA()\n"
+-        + "      test.Outer.Module10.provideA()\n"
++        + "      @Provides test.Outer.A test.Outer.Module1.provideA()\n"
++        + "      @Provides test.Outer.A test.Outer.Module2.provideA()\n"
++        + "      @Provides test.Outer.A test.Outer.Module3.provideA()\n"
++        + "      @Provides test.Outer.A test.Outer.Module4.provideA()\n"
++        + "      @Provides test.Outer.A test.Outer.Module5.provideA()\n"
++        + "      @Provides test.Outer.A test.Outer.Module6.provideA()\n"
++        + "      @Provides test.Outer.A test.Outer.Module7.provideA()\n"
++        + "      @Provides test.Outer.A test.Outer.Module8.provideA()\n"
++        + "      @Provides test.Outer.A test.Outer.Module9.provideA()\n"
++        + "      @Provides test.Outer.A test.Outer.Module10.provideA()\n"
+         + "      and 2 others";
+ 
+     assert_().about(javaSource()).that(component)
+@@ -506,4 +508,98 @@
+         .withErrorContaining(firstError).in(component).onLine(33)
+         .and().withErrorContaining(secondError).in(component).onLine(34);
+   }
++
++  @Test public void componentWithoutScopeIncludesScopedBindings() {
++    JavaFileObject componentFile = JavaFileObjects.forSourceLines("test.MyComponent",
++        "package test;",
++        "",
++        "import dagger.Component;",
++        "import javax.inject.Singleton;",
++        "",
++        "@Component(modules = ScopedModule.class)",
++        "interface MyComponent {",
++        "  ScopedType string();",
++        "}");
++    JavaFileObject typeFile = JavaFileObjects.forSourceLines("test.ScopedType",
++        "package test;",
++        "",
++        "import javax.inject.Inject;",
++        "import javax.inject.Singleton;",
++        "",
++        "@Singleton",
++        "class ScopedType {",
++        "  @Inject ScopedType(String s, long l, float f) {}",
++        "}");
++    JavaFileObject moduleFile = JavaFileObjects.forSourceLines("test.ScopedModule",
++        "package test;",
++        "",
++        "import dagger.Module;",
++        "import dagger.Provides;",
++        "import javax.inject.Singleton;",
++        "",
++        "@Module",
++        "class ScopedModule {",
++        "  @Provides @Singleton String string() { return \"a string\"; }",
++        "  @Provides long integer() { return 0L; }",
++        "  @Provides float floatingPoint() { return 0.0f; }",
++        "}");
++    String errorMessage = "test.MyComponent (unscoped) may not reference scoped bindings:\n"
++        + "      @Provides @Singleton String test.ScopedModule.string()\n"
++        + "      @Singleton class test.ScopedType";
++    assert_().about(javaSources()).that(asList(componentFile, typeFile, moduleFile))
++        .processedWith(new ComponentProcessor())
++        .failsToCompile()
++        .withErrorContaining(errorMessage);
++  }
++
++  @Test public void componentWithScopeIncludesIncompatiblyScopedBindings() {
++    JavaFileObject componentFile = JavaFileObjects.forSourceLines("test.MyComponent",
++        "package test;",
++        "",
++        "import dagger.Component;",
++        "import javax.inject.Singleton;",
++        "",
++        "@Singleton",
++        "@Component(modules = ScopedModule.class)",
++        "interface MyComponent {",
++        "  ScopedType string();",
++        "}");
++    JavaFileObject scopeFile = JavaFileObjects.forSourceLines("test.PerTest",
++        "package test;",
++        "",
++        "import javax.inject.Scope;",
++        "",
++        "@Scope",
++        "@interface PerTest {}");
++    JavaFileObject typeFile = JavaFileObjects.forSourceLines("test.ScopedType",
++        "package test;",
++        "",
++        "import javax.inject.Inject;",
++        "",
++        "@PerTest", // incompatible scope
++        "class ScopedType {",
++        "  @Inject ScopedType(String s, long l, float f) {}",
++        "}");
++    JavaFileObject moduleFile = JavaFileObjects.forSourceLines("test.ScopedModule",
++        "package test;",
++        "",
++        "import dagger.Module;",
++        "import dagger.Provides;",
++        "import javax.inject.Singleton;",
++        "",
++        "@Module",
++        "class ScopedModule {",
++        "  @Provides @PerTest String string() { return \"a string\"; }", // incompatible scope
++        "  @Provides long integer() { return 0L; }", // unscoped - valid
++        "  @Provides @Singleton float floatingPoint() { return 0.0f; }", // same scope - valid
++        "}");
++    String errorMessage = "test.MyComponent scoped with @Singleton "
++        + "may not reference bindings with different scopes:\n"
++        + "      @Provides @test.PerTest String test.ScopedModule.string()\n"
++        + "      @test.PerTest class test.ScopedType";
++    assert_().about(javaSources()).that(asList(componentFile, scopeFile, typeFile, moduleFile))
++        .processedWith(new ComponentProcessor())
++        .failsToCompile()
++        .withErrorContaining(errorMessage);
++  }
+ }
+diff --git a/compiler/src/test/java/dagger/internal/codegen/MethodSignatureFormatterTest.java b/compiler/src/test/java/dagger/internal/codegen/MethodSignatureFormatterTest.java
+new file mode 100644
+index 000000000..f00d9f4b3
+--- /dev/null
++++ b/compiler/src/test/java/dagger/internal/codegen/MethodSignatureFormatterTest.java
+@@ -0,0 +1,61 @@
++/*
++ * Copyright (C) 2014 Google, Inc.
++ *
++ * Licensed under the Apache License, Version 2.0 (the "License");
++ * you may not use this file except in compliance with the License.
++ * You may obtain a copy of the License at
++ *
++ * http://www.apache.org/licenses/LICENSE-2.0
++ *
++ * Unless required by applicable law or agreed to in writing, software
++ * distributed under the License is distributed on an "AS IS" BASIS,
++ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++ * See the License for the specific language governing permissions and
++ * limitations under the License.
++ */
++package dagger.internal.codegen;
++
++import com.google.common.collect.ImmutableList;
++import com.google.common.collect.Iterables;
++import com.google.testing.compile.CompilationRule;
++import dagger.internal.codegen.MethodSignatureFormatterTest.OuterClass.InnerClass;
++import javax.inject.Singleton;
++import javax.lang.model.element.ExecutableElement;
++import javax.lang.model.element.TypeElement;
++import javax.lang.model.util.Elements;
++import org.junit.Rule;
++import org.junit.Test;
++import org.junit.runner.RunWith;
++import org.junit.runners.JUnit4;
++
++import static com.google.common.truth.Truth.assertThat;
++import static javax.lang.model.util.ElementFilter.methodsIn;
++
++@RunWith(JUnit4.class)
++public class MethodSignatureFormatterTest {
++  @Rule public CompilationRule compilationRule = new CompilationRule();
++
++  static class OuterClass {
++    @interface Foo {
++       Class<?> bar();
++    }
++
++    static class InnerClass {
++      @Foo(bar = String.class)
++      @Singleton
++      String foo(int a, ImmutableList<Boolean> blah) { return "foo"; }
++    }
++  }
++
++  @Test public void methodSignatureTest() {
++    Elements elements = compilationRule.getElements();
++    TypeElement inner = elements.getTypeElement(InnerClass.class.getCanonicalName());
++    ExecutableElement method = Iterables.getOnlyElement(methodsIn(inner.getEnclosedElements()));
++    assertThat(MethodSignatureFormatter.instance().format(method))
++        .isEqualTo(
++            "@dagger.internal.codegen.MethodSignatureFormatterTest.OuterClass.Foo(bar=String.class)"
++            + " @Singleton String "
++            + "dagger.internal.codegen.MethodSignatureFormatterTest.OuterClass.InnerClass.foo"
++            + "(int, ImmutableList<Boolean>)");
++  }
++}
+diff --git a/compiler/src/test/java/dagger/internal/codegen/ClassNameTest.java b/compiler/src/test/java/dagger/internal/codegen/writer/ClassNameTest.java
+similarity index 97%
+rename from compiler/src/test/java/dagger/internal/codegen/ClassNameTest.java
+rename to compiler/src/test/java/dagger/internal/codegen/writer/ClassNameTest.java
+index d61fe4340..5da543e55 100644
+--- a/compiler/src/test/java/dagger/internal/codegen/ClassNameTest.java
++++ b/compiler/src/test/java/dagger/internal/codegen/writer/ClassNameTest.java
+@@ -13,11 +13,12 @@
+  * See the License for the specific language governing permissions and
+  * limitations under the License.
+  */
+-package dagger.internal.codegen;
++package dagger.internal.codegen.writer;
++
++import dagger.internal.codegen.writer.ClassNameTest.OuterClass.InnerClass;
+ 
+ import com.google.common.collect.ImmutableList;
+ import com.google.testing.compile.CompilationRule;
+-import dagger.internal.codegen.ClassNameTest.OuterClass.InnerClass;
+ import dagger.internal.codegen.writer.ClassName;
+ import java.util.Map;
+ import javax.lang.model.element.TypeElement;
+@@ -26,7 +27,6 @@
+ import org.junit.Test;
+ import org.junit.runner.RunWith;
+ import org.junit.runners.JUnit4;
+-
+ import static com.google.common.truth.Truth.assert_;
+ import static org.junit.Assert.fail;
+ 
+diff --git a/examples/android-activity-graphs/README.md b/examples/android-activity-graphs/README.md
+index c763b92a1..ac3680bb5 100644
+--- a/examples/android-activity-graphs/README.md
++++ b/examples/android-activity-graphs/README.md
+@@ -18,3 +18,7 @@ user.
+ 
+ _Note: The app does not actually do anything when it is run. It is only to show how you can
+  structure Dagger within an Android app_
++
++_Note: The app is in transition to Dagger 2 and may not reflect recommended patterns.  Before
++ we release Dagger 2.0 it will, but until this note is removed, please do not rely on this
++ example as a strong recommendation._
+diff --git a/examples/android-simple/README.md b/examples/android-simple/README.md
+index 2a9c1fe2a..944d01533 100644
+--- a/examples/android-simple/README.md
++++ b/examples/android-simple/README.md
+@@ -11,3 +11,7 @@ Injection of activities is done automatically in a base activity.
+ 
+ _Note: The app does not actually do anything when it is run. It is only to show how you can
+  structure Dagger within an Android app_
++
++_Note: The app is in transition to Dagger 2 and may not reflect recommended patterns.  Before
++ we release Dagger 2.0 it will, but until this note is removed, please do not rely on this
++ example as a strong recommendation._
+diff --git a/examples/simple/src/main/java/coffee/CoffeeApp.java b/examples/simple/src/main/java/coffee/CoffeeApp.java
+index 32358063c..ea1ed20e9 100644
+--- a/examples/simple/src/main/java/coffee/CoffeeApp.java
++++ b/examples/simple/src/main/java/coffee/CoffeeApp.java
+@@ -1,8 +1,10 @@
+ package coffee;
+ 
+ import dagger.Component;
++import javax.inject.Singleton;
+ 
+ public class CoffeeApp {
++  @Singleton
+   @Component(modules = { DripCoffeeModule.class })
+   public interface Coffee {
+     CoffeeMaker maker();

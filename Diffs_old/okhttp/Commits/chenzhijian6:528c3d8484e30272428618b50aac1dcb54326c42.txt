@@ -1,0 +1,144 @@
+diff --git a/okhttp/pom.xml b/okhttp/pom.xml
+index 8b994410ab..89d82921c7 100644
+--- a/okhttp/pom.xml
++++ b/okhttp/pom.xml
+@@ -16,6 +16,7 @@
+     <dependency>
+       <groupId>com.squareup.okio</groupId>
+       <artifactId>okio</artifactId>
++      <version>0.9.0-LAYER</version>
+     </dependency>
+   </dependencies>
+ 
+diff --git a/okhttp/src/main/java/com/squareup/okhttp/Connection.java b/okhttp/src/main/java/com/squareup/okhttp/Connection.java
+index a1ae96fe27..943f764916 100644
+--- a/okhttp/src/main/java/com/squareup/okhttp/Connection.java
++++ b/okhttp/src/main/java/com/squareup/okhttp/Connection.java
+@@ -198,7 +198,7 @@ private void upgradeToTls(Request tunnelRequest, int readTimeout, int writeTimeo
+ 
+     if (protocol == Protocol.SPDY_3 || protocol == Protocol.HTTP_2) {
+       sslSocket.setSoTimeout(0); // SPDY timeouts are set per-stream.
+-      spdyConnection = new SpdyConnection.Builder(route.address.getUriHost(), true, socket)
++      spdyConnection = new SpdyConnection.Builder(this, route.address.getUriHost(), true, socket)
+           .protocol(protocol).build();
+       spdyConnection.sendConnectionPreface();
+     } else {
+diff --git a/okhttp/src/main/java/com/squareup/okhttp/ConnectionObserver.java b/okhttp/src/main/java/com/squareup/okhttp/ConnectionObserver.java
+new file mode 100644
+index 0000000000..6039236d3b
+--- /dev/null
++++ b/okhttp/src/main/java/com/squareup/okhttp/ConnectionObserver.java
+@@ -0,0 +1,10 @@
++package com.squareup.okhttp;
++
++import java.io.IOException;
++
++public interface ConnectionObserver {
++    /**
++     * Invoked when an exception occurs on the Connection's socket
++     */
++    void onIOException(Connection connection, IOException e);
++}
+diff --git a/okhttp/src/main/java/com/squareup/okhttp/internal/spdy/SpdyConnection.java b/okhttp/src/main/java/com/squareup/okhttp/internal/spdy/SpdyConnection.java
+index b065449e40..d27686abba 100644
+--- a/okhttp/src/main/java/com/squareup/okhttp/internal/spdy/SpdyConnection.java
++++ b/okhttp/src/main/java/com/squareup/okhttp/internal/spdy/SpdyConnection.java
+@@ -15,6 +15,8 @@
+  */
+ package com.squareup.okhttp.internal.spdy;
+ 
++import com.squareup.okhttp.Connection;
++import com.squareup.okhttp.ConnectionObserver;
+ import com.squareup.okhttp.Protocol;
+ import com.squareup.okhttp.internal.NamedRunnable;
+ import com.squareup.okhttp.internal.Util;
+@@ -35,6 +37,7 @@
+ import okio.Buffer;
+ import okio.BufferedSource;
+ import okio.ByteString;
++import okio.IOExceptionObserver;
+ import okio.Okio;
+ 
+ import static com.squareup.okhttp.internal.spdy.Settings.DEFAULT_INITIAL_WINDOW_SIZE;
+@@ -66,6 +69,15 @@
+       Integer.MAX_VALUE, 60, TimeUnit.SECONDS, new SynchronousQueue<Runnable>(),
+       Util.threadFactory("OkHttp SpdyConnection", true));
+ 
++    // Optional callback that will be invoked when a socket gets closed
++    private static ConnectionObserver connectionObserver = null;
++
++    public static void setConnectionObserver(ConnectionObserver observer) {
++        connectionObserver = observer;
++    }
++
++    private final Connection connection;
++
+   /** The protocol variant, like {@link com.squareup.okhttp.internal.spdy.Spdy3}. */
+   final Protocol protocol;
+ 
+@@ -126,6 +138,7 @@
+   final Reader readerRunnable;
+ 
+   private SpdyConnection(Builder builder) throws IOException {
++    connection = builder.connection;
+     protocol = builder.protocol;
+     client = builder.client;
+     handler = builder.handler;
+@@ -158,7 +171,13 @@ private SpdyConnection(Builder builder) throws IOException {
+ 
+     bytesLeftInWriteWindow = peerSettings.getInitialWindowSize(DEFAULT_INITIAL_WINDOW_SIZE);
+     socket = builder.socket;
+-    frameWriter = variant.newWriter(Okio.buffer(Okio.sink(builder.socket)), client);
++    frameWriter = variant.newWriter(Okio.buffer(Okio.sink(builder.socket, new IOExceptionObserver() {
++            public void onIOException(IOException e) {
++                if (connectionObserver != null) {
++                    connectionObserver.onIOException(SpdyConnection.this.connection, e);
++                }
++            }
++        })), client);
+     maxFrameSize = variant.maxFrameSize();
+     pushObserver = builder.pushObserver;
+ 
+@@ -499,6 +518,7 @@ public void sendConnectionPreface() throws IOException {
+   }
+ 
+   public static class Builder {
++    private Connection connection;
+     private String hostName;
+     private Socket socket;
+     private IncomingStreamHandler handler = IncomingStreamHandler.REFUSE_INCOMING_STREAMS;
+@@ -506,15 +526,16 @@ public void sendConnectionPreface() throws IOException {
+     private SpdyPushObserver pushObserver = SpdyPushObserver.CANCEL;
+     private boolean client;
+ 
+-    public Builder(boolean client, Socket socket) throws IOException {
+-      this(((InetSocketAddress) socket.getRemoteSocketAddress()).getHostName(), client, socket);
++    public Builder(Connection connection, boolean client, Socket socket) throws IOException {
++      this(connection, ((InetSocketAddress) socket.getRemoteSocketAddress()).getHostName(), client, socket);
+     }
+ 
+     /**
+      * @param client true if this peer initiated the connection; false if this
+      *     peer accepted the connection.
+      */
+-    public Builder(String hostName, boolean client, Socket socket) throws IOException {
++    public Builder(Connection connection, String hostName, boolean client, Socket socket) throws IOException {
++      this.connection = connection;
+       this.hostName = hostName;
+       this.client = client;
+       this.socket = socket;
+@@ -555,7 +576,13 @@ private Reader() {
+       ErrorCode connectionErrorCode = ErrorCode.INTERNAL_ERROR;
+       ErrorCode streamErrorCode = ErrorCode.INTERNAL_ERROR;
+       try {
+-        frameReader = variant.newReader(Okio.buffer(Okio.source(socket)), client);
++        frameReader = variant.newReader(Okio.buffer(Okio.source(socket, new IOExceptionObserver() {
++                public void onIOException(IOException e) {
++                    if (connectionObserver != null) {
++                        connectionObserver.onIOException(SpdyConnection.this.connection, e);
++                    }
++                }
++            })), client);
+         if (!client) {
+           frameReader.readConnectionPreface();
+         }

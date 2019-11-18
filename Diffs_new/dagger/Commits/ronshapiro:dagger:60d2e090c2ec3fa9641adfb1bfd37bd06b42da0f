@@ -1,0 +1,1175 @@
+diff --git a/BUILD b/BUILD
+index e1924f29e..7f42e3c8c 100644
+--- a/BUILD
++++ b/BUILD
+@@ -62,8 +62,10 @@ jarjar_library(
+         "//java/dagger/internal/codegen:base",
+         "//java/dagger/internal/codegen:binding",
+         "//java/dagger/internal/codegen:processor",
++        "//java/dagger/internal/codegen:shared-with-spi",
+         "//java/dagger/internal/codegen:validation",
+         "//java/dagger/internal/codegen:writing",
++        "//java/dagger/model:internal-proxies",
+         "@com_google_auto_auto_common//jar",
+     ],
+ )
+@@ -72,6 +74,7 @@ jarjar_library(
+     name = "shaded_spi",
+     rules_file = "shade_rules.txt",
+     deps = [
++        "//java/dagger/internal/codegen:shared-with-spi",
+         "//java/dagger/model",
+         "@com_google_auto_auto_common//jar",
+     ],
+diff --git a/java/dagger/internal/codegen/BUILD b/java/dagger/internal/codegen/BUILD
+index 1b0b9bbea..4f87ef72f 100644
+--- a/java/dagger/internal/codegen/BUILD
++++ b/java/dagger/internal/codegen/BUILD
+@@ -51,12 +51,26 @@ CODEGEN_SHARED_DEPS = [
+     "//java/dagger:core",
+     "//java/dagger/producers",
+     "//java/dagger/model",
++    "//java/dagger/model:internal-proxies",
+ ]
+ 
+ CODEGEN_DEPS = CODEGEN_SHARED_DEPS + [
+     "//third_party:guava",
++    ":shared-with-spi",
+ ]
+ 
++# Code that is shared with the dagger.model and dagger.spi packages. This code is merged into both
++# the dagger-compiler and dagger-spi artifacts that are sent to Maven
++java_library(
++    name = "shared-with-spi",
++    srcs = ["DaggerStreams.java"],
++    plugins = CODEGEN_PLUGINS,
++    tags = ["maven:merged"],
++    deps = [
++        "//third_party:guava",
++    ],
++)
++
+ # Common types needed across all of the codegen package
+ java_library(
+     name = "base",
+@@ -67,12 +81,10 @@ java_library(
+         "CompilerOptions.java",
+         "ContributionType.java",
+         "DaggerElements.java",
+-        "DaggerStreams.java",
+         "DaggerTypes.java",
+         "DiagnosticFormatting.java",
+         "Expression.java",
+         "FeatureStatus.java",
+-        "ForwardingNetwork.java",
+         "FrameworkTypes.java",
+         "InjectionAnnotations.java",
+         "Keys.java",
+@@ -112,7 +124,6 @@ java_library(
+         "BindingFactory.java",
+         "BindingGraph.java",
+         "BindingGraphPlugin.java",  # TODO(ronshapiro): this should move to its own model target
+-        "BindingNetwork.java",
+         "BindingType.java",
+         "BindingTypeMapper.java",
+         "BindingVariableNamer.java",  # needed by FrameworkField
+@@ -259,6 +270,7 @@ java_library(
+ java_library(
+     name = "processor",
+     srcs = [
++        "BindingGraphConverter.java",
+         "BindingGraphPluginsModule.java",
+         "BindingMethodValidatorsModule.java",
+         "CanReleaseReferencesProcessingStep.java",
+@@ -340,6 +352,7 @@ java_plugin(
+     deps = [
+         ":base",
+         ":binding",
++        "//java/dagger/model",
+         "//third_party:auto_service",
+         "//third_party:error_prone_annotations",
+         "//third_party:guava",
+diff --git a/java/dagger/internal/codegen/BindingGraphConverter.java b/java/dagger/internal/codegen/BindingGraphConverter.java
+new file mode 100644
+index 000000000..3902743d8
+--- /dev/null
++++ b/java/dagger/internal/codegen/BindingGraphConverter.java
+@@ -0,0 +1,167 @@
++/*
++ * Copyright (C) 2018 The Dagger Authors.
++ *
++ * Licensed under the Apache License, Version 2.0 (the "License");
++ * you may not use this file except in compliance with the License.
++ * You may obtain a copy of the License at
++ *
++ * http://www.apache.org/licenses/LICENSE-2.0
++ *
++ * Unless required by applicable law or agreed to in writing, software
++ * distributed under the License is distributed on an "AS IS" BASIS,
++ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++ * See the License for the specific language governing permissions and
++ * limitations under the License.
++ */
++
++package dagger.internal.codegen;
++
++import static com.google.auto.common.MoreElements.asType;
++import static com.google.auto.common.MoreTypes.asTypeElement;
++import static com.google.common.base.Preconditions.checkArgument;
++import static com.google.common.collect.Iterables.concat;
++import static dagger.internal.codegen.DaggerStreams.instancesOf;
++import static dagger.model.BindingGraphProxies.bindingNode;
++import static dagger.model.BindingGraphProxies.childFactoryMethodEdge;
++import static dagger.model.BindingGraphProxies.componentNode;
++import static dagger.model.BindingGraphProxies.dependencyEdge;
++import static dagger.model.BindingGraphProxies.subcomponentBuilderBindingEdge;
++import static dagger.model.BindingKind.SUBCOMPONENT_BUILDER;
++
++import com.google.common.collect.ImmutableList;
++import com.google.common.collect.ImmutableSet;
++import com.google.common.graph.MutableNetwork;
++import com.google.common.graph.NetworkBuilder;
++import dagger.internal.codegen.ComponentDescriptor.ComponentMethodDescriptor;
++import dagger.model.BindingGraph.BindingNode;
++import dagger.model.BindingGraph.ComponentNode;
++import dagger.model.BindingGraph.DependencyEdge;
++import dagger.model.BindingGraph.Edge;
++import dagger.model.BindingGraph.Node;
++import dagger.model.BindingGraphProxies;
++import javax.lang.model.element.Element;
++import javax.lang.model.element.ExecutableElement;
++import javax.lang.model.element.TypeElement;
++
++/** Converts {@link dagger.internal.codegen.BindingGraph}s to {@link dagger.model.BindingGraph}s. */
++final class BindingGraphConverter extends ComponentTreeTraverser {
++
++  private final MutableNetwork<Node, Edge> network =
++      NetworkBuilder.directed().allowsParallelEdges(true).allowsSelfLoops(true).build();
++
++  private ComponentNode parentComponent;
++  private ComponentNode currentComponent;
++
++  private BindingGraphConverter(BindingGraph graph) {
++    super(graph);
++  }
++
++  /**
++   * Creates the external {@link dagger.model.BindingGraph} representing the given internal root
++   * {@link dagger.internal.codegen.BindingGraph}.
++   */
++  static dagger.model.BindingGraph convert(BindingGraph graph) {
++    BindingGraphConverter converter = new BindingGraphConverter(graph);
++    converter.traverseComponents();
++    return BindingGraphProxies.bindingGraph(converter.network);
++  }
++
++  @Override
++  protected void visitComponent(BindingGraph graph) {
++    ComponentNode grandparentNode = parentComponent;
++    parentComponent = currentComponent;
++    currentComponent = componentNode(componentTreePath().toComponentPath());
++    network.addNode(currentComponent);
++    super.visitComponent(graph);
++    currentComponent = parentComponent;
++    parentComponent = grandparentNode;
++  }
++
++  @Override
++  protected void visitSubcomponentFactoryMethod(
++      BindingGraph graph, BindingGraph parent, ExecutableElement factoryMethod) {
++    network.addEdge(parentComponent, currentComponent, childFactoryMethodEdge(factoryMethod));
++    super.visitSubcomponentFactoryMethod(graph, parent, factoryMethod);
++  }
++
++  @Override
++  protected BindingGraphTraverser bindingGraphTraverser(
++      ComponentTreePath componentTreePath, ComponentMethodDescriptor entryPointMethod) {
++    return new BindingGraphVisitor(componentTreePath, entryPointMethod);
++  }
++
++  private final class BindingGraphVisitor extends BindingGraphTraverser {
++
++    private Node current;
++
++    BindingGraphVisitor(
++        ComponentTreePath componentTreePath, ComponentMethodDescriptor entryPointMethod) {
++      super(componentTreePath, entryPointMethod);
++      current = currentComponent;
++      network.addNode(current);
++    }
++
++    @Override
++    protected void visitBinding(Binding binding, ComponentDescriptor owningComponent) {
++      // TODO(dpb): Should we visit only bindings owned by the current component, since other
++      // bindings will be visited in the parent?
++      Node previous = current;
++      current = newBindingNode(resolvedBindings(), binding, owningComponent);
++      network.addNode(current);
++      if (binding instanceof ContributionBinding) {
++        ContributionBinding contributionBinding = (ContributionBinding) binding;
++        if (contributionBinding.kind().equals(SUBCOMPONENT_BUILDER)) {
++          ImmutableSet.Builder<TypeElement> modules = ImmutableSet.builder();
++          for (SubcomponentDeclaration subcomponentDeclaration :
++              resolvedBindings().subcomponentDeclarations()) {
++            modules.add(subcomponentDeclaration.contributingModule().get());
++          }
++          network.addEdge(
++              current,
++              subcomponentNode(contributionBinding, owningComponent),
++              subcomponentBuilderBindingEdge(modules.build()));
++        }
++      }
++      if (network
++          .edgesConnecting(previous, current)
++          .stream()
++          .flatMap(instancesOf(DependencyEdge.class))
++          .noneMatch(e -> e.dependencyRequest().equals(dependencyRequest()))) {
++        network.addEdge(
++            previous, current, dependencyEdge(dependencyRequest(), atEntryPoint()));
++        super.visitBinding(binding, owningComponent);
++      }
++      current = previous;
++    }
++
++    private ComponentNode subcomponentNode(
++        ContributionBinding binding, ComponentDescriptor subcomponentParent) {
++      checkArgument(binding.kind().equals(SUBCOMPONENT_BUILDER));
++      TypeElement builderType = asTypeElement(binding.key().type());
++      TypeElement subcomponentType = asType(builderType.getEnclosingElement());
++      ComponentTreePath childPath =
++          componentTreePath()
++              .pathFromRootToAncestor(subcomponentParent)
++              .childPath(subcomponentType);
++      ComponentNode childNode = componentNode(childPath.toComponentPath());
++      network.addNode(childNode);
++      return childNode;
++    }
++
++    private BindingNode newBindingNode(
++        ResolvedBindings resolvedBindings, Binding binding, ComponentDescriptor owningComponent) {
++      ImmutableList.Builder<Element> associatedDeclarations = ImmutableList.builder();
++      for (BindingDeclaration declaration :
++          concat(
++              resolvedBindings.multibindingDeclarations(),
++              resolvedBindings.optionalBindingDeclarations(),
++              resolvedBindings.subcomponentDeclarations())) {
++        associatedDeclarations.add(declaration.bindingElement().get());
++      }
++      return bindingNode(
++          componentTreePath().pathFromRootToAncestor(owningComponent).toComponentPath(),
++          binding,
++          associatedDeclarations.build());
++    }
++  }
++}
+diff --git a/java/dagger/internal/codegen/BindingGraphPlugin.java b/java/dagger/internal/codegen/BindingGraphPlugin.java
+index 47628deed..8ea0a6ce7 100644
+--- a/java/dagger/internal/codegen/BindingGraphPlugin.java
++++ b/java/dagger/internal/codegen/BindingGraphPlugin.java
+@@ -16,6 +16,7 @@
+ 
+ package dagger.internal.codegen;
+ 
++import dagger.model.BindingGraph;
+ import java.util.Collections;
+ import java.util.Map;
+ import java.util.Set;
+@@ -24,7 +25,7 @@
+ import javax.annotation.processing.Processor;
+ 
+ /**
+- * A pluggable visitor for {@link BindingNetwork}.
++ * A pluggable visitor for {@link BindingGraph}.
+  *
+  * <p>Note: This is still experimental and will change.
+  */
+@@ -44,8 +45,8 @@ protected final Filer filer() {
+     return filer;
+   }
+ 
+-  /** Called once for each valid root binding graph encountered by the Dagger processor. */
+-  protected abstract void visitGraph(BindingNetwork bindingNetwork);
++  /** Called once for each valid binding graph encountered by the Dagger processor. */
++  protected abstract void visitGraph(BindingGraph bindingGraph);
+ 
+   /**
+    * Returns the annotation-processing options that this plugin uses to configure behavior.
+diff --git a/java/dagger/internal/codegen/BindingNetworkVisualizer.java b/java/dagger/internal/codegen/BindingNetworkVisualizer.java
+index b431beba2..f2a724c03 100644
+--- a/java/dagger/internal/codegen/BindingNetworkVisualizer.java
++++ b/java/dagger/internal/codegen/BindingNetworkVisualizer.java
+@@ -28,13 +28,15 @@
+ import com.google.common.graph.EndpointPair;
+ import com.google.errorprone.annotations.CanIgnoreReturnValue;
+ import com.squareup.javapoet.ClassName;
+-import dagger.internal.codegen.BindingNetwork.BindingNode;
+-import dagger.internal.codegen.BindingNetwork.ChildFactoryMethodEdge;
+-import dagger.internal.codegen.BindingNetwork.DependencyEdge;
+-import dagger.internal.codegen.BindingNetwork.Edge;
+-import dagger.internal.codegen.BindingNetwork.Node;
+-import dagger.internal.codegen.BindingNetwork.SubcomponentBuilderBindingEdge;
+-import dagger.internal.codegen.ComponentTreeTraverser.ComponentTreePath;
++import dagger.model.BindingGraph;
++import dagger.model.BindingGraph.BindingNode;
++import dagger.model.BindingGraph.ChildFactoryMethodEdge;
++import dagger.model.BindingGraph.DependencyEdge;
++import dagger.model.BindingGraph.Edge;
++import dagger.model.BindingGraph.Node;
++import dagger.model.BindingGraph.SubcomponentBuilderBindingEdge;
++import dagger.model.BindingKind;
++import dagger.model.ComponentPath;
+ import java.io.IOException;
+ import java.io.PrintWriter;
+ import java.util.ArrayList;
+@@ -80,10 +82,10 @@
+           "/set312/12");
+ 
+   @Override
+-  public void visitGraph(BindingNetwork bindingNetwork) {
++  public void visitGraph(BindingGraph bindingGraph) {
+     TypeElement componentElement =
+-        bindingNetwork.rootComponentNode().componentTreePath().currentComponent();
+-    DotGraph graph = new NodesGraph(bindingNetwork).graph();
++        bindingGraph.rootComponentNode().componentPath().currentComponent();
++    DotGraph graph = new NodesGraph(bindingGraph).graph();
+     ClassName componentName = ClassName.get(componentElement);
+     try {
+       FileObject file =
+@@ -201,20 +203,20 @@ private static String quote(String string) {
+                     .addAttribute("labeljust", "l")
+                     .addAttribute("compound", true));
+ 
+-    private final BindingNetwork bindingNetwork;
++    private final BindingGraph bindingGraph;
+     private final Map<Node, UUID> nodeIds = new HashMap<>();
+ 
+-    NodesGraph(BindingNetwork bindingNetwork) {
+-      this.bindingNetwork = bindingNetwork;
++    NodesGraph(BindingGraph bindingGraph) {
++      this.bindingGraph = bindingGraph;
+     }
+ 
+     DotGraph graph() {
+       if (nodeIds.isEmpty()) {
+         Iterator<String> colors = Iterators.cycle(BindingNetworkVisualizer.COMPONENT_COLORS);
+-        bindingNetwork
++        bindingGraph
+             .nodes()
+             .stream()
+-            .collect(groupingBy(Node::componentTreePath))
++            .collect(groupingBy(Node::componentPath))
+             .forEach(
+                 (component, networkNodes) -> {
+                   DotGraph subgraph = subgraph(component);
+@@ -228,14 +230,14 @@ DotGraph graph() {
+                     subgraph.add(dotNode(node));
+                   }
+                 });
+-        for (Edge edge : bindingNetwork.edges()) {
++        for (Edge edge : bindingGraph.edges()) {
+           dotEdge(edge).ifPresent(graph::add);
+         }
+       }
+       return graph;
+     }
+ 
+-    DotGraph subgraph(ComponentTreePath component) {
++    DotGraph subgraph(ComponentPath component) {
+       DotGraph subgraph = new DotGraph("subgraph " + quote(clusterName(component)));
+       graph.add(subgraph);
+       return subgraph;
+@@ -246,7 +248,7 @@ UUID nodeId(Node node) {
+     }
+ 
+     Optional<DotEdge> dotEdge(Edge edge) {
+-      EndpointPair<Node> incidentNodes = bindingNetwork.incidentNodes(edge);
++      EndpointPair<Node> incidentNodes = bindingGraph.incidentNodes(edge);
+       DotEdge dotEdge = new DotEdge(nodeId(incidentNodes.source()), nodeId(incidentNodes.target()));
+       if (edge instanceof DependencyEdge) {
+         if (((DependencyEdge) edge).isEntryPoint()) {
+@@ -254,12 +256,12 @@ UUID nodeId(Node node) {
+         }
+       } else if (edge instanceof ChildFactoryMethodEdge) {
+         dotEdge.addAttribute("style", "dashed");
+-        dotEdge.addAttribute("lhead", clusterName(incidentNodes.target().componentTreePath()));
+-        dotEdge.addAttribute("ltail", clusterName(incidentNodes.source().componentTreePath()));
++        dotEdge.addAttribute("lhead", clusterName(incidentNodes.target().componentPath()));
++        dotEdge.addAttribute("ltail", clusterName(incidentNodes.source().componentPath()));
+         dotEdge.addAttribute("taillabel", ((ChildFactoryMethodEdge) edge).factoryMethod());
+       } else if (edge instanceof SubcomponentBuilderBindingEdge) {
+         dotEdge.addAttribute("style", "dashed");
+-        dotEdge.addAttribute("lhead", clusterName(incidentNodes.target().componentTreePath()));
++        dotEdge.addAttribute("lhead", clusterName(incidentNodes.target().componentPath()));
+         dotEdge.addAttribute("taillabel", "subcomponent");
+       }
+       return Optional.of(dotEdge);
+@@ -268,25 +270,16 @@ UUID nodeId(Node node) {
+     DotNode dotNode(Node node) {
+       DotNode dotNode = new DotNode(nodeId(node));
+       if (node instanceof BindingNode) {
+-        Binding binding = ((BindingNode) node).binding();
+-        switch (binding.bindingType()) {
+-          case PROVISION:
+-            dotNode.addAttribute("label", binding.key());
+-            break;
+-
+-          case PRODUCTION:
+-            dotNode.addAttributeFormat("label", "@Produces %s", binding.key());
+-            break;
+-
+-          case MEMBERS_INJECTION:
+-            dotNode.addAttributeFormat("label", "MembersInjector<%s>", binding.key());
+-            break;
+-
+-          default:
+-            throw new AssertionError(binding);
++        dagger.model.Binding binding = ((BindingNode) node).binding();
++        if (binding.kind().equals(BindingKind.MEMBERS_INJECTION)) {
++          dotNode.addAttributeFormat("label", "inject(%s)", binding.key());
++        } else if (binding.isProduction()) {
++          dotNode.addAttributeFormat("label", "@Produces %s", binding.key());
++        } else {
++          dotNode.addAttribute("label", binding.key());
+         }
+         dotNode.addAttribute("tooltip", "");
+-        if (bindingNetwork.entryPointBindingNodes().contains(node)) {
++        if (bindingGraph.entryPointBindingNodes().contains(node)) {
+           dotNode.addAttribute("penwidth", 3);
+         }
+       } else {
+@@ -295,7 +288,7 @@ DotNode dotNode(Node node) {
+       return dotNode;
+     }
+ 
+-    private static String clusterName(ComponentTreePath owningComponentPath) {
++    private static String clusterName(ComponentPath owningComponentPath) {
+       return "cluster" + owningComponentPath;
+     }
+   }
+diff --git a/java/dagger/internal/codegen/ComponentProcessingStep.java b/java/dagger/internal/codegen/ComponentProcessingStep.java
+index 4a3273d6c..a8c37300b 100644
+--- a/java/dagger/internal/codegen/ComponentProcessingStep.java
++++ b/java/dagger/internal/codegen/ComponentProcessingStep.java
+@@ -146,8 +146,8 @@
+         }
+ 
+         if (!bindingGraphPlugins.isEmpty()) {
+-          BindingNetwork bindingNetwork = BindingNetwork.create(bindingGraph);
+-          bindingGraphPlugins.forEach(plugin -> plugin.visitGraph(bindingNetwork));
++          dagger.model.BindingGraph graph = BindingGraphConverter.convert(bindingGraph);
++          bindingGraphPlugins.forEach(plugin -> plugin.visitGraph(graph));
+         }
+ 
+         generateComponent(bindingGraph);
+diff --git a/java/dagger/internal/codegen/ComponentTreeTraverser.java b/java/dagger/internal/codegen/ComponentTreeTraverser.java
+index 30654e29c..816d4c89a 100644
+--- a/java/dagger/internal/codegen/ComponentTreeTraverser.java
++++ b/java/dagger/internal/codegen/ComponentTreeTraverser.java
+@@ -29,6 +29,7 @@
+ import static java.util.Spliterator.ORDERED;
+ import static java.util.Spliterator.SIZED;
+ import static java.util.stream.Collectors.joining;
++import static java.util.stream.Collectors.toList;
+ 
+ import com.google.auto.value.AutoValue;
+ import com.google.common.collect.FluentIterable;
+@@ -39,6 +40,7 @@
+ import com.google.common.collect.LinkedHashMultiset;
+ import dagger.internal.codegen.ComponentDescriptor.ComponentMethodDescriptor;
+ import dagger.internal.codegen.ComponentDescriptor.ComponentMethodKind;
++import dagger.model.ComponentPath;
+ import dagger.model.DependencyRequest;
+ import dagger.model.Key;
+ import java.util.ArrayDeque;
+@@ -650,6 +652,12 @@ private BindingGraph rootmostGraph(Predicate<? super BindingGraph> predicate) {
+       return graphsInPath().stream().filter(predicate).findFirst().get();
+     }
+ 
++    /** Converts this {@link ComponentTreePath} into a {@link ComponentPath}. */
++    ComponentPath toComponentPath() {
++      return ComponentPath.create(
++          graphsInPath().stream().map(BindingGraph::componentType).collect(toList()));
++    }
++
+     @Override
+     public String toString() {
+       return graphsInPath()
+diff --git a/java/dagger/internal/codegen/DaggerStreams.java b/java/dagger/internal/codegen/DaggerStreams.java
+index ce8dc1ebf..97072e3b6 100644
+--- a/java/dagger/internal/codegen/DaggerStreams.java
++++ b/java/dagger/internal/codegen/DaggerStreams.java
+@@ -30,13 +30,13 @@
+ import java.util.stream.Stream;
+ 
+ /** Utilities for streams. */
+-final class DaggerStreams {
++public final class DaggerStreams {
+ 
+   /**
+    * Returns a {@link Collector} that accumulates the input elements into a new {@link
+    * ImmutableList}, in encounter order.
+    */
+-  static <T> Collector<T, ?, ImmutableList<T>> toImmutableList() {
++  public static <T> Collector<T, ?, ImmutableList<T>> toImmutableList() {
+     return collectingAndThen(toList(), ImmutableList::copyOf);
+   }
+ 
+@@ -44,7 +44,7 @@
+    * Returns a {@link Collector} that accumulates the input elements into a new {@link
+    * ImmutableSet}, in encounter order.
+    */
+-  static <T> Collector<T, ?, ImmutableSet<T>> toImmutableSet() {
++  public static <T> Collector<T, ?, ImmutableSet<T>> toImmutableSet() {
+     return collectingAndThen(toList(), ImmutableSet::copyOf);
+   }
+ 
+@@ -53,7 +53,7 @@
+    * and values are the result of applying the provided mapping functions to the input elements.
+    * Entries appear in the result {@code ImmutableMap} in encounter order.
+    */
+-  static <T, K, V> Collector<T, ?, ImmutableMap<K, V>> toImmutableMap(
++  public static <T, K, V> Collector<T, ?, ImmutableMap<K, V>> toImmutableMap(
+       Function<? super T, K> keyMapper, Function<? super T, V> valueMapper) {
+     return Collectors.mapping(
+         value -> Maps.immutableEntry(keyMapper.apply(value), valueMapper.apply(value)),
+@@ -72,7 +72,7 @@
+    *
+    * <pre>{@code Stream<Bar>} barStream = fooStream.flatMap(instancesOf(Bar.class));</pre>
+    */
+-  static <T> Function<Object, Stream<T>> instancesOf(Class<T> to) {
++  public static <T> Function<Object, Stream<T>> instancesOf(Class<T> to) {
+     return f -> to.isInstance(f) ? Stream.of(to.cast(f)) : Stream.empty();
+   }
+ 
+diff --git a/java/dagger/model/BUILD b/java/dagger/model/BUILD
+index 65d90ce26..43f01cc37 100644
+--- a/java/dagger/model/BUILD
++++ b/java/dagger/model/BUILD
+@@ -23,9 +23,14 @@ load(
+     "DOCLINT_REFERENCES",
+ )
+ 
++INTERNAL_PROXIES = ["BindingGraphProxies.java"]
++
+ filegroup(
+     name = "model-srcs",
+-    srcs = glob(["*.java"]),
++    srcs = glob(
++        ["*.java"],
++        exclude = INTERNAL_PROXIES,
++    ),
+ )
+ 
+ java_library(
+@@ -34,6 +39,7 @@ java_library(
+     javacopts = DOCLINT_HTML_AND_SYNTAX + DOCLINT_REFERENCES,
+     deps = [
+         "//java/dagger:core",
++        "//java/dagger/internal/codegen:shared-with-spi",
+         "//java/dagger/producers",
+         "//third_party:auto_common",
+         "//third_party:auto_value",
+@@ -43,6 +49,15 @@ java_library(
+     ],
+ )
+ 
++java_library(
++    name = "internal-proxies",
++    srcs = INTERNAL_PROXIES,
++    deps = [
++        ":model",
++        "//third_party:guava",
++    ],
++)
++
+ load("//tools:javadoc.bzl", "javadoc_library")
+ 
+ javadoc_library(
+diff --git a/java/dagger/internal/codegen/BindingNetwork.java b/java/dagger/model/BindingGraph.java
+similarity index 58%
+rename from java/dagger/internal/codegen/BindingNetwork.java
+rename to java/dagger/model/BindingGraph.java
+index a11c013af..ab089c6a1 100644
+--- a/java/dagger/internal/codegen/BindingNetwork.java
++++ b/java/dagger/model/BindingGraph.java
+@@ -14,13 +14,9 @@
+  * limitations under the License.
+  */
+ 
+-package dagger.internal.codegen;
++package dagger.model;
+ 
+-import static com.google.auto.common.MoreElements.asType;
+-import static com.google.auto.common.MoreTypes.asTypeElement;
+ import static com.google.common.base.MoreObjects.toStringHelper;
+-import static com.google.common.base.Preconditions.checkArgument;
+-import static com.google.common.collect.Iterables.concat;
+ import static com.google.common.collect.Sets.intersection;
+ import static com.google.common.graph.Graphs.inducedSubgraph;
+ import static com.google.common.graph.Graphs.reachableNodes;
+@@ -28,24 +24,20 @@
+ import static dagger.internal.codegen.DaggerStreams.instancesOf;
+ import static dagger.internal.codegen.DaggerStreams.toImmutableMap;
+ import static dagger.internal.codegen.DaggerStreams.toImmutableSet;
+-import static dagger.model.BindingKind.SUBCOMPONENT_BUILDER;
+ 
+ import com.google.auto.value.AutoValue;
+ import com.google.common.collect.ImmutableMap;
+ import com.google.common.collect.ImmutableSet;
+ import com.google.common.graph.ImmutableNetwork;
+-import com.google.common.graph.MutableNetwork;
+ import com.google.common.graph.Network;
+-import com.google.common.graph.NetworkBuilder;
+ import dagger.BindsOptionalOf;
+ import dagger.Module;
+-import dagger.internal.codegen.ComponentDescriptor.ComponentMethodDescriptor;
+-import dagger.internal.codegen.ComponentTreeTraverser.ComponentTreePath;
+-import dagger.model.DependencyRequest;
+-import dagger.model.Key;
++import dagger.model.BindingGraph.Edge;
++import dagger.model.BindingGraph.Node;
+ import dagger.multibindings.Multibinds;
+ import java.util.Optional;
+ import java.util.stream.Stream;
++import javax.lang.model.element.Element;
+ import javax.lang.model.element.ExecutableElement;
+ import javax.lang.model.element.TypeElement;
+ 
+@@ -78,18 +70,9 @@
+  * the parent.
+  */
+ // TODO(dpb): Represent graphs with missing or conflicting bindings.
+-public final class BindingNetwork
+-    extends ForwardingNetwork<BindingNetwork.Node, BindingNetwork.Edge> {
+-
+-  /** Creates a {@link BindingNetwork} representing the given root {@link BindingGraph}. */
+-  static BindingNetwork create(BindingGraph graph) {
+-    Factory factory = new Factory(graph);
+-    factory.traverseComponents();
+-    return factory.bindingNetwork();
+-  }
+-
+-  private BindingNetwork(Network<Node, Edge> bindingNetwork) {
+-    super(ImmutableNetwork.copyOf(bindingNetwork));
++public final class BindingGraph extends ForwardingNetwork<Node, Edge> {
++  BindingGraph(Network<Node, Edge> network) {
++    super(ImmutableNetwork.copyOf(network));
+   }
+ 
+   /** Returns the binding nodes. */
+@@ -110,23 +93,23 @@ private BindingNetwork(Network<Node, Edge> bindingNetwork) {
+   }
+ 
+   /** Returns the component node for a component. */
+-  public Optional<ComponentNode> componentNode(ComponentTreePath component) {
++  public Optional<ComponentNode> componentNode(ComponentPath component) {
+     return componentNodeStream()
+-        .filter(node -> node.componentTreePath().equals(component))
++        .filter(node -> node.componentPath().equals(component))
+         .findFirst();
+   }
+ 
+   /** Returns the component nodes for a component. */
+   public ImmutableSet<ComponentNode> componentNodes(TypeElement component) {
+     return componentNodeStream()
+-        .filter(node -> node.componentTreePath().currentComponent().equals(component))
++        .filter(node -> node.componentPath().currentComponent().equals(component))
+         .collect(toImmutableSet());
+   }
+ 
+   /** Returns the component node for the root component. */
+   public ComponentNode rootComponentNode() {
+     return componentNodeStream()
+-        .filter(node -> node.componentTreePath().atRoot())
++        .filter(node -> node.componentPath().atRoot())
+         .findFirst()
+         .get();
+   }
+@@ -163,7 +146,7 @@ public ComponentNode rootComponentNode() {
+    * Returns the dependency edges for the entry points of a given {@code component}. Each edge's
+    * source node is that component's component node.
+    */
+-  public ImmutableSet<DependencyEdge> entryPointEdges(ComponentTreePath component) {
++  public ImmutableSet<DependencyEdge> entryPointEdges(ComponentPath component) {
+     return outEdges(componentNode(component).get())
+         .stream()
+         .flatMap(instancesOf(DependencyEdge.class))
+@@ -220,7 +203,7 @@ public ComponentNode rootComponentNode() {
+     private final DependencyRequest dependencyRequest;
+     private final boolean entryPoint;
+ 
+-    private DependencyEdge(DependencyRequest dependencyRequest, boolean entryPoint) {
++    DependencyEdge(DependencyRequest dependencyRequest, boolean entryPoint) {
+       this.dependencyRequest = dependencyRequest;
+       this.entryPoint = entryPoint;
+     }
+@@ -252,7 +235,7 @@ public String toString() {
+ 
+     private final ExecutableElement factoryMethod;
+ 
+-    private ChildFactoryMethodEdge(ExecutableElement factoryMethod) {
++    ChildFactoryMethodEdge(ExecutableElement factoryMethod) {
+       this.factoryMethod = factoryMethod;
+     }
+ 
+@@ -269,37 +252,38 @@ public String toString() {
+ 
+   /**
+    * An edge that represents the link between a parent component and a child subcomponent implied by
+-   * a subcomponent builder binding.
++   * a subcomponent builder binding. The {@linkplain com.google.common.graph.EndpointPair#source()
++   * source node} of this edge is a {@link BindingNode} for the subcomponent builder {@link Key} and
++   * the {@linkplain com.google.common.graph.EndpointPair#target() target node} is a {@link
++   * ComponentNode} for the child subcomponent.
+    */
+   public static final class SubcomponentBuilderBindingEdge implements Edge {
+ 
+-    private final ImmutableSet<SubcomponentDeclaration> subcomponentDeclarations;
++    private final ImmutableSet<TypeElement> declaringModules;
+ 
+-    private SubcomponentBuilderBindingEdge(
+-        Iterable<SubcomponentDeclaration> subcomponentDeclarations) {
+-      this.subcomponentDeclarations = ImmutableSet.copyOf(subcomponentDeclarations);
++    SubcomponentBuilderBindingEdge(Iterable<TypeElement> declaringModules) {
++      this.declaringModules = ImmutableSet.copyOf(declaringModules);
+     }
+ 
+     /**
+-     * The {@code @Module.subcomponents} declarations that generated this edge. May be empty if the
+-     * parent component has a subcomponent builder method.
++     * The modules that {@linkplain Module#subcomponents() declare the subcomponent} that generated
++     * this edge. Empty if the parent component has a subcomponent builder method and there are no
++     * declaring modules.
+      */
+-    public ImmutableSet<SubcomponentDeclaration> subcomponentDeclarations() {
+-      return subcomponentDeclarations;
++    public ImmutableSet<TypeElement> declaringModules() {
++      return declaringModules;
+     }
+ 
+     @Override
+     public String toString() {
+-      return toStringHelper(this)
+-          .add("subcomponentDeclarations", subcomponentDeclarations)
+-          .toString();
++      return toStringHelper(this).add("declaringModules", declaringModules).toString();
+     }
+   }
+ 
+   /** A node in the binding graph. Either a {@link BindingNode} or a {@link ComponentNode}. */
+   public interface Node {
+     /** The component this node belongs to. */
+-    ComponentTreePath componentTreePath();
++    ComponentPath componentPath();
+   }
+ 
+   /**
+@@ -309,14 +293,12 @@ public String toString() {
+   // TODO(dpb): Should this be a value type?
+   public static final class BindingNode implements Node {
+ 
+-    private final ComponentTreePath component;
++    private final ComponentPath component;
+     private final Binding binding;
+-    private final ImmutableSet<BindingDeclaration> associatedDeclarations;
++    private final ImmutableSet<Element> associatedDeclarations;
+ 
+-    private BindingNode(
+-        ComponentTreePath component,
+-        Binding binding,
+-        Iterable<BindingDeclaration> associatedDeclarations) {
++    BindingNode(
++        ComponentPath component, Binding binding, Iterable<Element> associatedDeclarations) {
+       this.component = component;
+       this.binding = binding;
+       this.associatedDeclarations = ImmutableSet.copyOf(associatedDeclarations);
+@@ -324,28 +306,26 @@ private BindingNode(
+ 
+     /** The component that owns the {@link #binding()}. */
+     @Override
+-    public ComponentTreePath componentTreePath() {
++    public ComponentPath componentPath() {
+       return component;
+     }
+ 
+     /** The binding. */
+-    Binding binding() {
++    public Binding binding() {
+       return binding;
+     }
+ 
+     /**
+-     * The declarations (other than the binding's {@link Binding#bindingElement()}) that are
++     * The {@link Element}s (other than the binding's {@link Binding#bindingElement()}) that are
+      * associated with the binding.
+      *
+      * <ul>
+-     *   <li>For {@linkplain BindsOptionalOf optional bindings}, the {@link
+-     *       OptionalBindingDeclaration}s.
+-     *   <li>For {@linkplain Module#subcomponents() module subcomponents}, the {@link
+-     *       SubcomponentDeclaration}s.
+-     *   <li>For {@linkplain Multibinds multibindings}, the {@link MultibindingDeclaration}s.
++     *   <li>{@linkplain BindsOptionalOf optional binding} declarations
++     *   <li>{@linkplain Module#subcomponents() module subcomponent} declarations
++     *   <li>{@linkplain Multibinds multibinding} declarations
+      * </ul>
+      */
+-    public ImmutableSet<BindingDeclaration> associatedDeclarations() {
++    public ImmutableSet<Element> associatedDeclarations() {
+       return associatedDeclarations;
+     }
+ 
+@@ -365,119 +345,12 @@ public String toString() {
+    */
+   @AutoValue
+   public abstract static class ComponentNode implements Node {
+-
+-    /** The component represented by this node. */
+-    @Override
+-    public abstract ComponentTreePath componentTreePath();
+-
+-    private static ComponentNode create(ComponentTreePath component) {
+-      return new AutoValue_BindingNetwork_ComponentNode(component);
+-    }
+-  }
+-
+-  private static class Factory extends ComponentTreeTraverser {
+-
+-    private final MutableNetwork<Node, Edge> network =
+-        NetworkBuilder.directed().allowsParallelEdges(true).allowsSelfLoops(true).build();
+-
+-    private ComponentNode parentComponent;
+-    private ComponentNode currentComponent;
+-
+-    Factory(BindingGraph graph) {
+-      super(graph);
+-    }
+-
+-    @Override
+-    protected void visitComponent(BindingGraph graph) {
+-      ComponentNode grandparentNode = parentComponent;
+-      parentComponent = currentComponent;
+-      currentComponent = ComponentNode.create(componentTreePath());
+-      network.addNode(currentComponent);
+-      super.visitComponent(graph);
+-      currentComponent = parentComponent;
+-      parentComponent = grandparentNode;
+-    }
+-
+-    @Override
+-    protected void visitSubcomponentFactoryMethod(
+-        BindingGraph graph, BindingGraph parent, ExecutableElement factoryMethod) {
+-      network.addEdge(parentComponent, currentComponent, new ChildFactoryMethodEdge(factoryMethod));
+-      super.visitSubcomponentFactoryMethod(graph, parent, factoryMethod);
++    static ComponentNode create(ComponentPath componentPath) {
++      return new AutoValue_BindingGraph_ComponentNode(componentPath);
+     }
+ 
++    /** The component represented by this node. */
+     @Override
+-    protected BindingGraphTraverser bindingGraphTraverser(
+-        ComponentTreePath componentPath, ComponentMethodDescriptor entryPointMethod) {
+-      return new BindingGraphVisitor(componentPath, entryPointMethod);
+-    }
+-
+-    BindingNetwork bindingNetwork() {
+-      return new BindingNetwork(network);
+-    }
+-
+-    private final class BindingGraphVisitor extends BindingGraphTraverser {
+-
+-      private Node current;
+-
+-      BindingGraphVisitor(
+-          ComponentTreePath componentPath, ComponentMethodDescriptor entryPointMethod) {
+-        super(componentPath, entryPointMethod);
+-        current = currentComponent;
+-        network.addNode(current);
+-      }
+-
+-      @Override
+-      protected void visitBinding(Binding binding, ComponentDescriptor owningComponent) {
+-        // TODO(dpb): Should we visit only bindings owned by the current component, since other
+-        // bindings will be visited in the parent?
+-        Node previous = current;
+-        current = newBindingNode(resolvedBindings(), binding, owningComponent);
+-        network.addNode(current);
+-        if (binding instanceof ContributionBinding) {
+-          ContributionBinding contributionBinding = (ContributionBinding) binding;
+-          if (contributionBinding.kind().equals(SUBCOMPONENT_BUILDER)) {
+-            network.addEdge(
+-                current,
+-                subcomponentNode(contributionBinding, owningComponent),
+-                new SubcomponentBuilderBindingEdge(resolvedBindings().subcomponentDeclarations()));
+-          }
+-        }
+-        if (network
+-            .edgesConnecting(previous, current)
+-            .stream()
+-            .flatMap(instancesOf(DependencyEdge.class))
+-            .noneMatch(e -> e.dependencyRequest().equals(dependencyRequest()))) {
+-          network.addEdge(
+-              previous, current, new DependencyEdge(dependencyRequest(), atEntryPoint()));
+-          super.visitBinding(binding, owningComponent);
+-        }
+-        current = previous;
+-      }
+-
+-      private ComponentNode subcomponentNode(
+-          ContributionBinding binding, ComponentDescriptor subcomponentParent) {
+-        checkArgument(binding.kind().equals(SUBCOMPONENT_BUILDER));
+-        TypeElement builderType = asTypeElement(binding.key().type());
+-        TypeElement subcomponentType = asType(builderType.getEnclosingElement());
+-        ComponentTreePath childPath =
+-            componentTreePath()
+-                .pathFromRootToAncestor(subcomponentParent)
+-                .childPath(subcomponentType);
+-        ComponentNode childNode = ComponentNode.create(childPath);
+-        network.addNode(childNode);
+-        return childNode;
+-      }
+-
+-      private BindingNode newBindingNode(
+-          ResolvedBindings resolvedBindings, Binding binding, ComponentDescriptor owningComponent) {
+-        return new BindingNode(
+-            componentTreePath().pathFromRootToAncestor(owningComponent),
+-            binding,
+-            concat(
+-                resolvedBindings.multibindingDeclarations(),
+-                resolvedBindings.optionalBindingDeclarations(),
+-                resolvedBindings.subcomponentDeclarations()));
+-      }
+-    }
++    public abstract ComponentPath componentPath();
+   }
+ }
+diff --git a/java/dagger/model/BindingGraphProxies.java b/java/dagger/model/BindingGraphProxies.java
+new file mode 100644
+index 000000000..2e5cd83b7
+--- /dev/null
++++ b/java/dagger/model/BindingGraphProxies.java
+@@ -0,0 +1,71 @@
++/*
++ * Copyright (C) 2018 The Dagger Authors.
++ *
++ * Licensed under the Apache License, Version 2.0 (the "License");
++ * you may not use this file except in compliance with the License.
++ * You may obtain a copy of the License at
++ *
++ * http://www.apache.org/licenses/LICENSE-2.0
++ *
++ * Unless required by applicable law or agreed to in writing, software
++ * distributed under the License is distributed on an "AS IS" BASIS,
++ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++ * See the License for the specific language governing permissions and
++ * limitations under the License.
++ */
++
++package dagger.model;
++
++import com.google.common.graph.Network;
++import dagger.model.BindingGraph.BindingNode;
++import dagger.model.BindingGraph.ChildFactoryMethodEdge;
++import dagger.model.BindingGraph.ComponentNode;
++import dagger.model.BindingGraph.DependencyEdge;
++import dagger.model.BindingGraph.Edge;
++import dagger.model.BindingGraph.Node;
++import dagger.model.BindingGraph.SubcomponentBuilderBindingEdge;
++import javax.lang.model.element.Element;
++import javax.lang.model.element.ExecutableElement;
++import javax.lang.model.element.TypeElement;
++
++/**
++ * Exposes package-private constructors to the {@code dagger.internal.codegen} package. <em>This
++ * class should only be used in the Dagger implementation and is not part of any documented
++ * API.</em>
++ */
++public final class BindingGraphProxies {
++  /** Creates a new {@link BindingGraph}. */
++  public static BindingGraph bindingGraph(Network<Node, Edge> network) {
++    return new BindingGraph(network);
++  }
++
++  /** Creates a new {@link BindingNode}. */
++  public static BindingNode bindingNode(
++      ComponentPath component, Binding binding, Iterable<Element> associatedDeclarations) {
++    return new BindingNode(component, binding, associatedDeclarations);
++  }
++
++  /** Creates a new {@link ComponentNode}. */
++  public static ComponentNode componentNode(ComponentPath component) {
++    return ComponentNode.create(component);
++  }
++
++  /** Creates a new {@link DependencyEdge}. */
++  public static DependencyEdge dependencyEdge(
++      DependencyRequest dependencyRequest, boolean entryPoint) {
++    return new DependencyEdge(dependencyRequest, entryPoint);
++  }
++
++  /** Creates a new {@link ChildFactoryMethodEdge}. */
++  public static ChildFactoryMethodEdge childFactoryMethodEdge(ExecutableElement factoryMethod) {
++    return new ChildFactoryMethodEdge(factoryMethod);
++  }
++
++  /** Creates a new {@link SubcomponentBuilderBindingEdge}. */
++  public static SubcomponentBuilderBindingEdge subcomponentBuilderBindingEdge(
++      Iterable<TypeElement> declaringModules) {
++    return new SubcomponentBuilderBindingEdge(declaringModules);
++  }
++
++  private BindingGraphProxies() {}
++}
+diff --git a/java/dagger/model/ComponentPath.java b/java/dagger/model/ComponentPath.java
+new file mode 100644
+index 000000000..ce9329ac7
+--- /dev/null
++++ b/java/dagger/model/ComponentPath.java
+@@ -0,0 +1,78 @@
++/*
++ * Copyright (C) 2018 The Dagger Authors.
++ *
++ * Licensed under the Apache License, Version 2.0 (the "License");
++ * you may not use this file except in compliance with the License.
++ * You may obtain a copy of the License at
++ *
++ * http://www.apache.org/licenses/LICENSE-2.0
++ *
++ * Unless required by applicable law or agreed to in writing, software
++ * distributed under the License is distributed on an "AS IS" BASIS,
++ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++ * See the License for the specific language governing permissions and
++ * limitations under the License.
++ */
++
++package dagger.model;
++
++import static com.google.common.base.Preconditions.checkState;
++import static com.google.common.collect.Iterables.getLast;
++import static java.util.stream.Collectors.joining;
++
++import com.google.auto.value.AutoValue;
++import com.google.common.collect.ImmutableList;
++import com.google.errorprone.annotations.DoNotMock;
++import javax.lang.model.element.TypeElement;
++
++/** A path containing a component and all of its ancestor components. */
++@AutoValue
++@DoNotMock("Use ComponentPath.create() to create an instance.")
++public abstract class ComponentPath {
++  /** Returns a new {@link ComponentPath} from {@code components}. */
++  public static ComponentPath create(Iterable<TypeElement> components) {
++    return new AutoValue_ComponentPath(ImmutableList.copyOf(components));
++  }
++
++  /**
++   * Returns the component types, starting from the {@linkplain #rootComponent() root
++   * component} and ending with the {@linkplain #currentComponent() current component}.
++   */
++  public abstract ImmutableList<TypeElement> components();
++
++  /**
++   * Returns the root {@link dagger.Component}- or {@link
++   * dagger.producers.ProductionComponent}-annotated type
++   */
++  public final TypeElement rootComponent() {
++    return components().get(0);
++  }
++
++  /** Returns the component at the end of the path. */
++  public final TypeElement currentComponent() {
++    return getLast(components());
++  }
++
++  /**
++   * Returns the parent of the {@linkplain #currentComponent()} current component}.
++   *
++   * @throws IllegalStateException if the current graph is the {@linkplain #atRoot() root component}
++   */
++  public final TypeElement parentComponent() {
++    checkState(!atRoot());
++    return components().reverse().get(1);
++  }
++
++  /**
++   * Returns {@code true} if the {@linkplain #currentComponent()} current component} is the
++   * {@linkplain #rootComponent()} root component}.
++   */
++  public final boolean atRoot() {
++    return components().size() == 1;
++  }
++
++  @Override
++  public final String toString() {
++    return components().stream().map(TypeElement::getQualifiedName).collect(joining(" → "));
++  }
++}
+diff --git a/java/dagger/internal/codegen/ForwardingNetwork.java b/java/dagger/model/ForwardingNetwork.java
+similarity index 99%
+rename from java/dagger/internal/codegen/ForwardingNetwork.java
+rename to java/dagger/model/ForwardingNetwork.java
+index bfafc1072..aa4b538f9 100644
+--- a/java/dagger/internal/codegen/ForwardingNetwork.java
++++ b/java/dagger/model/ForwardingNetwork.java
+@@ -14,7 +14,7 @@
+  * limitations under the License.
+  */
+ 
+-package dagger.internal.codegen;
++package dagger.model;
+ 
+ import static dagger.internal.Preconditions.checkNotNull;
+ 
+diff --git a/javatests/dagger/functional/spi/BUILD b/javatests/dagger/functional/spi/BUILD
+index c210b6e47..cbfc47825 100644
+--- a/javatests/dagger/functional/spi/BUILD
++++ b/javatests/dagger/functional/spi/BUILD
+@@ -24,6 +24,7 @@ java_plugin(
+     srcs = ["TestPlugin.java"],
+     deps = [
+         "//java/dagger/internal/codegen:binding",
++        "//java/dagger/model",
+         "//third_party:auto_service",
+         "//third_party:guava",
+         "//third_party:javapoet",
+diff --git a/javatests/dagger/functional/spi/TestPlugin.java b/javatests/dagger/functional/spi/TestPlugin.java
+index 0e81514c2..45c50a20b 100644
+--- a/javatests/dagger/functional/spi/TestPlugin.java
++++ b/javatests/dagger/functional/spi/TestPlugin.java
+@@ -22,8 +22,8 @@
+ import com.google.common.base.Joiner;
+ import com.squareup.javapoet.ClassName;
+ import dagger.internal.codegen.BindingGraphPlugin;
+-import dagger.internal.codegen.BindingNetwork;
+-import dagger.internal.codegen.BindingNetwork.ComponentNode;
++import dagger.model.BindingGraph;
++import dagger.model.BindingGraph.ComponentNode;
+ import java.io.IOException;
+ import java.io.UncheckedIOException;
+ import java.io.Writer;
+@@ -33,19 +33,19 @@
+ public final class TestPlugin extends BindingGraphPlugin {
+ 
+   @Override
+-  protected void visitGraph(BindingNetwork bindingNetwork) {
++  protected void visitGraph(BindingGraph bindingGraph) {
+     Properties properties = new Properties();
+     int i = 0;
+-    for (ComponentNode node : bindingNetwork.componentNodes()) {
++    for (ComponentNode node : bindingGraph.componentNodes()) {
+       properties.setProperty(
+-          String.format("component[%s]", i++), node.componentTreePath().toString());
++          String.format("component[%s]", i++), node.componentPath().toString());
+     }
+-    write(bindingNetwork, properties);
++    write(bindingGraph, properties);
+   }
+ 
+-  private void write(BindingNetwork bindingNetwork, Properties properties) {
++  private void write(BindingGraph bindingGraph, Properties properties) {
+     ClassName rootComponentName =
+-        ClassName.get(bindingNetwork.rootComponentNode().componentTreePath().currentComponent());
++        ClassName.get(bindingGraph.rootComponentNode().componentPath().currentComponent());
+     try (Writer writer =
+         filer()
+             .createResource(

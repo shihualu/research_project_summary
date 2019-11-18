@@ -1,0 +1,346 @@
+diff --git a/java/dagger/internal/codegen/BUILD b/java/dagger/internal/codegen/BUILD
+index baf685e82..9fad8ca54 100644
+--- a/java/dagger/internal/codegen/BUILD
++++ b/java/dagger/internal/codegen/BUILD
+@@ -180,6 +180,7 @@ java_library(
+         "ForReleasableReferencesValidator.java",
+         "InjectValidator.java",
+         "MapKeyValidator.java",
++        "MembersInjectionValidator.java",
+         "MethodSignatureFormatter.java",
+         "ModuleValidator.java",
+         "MultibindingAnnotationsProcessingStep.java",
+@@ -207,7 +208,6 @@ java_library(
+         "IncorrectlyInstalledBindsMethodsValidator.java",
+         "InjectBindingValidation.java",
+         "MapMultibindingValidation.java",
+-        "MembersInjectionBindingValidation.java",
+         "MissingBindingValidation.java",
+         "NullableBindingValidation.java",
+         "ProvisionDependencyOnProducerBindingValidation.java",
+diff --git a/java/dagger/internal/codegen/BindingGraphValidationModule.java b/java/dagger/internal/codegen/BindingGraphValidationModule.java
+index 9dfa285a9..fb7ecda20 100644
+--- a/java/dagger/internal/codegen/BindingGraphValidationModule.java
++++ b/java/dagger/internal/codegen/BindingGraphValidationModule.java
+@@ -55,11 +55,6 @@
+   @Validation
+   BindingGraphPlugin mapMultibinding(MapMultibindingValidation validation);
+ 
+-  @Binds
+-  @IntoSet
+-  @Validation
+-  BindingGraphPlugin membersInjection(MembersInjectionBindingValidation validation);
+-
+   @Binds
+   @IntoSet
+   @Validation
+diff --git a/java/dagger/internal/codegen/ComponentValidator.java b/java/dagger/internal/codegen/ComponentValidator.java
+index 3ed0ae801..0ba4ecc4a 100644
+--- a/java/dagger/internal/codegen/ComponentValidator.java
++++ b/java/dagger/internal/codegen/ComponentValidator.java
+@@ -83,6 +83,7 @@
+   private final ModuleValidator moduleValidator;
+   private final BuilderValidator builderValidator;
+   private final DependencyRequestValidator dependencyRequestValidator;
++  private final MembersInjectionValidator membersInjectionValidator;
+   private final MethodSignatureFormatter methodSignatureFormatter;
+   private final DependencyRequestFactory dependencyRequestFactory;
+ 
+@@ -93,6 +94,7 @@
+       ModuleValidator moduleValidator,
+       BuilderValidator builderValidator,
+       DependencyRequestValidator dependencyRequestValidator,
++      MembersInjectionValidator membersInjectionValidator,
+       MethodSignatureFormatter methodSignatureFormatter,
+       DependencyRequestFactory dependencyRequestFactory) {
+     this.elements = elements;
+@@ -100,6 +102,7 @@
+     this.moduleValidator = moduleValidator;
+     this.builderValidator = builderValidator;
+     this.dependencyRequestValidator = dependencyRequestValidator;
++    this.membersInjectionValidator = membersInjectionValidator;
+     this.methodSignatureFormatter = methodSignatureFormatter;
+     this.dependencyRequestFactory = dependencyRequestFactory;
+   }
+@@ -152,8 +155,7 @@ public ComponentValidationReport validate(
+     DeclaredType subjectType = MoreTypes.asDeclared(subject.asType());
+ 
+     SetMultimap<Element, ExecutableElement> referencedSubcomponents = LinkedHashMultimap.create();
+-    getLocalAndInheritedMethods(subject, types, elements)
+-        .stream()
++    getLocalAndInheritedMethods(subject, types, elements).stream()
+         .filter(method -> method.getModifiers().contains(ABSTRACT))
+         .forEachOrdered(
+             method -> {
+@@ -208,6 +210,8 @@ public ComponentValidationReport validate(
+                   case 1:
+                     // one parameter means that it's a members injection method
+                     TypeMirror onlyParameter = Iterables.getOnlyElement(parameterTypes);
++                    membersInjectionValidator.validateMembersInjectionRequest(
++                        report, method, onlyParameter);
+                     if (!(returnType.getKind().equals(VOID)
+                         || types.isSameType(returnType, onlyParameter))) {
+                       report.addError(
+diff --git a/java/dagger/internal/codegen/DependencyRequestValidator.java b/java/dagger/internal/codegen/DependencyRequestValidator.java
+index eb9642215..c546fb214 100644
+--- a/java/dagger/internal/codegen/DependencyRequestValidator.java
++++ b/java/dagger/internal/codegen/DependencyRequestValidator.java
+@@ -23,16 +23,22 @@
+ 
+ import com.google.auto.common.MoreTypes;
+ import com.google.common.collect.ImmutableSet;
++import dagger.MembersInjector;
+ import javax.inject.Inject;
+ import javax.lang.model.element.AnnotationMirror;
+ import javax.lang.model.element.Element;
+ import javax.lang.model.element.VariableElement;
++import javax.lang.model.type.DeclaredType;
+ import javax.lang.model.type.TypeMirror;
+ 
+ /** Validation for dependency requests. */
+ final class DependencyRequestValidator {
++  private final MembersInjectionValidator membersInjectionValidator;
++
+   @Inject
+-  DependencyRequestValidator() {}
++  DependencyRequestValidator(MembersInjectionValidator membersInjectionValidator) {
++    this.membersInjectionValidator = membersInjectionValidator;
++  }
+ 
+   /**
+    * Adds an error if the given dependency request has more than one qualifier annotation or is a
+@@ -59,6 +65,15 @@ void validateDependencyRequest(
+               + keyType,
+           requestElement);
+     }
++    if (MoreTypes.isType(keyType) && MoreTypes.isTypeOf(MembersInjector.class, keyType)) {
++      DeclaredType membersInjectorType = MoreTypes.asDeclared(keyType);
++      if (membersInjectorType.getTypeArguments().isEmpty()) {
++        report.addError("Cannot inject a raw MembersInjector", requestElement);
++      } else {
++        membersInjectionValidator.validateMembersInjectionRequest(
++            report, requestElement, membersInjectorType.getTypeArguments().get(0));
++      }
++    }
+   }
+ 
+   /**
+diff --git a/java/dagger/internal/codegen/KytheBindingGraphFactory.java b/java/dagger/internal/codegen/KytheBindingGraphFactory.java
+index 28b724fbe..10e67ec03 100644
+--- a/java/dagger/internal/codegen/KytheBindingGraphFactory.java
++++ b/java/dagger/internal/codegen/KytheBindingGraphFactory.java
+@@ -121,7 +121,11 @@ private static BindingGraphFactory createBindingGraphFactory(
+             elements,
+             types,
+             new NullMessager(),
+-            new InjectValidator(types, elements, new DependencyRequestValidator(), compilerOptions),
++            new InjectValidator(
++                types,
++                elements,
++                new DependencyRequestValidator(new MembersInjectionValidator()),
++                compilerOptions),
+             keyFactory,
+             bindingFactory,
+             compilerOptions);
+diff --git a/java/dagger/internal/codegen/MembersInjectionBindingValidation.java b/java/dagger/internal/codegen/MembersInjectionValidator.java
+similarity index 62%
+rename from java/dagger/internal/codegen/MembersInjectionBindingValidation.java
+rename to java/dagger/internal/codegen/MembersInjectionValidator.java
+index 0ce55fca3..6ecd1d431 100644
+--- a/java/dagger/internal/codegen/MembersInjectionBindingValidation.java
++++ b/java/dagger/internal/codegen/MembersInjectionValidator.java
+@@ -16,15 +16,9 @@
+ 
+ package dagger.internal.codegen;
+ 
+-import static javax.tools.Diagnostic.Kind.ERROR;
+-
+ import com.google.auto.common.MoreElements;
+-import dagger.model.BindingGraph;
+-import dagger.model.BindingGraph.BindingNode;
+-import dagger.spi.BindingGraphPlugin;
+-import dagger.spi.DiagnosticReporter;
+-import java.util.Optional;
+ import javax.inject.Inject;
++import javax.lang.model.element.Element;
+ import javax.lang.model.type.ArrayType;
+ import javax.lang.model.type.DeclaredType;
+ import javax.lang.model.type.PrimitiveType;
+@@ -33,61 +27,26 @@
+ import javax.lang.model.util.SimpleTypeVisitor8;
+ 
+ /**
+- * Validates bindings that satisfy members-injecting entry point methods or requests for a {@link
+- * dagger.MembersInjector}.
++ * Validates members injection requests (members injection methods on components and requests for
++ * {@code MembersInjector<Foo>}).
+  */
+-final class MembersInjectionBindingValidation implements BindingGraphPlugin {
+-
+-  private final DaggerTypes types;
++final class MembersInjectionValidator {
+ 
+   @Inject
+-  MembersInjectionBindingValidation(DaggerTypes types) {
+-    this.types = types;
+-  }
+-
+-  @Override
+-  public String pluginName() {
+-    return "Dagger/MembersInjection";
+-  }
+-
+-  @Override
+-  public void visitGraph(BindingGraph bindingGraph, DiagnosticReporter diagnosticReporter) {
+-    for (BindingNode bindingNode : bindingGraph.bindingNodes()) {
+-      membersInjectedType(bindingNode)
+-          .ifPresent(type -> validateMembersInjectionType(type, bindingNode, diagnosticReporter));
+-    }
+-  }
++  MembersInjectionValidator() {}
+ 
+   /**
+-   * Returns the type whose members will be injected if the binding is a {@link
+-   * dagger.model.BindingKind#MEMBERS_INJECTION} or {@link
+-   * dagger.model.BindingKind#MEMBERS_INJECTOR} binding.
++   * Reports errors if a members injection dependency request (an injection method on a component or
++   * a request for a {@code MembersInjector<Foo>}) is invalid.
+    */
+-  private Optional<TypeMirror> membersInjectedType(BindingNode bindingNode) {
+-    switch (bindingNode.binding().kind()) {
+-      case MEMBERS_INJECTION:
+-        return Optional.of(bindingNode.key().type());
+-
+-      case MEMBERS_INJECTOR:
+-        return Optional.of(types.unwrapType(bindingNode.key().type()));
+-
+-      default:
+-        return Optional.empty();
+-    }
+-  }
+-
+-  /** Reports errors if a members injection binding is invalid. */
+-  private void validateMembersInjectionType(
+-      TypeMirror membersInjectedType,
+-      BindingNode bindingNode,
+-      DiagnosticReporter diagnosticReporter) {
++  void validateMembersInjectionRequest(
++      ValidationReport.Builder<?> report, Element requestElement, TypeMirror membersInjectedType) {
+     membersInjectedType.accept(
+         new SimpleTypeVisitor8<Void, Void>() {
+           @Override
+-          protected Void defaultAction(TypeMirror e, Void v) {
++          protected Void defaultAction(TypeMirror type, Void v) {
+             // Only declared types can be members-injected.
+-            diagnosticReporter.reportBinding(
+-                ERROR, bindingNode, "Cannot inject members into %s", e);
++            report.addError("Cannot inject members into " + type, requestElement);
+             return null;
+           }
+ 
+@@ -98,8 +57,7 @@ public Void visitDeclared(DeclaredType type, Void v) {
+               // Foo<T> as just 'Foo', which we don't allow.  (This is a judgement call; we
+               // *could* allow it and instantiate the type bounds, but we don't.)
+               if (!MoreElements.asType(type.asElement()).getTypeParameters().isEmpty()) {
+-                diagnosticReporter.reportBinding(
+-                    ERROR, bindingNode, "Cannot inject members into raw type %s", type);
++                report.addError("Cannot inject members into raw type " + type, requestElement);
+               }
+             } else {
+               // If the type has arguments, validate that each type argument is declared.
+@@ -108,11 +66,9 @@ public Void visitDeclared(DeclaredType type, Void v) {
+               // the array.
+               for (TypeMirror arg : type.getTypeArguments()) {
+                 if (!arg.accept(DECLARED_OR_ARRAY, null)) {
+-                  diagnosticReporter.reportBinding(
+-                      ERROR,
+-                      bindingNode,
+-                      "Cannot inject members into types with unbounded type arguments: %s",
+-                      type);
++                  report.addError(
++                      "Cannot inject members into types with unbounded type arguments: " + type,
++                      requestElement);
+                 }
+               }
+             }
+diff --git a/javatests/dagger/internal/codegen/MembersInjectionValidationTest.java b/javatests/dagger/internal/codegen/MembersInjectionValidationTest.java
+index f8e41e98a..3af651d6c 100644
+--- a/javatests/dagger/internal/codegen/MembersInjectionValidationTest.java
++++ b/javatests/dagger/internal/codegen/MembersInjectionValidationTest.java
+@@ -18,16 +18,18 @@
+ 
+ import static com.google.testing.compile.CompilationSubject.assertThat;
+ import static dagger.internal.codegen.Compilers.daggerCompiler;
+-import static dagger.internal.codegen.TestUtils.message;
+ 
+ import com.google.testing.compile.Compilation;
+ import com.google.testing.compile.JavaFileObjects;
+ import javax.tools.JavaFileObject;
+-import org.junit.Ignore;
+ import org.junit.Test;
+ import org.junit.runner.RunWith;
+ import org.junit.runners.JUnit4;
+ 
++/**
++ * Tests that errors are reported for invalid members injection methods and {@link
++ * dagger.MembersInjector} dependency requests.
++ */
+ @RunWith(JUnit4.class)
+ public class MembersInjectionValidationTest {
+   @Test
+@@ -44,34 +46,17 @@ public void membersInjectDependsOnUnboundedType() {
+             "class InjectsUnboundedType {",
+             "  @Inject MembersInjector<ArrayList<?>> listInjector;",
+             "}");
+-    JavaFileObject component =
+-        JavaFileObjects.forSourceLines(
+-            "test.TestComponent",
+-            "package test;",
+-            "",
+-            "import dagger.Component;",
+-            "",
+-            "@Component",
+-            "interface TestComponent {",
+-            "  void injectsUnboundedType(InjectsUnboundedType injects);",
+-            "}");
+ 
+-    Compilation compilation = daggerCompiler().compile(injectsUnboundedType, component);
++    Compilation compilation = daggerCompiler().compile(injectsUnboundedType);
+     assertThat(compilation).failed();
+     assertThat(compilation)
+         .hadErrorContaining(
+-            message(
+-                "Cannot inject members into types with unbounded type arguments: "
+-                    + "java.util.ArrayList<?>",
+-                "    dagger.MembersInjector<java.util.ArrayList<?>> is injected at",
+-                "        test.InjectsUnboundedType.listInjector",
+-                "    test.InjectsUnboundedType is injected at",
+-                "        test.TestComponent.injectsUnboundedType(test.InjectsUnboundedType)"))
+-        .inFile(component)
+-        .onLineContaining("interface TestComponent");
++            "Cannot inject members into types with unbounded type arguments: "
++                + "java.util.ArrayList<?>")
++        .inFile(injectsUnboundedType)
++        .onLineContaining("@Inject MembersInjector<ArrayList<?>> listInjector;");
+   }
+ 
+-  @Ignore // TODO(b/77220343)
+   @Test
+   public void membersInjectPrimitive() {
+     JavaFileObject component =
+@@ -93,7 +78,6 @@ public void membersInjectPrimitive() {
+         .onLineContaining("void inject(int primitive);");
+   }
+ 
+-  @Ignore // TODO(b/77220343)
+   @Test
+   public void membersInjectArray() {
+     JavaFileObject component =
+@@ -115,7 +99,6 @@ public void membersInjectArray() {
+         .onLineContaining("void inject(Object[] array);");
+   }
+ 
+-  @Ignore // TODO(b/77220343)
+   @Test
+   public void membersInjectorOfArray() {
+     JavaFileObject component =

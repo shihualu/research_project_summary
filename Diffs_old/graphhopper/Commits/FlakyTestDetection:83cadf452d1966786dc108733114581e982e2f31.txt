@@ -1,0 +1,846 @@
+diff --git a/core/src/main/java/com/graphhopper/util/Parameters.java b/core/src/main/java/com/graphhopper/util/Parameters.java
+index 66afce3389..4544f74625 100644
+--- a/core/src/main/java/com/graphhopper/util/Parameters.java
++++ b/core/src/main/java/com/graphhopper/util/Parameters.java
+@@ -188,11 +188,13 @@
+ 
+     public static final class PT {
+         public static final String EARLIEST_DEPARTURE_TIME = "pt.earliest_departure_time";
+-        public static final String RANGE_QUERY_END_TIME = "pt.range_query_end_time";
++        public static final String PROFILE_QUERY = "pt.profile";
+         public static final String ARRIVE_BY = "pt.arrive_by";
+         public static final String IGNORE_TRANSFERS = "pt.ignore_transfers";
+         public static final String WALK_SPEED = "pt.walk_speed";
+         public static final String MAX_WALK_DISTANCE_PER_LEG = "pt.max_walk_distance_per_leg";
+         public static final String MAX_TRANSFER_DISTANCE_PER_LEG = "pt.max_transfer_distance_per_leg";
++        public static final String LIMIT_SOLUTIONS = "pt.limit_solutions";
++
+     }
+ }
+diff --git a/reader-gtfs/src/main/java/com/graphhopper/reader/gtfs/GraphExplorer.java b/reader-gtfs/src/main/java/com/graphhopper/reader/gtfs/GraphExplorer.java
+index 233c76d791..b569436fed 100644
+--- a/reader-gtfs/src/main/java/com/graphhopper/reader/gtfs/GraphExplorer.java
++++ b/reader-gtfs/src/main/java/com/graphhopper/reader/gtfs/GraphExplorer.java
+@@ -66,6 +66,12 @@ public boolean hasNext() {
+                             if (realtimeFeed.isBlocked(edgeIterator.getEdge())) {
+                                 continue;
+                             }
++                            if (edgeType == GtfsStorage.EdgeType.WAIT_ARRIVAL && !reverse) {
++                                continue;
++                            }
++                            if (edgeType == GtfsStorage.EdgeType.WAIT && reverse) {
++                                continue;
++                            }
+                             if (edgeType == GtfsStorage.EdgeType.ENTER_TIME_EXPANDED_NETWORK && !reverse) {
+                                 if (secondsOnTrafficDay(edgeIterator, label.currentTime) > flagEncoder.getTime(edgeIterator.getFlags())) {
+                                     continue;
+@@ -132,7 +138,7 @@ private boolean isValidOn(EdgeIteratorState edge, long instant) {
+             final int validityId = flagEncoder.getValidityId(edge.getFlags());
+             final GtfsStorage.Validity validity = gtfsStorage.getValidities().get(validityId);
+             final int trafficDay = (int) ChronoUnit.DAYS.between(validity.start, Instant.ofEpochMilli(instant).atZone(validity.zoneId).toLocalDate());
+-            return validity.validity.get(trafficDay);
++            return trafficDay >= 0 && validity.validity.get(trafficDay);
+         } else {
+             return true;
+         }
+diff --git a/reader-gtfs/src/main/java/com/graphhopper/reader/gtfs/GraphHopperGtfs.java b/reader-gtfs/src/main/java/com/graphhopper/reader/gtfs/GraphHopperGtfs.java
+index 91d1f3a971..855bf558d6 100644
+--- a/reader-gtfs/src/main/java/com/graphhopper/reader/gtfs/GraphHopperGtfs.java
++++ b/reader-gtfs/src/main/java/com/graphhopper/reader/gtfs/GraphHopperGtfs.java
+@@ -53,7 +53,7 @@
+ import java.util.zip.ZipFile;
+ 
+ import static com.graphhopper.reader.gtfs.Label.reverseEdges;
+-import static com.graphhopper.util.Parameters.PT.RANGE_QUERY_END_TIME;
++import static com.graphhopper.util.Parameters.PT.PROFILE_QUERY;
+ 
+ public final class GraphHopperGtfs implements GraphHopperAPI {
+ 
+@@ -95,8 +95,9 @@ public static Factory createFactory(PtFlagEncoder flagEncoder, TranslationMap tr
+ 
+     private class RequestHandler {
+         private final int maxVisitedNodesForRequest;
++        private final int limitSolutions;
+         private final Instant initialTime;
+-        private final Instant rangeQueryEndTime;
++        private final boolean profileQuery;
+         private final boolean arriveBy;
+         private final boolean ignoreTransfers;
+         private final double walkSpeedKmH;
+@@ -112,15 +113,16 @@ public static Factory createFactory(PtFlagEncoder flagEncoder, TranslationMap tr
+ 
+         RequestHandler(GHRequest request) {
+             maxVisitedNodesForRequest = request.getHints().getInt(Parameters.Routing.MAX_VISITED_NODES, Integer.MAX_VALUE);
++            profileQuery = request.getHints().getBool(PROFILE_QUERY, false);
++            ignoreTransfers = request.getHints().getBool(Parameters.PT.IGNORE_TRANSFERS, false);
++            limitSolutions = request.getHints().getInt(Parameters.PT.LIMIT_SOLUTIONS, profileQuery ? 5 : Integer.MAX_VALUE);
+             final String departureTimeString = request.getHints().get(Parameters.PT.EARLIEST_DEPARTURE_TIME, "");
+             try {
+                 initialTime = Instant.parse(departureTimeString);
+             } catch (DateTimeParseException e) {
+                 throw new IllegalArgumentException(String.format("Illegal value for required parameter %s: [%s]", Parameters.PT.EARLIEST_DEPARTURE_TIME, departureTimeString));
+             }
+-            rangeQueryEndTime = request.getHints().has(Parameters.PT.RANGE_QUERY_END_TIME) ? Instant.parse(request.getHints().get(RANGE_QUERY_END_TIME, "")) : initialTime;
+             arriveBy = request.getHints().getBool(Parameters.PT.ARRIVE_BY, false);
+-            ignoreTransfers = request.getHints().getBool(Parameters.PT.IGNORE_TRANSFERS, false);
+             walkSpeedKmH = request.getHints().getDouble(Parameters.PT.WALK_SPEED, 5.0);
+             maxWalkDistancePerLeg = request.getHints().getDouble(Parameters.PT.MAX_WALK_DISTANCE_PER_LEG, Double.MAX_VALUE);
+             maxTransferDistancePerLeg = request.getHints().getDouble(Parameters.PT.MAX_TRANSFER_DISTANCE_PER_LEG, Double.MAX_VALUE);
+@@ -152,7 +154,7 @@ GHResponse route() {
+                 startNode = source.getClosestNode();
+                 destNode = dest.getClosestNode();
+             }
+-            Set<Label> solutions = findPaths(startNode, destNode);
++            List<Label> solutions = findPaths(startNode, destNode);
+             parseSolutionsAndAddToResponse(solutions, startAndEndpoint);
+             return response;
+         }
+@@ -165,18 +167,20 @@ private QueryResult findClosest(GHPoint point, int indexForErrorMessage) {
+             return source;
+         }
+ 
+-        private void parseSolutionsAndAddToResponse(Set<Label> solutions, PointList waypoints) {
++        private void parseSolutionsAndAddToResponse(List<Label> solutions, PointList waypoints) {
+             for (Label solution : solutions) {
+                 response.add(parseSolutionIntoPath(initialTime, arriveBy, flagEncoder, translation, queryGraph, weighting, solution, waypoints));
+             }
+             response.getAll().sort(Comparator.comparingDouble(PathWrapper::getTime));
+         }
+ 
+-        private Set<Label> findPaths(int startNode, int destNode) {
++        private List<Label> findPaths(int startNode, int destNode) {
+             StopWatch stopWatch = new StopWatch().start();
+             GraphExplorer graphExplorer = new GraphExplorer(queryGraph, weighting, flagEncoder, gtfsStorage, realtimeFeed, arriveBy);
+-            MultiCriteriaLabelSetting router = new MultiCriteriaLabelSetting(graphExplorer, weighting, arriveBy, maxWalkDistancePerLeg, maxTransferDistancePerLeg, !ignoreTransfers, maxVisitedNodesForRequest);
+-            Set<Label> solutions = router.calcPaths(startNode, Collections.singleton(destNode), initialTime, rangeQueryEndTime);
++            MultiCriteriaLabelSetting router = new MultiCriteriaLabelSetting(graphExplorer, weighting, arriveBy, maxWalkDistancePerLeg, maxTransferDistancePerLeg, !ignoreTransfers, profileQuery, maxVisitedNodesForRequest);
++            List<Label> solutions = router.calcPaths(startNode, Collections.singleton(destNode), initialTime)
++                    .limit(limitSolutions)
++                    .collect(Collectors.toList());
+             response.addDebugInfo("routing:" + stopWatch.stop().getSeconds() + "s");
+             if (router.getVisitedNodes() >= maxVisitedNodesForRequest) {
+                 throw new IllegalArgumentException("No path found - maximum number of nodes exceeded: " + maxVisitedNodesForRequest);
+@@ -188,7 +192,6 @@ private void parseSolutionsAndAddToResponse(Set<Label> solutions, PointList wayp
+             }
+             return solutions;
+         }
+-
+     }
+ 
+     public GraphHopperGtfs(PtFlagEncoder flagEncoder, TranslationMap translationMap, GraphHopperStorage graphHopperStorage, LocationIndex locationIndex, GtfsStorage gtfsStorage, RealtimeFeed realtimeFeed) {
+@@ -309,8 +312,8 @@ private PathWrapper parseSolutionIntoPath(Instant initialTime, boolean arriveBy,
+         path.setPoints(pointsList);
+         path.setDistance(path.getLegs().stream().mapToDouble(Trip.Leg::getDistance).sum());
+         path.setTime((solution.currentTime - initialTime.toEpochMilli()) * (arriveBy ? -1 : 1));
+-        if (solution.firstPtDepartureTime != Long.MAX_VALUE) {
+-            path.setFirstPtLegDeparture(solution.firstPtDepartureTime);
++        if (solution.departureTime != null) {
++            path.setFirstPtLegDeparture(solution.departureTime);
+         }
+         path.setNumChanges((int) path.getLegs().stream()
+                 .filter(l -> l instanceof Trip.PtLeg)
+diff --git a/reader-gtfs/src/main/java/com/graphhopper/reader/gtfs/GtfsReader.java b/reader-gtfs/src/main/java/com/graphhopper/reader/gtfs/GtfsReader.java
+index 40674108f9..424b8b6df6 100644
+--- a/reader-gtfs/src/main/java/com/graphhopper/reader/gtfs/GtfsReader.java
++++ b/reader-gtfs/src/main/java/com/graphhopper/reader/gtfs/GtfsReader.java
+@@ -114,8 +114,8 @@ public void readGraph() {
+             QueryResult locationQueryResult = walkNetworkIndex.findClosest(stop.stop_lat, stop.stop_lon, filter);
+             int streetNode;
+             if (!locationQueryResult.isValid()) {
+-                streetNode = i;
+-                nodeAccess.setNode(i++, stop.stop_lat, stop.stop_lon);
++                streetNode = i++;
++                nodeAccess.setNode(streetNode, stop.stop_lat, stop.stop_lon);
+                 graph.edge(streetNode, streetNode, 0.0, false);
+             } else {
+                 streetNode = locationQueryResult.getClosestNode();
+@@ -300,14 +300,24 @@ private void buildPtNetwork() {
+         }
+     }
+ 
+-    private void wireUpAndAndConnectArrivalTimeline(Stop stop, String routeId, int stopExitNode, NavigableSet<Fun.Tuple2<Integer, Integer>> timeNodes) {
++    private void wireUpAndAndConnectArrivalTimeline(Stop toStop, String routeId, int stopExitNode, NavigableSet<Fun.Tuple2<Integer, Integer>> timeNodes) {
+         ZoneId zoneId = ZoneId.of(feed.agency.get(feed.routes.get(routeId).agency_id).agency_timezone);
++        int time = 0;
++        int prev = -1;
+         for (Fun.Tuple2<Integer, Integer> e : timeNodes.descendingSet()) {
+             EdgeIteratorState leaveTimeExpandedNetworkEdge = graph.edge(e.b, stopExitNode, 0.0, false);
+             setEdgeType(leaveTimeExpandedNetworkEdge, GtfsStorage.EdgeType.LEAVE_TIME_EXPANDED_NETWORK);
+             int arrivalTime = e.a;
+             leaveTimeExpandedNetworkEdge.setFlags(encoder.setTime(leaveTimeExpandedNetworkEdge.getFlags(), arrivalTime));
+             setFeedIdWithTimezone(leaveTimeExpandedNetworkEdge, new GtfsStorage.FeedIdWithTimezone(id, zoneId));
++            if (prev != -1) {
++                EdgeIteratorState edge = graph.edge(e.b, prev, 0.0, false);
++                setEdgeType(edge, GtfsStorage.EdgeType.WAIT_ARRIVAL);
++                edge.setName(toStop.stop_name);
++                edge.setFlags(encoder.setTime(edge.getFlags(), time-e.a));
++            }
++            time = e.a;
++            prev = e.b;
+         }
+     }
+ 
+diff --git a/reader-gtfs/src/main/java/com/graphhopper/reader/gtfs/GtfsStorage.java b/reader-gtfs/src/main/java/com/graphhopper/reader/gtfs/GtfsStorage.java
+index bcf528da11..0befedbb5a 100644
+--- a/reader-gtfs/src/main/java/com/graphhopper/reader/gtfs/GtfsStorage.java
++++ b/reader-gtfs/src/main/java/com/graphhopper/reader/gtfs/GtfsStorage.java
+@@ -100,7 +100,7 @@ public int hashCode() {
+ 	private Map<GtfsRealtime.TripDescriptor, int[]> leaveEdgesForTrip;
+ 
+ 	enum EdgeType {
+-		HIGHWAY, ENTER_TIME_EXPANDED_NETWORK, LEAVE_TIME_EXPANDED_NETWORK, ENTER_PT, EXIT_PT, HOP, DWELL, BOARD, ALIGHT, OVERNIGHT, TRANSFER, WAIT
++		HIGHWAY, ENTER_TIME_EXPANDED_NETWORK, LEAVE_TIME_EXPANDED_NETWORK, ENTER_PT, EXIT_PT, HOP, DWELL, BOARD, ALIGHT, OVERNIGHT, TRANSFER, WAIT, WAIT_ARRIVAL
+     }
+ 
+ 	private DB data;
+diff --git a/reader-gtfs/src/main/java/com/graphhopper/reader/gtfs/Label.java b/reader-gtfs/src/main/java/com/graphhopper/reader/gtfs/Label.java
+index 71e7706790..ac134894b9 100644
+--- a/reader-gtfs/src/main/java/com/graphhopper/reader/gtfs/Label.java
++++ b/reader-gtfs/src/main/java/com/graphhopper/reader/gtfs/Label.java
+@@ -20,6 +20,7 @@
+ import com.graphhopper.storage.Graph;
+ import com.graphhopper.util.EdgeIteratorState;
+ 
++import java.time.Instant;
+ import java.util.Iterator;
+ 
+ class Label {
+@@ -70,24 +71,26 @@ public String toString() {
+     final int nWalkDistanceConstraintViolations;
+ 
+     final double walkDistanceOnCurrentLeg;
+-    final long firstPtDepartureTime;
++    final Long departureTime;
++    final long walkTime;
+ 
+     final Label parent;
+ 
+-    Label(long currentTime, int edgeId, int adjNode, int nTransfers, int nWalkDistanceConstraintViolations, double walkDistance, long firstPtDepartureTime, Label parent) {
++    Label(long currentTime, int edgeId, int adjNode, int nTransfers, int nWalkDistanceConstraintViolations, double walkDistance, Long departureTime, long walkTime, Label parent) {
+         this.currentTime = currentTime;
+         this.edge = edgeId;
+         this.adjNode = adjNode;
+         this.nTransfers = nTransfers;
+         this.nWalkDistanceConstraintViolations = nWalkDistanceConstraintViolations;
+         this.walkDistanceOnCurrentLeg = walkDistance;
+-        this.firstPtDepartureTime = firstPtDepartureTime;
++        this.departureTime = departureTime;
++        this.walkTime = walkTime;
+         this.parent = parent;
+     }
+ 
+     @Override
+     public String toString() {
+-        return adjNode + " (" + edge + ") time: " + currentTime;
++        return adjNode + " " + Instant.ofEpochMilli(currentTime) + " " + nTransfers + " " + nWalkDistanceConstraintViolations + " " +  (departureTime != null ? Instant.ofEpochMilli(departureTime) : "");
+     }
+ 
+     static Iterable<Transition> reverseEdges(Label leaf, Graph graph, PtFlagEncoder flagEncoder, boolean reverseEdgeFlags) {
+diff --git a/reader-gtfs/src/main/java/com/graphhopper/reader/gtfs/MultiCriteriaLabelSetting.java b/reader-gtfs/src/main/java/com/graphhopper/reader/gtfs/MultiCriteriaLabelSetting.java
+index 68466f380a..3430960131 100644
+--- a/reader-gtfs/src/main/java/com/graphhopper/reader/gtfs/MultiCriteriaLabelSetting.java
++++ b/reader-gtfs/src/main/java/com/graphhopper/reader/gtfs/MultiCriteriaLabelSetting.java
+@@ -25,6 +25,9 @@
+ 
+ import java.time.Instant;
+ import java.util.*;
++import java.util.function.Consumer;
++import java.util.stream.Stream;
++import java.util.stream.StreamSupport;
+ 
+ /**
+  * Implements a Multi-Criteria Label Setting (MLS) path finding algorithm
+@@ -36,6 +39,8 @@
+  */
+ class MultiCriteriaLabelSetting {
+ 
++    private final Comparator<Label> queueComparator;
++    private long startTime;
+     private final PtFlagEncoder flagEncoder;
+     private final PtTravelTimeWeighting weighting;
+     private final SetMultimap<Integer, Label> fromMap;
+@@ -45,11 +50,11 @@
+     private final double maxWalkDistancePerLeg;
+     private final double maxTransferDistancePerLeg;
+     private final boolean mindTransfers;
+-    private long rangeQueryEndTime;
++    private final boolean profileQuery;
+     private int visitedNodes;
+     private final GraphExplorer explorer;
+ 
+-    MultiCriteriaLabelSetting(GraphExplorer explorer, Weighting weighting, boolean reverse, double maxWalkDistancePerLeg, double maxTransferDistancePerLeg, boolean mindTransfers, int maxVisitedNodes) {
++    MultiCriteriaLabelSetting(GraphExplorer explorer, Weighting weighting, boolean reverse, double maxWalkDistancePerLeg, double maxTransferDistancePerLeg, boolean mindTransfers, boolean profileQuery, int maxVisitedNodes) {
+         this.weighting = (PtTravelTimeWeighting) weighting;
+         this.flagEncoder = (PtFlagEncoder) weighting.getFlagEncoder();
+         this.maxVisitedNodes = maxVisitedNodes;
+@@ -58,10 +63,16 @@
+         this.maxWalkDistancePerLeg = maxWalkDistancePerLeg;
+         this.maxTransferDistancePerLeg = maxTransferDistancePerLeg;
+         this.mindTransfers = mindTransfers;
++        this.profileQuery = profileQuery;
++
++        queueComparator = Comparator.<Label>comparingLong(l2 -> currentTimeCriterion(l2))
++                .thenComparing(Comparator.comparingLong(l1 -> l1.nTransfers))
++                .thenComparing(Comparator.comparingLong(l1 -> l1.nWalkDistanceConstraintViolations))
++                .thenComparing(Comparator.comparingLong(l -> departureTimeCriterion(l) != null ? departureTimeCriterion(l) : 0));
+         fromHeap = new PriorityQueue<>(new Comparator<Label>() {
+             @Override
+             public int compare(Label o1, Label o) {
+-                return Long.compare(queueCriterion(o1), queueCriterion(o));
++                return queueComparator.compare(o1, o);
+             }
+ 
+             @Override
+@@ -72,114 +83,95 @@ public boolean equals(Object obj) {
+         fromMap = HashMultimap.create();
+     }
+ 
+-    private long queueCriterion(Label o1) {
+-        return currentTimeCriterion(o1) + o1.nTransfers + o1.nWalkDistanceConstraintViolations;
+-    }
+-
+-    Set<Label> calcPaths(int from, Set<Integer> to, Instant startTime, Instant rangeQueryEndTime) {
+-        this.rangeQueryEndTime = rangeQueryEndTime.toEpochMilli();
+-        Set<Label> targetLabels = new HashSet<>();
+-        Label label = new Label(startTime.toEpochMilli(), EdgeIterator.NO_EDGE, from, 0, 0, 0.0, Long.MAX_VALUE, null);
+-        fromMap.put(from, label);
+-        if (to.contains(from)) {
+-            targetLabels.add(label);
+-        }
+-        while (true) {
+-            visitedNodes++;
+-            if (maxVisitedNodes < visitedNodes)
+-                break;
+-
+-            for (EdgeIteratorState edge : explorer.exploreEdgesAround(label)) {
+-                GtfsStorage.EdgeType edgeType = flagEncoder.getEdgeType(edge.getFlags());
+-                long nextTime;
+-                if (reverse) {
+-                    nextTime = label.currentTime - explorer.calcTravelTimeMillis(edge, label.currentTime);
+-                } else {
+-                    nextTime = label.currentTime + explorer.calcTravelTimeMillis(edge, label.currentTime);
+-                }
+-                int nTransfers = label.nTransfers + weighting.calcNTransfers(edge);
+-                long firstPtDepartureTime = label.firstPtDepartureTime;
+-                if (!reverse && edgeType == GtfsStorage.EdgeType.BOARD && firstPtDepartureTime == Long.MAX_VALUE) {
+-                    firstPtDepartureTime = nextTime;
+-                }
+-                if (reverse && edgeType == GtfsStorage.EdgeType.ALIGHT && firstPtDepartureTime == Long.MAX_VALUE) {
+-                    firstPtDepartureTime = nextTime;
+-                }
+-                double walkDistanceOnCurrentLeg = (!reverse && edgeType == GtfsStorage.EdgeType.BOARD || reverse && edgeType == GtfsStorage.EdgeType.ALIGHT) ? 0 : (label.walkDistanceOnCurrentLeg + weighting.getWalkDistance(edge));
+-                boolean isTryingToReEnterPtAfterTransferWalking = (!reverse && edgeType == GtfsStorage.EdgeType.ENTER_PT || reverse && edgeType == GtfsStorage.EdgeType.EXIT_PT) && label.nTransfers > 0 && label.walkDistanceOnCurrentLeg > maxTransferDistancePerLeg;
+-                int nWalkDistanceConstraintViolations = Math.min(1, label.nWalkDistanceConstraintViolations + (
+-                        isTryingToReEnterPtAfterTransferWalking ? 1 : (label.walkDistanceOnCurrentLeg <= maxWalkDistancePerLeg && walkDistanceOnCurrentLeg > maxWalkDistancePerLeg ? 1 : 0)));
+-                Set<Label> sptEntries = fromMap.get(edge.getAdjNode());
+-                Label nEdge = new Label(nextTime, edge.getEdge(), edge.getAdjNode(), nTransfers, nWalkDistanceConstraintViolations, walkDistanceOnCurrentLeg, firstPtDepartureTime, label);
+-                if (isNotEqualToAnyOf(nEdge, sptEntries) && isNotDominatedByAnyOf(nEdge, sptEntries) && isNotDominatedWithoutTieBreaksByAnyOf(nEdge, targetLabels)) {
+-                    removeDominated(nEdge, sptEntries);
+-                    if (to.contains(edge.getAdjNode())) {
+-                        removeDominated(nEdge, targetLabels);
+-                    }
+-                    fromMap.put(edge.getAdjNode(), nEdge);
+-                    if (to.contains(edge.getAdjNode())) {
+-                        targetLabels.add(nEdge);
++    Stream<Label> calcPaths(int from, Set<Integer> to, Instant startTime) {
++        this.startTime = startTime.toEpochMilli();
++        final Stream<Label> labels = StreamSupport.stream(new MultiCriteriaLabelSettingSpliterator(from, to), false)
++                .limit(maxVisitedNodes)
++                .peek(label -> visitedNodes++);
++        final Spliterator<Label> spliterator = labels.spliterator();
++        return StreamSupport.stream(new Spliterators.AbstractSpliterator<Label>(0, 0) {
++            Label current = null;
++            List<Label> solutions = new ArrayList<>();
++            @Override
++            public boolean tryAdvance(Consumer<? super Label> action) {
++                while (spliterator.tryAdvance(label -> current = label)) {
++                    if (to.contains(current.adjNode)) {
++                        action.accept(current);
++                        solutions.add(current);
++                        return true;
+                     }
+-                    fromHeap.add(nEdge);
+                 }
++                return false;
+             }
++        }, false)
++                .filter(me -> me.nWalkDistanceConstraintViolations <= 0);
++    }
+ 
+-            if (fromHeap.isEmpty())
+-                break;
++    private class MultiCriteriaLabelSettingSpliterator extends Spliterators.AbstractSpliterator<Label> {
+ 
+-            label = fromHeap.poll();
+-        }
+-        return filterTargetLabels(targetLabels);
+-    }
++        private final Set<Integer> to;
++        private final Set<Label> targetLabels;
+ 
+-    private boolean isNotEqualToAnyOf(Label me, Set<Label> sptEntries) {
+-        for (Label they : sptEntries) {
+-            if (me.currentTime == they.currentTime && me.nTransfers == they.nTransfers && me.nWalkDistanceConstraintViolations == they.nWalkDistanceConstraintViolations && me.firstPtDepartureTime == they.firstPtDepartureTime) {
+-                return false;
++        MultiCriteriaLabelSettingSpliterator(int from, Set<Integer> to) {
++            super(0, 0);
++            this.to = to;
++            targetLabels = new HashSet<>();
++            Label label = new Label(startTime, EdgeIterator.NO_EDGE, from, 0, 0, 0.0, null, 0, null);
++            fromMap.put(from, label);
++            fromHeap.add(label);
++            if (to.contains(from)) {
++                targetLabels.add(label);
+             }
+         }
+-        return true;
+-    }
+-
+-    private Set<Label> filterTargetLabels(Set<Label> targetLabels) {
+-        HashSet<Label> filteredLabels = new HashSet<>(targetLabels);
+-        for (Label me : new ArrayList<>(filteredLabels)) {
+-            filteredLabels.removeIf(they -> dominatesForFiltering(me, they));
+-        }
+-        filteredLabels.removeIf(they -> they.nWalkDistanceConstraintViolations > 0);
+-        return filteredLabels;
+-    }
+ 
+-    private boolean dominatesForFiltering(Label me, Label they) {
+-        if (currentTimeCriterion(me) > currentTimeCriterion(they)) {
+-            return false;
+-        }
+-        if (mindTransfers) {
+-            if (me.nTransfers > they.nTransfers) {
++        @Override
++        public boolean tryAdvance(Consumer<? super Label> action) {
++            if (fromHeap.isEmpty()) {
+                 return false;
++            } else {
++                Label label = fromHeap.poll();
++                action.accept(label);
++                for (EdgeIteratorState edge : explorer.exploreEdgesAround(label)) {
++                    GtfsStorage.EdgeType edgeType = flagEncoder.getEdgeType(edge.getFlags());
++                    long nextTime;
++                    if (reverse) {
++                        nextTime = label.currentTime - explorer.calcTravelTimeMillis(edge, label.currentTime);
++                    } else {
++                        nextTime = label.currentTime + explorer.calcTravelTimeMillis(edge, label.currentTime);
++                    }
++                    int nTransfers = label.nTransfers + weighting.calcNTransfers(edge);
++                    Long firstPtDepartureTime = label.departureTime;
++                    if (!reverse && (edgeType == GtfsStorage.EdgeType.ENTER_TIME_EXPANDED_NETWORK || edgeType == GtfsStorage.EdgeType.WAIT)) {
++                        if (label.nTransfers == 0) {
++                            firstPtDepartureTime = nextTime - label.walkTime;
++                        }
++                    } else if (reverse && (edgeType == GtfsStorage.EdgeType.LEAVE_TIME_EXPANDED_NETWORK || edgeType == GtfsStorage.EdgeType.WAIT_ARRIVAL)) {
++                        if (label.nTransfers == 0) {
++                            firstPtDepartureTime = nextTime - label.walkTime;
++                        }
++                    }
++                    double walkDistanceOnCurrentLeg = (!reverse && edgeType == GtfsStorage.EdgeType.BOARD || reverse && edgeType == GtfsStorage.EdgeType.ALIGHT) ? 0 : (label.walkDistanceOnCurrentLeg + weighting.getWalkDistance(edge));
++                    boolean isTryingToReEnterPtAfterTransferWalking = (!reverse && edgeType == GtfsStorage.EdgeType.ENTER_PT || reverse && edgeType == GtfsStorage.EdgeType.EXIT_PT) && label.nTransfers > 0 && label.walkDistanceOnCurrentLeg > maxTransferDistancePerLeg;
++                    long walkTime = label.walkTime + (edgeType == GtfsStorage.EdgeType.HIGHWAY ? nextTime - label.currentTime : 0);
++                    int nWalkDistanceConstraintViolations = Math.min(1, label.nWalkDistanceConstraintViolations + (
++                            isTryingToReEnterPtAfterTransferWalking ? 1 : (label.walkDistanceOnCurrentLeg <= maxWalkDistancePerLeg && walkDistanceOnCurrentLeg > maxWalkDistancePerLeg ? 1 : 0)));
++                    Set<Label> sptEntries = fromMap.get(edge.getAdjNode());
++                    Label nEdge = new Label(nextTime, edge.getEdge(), edge.getAdjNode(), nTransfers, nWalkDistanceConstraintViolations, walkDistanceOnCurrentLeg, firstPtDepartureTime, walkTime, label);
++                    if (isNotDominatedByAnyOf(nEdge, sptEntries) && isNotDominatedByAnyOf(nEdge, targetLabels)) {
++                        removeDominated(nEdge, sptEntries);
++                        if (to.contains(edge.getAdjNode())) {
++                            removeDominated(nEdge, targetLabels);
++                        }
++                        fromMap.put(edge.getAdjNode(), nEdge);
++                        if (to.contains(edge.getAdjNode())) {
++                            targetLabels.add(nEdge);
++                        }
++                        fromHeap.add(nEdge);
++                    }
++                }
++                return true;
+             }
+         }
+-        if (me.firstPtDepartureTime != Long.MAX_VALUE && they.firstPtDepartureTime != Long.MAX_VALUE
+-                && firstPtDepartureTimeCriterion(me) < firstPtDepartureTimeCriterion(they)) {
+-            return false;
+-        }
+-        if (me.nWalkDistanceConstraintViolations > they.nWalkDistanceConstraintViolations) {
+-            return false;
+-        }
+-        if (currentTimeCriterion(me) < currentTimeCriterion(they)) {
+-            return true;
+-        }
+-        if (me.nTransfers < they.nTransfers) {
+-            return true;
+-        }
+-        if (me.firstPtDepartureTime != Long.MAX_VALUE && they.firstPtDepartureTime != Long.MAX_VALUE
+-                && firstPtDepartureTimeCriterion(me) > firstPtDepartureTimeCriterion(they)) {
+-            return true;
+-        }
+-        if (me.nWalkDistanceConstraintViolations > they.nWalkDistanceConstraintViolations) {
+-            return true;
+-        }
+-        return false;
+     }
+ 
+     private boolean isNotDominatedByAnyOf(Label me, Set<Label> sptEntries) {
+@@ -191,20 +183,11 @@ private boolean isNotDominatedByAnyOf(Label me, Set<Label> sptEntries) {
+         return true;
+     }
+ 
+-    private boolean isNotDominatedWithoutTieBreaksByAnyOf(Label me, Set<Label> sptEntries) {
+-        for (Label they : sptEntries) {
+-            if (dominatesWithoutTieBreaks(they, me)) {
+-                return false;
+-            }
+-        }
+-        return true;
+-    }
+-
+ 
+     private void removeDominated(Label me, Set<Label> sptEntries) {
+         for (Iterator<Label> iterator = sptEntries.iterator(); iterator.hasNext();) {
+             Label sptEntry = iterator.next();
+-            if (dominatesWithoutTieBreaks(me, sptEntry)) {
++            if (dominates(me, sptEntry)) {
+                 fromHeap.remove(sptEntry);
+                 iterator.remove();
+             }
+@@ -212,94 +195,64 @@ private void removeDominated(Label me, Set<Label> sptEntries) {
+     }
+ 
+     private boolean dominates(Label me, Label they) {
+-        if (currentTimeCriterion(me) + currentTimeSlack(me, they) > currentTimeCriterion(they))
+-            return false;
+-        if (mindTransfers) {
+-            if (me.nTransfers + nTransfersSlack(me, they) > they.nTransfers)
++        if (profileQuery) {
++            if (me.departureTime != null && they.departureTime != null) {
++                if (currentTimeCriterion(me) > currentTimeCriterion(they))
++                    return false;
++                if (departureTimeCriterion(me) > departureTimeCriterion(they))
++                    return false;
++            } else {
++                if (travelTimeCriterion(me) > travelTimeCriterion(they))
++                    return false;
++            }
++        } else {
++            if (currentTimeCriterion(me) > currentTimeCriterion(they))
+                 return false;
+         }
+-        if (me.nWalkDistanceConstraintViolations + nWalkDistanceConstraintViolationsSlack(me, they) > they.nWalkDistanceConstraintViolations)
++
++        if (mindTransfers && me.nTransfers > they.nTransfers)
++            return false;
++        if (me.nWalkDistanceConstraintViolations  > they.nWalkDistanceConstraintViolations)
+             return false;
+-        if (currentTimeCriterion(me) + currentTimeSlack(me, they) < currentTimeCriterion(they))
+-            return true;
+-        if (mindTransfers) {
+-            if (me.nTransfers + nTransfersSlack(me, they) < they.nTransfers)
+-                return true;
+-        }
+-        if (me.nWalkDistanceConstraintViolations + nWalkDistanceConstraintViolationsSlack(me, they) < they.nWalkDistanceConstraintViolations)
+-            return true;
+ 
+-        if (!reverse) {
+-            // Break ties: Fewer transfers is better
+-            if (me.nTransfers < they.nTransfers) {
+-                return true;
++        if (profileQuery) {
++            if (me.departureTime != null && they.departureTime != null) {
++                if (currentTimeCriterion(me) < currentTimeCriterion(they))
++                    return true;
++                if (departureTimeCriterion(me) < departureTimeCriterion(they))
++                    return true;
++            } else {
++                if (travelTimeCriterion(me) < travelTimeCriterion(they))
++                    return true;
+             }
+-
+-//            Break ties: Leaving later / arriving earlier is better
+-            if (firstPtDepartureTimeCriterion(me) != Long.MAX_VALUE
+-                    && firstPtDepartureTimeCriterion(they) != Long.MAX_VALUE
+-                    && firstPtDepartureTimeCriterion(me) > firstPtDepartureTimeCriterion(they)) {
++        } else {
++            if (currentTimeCriterion(me) < currentTimeCriterion(they))
+                 return true;
+-            }
+-        }
+-        return false;
+-    }
+-
+-    private boolean dominatesWithoutTieBreaks(Label me, Label they) {
+-        if (currentTimeCriterion(me) + currentTimeSlack(me, they) > currentTimeCriterion(they))
+-            return false;
+-        if (mindTransfers) {
+-            if (me.nTransfers + nTransfersSlack(me, they) > they.nTransfers)
+-                return false;
+         }
+-        if (me.nWalkDistanceConstraintViolations + nWalkDistanceConstraintViolationsSlack(me, they) > they.nWalkDistanceConstraintViolations)
+-            return false;
+-        if (currentTimeCriterion(me) + currentTimeSlack(me, they) < currentTimeCriterion(they))
++        if (mindTransfers && me.nTransfers  < they.nTransfers)
+             return true;
+-        if (mindTransfers) {
+-            if (me.nTransfers + nTransfersSlack(me, they) < they.nTransfers)
+-                return true;
+-        }
+-        if (me.nWalkDistanceConstraintViolations + nWalkDistanceConstraintViolationsSlack(me, they) < they.nWalkDistanceConstraintViolations)
++        if (me.nWalkDistanceConstraintViolations < they.nWalkDistanceConstraintViolations)
+             return true;
+-        return false;
++
++        return queueComparator.compare(me,they) <= 0;
+     }
+ 
+-    private long currentTimeCriterion(Label label) {
+-        return reverse ? -label.currentTime : label.currentTime;
++    private Long departureTimeCriterion(Label label) {
++        return label.departureTime == null ? null : reverse ? label.departureTime : -label.departureTime;
+     }
+ 
+-    private double nWalkDistanceConstraintViolationsSlack(Label me, Label they) {
+-        return profileQuerySlackComponent(me, they);
++    private long currentTimeCriterion(Label label) {
++        return reverse ? -label.currentTime : label.currentTime;
+     }
+ 
+-    private double profileQuerySlackComponent(Label me, Label they) {
+-        if ((they.firstPtDepartureTime == Long.MAX_VALUE && me.firstPtDepartureTime != Long.MAX_VALUE && currentTimeCriterion(they) <= rangeQueryEndTimeConstraint()) ||
+-                (they.firstPtDepartureTime != Long.MAX_VALUE && me.firstPtDepartureTime != Long.MAX_VALUE &&
+-                firstPtDepartureTimeCriterion(they) > firstPtDepartureTimeCriterion(me) &&
+-                firstPtDepartureTimeCriterion(they) <= rangeQueryEndTimeConstraint())) {
+-            return Double.POSITIVE_INFINITY;
++    private long travelTimeCriterion(Label label) {
++        if (label.departureTime == null) {
++            return label.walkTime;
+         } else {
+-            return 0;
++            return (reverse ? -1 : 1) * (label.currentTime - label.departureTime);
+         }
+     }
+ 
+-    private long rangeQueryEndTimeConstraint() {
+-        return reverse ? -rangeQueryEndTime : rangeQueryEndTime;
+-    }
+-
+-    private long firstPtDepartureTimeCriterion(Label label) {
+-        return reverse ? -label.firstPtDepartureTime : label.firstPtDepartureTime;
+-    }
+-
+-    private double nTransfersSlack(Label me, Label they) {
+-        return profileQuerySlackComponent(me, they);
+-    }
+-
+-    private double currentTimeSlack(Label me, Label they) {
+-        return profileQuerySlackComponent(me, they);
+-    }
+-
+     int getVisitedNodes() {
+         return visitedNodes;
+     }
+diff --git a/reader-gtfs/src/test/java/com/graphhopper/GraphHopperGtfsIT.java b/reader-gtfs/src/test/java/com/graphhopper/GraphHopperGtfsIT.java
+index 480c8b8d3a..847b909353 100644
+--- a/reader-gtfs/src/test/java/com/graphhopper/GraphHopperGtfsIT.java
++++ b/reader-gtfs/src/test/java/com/graphhopper/GraphHopperGtfsIT.java
+@@ -35,7 +35,6 @@
+ 
+ import java.io.File;
+ import java.math.BigDecimal;
+-import java.time.Instant;
+ import java.time.LocalDateTime;
+ import java.time.LocalTime;
+ import java.time.ZoneId;
+@@ -85,6 +84,7 @@ public void testRoute1() {
+                 TO_LAT, TO_LON
+         );
+         ghRequest.getHints().put(Parameters.PT.EARLIEST_DEPARTURE_TIME, LocalDateTime.of(2007,1,1,0,0,0).atZone(zoneId).toInstant());
++        ghRequest.getHints().put(Parameters.PT.IGNORE_TRANSFERS, true);
+         GHResponse route = graphHopper.route(ghRequest);
+ 
+         assertFalse(route.hasErrors());
+@@ -117,7 +117,7 @@ public void testRoute1GoesAt744() {
+                 TO_LAT, TO_LON
+         );
+         ghRequest.getHints().put(Parameters.PT.EARLIEST_DEPARTURE_TIME, LocalDateTime.of(2007,1,1,7,44).atZone(zoneId).toInstant());
+-        ghRequest.getHints().put(Parameters.PT.IGNORE_TRANSFERS, "true");
++        ghRequest.getHints().put(Parameters.PT.IGNORE_TRANSFERS, true);
+ 
+         GHResponse response = graphHopper.route(ghRequest);
+ 
+@@ -146,6 +146,27 @@ public void testRoute1ArriveBy() {
+ 
+     }
+ 
++    @Test
++    public void testRoute1ArriveBy2() {
++        final double FROM_LAT = 36.914893, FROM_LON = -116.76821; // NADAV stop
++        final double TO_LAT = 36.914944, TO_LON = -116.761472; // NANAA stop
++        GHRequest ghRequest = new GHRequest(
++                FROM_LAT, FROM_LON,
++                TO_LAT, TO_LON
++        );
++        // Tests that it also works when the query arrival time is not exactly the scheduled arrival time of the solution
++        ghRequest.getHints().put(Parameters.PT.EARLIEST_DEPARTURE_TIME, LocalDateTime.of(2007,1,1,6, 50).atZone(zoneId).toInstant());
++        ghRequest.getHints().put(Parameters.PT.ARRIVE_BY, true);
++
++        GHResponse route = graphHopper.route(ghRequest);
++
++        assertFalse(route.hasErrors());
++        assertEquals(1, route.getAll().size());
++        assertEquals("Expected travel time == scheduled travel time", time(0, 6), route.getBest().getTime(), 0.1);
++
++    }
++
++
+     @Test
+     public void testRoute1ProfileEarliestArrival() {
+         final double FROM_LAT = 36.914893, FROM_LON = -116.76821; // NADAV stop
+@@ -155,8 +176,9 @@ public void testRoute1ProfileEarliestArrival() {
+                 TO_LAT, TO_LON
+         );
+         ghRequest.getHints().put(Parameters.PT.EARLIEST_DEPARTURE_TIME, LocalDateTime.of(2007,1,1,0,0).atZone(zoneId).toInstant());
+-        ghRequest.getHints().put(Parameters.PT.RANGE_QUERY_END_TIME, LocalDateTime.of(2007,1,1,13,0).atZone(zoneId).toInstant());
+-        ghRequest.getHints().put(Parameters.PT.IGNORE_TRANSFERS, "true");
++        ghRequest.getHints().put(Parameters.PT.PROFILE_QUERY, true);
++        ghRequest.getHints().put(Parameters.PT.IGNORE_TRANSFERS, true);
++        ghRequest.getHints().put(Parameters.PT.LIMIT_SOLUTIONS, 21);
+ 
+         GHResponse response = graphHopper.route(ghRequest);
+         List<LocalTime> actualDepartureTimes = response.getAll().stream()
+@@ -179,17 +201,18 @@ public void testRoute1ProfileLatestDeparture() {
+                 TO_LAT, TO_LON
+         );
+         ghRequest.getHints().put(Parameters.PT.EARLIEST_DEPARTURE_TIME, LocalDateTime.of(2007,1,2,13,0).atZone(zoneId).toInstant());
+-        ghRequest.getHints().put(Parameters.PT.ARRIVE_BY, "true");
+-        ghRequest.getHints().put(Parameters.PT.RANGE_QUERY_END_TIME, LocalDateTime.of(2007,1,2,11,0).atZone(zoneId).toInstant());
++        ghRequest.getHints().put(Parameters.PT.ARRIVE_BY, true);
++        ghRequest.getHints().put(Parameters.PT.PROFILE_QUERY, true);
+         // TODO: Find the problem with 1.1.2007
+-        ghRequest.getHints().put(Parameters.PT.IGNORE_TRANSFERS, "true");
++        ghRequest.getHints().put(Parameters.PT.IGNORE_TRANSFERS, true);
++        ghRequest.getHints().put(Parameters.PT.LIMIT_SOLUTIONS, 4);
+ 
+         GHResponse response = graphHopper.route(ghRequest);
+         List<LocalTime> actualDepartureTimes = response.getAll().stream()
+                 .map(path -> LocalTime.from(((Trip.PtLeg) path.getLegs().get(0)).departureTime.toInstant().atZone(zoneId)))
+                 .collect(Collectors.toList());
+         List<LocalTime> expectedDepartureTimes = Stream.of(
+-                "12:44", "12:14", "11:44", "11:14", "10:44")
++                "12:44", "12:14", "11:44", "11:14")
+                 .map(LocalTime::parse)
+                 .collect(Collectors.toList());
+         assertEquals(expectedDepartureTimes, actualDepartureTimes);
+@@ -247,7 +270,17 @@ public void testRouteWithLaterDepartureTime() {
+         final double FROM_LAT = 36.915682, FROM_LON = -116.751677; // STAGECOACH stop
+         final double TO_LAT = 36.914894, TO_LON = -116.76821; // NADAV stop
+         // Missed the bus at 10 by one minute, will have to use the 10:30 one.
+-        assertTravelTimeIs(graphHopper, FROM_LAT, FROM_LON, LocalDateTime.of(2007,1,1,10, 1).atZone(zoneId).toInstant(), TO_LAT, TO_LON, time(0, 41));
++        GHRequest ghRequest = new GHRequest(
++                FROM_LAT, FROM_LON,
++                TO_LAT, TO_LON
++        );
++        ghRequest.getHints().put(Parameters.PT.EARLIEST_DEPARTURE_TIME, LocalDateTime.of(2007,1,1,10, 1).atZone(zoneId).toInstant());
++        ghRequest.getHints().put(Parameters.PT.MAX_WALK_DISTANCE_PER_LEG, 30);
++        GHResponse route = graphHopper.route(ghRequest);
++
++        assertFalse(route.hasErrors());
++        assertFalse(route.getAll().isEmpty());
++        assertEquals("Expected travel time == scheduled travel time", time(0, 41), route.getBest().getTime(), 0.1);
+     }
+ 
+     @Test
+@@ -264,18 +297,16 @@ public void testWeekendRouteWorksOnlyOnWeekend() {
+         GHResponse route = graphHopper.route(ghRequest);
+         Assert.assertTrue(route.getAll().isEmpty()); // No service on monday morning, and we cannot spend the night at stations yet
+ 
+-        GHRequest ghRequest1 = new GHRequest(
++        ghRequest = new GHRequest(
+                 FROM_LAT, FROM_LON,
+                 TO_LAT, TO_LON
+         );
+-        ghRequest1.getHints().put(Parameters.PT.EARLIEST_DEPARTURE_TIME, LocalDateTime.of(2007,1,6,0,0).atZone(zoneId).toInstant());
+-        GHResponse route1 = graphHopper.route(ghRequest1);
+-
+-        assertFalse(route1.hasErrors());
+-        assertFalse(route1.getAll().isEmpty());
+-        assertEquals("Expected travel time == scheduled travel time", time(9, 0), route1.getBest().getTime());
+-        assertEquals("Using expected trip", "AAMV1", (((Trip.PtLeg) route1.getBest().getLegs().get(0)).tripId));
+-        assertEquals("Paid expected fare", 525, route1.getBest().getFare().multiply(BigDecimal.valueOf(100)).intValue());
++        ghRequest.getHints().put(Parameters.PT.EARLIEST_DEPARTURE_TIME, LocalDateTime.of(2007,1,6,0,0).atZone(zoneId).toInstant());
++        route = graphHopper.route(ghRequest);
++        assertFalse(route.getAll().isEmpty());
++        assertEquals("Expected travel time == scheduled travel time", time(9, 0), route.getBest().getTime());
++        assertEquals("Using expected trip", "AAMV1", (((Trip.PtLeg) route.getBest().getLegs().get(0)).tripId));
++        assertEquals("Paid expected fare", 525, route.getBest().getFare().multiply(BigDecimal.valueOf(100)).intValue());
+ 
+     }
+ 
+@@ -352,22 +383,18 @@ public void testTransferRules() {
+     }
+ 
+ 
+-    private void assertTravelTimeIs(GraphHopperGtfs graphHopper, double from_lat, double from_lon, Instant earliestDepartureTime, double to_lat, double to_lon, int expectedTravelTime) {
++    private void assertTravelTimeIs(GraphHopperGtfs graphHopper, double FROM_LAT, double FROM_LON, double TO_LAT, double TO_LON, int expectedWeight) {
+         GHRequest ghRequest = new GHRequest(
+-                from_lat, from_lon,
+-                to_lat, to_lon
++                FROM_LAT, FROM_LON,
++                TO_LAT, TO_LON
+         );
+-        ghRequest.getHints().put(Parameters.PT.EARLIEST_DEPARTURE_TIME, earliestDepartureTime);
++        ghRequest.getHints().put(Parameters.PT.EARLIEST_DEPARTURE_TIME, LocalDateTime.of(2007,1,1,0,0).atZone(zoneId).toInstant());
+         ghRequest.getHints().put(Parameters.PT.MAX_WALK_DISTANCE_PER_LEG, 30);
+         GHResponse route = graphHopper.route(ghRequest);
+ 
+         assertFalse(route.hasErrors());
+         assertFalse(route.getAll().isEmpty());
+-        assertEquals("Expected travel time == scheduled travel time", expectedTravelTime, route.getBest().getTime(), 0.1);
+-    }
+-
+-    private void assertTravelTimeIs(GraphHopperGtfs graphHopper, double FROM_LAT, double FROM_LON, double TO_LAT, double TO_LON, int expectedWeight) {
+-        assertTravelTimeIs(graphHopper, FROM_LAT, FROM_LON, LocalDateTime.of(2007,1,1,0,0).atZone(zoneId).toInstant(), TO_LAT, TO_LON, expectedWeight);
++        assertEquals("Expected travel time == scheduled travel time", expectedWeight, route.getBest().getTime(), 0.1);
+     }
+ 
+     private void assertNoRoute(GraphHopperGtfs graphHopper, double from_lat, double from_lon, double to_lat, double to_lon) {
+diff --git a/reader-gtfs/src/test/java/com/graphhopper/RealtimeIT.java b/reader-gtfs/src/test/java/com/graphhopper/RealtimeIT.java
+index 4982eb31c8..99168b8548 100644
+--- a/reader-gtfs/src/test/java/com/graphhopper/RealtimeIT.java
++++ b/reader-gtfs/src/test/java/com/graphhopper/RealtimeIT.java
+@@ -80,7 +80,7 @@ public void testSkipDepartureStop() {
+ 
+         // I want to go at 6:44
+         ghRequest.getHints().put(Parameters.PT.EARLIEST_DEPARTURE_TIME, LocalDateTime.of(2007,1,1,6,44).atZone(zoneId).toInstant());
+-        ghRequest.getHints().put(Parameters.PT.IGNORE_TRANSFERS, "true");
++        ghRequest.getHints().put(Parameters.PT.IGNORE_TRANSFERS, true);
+         ghRequest.getHints().put(Parameters.PT.MAX_WALK_DISTANCE_PER_LEG, 30);
+ 
+         // But the 6:00 departure of my line is going to skip my departure stop :-(
+@@ -111,7 +111,7 @@ public void testSkipArrivalStop() {
+ 
+         // I want to go at 6:44
+         ghRequest.getHints().put(Parameters.PT.EARLIEST_DEPARTURE_TIME, LocalDateTime.of(2007,1,1,6,44).atZone(zoneId).toInstant());
+-        ghRequest.getHints().put(Parameters.PT.IGNORE_TRANSFERS, "true");
++        ghRequest.getHints().put(Parameters.PT.IGNORE_TRANSFERS, true);
+         ghRequest.getHints().put(Parameters.PT.MAX_WALK_DISTANCE_PER_LEG, 30);
+ 
+         // But the 6:00 departure of my line is going to skip my arrival stop :-(
+@@ -142,7 +142,7 @@ public void testSkipTransferStop() {
+ 
+         // I want to go at 6:44
+         ghRequest.getHints().put(Parameters.PT.EARLIEST_DEPARTURE_TIME, LocalDateTime.of(2007,1,1,6,44).atZone(zoneId).toInstant());
+-        ghRequest.getHints().put(Parameters.PT.IGNORE_TRANSFERS, "true");
++        ghRequest.getHints().put(Parameters.PT.IGNORE_TRANSFERS, true);
+         ghRequest.getHints().put(Parameters.PT.MAX_WALK_DISTANCE_PER_LEG, 30);
+ 
+         // But the 6:00 departure of my line is going to skip my transfer stop :-(
+@@ -171,7 +171,7 @@ public void testBlockTrips() {
+                 TO_LAT, TO_LON
+         );
+         ghRequest.getHints().put(Parameters.PT.EARLIEST_DEPARTURE_TIME, LocalDateTime.of(2007,1,1,8,0).atZone(zoneId).toInstant());
+-        ghRequest.getHints().put(Parameters.PT.IGNORE_TRANSFERS, "true");
++        ghRequest.getHints().put(Parameters.PT.IGNORE_TRANSFERS, true);
+         ghRequest.getHints().put(Parameters.PT.MAX_WALK_DISTANCE_PER_LEG, 30);
+ 
+         // My line does not stop at Bullfrog today. If this was a real transfer, I would not be

@@ -1,0 +1,1517 @@
+diff --git a/animated-base/src/main/java/com/facebook/fresco/animation/bitmap/cache/FrescoFrameCache.java b/animated-base/src/main/java/com/facebook/fresco/animation/bitmap/cache/FrescoFrameCache.java
+index d99c7ccc3..1367762a2 100644
+--- a/animated-base/src/main/java/com/facebook/fresco/animation/bitmap/cache/FrescoFrameCache.java
++++ b/animated-base/src/main/java/com/facebook/fresco/animation/bitmap/cache/FrescoFrameCache.java
+@@ -29,9 +29,12 @@
+ public class FrescoFrameCache implements BitmapFrameCache {
+ 
+   private static final Class<?> TAG = FrescoFrameCache.class;
++  private static final int NO_VALUE = -1;
+ 
+   private final AnimatedFrameCache mAnimatedFrameCache;
++  private AnimatedFrameCache mOtherFrameCache;
+   private final boolean mEnableBitmapReusing;
++  private int mLastRenderedFrame = NO_VALUE;
+   @GuardedBy("this")
+   private final SparseArray<CloseableReference<CloseableImage>> mPreparedPendingFrames;
+ 
+@@ -39,15 +42,34 @@
+   @Nullable
+   private CloseableReference<CloseableImage> mLastRenderedItem;
+ 
+-  public FrescoFrameCache(AnimatedFrameCache animatedFrameCache, boolean enableBitmapReusing) {
++  public FrescoFrameCache(AnimatedFrameCache animatedFrameCache,
++                          boolean enableBitmapReusing) {
++    this(animatedFrameCache, enableBitmapReusing, null);
++  }
++
++  public FrescoFrameCache(AnimatedFrameCache animatedFrameCache,
++                          boolean enableBitmapReusing,
++                          AnimatedFrameCache otherFrameCache) {
+     mAnimatedFrameCache = animatedFrameCache;
+     mEnableBitmapReusing = enableBitmapReusing;
+     mPreparedPendingFrames = new SparseArray<>();
++    mOtherFrameCache = otherFrameCache;
++  }
++
++  private boolean checkOtherFrameEnable(int frame) {
++    return frame != 0 && mOtherFrameCache != null;
++  }
++
++  private boolean checkDropFrame() {
++    return mOtherFrameCache != null;
+   }
+ 
+   @Nullable
+   @Override
+   public synchronized CloseableReference<Bitmap> getCachedFrame(int frameNumber) {
++    if (checkOtherFrameEnable(frameNumber)) {
++      return convertToBitmapReferenceAndClose(mOtherFrameCache.get(frameNumber));
++    }
+     return convertToBitmapReferenceAndClose(mAnimatedFrameCache.get(frameNumber));
+   }
+ 
+@@ -66,11 +88,17 @@ public FrescoFrameCache(AnimatedFrameCache animatedFrameCache, boolean enableBit
+     if (!mEnableBitmapReusing) {
+       return null;
+     }
++    if (checkOtherFrameEnable(frameNumber)) {
++      return convertToBitmapReferenceAndClose(mOtherFrameCache.getForReuse());
++    }
+     return convertToBitmapReferenceAndClose(mAnimatedFrameCache.getForReuse());
+   }
+ 
+   @Override
+   public synchronized boolean contains(int frameNumber) {
++    if (checkOtherFrameEnable(frameNumber)) {
++      return mOtherFrameCache.contains(frameNumber);
++    }
+     return mAnimatedFrameCache.contains(frameNumber);
+   }
+ 
+@@ -99,7 +127,13 @@ public synchronized void onFrameRendered(
+     Preconditions.checkNotNull(bitmapReference);
+ 
+     // Close up prepared references.
+-    removePreparedReference(frameNumber);
++    if (checkDropFrame()) {
++      if (mLastRenderedFrame != NO_VALUE && mLastRenderedFrame != frameNumber) {
++        removePreparedReference(mLastRenderedFrame);
++      }
++    } else {
++      removePreparedReference(frameNumber);
++    }
+ 
+     // Create the new image reference and cache it.
+     CloseableReference<CloseableImage> closableReference = null;
+@@ -107,11 +141,16 @@ public synchronized void onFrameRendered(
+       closableReference = createImageReference(bitmapReference);
+       if (closableReference != null) {
+         CloseableReference.closeSafely(mLastRenderedItem);
+-        mLastRenderedItem = mAnimatedFrameCache.cache(frameNumber, closableReference);
++        if (checkOtherFrameEnable(frameNumber)) {
++          mLastRenderedItem = mOtherFrameCache.cache(frameNumber, closableReference);
++        } else {
++          mLastRenderedItem = mAnimatedFrameCache.cache(frameNumber, closableReference);
++        }
+       }
+     } finally {
+       CloseableReference.closeSafely(closableReference);
+     }
++    mLastRenderedFrame = frameNumber;
+   }
+ 
+   @Override
+@@ -126,8 +165,12 @@ public synchronized void onFramePrepared(
+       if (closableReference == null) {
+         return;
+       }
+-      CloseableReference<CloseableImage> newReference =
+-          mAnimatedFrameCache.cache(frameNumber, closableReference);
++      CloseableReference<CloseableImage> newReference;
++      if (checkOtherFrameEnable(frameNumber)) {
++        newReference = mOtherFrameCache.cache(frameNumber, closableReference);
++      } else {
++        newReference = mAnimatedFrameCache.cache(frameNumber, closableReference);
++      }
+       if (CloseableReference.isValid(newReference)) {
+         CloseableReference<CloseableImage> oldReference = mPreparedPendingFrames.get(frameNumber);
+         CloseableReference.closeSafely(oldReference);
+diff --git a/animated-base/src/main/java/com/facebook/fresco/animation/factory/AnimatedFactoryV2Impl.java b/animated-base/src/main/java/com/facebook/fresco/animation/factory/AnimatedFactoryV2Impl.java
+index ae1d85e17..13a13c02b 100644
+--- a/animated-base/src/main/java/com/facebook/fresco/animation/factory/AnimatedFactoryV2Impl.java
++++ b/animated-base/src/main/java/com/facebook/fresco/animation/factory/AnimatedFactoryV2Impl.java
+@@ -11,6 +11,7 @@
+ import android.graphics.Rect;
+ import com.facebook.cache.common.CacheKey;
+ import com.facebook.common.executors.DefaultSerialExecutorService;
++import com.facebook.common.executors.DropSerialExecutorService;
+ import com.facebook.common.executors.SerialExecutorService;
+ import com.facebook.common.executors.UiThreadImmediateExecutorService;
+ import com.facebook.common.internal.DoNotStrip;
+@@ -49,6 +50,7 @@
+   private final PlatformBitmapFactory mPlatformBitmapFactory;
+   private final ExecutorSupplier mExecutorSupplier;
+   private final CountingMemoryCache<CacheKey, CloseableImage> mBackingCache;
++  private final CountingMemoryCache<CacheKey, CloseableImage> mOtherCache;
+ 
+   private @Nullable AnimatedImageFactory mAnimatedImageFactory;
+   private @Nullable AnimatedDrawableBackendProvider mAnimatedDrawableBackendProvider;
+@@ -60,9 +62,22 @@ public AnimatedFactoryV2Impl(
+       PlatformBitmapFactory platformBitmapFactory,
+       ExecutorSupplier executorSupplier,
+       CountingMemoryCache<CacheKey, CloseableImage> backingCache) {
++    this(platformBitmapFactory,
++            executorSupplier,
++            backingCache,
++            null);
++  }
++
++  @DoNotStrip
++  public AnimatedFactoryV2Impl(
++          PlatformBitmapFactory platformBitmapFactory,
++          ExecutorSupplier executorSupplier,
++          CountingMemoryCache<CacheKey, CloseableImage> backingCache,
++          CountingMemoryCache<CacheKey, CloseableImage> otherCahce) {
+     mPlatformBitmapFactory = platformBitmapFactory;
+     mExecutorSupplier = executorSupplier;
+     mBackingCache = backingCache;
++    mOtherCache = otherCahce;
+   }
+ 
+   @Nullable
+@@ -113,6 +128,9 @@ public Integer get() {
+     final SerialExecutorService serialExecutorServiceForFramePreparing =
+         new DefaultSerialExecutorService(mExecutorSupplier.forDecode());
+ 
++    final SerialExecutorService dropExecutorServiceForFramePreparing =
++        new DropSerialExecutorService(mExecutorSupplier.forDecode());
++
+     Supplier<Integer> numberOfFramesToPrepareSupplier = new Supplier<Integer>() {
+       @Override
+       public Integer get() {
+@@ -128,7 +146,9 @@ public Integer get() {
+         mPlatformBitmapFactory,
+         mBackingCache,
+         cachingStrategySupplier,
+-        numberOfFramesToPrepareSupplier);
++        numberOfFramesToPrepareSupplier,
++        mOtherCache,
++        dropExecutorServiceForFramePreparing);
+   }
+ 
+   private AnimatedDrawableUtil getAnimatedDrawableUtil() {
+diff --git a/animated-base/src/main/java/com/facebook/fresco/animation/factory/ExperimentalBitmapAnimationDrawableFactory.java b/animated-base/src/main/java/com/facebook/fresco/animation/factory/ExperimentalBitmapAnimationDrawableFactory.java
+index fc3fbe879..d614d1557 100644
+--- a/animated-base/src/main/java/com/facebook/fresco/animation/factory/ExperimentalBitmapAnimationDrawableFactory.java
++++ b/animated-base/src/main/java/com/facebook/fresco/animation/factory/ExperimentalBitmapAnimationDrawableFactory.java
+@@ -10,6 +10,7 @@
+ import android.graphics.Bitmap;
+ import android.graphics.Rect;
+ import android.net.Uri;
++
+ import com.facebook.cache.common.CacheKey;
+ import com.facebook.common.internal.Supplier;
+ import com.facebook.common.time.MonotonicClock;
+@@ -24,6 +25,7 @@
+ import com.facebook.fresco.animation.bitmap.preparation.BitmapFramePreparationStrategy;
+ import com.facebook.fresco.animation.bitmap.preparation.BitmapFramePreparer;
+ import com.facebook.fresco.animation.bitmap.preparation.DefaultBitmapFramePreparer;
++import com.facebook.fresco.animation.bitmap.preparation.DropFramePreparationStrategy;
+ import com.facebook.fresco.animation.bitmap.preparation.FixedNumberBitmapFramePreparationStrategy;
+ import com.facebook.fresco.animation.bitmap.wrapper.AnimatedDrawableBackendAnimationInformation;
+ import com.facebook.fresco.animation.bitmap.wrapper.AnimatedDrawableBackendFrameRenderer;
+@@ -39,7 +41,10 @@
+ import com.facebook.imagepipeline.image.CloseableAnimatedImage;
+ import com.facebook.imagepipeline.image.CloseableImage;
+ import java.util.concurrent.ExecutorService;
++import java.util.concurrent.PriorityBlockingQueue;
+ import java.util.concurrent.ScheduledExecutorService;
++import java.util.concurrent.ThreadPoolExecutor;
++import java.util.concurrent.TimeUnit;
+ 
+ /**
+  * Animation factory for {@link AnimatedDrawable2}.
+@@ -55,9 +60,11 @@
+   private final AnimatedDrawableBackendProvider mAnimatedDrawableBackendProvider;
+   private final ScheduledExecutorService mScheduledExecutorServiceForUiThread;
+   private final ExecutorService mExecutorServiceForFramePreparing;
++  private final ExecutorService mDropServiceForFramePreparing;
+   private final MonotonicClock mMonotonicClock;
+   private final PlatformBitmapFactory mPlatformBitmapFactory;
+   private final CountingMemoryCache<CacheKey, CloseableImage> mBackingCache;
++  private final CountingMemoryCache<CacheKey, CloseableImage> mOtherFrameCache;
+   private final Supplier<Integer> mCachingStrategySupplier;
+   private final Supplier<Integer> mNumberOfFramesToPrepareSupplier;
+ 
+@@ -69,7 +76,9 @@ public ExperimentalBitmapAnimationDrawableFactory(
+       PlatformBitmapFactory platformBitmapFactory,
+       CountingMemoryCache<CacheKey, CloseableImage> backingCache,
+       Supplier<Integer> cachingStrategySupplier,
+-      Supplier<Integer> numberOfFramesToPrepareSupplier) {
++      Supplier<Integer> numberOfFramesToPrepareSupplier,
++      CountingMemoryCache<CacheKey, CloseableImage> otherCache,
++      ExecutorService dropServiceForFramePreparing) {
+     mAnimatedDrawableBackendProvider = animatedDrawableBackendProvider;
+     mScheduledExecutorServiceForUiThread = scheduledExecutorServiceForUiThread;
+     mExecutorServiceForFramePreparing = executorServiceForFramePreparing;
+@@ -78,6 +87,8 @@ public ExperimentalBitmapAnimationDrawableFactory(
+     mBackingCache = backingCache;
+     mCachingStrategySupplier = cachingStrategySupplier;
+     mNumberOfFramesToPrepareSupplier = numberOfFramesToPrepareSupplier;
++    mOtherFrameCache = otherCache;
++    mDropServiceForFramePreparing = dropServiceForFramePreparing;
+   }
+ 
+   @Override
+@@ -87,9 +98,11 @@ public boolean supportsImageType(CloseableImage image) {
+ 
+   @Override
+   public AnimatedDrawable2 createDrawable(CloseableImage image) {
++    CloseableAnimatedImage animatedImage = (CloseableAnimatedImage) image;
++    AnimatedImageResult result = animatedImage.getImageResult();
+     return new AnimatedDrawable2(
+-        createAnimationBackend(
+-            ((CloseableAnimatedImage) image).getImageResult()));
++        createAnimationBackend(result),
++            result.getEnableDropFrame());
+   }
+ 
+   private AnimationBackend createAnimationBackend(AnimatedImageResult animatedImageResult) {
+@@ -104,8 +117,13 @@ private AnimationBackend createAnimationBackend(AnimatedImageResult animatedImag
+     BitmapFramePreparationStrategy bitmapFramePreparationStrategy = null;
+     BitmapFramePreparer bitmapFramePreparer = null;
+     if (numberOfFramesToPrefetch > 0) {
+-      bitmapFramePreparationStrategy =
+-          new FixedNumberBitmapFramePreparationStrategy(numberOfFramesToPrefetch);
++      if (animatedImageResult.getEnableDropFrame()) {
++        bitmapFramePreparationStrategy =
++                new DropFramePreparationStrategy();
++      } else {
++        bitmapFramePreparationStrategy =
++                new FixedNumberBitmapFramePreparationStrategy(numberOfFramesToPrefetch);
++        }
+       bitmapFramePreparer = createBitmapFramePreparer(bitmapFrameRenderer);
+     }
+ 
+@@ -115,7 +133,8 @@ private AnimationBackend createAnimationBackend(AnimatedImageResult animatedImag
+         new AnimatedDrawableBackendAnimationInformation(animatedDrawableBackend),
+         bitmapFrameRenderer,
+         bitmapFramePreparationStrategy,
+-        bitmapFramePreparer);
++        bitmapFramePreparer,
++        animatedImageResult.getEnableDropFrame());
+ 
+     return AnimationBackendDelegateWithInactivityCheck.createForBackend(
+         bitmapAnimationBackend,
+@@ -128,7 +147,8 @@ private BitmapFramePreparer createBitmapFramePreparer(BitmapFrameRenderer bitmap
+         mPlatformBitmapFactory,
+         bitmapFrameRenderer,
+         Bitmap.Config.ARGB_8888,
+-        mExecutorServiceForFramePreparing);
++        mExecutorServiceForFramePreparing,
++        mDropServiceForFramePreparing);
+   }
+ 
+   private AnimatedDrawableBackend createAnimatedDrawableBackend(
+@@ -141,9 +161,11 @@ private AnimatedDrawableBackend createAnimatedDrawableBackend(
+   private BitmapFrameCache createBitmapFrameCache(AnimatedImageResult animatedImageResult) {
+     switch (mCachingStrategySupplier.get()) {
+       case CACHING_STRATEGY_FRESCO_CACHE:
+-        return new FrescoFrameCache(createAnimatedFrameCache(animatedImageResult), true);
++        return new FrescoFrameCache(createAnimatedFrameCache(animatedImageResult),
++                true, createOtherFrameCache(animatedImageResult));
+       case CACHING_STRATEGY_FRESCO_CACHE_NO_REUSING:
+-        return new FrescoFrameCache(createAnimatedFrameCache(animatedImageResult), false);
++        return new FrescoFrameCache(createAnimatedFrameCache(animatedImageResult),
++                false, createOtherFrameCache(animatedImageResult));
+       case CACHING_STRATEGY_KEEP_LAST_CACHE:
+         return new KeepLastFrameCache();
+       case CACHING_STRATEGY_NO_CACHE:
+@@ -159,6 +181,16 @@ private AnimatedFrameCache createAnimatedFrameCache(
+         mBackingCache);
+   }
+ 
++  private AnimatedFrameCache createOtherFrameCache(
++          final AnimatedImageResult animatedImageResult) {
++    if (!animatedImageResult.getEnableDropFrame() || mOtherFrameCache == null) {
++      return null;
++    }
++    return new AnimatedFrameCache(
++            new AnimationFrameCacheKey(animatedImageResult.hashCode()),
++            mOtherFrameCache);
++  }
++
+   public static class AnimationFrameCacheKey implements CacheKey {
+ 
+     private static final String URI_PREFIX = "anim://";
+@@ -178,5 +210,18 @@ public boolean containsUri(Uri uri) {
+     public String getUriString() {
+       return mAnimationUriString;
+     }
++
++    @Override
++    public int hashCode() {
++      return mAnimationUriString.hashCode();
++    }
++
++    @Override
++    public boolean equals(Object obj) {
++      if (obj instanceof AnimationFrameCacheKey) {
++        return ((AnimationFrameCacheKey) obj).mAnimationUriString.equals(mAnimationUriString);
++      }
++      return false;
++    }
+   }
+ }
+diff --git a/animated-base/src/main/java/com/facebook/imagepipeline/animated/base/AnimatedImageResult.java b/animated-base/src/main/java/com/facebook/imagepipeline/animated/base/AnimatedImageResult.java
+index d3122c28f..eca6374b6 100644
+--- a/animated-base/src/main/java/com/facebook/imagepipeline/animated/base/AnimatedImageResult.java
++++ b/animated-base/src/main/java/com/facebook/imagepipeline/animated/base/AnimatedImageResult.java
+@@ -21,6 +21,7 @@
+ 
+   private final AnimatedImage mImage;
+   private final int mFrameForPreview;
++  private final boolean mEnableDropFrame;
+   private @Nullable CloseableReference<Bitmap> mPreviewBitmap;
+   private @Nullable List<CloseableReference<Bitmap>> mDecodedFrames;
+ 
+@@ -29,11 +30,13 @@
+     mFrameForPreview = builder.getFrameForPreview();
+     mPreviewBitmap = builder.getPreviewBitmap();
+     mDecodedFrames = builder.getDecodedFrames();
++    mEnableDropFrame = builder.getEnableDropFrame();
+   }
+ 
+   private AnimatedImageResult(AnimatedImage image) {
+     mImage = Preconditions.checkNotNull(image);
+     mFrameForPreview = 0;
++    mEnableDropFrame = false;
+   }
+ 
+   /**
+@@ -112,6 +115,10 @@ public synchronized boolean hasDecodedFrame(int index) {
+     return CloseableReference.cloneOrNull(mPreviewBitmap);
+   }
+ 
++  public boolean getEnableDropFrame() {
++    return mEnableDropFrame;
++  }
++
+   /**
+    * Disposes the result, which releases the reference to any bitmaps.
+    */
+diff --git a/animated-base/src/main/java/com/facebook/imagepipeline/animated/base/AnimatedImageResultBuilder.java b/animated-base/src/main/java/com/facebook/imagepipeline/animated/base/AnimatedImageResultBuilder.java
+index d11acb05d..0a25fa93b 100644
+--- a/animated-base/src/main/java/com/facebook/imagepipeline/animated/base/AnimatedImageResultBuilder.java
++++ b/animated-base/src/main/java/com/facebook/imagepipeline/animated/base/AnimatedImageResultBuilder.java
+@@ -20,6 +20,7 @@
+   private CloseableReference<Bitmap> mPreviewBitmap;
+   private List<CloseableReference<Bitmap>> mDecodedFrames;
+   private int mFrameForPreview;
++  private boolean mEnableDropFrame;
+ 
+   AnimatedImageResultBuilder(AnimatedImage image) {
+     mImage = image;
+@@ -99,6 +100,15 @@ public AnimatedImageResultBuilder setDecodedFrames(
+     return this;
+   }
+ 
++  public AnimatedImageResultBuilder setEnableDropFrame(boolean enable) {
++    mEnableDropFrame = enable;
++    return this;
++  }
++
++  public boolean getEnableDropFrame() {
++    return mEnableDropFrame;
++  }
++
+   /**
+    * Builds the {@link AnimatedImageResult}. The preview bitmap and the decoded frames are closed
+    * after build is called, so this should not be called more than once or those fields will be lost
+diff --git a/animated-base/src/main/java/com/facebook/imagepipeline/animated/factory/AnimatedImageFactoryImpl.java b/animated-base/src/main/java/com/facebook/imagepipeline/animated/factory/AnimatedImageFactoryImpl.java
+index a93027491..efaff952c 100644
+--- a/animated-base/src/main/java/com/facebook/imagepipeline/animated/factory/AnimatedImageFactoryImpl.java
++++ b/animated-base/src/main/java/com/facebook/imagepipeline/animated/factory/AnimatedImageFactoryImpl.java
+@@ -143,6 +143,7 @@ private CloseableImage getCloseableImage(
+           .setPreviewBitmap(previewBitmap)
+           .setFrameForPreview(frameForPreview)
+           .setDecodedFrames(decodedFrames)
++          .setEnableDropFrame(options.enableDropFrame)
+           .build();
+       return new CloseableAnimatedImage(animatedImageResult);
+     } finally {
+diff --git a/animated-base/src/main/java/com/facebook/imagepipeline/animated/impl/AnimatedFrameCache.java b/animated-base/src/main/java/com/facebook/imagepipeline/animated/impl/AnimatedFrameCache.java
+index 1badea330..f15231f0f 100644
+--- a/animated-base/src/main/java/com/facebook/imagepipeline/animated/impl/AnimatedFrameCache.java
++++ b/animated-base/src/main/java/com/facebook/imagepipeline/animated/impl/AnimatedFrameCache.java
+@@ -52,7 +52,7 @@ public boolean equals(Object o) {
+       }
+       if (o instanceof FrameKey) {
+         FrameKey that = (FrameKey) o;
+-        return this.mImageCacheKey == that.mImageCacheKey &&
++        return this.mImageCacheKey.equals(that.mImageCacheKey) &&
+             this.mFrameIndex == that.mFrameIndex;
+       }
+       return false;
+diff --git a/animated-base/src/main/java/com/facebook/imagepipeline/image/CloseableAnimatedImage.java b/animated-base/src/main/java/com/facebook/imagepipeline/image/CloseableAnimatedImage.java
+index 8c029baba..e84bc4d44 100644
+--- a/animated-base/src/main/java/com/facebook/imagepipeline/image/CloseableAnimatedImage.java
++++ b/animated-base/src/main/java/com/facebook/imagepipeline/image/CloseableAnimatedImage.java
+@@ -55,11 +55,6 @@ public synchronized int getSizeInBytes() {
+     return isClosed() ? 0 : mImageResult.getImage().getSizeInBytes();
+   }
+ 
+-  @Override
+-  public boolean isStateful() {
+-    return true;
+-  }
+-
+   public synchronized AnimatedImageResult getImageResult() {
+     return mImageResult;
+   }
+@@ -67,4 +62,5 @@ public synchronized AnimatedImageResult getImageResult() {
+   public synchronized AnimatedImage getImage() {
+     return isClosed() ? null : mImageResult.getImage();
+   }
++
+ }
+diff --git a/animated-drawable/src/main/java/com/facebook/fresco/animation/bitmap/BitmapAnimationBackend.java b/animated-drawable/src/main/java/com/facebook/fresco/animation/bitmap/BitmapAnimationBackend.java
+index 3fffcdb00..7c2864b3f 100644
+--- a/animated-drawable/src/main/java/com/facebook/fresco/animation/bitmap/BitmapAnimationBackend.java
++++ b/animated-drawable/src/main/java/com/facebook/fresco/animation/bitmap/BitmapAnimationBackend.java
+@@ -16,6 +16,7 @@
+ import android.graphics.drawable.Drawable;
+ import android.support.annotation.IntDef;
+ import android.support.annotation.IntRange;
++
+ import com.facebook.common.logging.FLog;
+ import com.facebook.common.references.CloseableReference;
+ import com.facebook.fresco.animation.backend.AnimationBackend;
+@@ -106,6 +107,7 @@
+   private Bitmap.Config mBitmapConfig = Bitmap.Config.ARGB_8888;
+   @Nullable
+   private FrameListener mFrameListener;
++  private boolean mEnableDropFrame;
+ 
+   public BitmapAnimationBackend(
+       PlatformBitmapFactory platformBitmapFactory,
+@@ -114,12 +116,30 @@ public BitmapAnimationBackend(
+       BitmapFrameRenderer bitmapFrameRenderer,
+       @Nullable BitmapFramePreparationStrategy bitmapFramePreparationStrategy,
+       @Nullable BitmapFramePreparer bitmapFramePreparer) {
++    this(platformBitmapFactory,
++            bitmapFrameCache,
++            animationInformation,
++            bitmapFrameRenderer,
++            bitmapFramePreparationStrategy,
++            bitmapFramePreparer,
++            false);
++  }
++
++  public BitmapAnimationBackend(
++          PlatformBitmapFactory platformBitmapFactory,
++          BitmapFrameCache bitmapFrameCache,
++          AnimationInformation animationInformation,
++          BitmapFrameRenderer bitmapFrameRenderer,
++          @Nullable BitmapFramePreparationStrategy bitmapFramePreparationStrategy,
++          @Nullable BitmapFramePreparer bitmapFramePreparer,
++          boolean enableDropFrame) {
+     mPlatformBitmapFactory = platformBitmapFactory;
+     mBitmapFrameCache = bitmapFrameCache;
+     mAnimationInformation = animationInformation;
+     mBitmapFrameRenderer = bitmapFrameRenderer;
+     mBitmapFramePreparationStrategy = bitmapFramePreparationStrategy;
+     mBitmapFramePreparer = bitmapFramePreparer;
++    mEnableDropFrame = enableDropFrame;
+ 
+     mPaint = new Paint(Paint.FILTER_BITMAP_FLAG | Paint.DITHER_FLAG);
+     updateBitmapDimensions();
+@@ -183,7 +203,7 @@ public boolean drawFrame(
+ 
+   private boolean drawFrameOrFallback(Canvas canvas, int frameNumber, @FrameType int frameType) {
+     CloseableReference<Bitmap> bitmapReference = null;
+-    boolean drawn = false;
++    boolean drawn;
+     int nextFrameType = FRAME_TYPE_UNKNOWN;
+ 
+     try {
+@@ -200,7 +220,11 @@ private boolean drawFrameOrFallback(Canvas canvas, int frameNumber, @FrameType i
+           // Try to render the frame and draw on the canvas immediately after
+           drawn = renderFrameInBitmap(frameNumber, bitmapReference) &&
+               drawBitmapAndCache(frameNumber, bitmapReference, canvas, FRAME_TYPE_REUSED);
+-          nextFrameType = FRAME_TYPE_CREATED;
++          if (!mEnableDropFrame) {
++            nextFrameType = FRAME_TYPE_CREATED;
++          } else {
++            nextFrameType = FRAME_TYPE_FALLBACK;
++          }
+           break;
+ 
+         case FRAME_TYPE_CREATED:
+diff --git a/animated-drawable/src/main/java/com/facebook/fresco/animation/bitmap/preparation/DefaultBitmapFramePreparer.java b/animated-drawable/src/main/java/com/facebook/fresco/animation/bitmap/preparation/DefaultBitmapFramePreparer.java
+index 8d996f07d..59aa688d0 100644
+--- a/animated-drawable/src/main/java/com/facebook/fresco/animation/bitmap/preparation/DefaultBitmapFramePreparer.java
++++ b/animated-drawable/src/main/java/com/facebook/fresco/animation/bitmap/preparation/DefaultBitmapFramePreparer.java
+@@ -7,6 +7,7 @@
+ package com.facebook.fresco.animation.bitmap.preparation;
+ 
+ import android.graphics.Bitmap;
++import android.support.annotation.NonNull;
+ import android.util.SparseArray;
+ import com.facebook.common.logging.FLog;
+ import com.facebook.common.references.CloseableReference;
+@@ -30,17 +31,32 @@
+   private final BitmapFrameRenderer mBitmapFrameRenderer;
+   private final Bitmap.Config mBitmapConfig;
+   private final ExecutorService mExecutorService;
++  private final ExecutorService mOtherFrameExecutorService;
+   private final SparseArray<Runnable> mPendingFrameDecodeJobs;
+ 
++  public DefaultBitmapFramePreparer(
++          PlatformBitmapFactory platformBitmapFactory,
++          BitmapFrameRenderer bitmapFrameRenderer,
++          Bitmap.Config bitmapConfig,
++          ExecutorService executorService) {
++    this(platformBitmapFactory,
++            bitmapFrameRenderer,
++            bitmapConfig,
++            executorService,
++            null);
++  }
++
+   public DefaultBitmapFramePreparer(
+       PlatformBitmapFactory platformBitmapFactory,
+       BitmapFrameRenderer bitmapFrameRenderer,
+       Bitmap.Config bitmapConfig,
+-      ExecutorService executorService) {
++      ExecutorService executorService,
++      ExecutorService otherFrameService) {
+     mPlatformBitmapFactory = platformBitmapFactory;
+     mBitmapFrameRenderer = bitmapFrameRenderer;
+     mBitmapConfig = bitmapConfig;
+     mExecutorService = executorService;
++    mOtherFrameExecutorService = otherFrameService;
+     mPendingFrameDecodeJobs = new SparseArray<>();
+   }
+ 
+@@ -68,7 +84,11 @@ public boolean prepareFrame(
+           frameNumber,
+           frameId);
+       mPendingFrameDecodeJobs.put(frameId, frameDecodeRunnable);
+-      mExecutorService.execute(frameDecodeRunnable);
++      if (frameNumber != 0 && mOtherFrameExecutorService != null) {
++        mOtherFrameExecutorService.execute(frameDecodeRunnable);
++      } else {
++        mExecutorService.execute(frameDecodeRunnable);
++      }
+     }
+     return true;
+   }
+@@ -79,12 +99,13 @@ private static int getUniqueId(AnimationBackend backend, int frameNumber) {
+     return result;
+   }
+ 
+-  private class FrameDecodeRunnable implements Runnable {
++  private class FrameDecodeRunnable implements Runnable, Comparable<FrameDecodeRunnable> {
+ 
+     private final BitmapFrameCache mBitmapFrameCache;
+     private final AnimationBackend mAnimationBackend;
+     private final int mFrameNumber;
+     private final int mHashCode;
++    private final long mCreateTime;
+ 
+     public FrameDecodeRunnable(
+         AnimationBackend animationBackend,
+@@ -95,6 +116,7 @@ public FrameDecodeRunnable(
+       mBitmapFrameCache = bitmapFrameCache;
+       mFrameNumber = frameNumber;
+       mHashCode = hashCode;
++      mCreateTime = System.currentTimeMillis();
+     }
+ 
+     @Override
+@@ -187,5 +209,17 @@ private boolean renderFrameAndCache(
+       }
+       return true;
+     }
++
++    @Override
++    public int compareTo(@NonNull FrameDecodeRunnable o) {
++      long result = o.mCreateTime - mCreateTime;
++      if (result < 0) {
++        return -1;
++      } else if (result > 0) {
++        return 1;
++      } else {
++        return 0;
++      }
++    }
+   }
+ }
+diff --git a/animated-drawable/src/main/java/com/facebook/fresco/animation/bitmap/preparation/DropFramePreparationStrategy.java b/animated-drawable/src/main/java/com/facebook/fresco/animation/bitmap/preparation/DropFramePreparationStrategy.java
+new file mode 100644
+index 000000000..147b486b6
+--- /dev/null
++++ b/animated-drawable/src/main/java/com/facebook/fresco/animation/bitmap/preparation/DropFramePreparationStrategy.java
+@@ -0,0 +1,36 @@
++/*
++ * Copyright (c) 2017-present, Facebook, Inc.
++ *
++ * This source code is licensed under the MIT license found in the
++ * LICENSE file in the root directory of this source tree.
++ */
++package com.facebook.fresco.animation.bitmap.preparation;
++
++import com.facebook.common.logging.FLog;
++import com.facebook.fresco.animation.backend.AnimationBackend;
++import com.facebook.fresco.animation.bitmap.BitmapFrameCache;
++
++/**
++ * Frame preparation strategy to prepare the next n frames
++ */
++public class DropFramePreparationStrategy
++    implements BitmapFramePreparationStrategy {
++
++  private static final Class<?> TAG = DropFramePreparationStrategy.class;
++
++  @Override
++  public void prepareFrames(
++      BitmapFramePreparer bitmapFramePreparer,
++      BitmapFrameCache bitmapFrameCache,
++      AnimationBackend animationBackend,
++      int lastDrawnFrameNumber) {
++      int nextFrameNumber = lastDrawnFrameNumber % animationBackend.getFrameCount();
++      if (FLog.isLoggable(FLog.VERBOSE)) {
++        FLog.v(TAG, "Preparing frame %d, last drawn: %d", nextFrameNumber, lastDrawnFrameNumber);
++      }
++      bitmapFramePreparer.prepareFrame(
++          bitmapFrameCache,
++          animationBackend,
++          nextFrameNumber);
++  }
++}
+diff --git a/animated-drawable/src/main/java/com/facebook/fresco/animation/drawable/AnimatedDrawable2.java b/animated-drawable/src/main/java/com/facebook/fresco/animation/drawable/AnimatedDrawable2.java
+index d5a87a329..831564bd0 100644
+--- a/animated-drawable/src/main/java/com/facebook/fresco/animation/drawable/AnimatedDrawable2.java
++++ b/animated-drawable/src/main/java/com/facebook/fresco/animation/drawable/AnimatedDrawable2.java
+@@ -54,6 +54,7 @@ void onDraw(
+ 
+   private static final int DEFAULT_FRAME_SCHEDULING_DELAY_MS = 8;
+   private static final int DEFAULT_FRAME_SCHEDULING_OFFSET_MS = 0;
++  private static final int NO_VALUE = -1;
+ 
+   @Nullable
+   private AnimationBackend mAnimationBackend;
+@@ -66,6 +67,9 @@ void onDraw(
+   private long mLastFrameAnimationTimeMs;
+   private long mExpectedRenderTimeMs;
+   private int mLastDrawnFrameNumber;
++  private long mDropFrameTimeOffset;
++  private long mLastNoDrawTime = NO_VALUE;
++  private boolean mEnableDropFrame;
+ 
+   private long mFrameSchedulingDelayMs = DEFAULT_FRAME_SCHEDULING_DELAY_MS;
+   private long mFrameSchedulingOffsetMs = DEFAULT_FRAME_SCHEDULING_OFFSET_MS;
+@@ -104,8 +108,15 @@ public AnimatedDrawable2() {
+ 
+   public AnimatedDrawable2(
+       @Nullable AnimationBackend animationBackend) {
++    this(animationBackend, false);
++  }
++
++  public AnimatedDrawable2(
++          @Nullable AnimationBackend animationBackend,
++          boolean enableDropFrame) {
+     mAnimationBackend = animationBackend;
+     mFrameScheduler = createSchedulerForBackendAndDelayMethod(mAnimationBackend);
++    mEnableDropFrame = enableDropFrame;
+   }
+ 
+   @Override
+@@ -137,6 +148,8 @@ public void start() {
+     mExpectedRenderTimeMs = mStartTimeMs;
+     mLastFrameAnimationTimeMs = -1;
+     mLastDrawnFrameNumber = -1;
++    mDropFrameTimeOffset = 0;
++    mLastNoDrawTime = NO_VALUE;
+     invalidateSelf();
+     mAnimationListener.onAnimationStart(this);
+   }
+@@ -154,6 +167,8 @@ public void stop() {
+     mExpectedRenderTimeMs = mStartTimeMs;
+     mLastFrameAnimationTimeMs = -1;
+     mLastDrawnFrameNumber = -1;
++    mDropFrameTimeOffset = 0;
++    mLastNoDrawTime = NO_VALUE;
+     unscheduleSelf(mInvalidateRunnable);
+     mAnimationListener.onAnimationStop(this);
+   }
+@@ -182,8 +197,11 @@ public void draw(Canvas canvas) {
+       return;
+     }
+     long actualRenderTimeStartMs = now();
++    if (mLastNoDrawTime != NO_VALUE) {
++      mDropFrameTimeOffset += mLastNoDrawTime - actualRenderTimeStartMs;
++    }
+     long animationTimeMs = mIsRunning
+-        ? actualRenderTimeStartMs - mStartTimeMs + mFrameSchedulingOffsetMs
++        ? actualRenderTimeStartMs - mStartTimeMs + mFrameSchedulingOffsetMs + mDropFrameTimeOffset
+         : Math.max(mLastFrameAnimationTimeMs, 0);
+ 
+     // What frame should be drawn?
+@@ -205,10 +223,15 @@ public void draw(Canvas canvas) {
+     // Draw the frame
+     boolean frameDrawn = mAnimationBackend.drawFrame(this, canvas, frameNumberToDraw);
+     if (frameDrawn) {
++      mLastNoDrawTime = NO_VALUE;
+       // Notify listeners that we draw a new frame and
+       // that the animation might be repeated
+       mAnimationListener.onAnimationFrame(this, frameNumberToDraw);
+       mLastDrawnFrameNumber = frameNumberToDraw;
++    } else {
++      if (mEnableDropFrame) {
++        mLastNoDrawTime = actualRenderTimeStartMs;
++      }
+     }
+ 
+     // Log potential dropped frames
+diff --git a/fbcore/src/main/java/com/facebook/common/executors/DropSerialExecutorService.java b/fbcore/src/main/java/com/facebook/common/executors/DropSerialExecutorService.java
+new file mode 100644
+index 000000000..cec623d23
+--- /dev/null
++++ b/fbcore/src/main/java/com/facebook/common/executors/DropSerialExecutorService.java
+@@ -0,0 +1,34 @@
++/*
++ * Copyright (c) 2015-present, Facebook, Inc.
++ *
++ * This source code is licensed under the MIT license found in the
++ * LICENSE file in the root directory of this source tree.
++ */
++
++package com.facebook.common.executors;
++
++import java.util.concurrent.Executor;
++import java.util.concurrent.PriorityBlockingQueue;
++
++/**
++ * Default implementation of {@link SerialExecutorService} that wraps an existing {@link Executor}.
++ */
++public class DropSerialExecutorService extends ConstrainedExecutorService
++    implements SerialExecutorService {
++
++  public DropSerialExecutorService(Executor executor) {
++    // SerialExecutorService is just a ConstrainedExecutorService with a concurrency limit
++    // of one and an unbounded work queue.
++    super("DropSerialExecutor", 1, executor, new PriorityBlockingQueue<Runnable>());
++  }
++
++  /**
++   * Synchronized override of {@link ConstrainedExecutorService#execute(Runnable)} to
++   * ensure that view of memory is consistent between different threads executing tasks serially.
++   * @param runnable The task to be executed.
++   */
++  @Override
++  public synchronized void execute(Runnable runnable) {
++    super.execute(runnable);
++  }
++}
+diff --git a/imagepipeline-base/src/main/java/com/facebook/imagepipeline/animated/factory/AnimatedFactoryProvider.java b/imagepipeline-base/src/main/java/com/facebook/imagepipeline/animated/factory/AnimatedFactoryProvider.java
+index 5890cfd8f..f0490772b 100644
+--- a/imagepipeline-base/src/main/java/com/facebook/imagepipeline/animated/factory/AnimatedFactoryProvider.java
++++ b/imagepipeline-base/src/main/java/com/facebook/imagepipeline/animated/factory/AnimatedFactoryProvider.java
+@@ -22,7 +22,8 @@
+   public static AnimatedFactory getAnimatedFactory(
+       PlatformBitmapFactory platformBitmapFactory,
+       ExecutorSupplier executorSupplier,
+-      CountingMemoryCache<CacheKey, CloseableImage> backingCache) {
++      CountingMemoryCache<CacheKey, CloseableImage> backingCache,
++      CountingMemoryCache<CacheKey, CloseableImage> otherFrameCache) {
+     if (!sImplLoaded) {
+       try {
+         final Class<?> clazz =
+@@ -30,11 +31,13 @@ public static AnimatedFactory getAnimatedFactory(
+         final Constructor<?> constructor = clazz.getConstructor(
+             PlatformBitmapFactory.class,
+             ExecutorSupplier.class,
++            CountingMemoryCache.class,
+             CountingMemoryCache.class);
+         sImpl = (AnimatedFactory) constructor.newInstance(
+             platformBitmapFactory,
+             executorSupplier,
+-            backingCache);
++            backingCache,
++            otherFrameCache);
+       } catch (Throwable e) {
+         // Head in the sand
+       }
+diff --git a/imagepipeline-base/src/main/java/com/facebook/imagepipeline/common/ImageDecodeOptions.java b/imagepipeline-base/src/main/java/com/facebook/imagepipeline/common/ImageDecodeOptions.java
+index 7230d0f7f..bbfe2adc9 100644
+--- a/imagepipeline-base/src/main/java/com/facebook/imagepipeline/common/ImageDecodeOptions.java
++++ b/imagepipeline-base/src/main/java/com/facebook/imagepipeline/common/ImageDecodeOptions.java
+@@ -55,6 +55,8 @@
+    */
+   public final Bitmap.Config bitmapConfig;
+ 
++  public final boolean enableDropFrame;
++
+   /**
+    * Custom image decoder override.
+    */
+@@ -68,6 +70,7 @@ public ImageDecodeOptions(ImageDecodeOptionsBuilder b) {
+     this.forceStaticImage = b.getForceStaticImage();
+     this.bitmapConfig = b.getBitmapConfig();
+     this.customImageDecoder = b.getCustomImageDecoder();
++    this.enableDropFrame = b.getEnableDropFrame();
+   }
+ 
+   /**
+@@ -101,6 +104,7 @@ public boolean equals(Object o) {
+     if (forceStaticImage != that.forceStaticImage) return false;
+     if (bitmapConfig != that.bitmapConfig) return false;
+     if (customImageDecoder != that.customImageDecoder) return false;
++    if (enableDropFrame != that.enableDropFrame) return false;
+     return true;
+   }
+ 
+@@ -113,6 +117,7 @@ public int hashCode() {
+     result = 31 * result + (forceStaticImage ? 1 : 0);
+     result = 31 * result + bitmapConfig.ordinal();
+     result = 31 * result + (customImageDecoder != null ? customImageDecoder.hashCode() : 0);
++    result = 31 * result + (enableDropFrame ? 1 : 0);
+     return result;
+   }
+ 
+@@ -120,13 +125,14 @@ public int hashCode() {
+   public String toString() {
+     return String.format(
+         (Locale) null,
+-        "%d-%b-%b-%b-%b-%s-%s",
++        "%d-%b-%b-%b-%b-%s-%s-%b",
+         minDecodeIntervalMs,
+         decodePreviewFrame,
+         useLastFrameForPreview,
+         decodeAllFrames,
+         forceStaticImage,
+         bitmapConfig.name(),
+-        customImageDecoder);
++        customImageDecoder,
++        enableDropFrame);
+   }
+ }
+diff --git a/imagepipeline-base/src/main/java/com/facebook/imagepipeline/common/ImageDecodeOptionsBuilder.java b/imagepipeline-base/src/main/java/com/facebook/imagepipeline/common/ImageDecodeOptionsBuilder.java
+index 915a8a5d9..702d005aa 100644
+--- a/imagepipeline-base/src/main/java/com/facebook/imagepipeline/common/ImageDecodeOptionsBuilder.java
++++ b/imagepipeline-base/src/main/java/com/facebook/imagepipeline/common/ImageDecodeOptionsBuilder.java
+@@ -8,6 +8,7 @@
+ package com.facebook.imagepipeline.common;
+ 
+ import android.graphics.Bitmap;
++
+ import com.facebook.imagepipeline.decoder.ImageDecoder;
+ import javax.annotation.Nullable;
+ 
+@@ -21,6 +22,7 @@
+   private boolean mUseLastFrameForPreview;
+   private boolean mDecodeAllFrames;
+   private boolean mForceStaticImage;
++  private boolean mEnableDropFrame;
+   private Bitmap.Config mBitmapConfig = Bitmap.Config.ARGB_8888;
+   private @Nullable ImageDecoder mCustomImageDecoder;
+ 
+@@ -40,6 +42,7 @@ public ImageDecodeOptionsBuilder setFrom(ImageDecodeOptions options) {
+     mForceStaticImage = options.forceStaticImage;
+     mBitmapConfig = options.bitmapConfig;
+     mCustomImageDecoder = options.customImageDecoder;
++    mEnableDropFrame = options.enableDropFrame;
+     return this;
+   }
+ 
+@@ -192,6 +195,15 @@ public ImageDecodeOptionsBuilder setBitmapConfig(Bitmap.Config bitmapConfig) {
+     return this;
+   }
+ 
++  public ImageDecodeOptionsBuilder setEnableDropFrame(boolean enable) {
++    mEnableDropFrame = enable;
++    return this;
++  }
++
++  public boolean getEnableDropFrame() {
++    return mEnableDropFrame;
++  }
++
+   /**
+    * Builds the immutable {@link ImageDecodeOptions} instance.
+    *
+diff --git a/imagepipeline/src/main/java/com/facebook/imagepipeline/core/ImagePipeline.java b/imagepipeline/src/main/java/com/facebook/imagepipeline/core/ImagePipeline.java
+index 0b0c59335..a54c53968 100644
+--- a/imagepipeline/src/main/java/com/facebook/imagepipeline/core/ImagePipeline.java
++++ b/imagepipeline/src/main/java/com/facebook/imagepipeline/core/ImagePipeline.java
+@@ -54,6 +54,7 @@
+   private final RequestListener mRequestListener;
+   private final Supplier<Boolean> mIsPrefetchEnabledSupplier;
+   private final MemoryCache<CacheKey, CloseableImage> mBitmapMemoryCache;
++  private final MemoryCache<CacheKey, CloseableImage> mOtherFrameCache;
+   private final MemoryCache<CacheKey, PooledByteBuffer> mEncodedMemoryCache;
+   private final BufferedDiskCache mMainBufferedDiskCache;
+   private final BufferedDiskCache mSmallImageBufferedDiskCache;
+@@ -69,6 +70,7 @@ public ImagePipeline(
+       Supplier<Boolean> isPrefetchEnabledSupplier,
+       MemoryCache<CacheKey, CloseableImage> bitmapMemoryCache,
+       MemoryCache<CacheKey, PooledByteBuffer> encodedMemoryCache,
++      MemoryCache<CacheKey, CloseableImage> otherMemoryCache,
+       BufferedDiskCache mainBufferedDiskCache,
+       BufferedDiskCache smallImageBufferedDiskCache,
+       CacheKeyFactory cacheKeyFactory,
+@@ -80,6 +82,7 @@ public ImagePipeline(
+     mRequestListener = new ForwardingRequestListener(requestListeners);
+     mIsPrefetchEnabledSupplier = isPrefetchEnabledSupplier;
+     mBitmapMemoryCache = bitmapMemoryCache;
++    mOtherFrameCache = otherMemoryCache;
+     mEncodedMemoryCache = encodedMemoryCache;
+     mMainBufferedDiskCache = mainBufferedDiskCache;
+     mSmallImageBufferedDiskCache = smallImageBufferedDiskCache;
+@@ -356,6 +359,7 @@ public String toString() {
+   public void evictFromMemoryCache(final Uri uri) {
+     Predicate<CacheKey> predicate = predicateForUri(uri);
+     mBitmapMemoryCache.removeAll(predicate);
++    mOtherFrameCache.removeAll(predicate);
+     mEncodedMemoryCache.removeAll(predicate);
+   }
+ 
+@@ -406,6 +410,7 @@ public boolean apply(CacheKey key) {
+           }
+         };
+     mBitmapMemoryCache.removeAll(allPredicate);
++    mOtherFrameCache.removeAll(allPredicate);
+     mEncodedMemoryCache.removeAll(allPredicate);
+   }
+ 
+@@ -436,7 +441,8 @@ public boolean isInBitmapMemoryCache(final Uri uri) {
+       return false;
+     }
+     Predicate<CacheKey> bitmapCachePredicate = predicateForUri(uri);
+-    return mBitmapMemoryCache.contains(bitmapCachePredicate);
++    return mBitmapMemoryCache.contains(bitmapCachePredicate) ||
++            mOtherFrameCache.contains(bitmapCachePredicate);
+   }
+ 
+   /**
+diff --git a/imagepipeline/src/main/java/com/facebook/imagepipeline/core/ImagePipelineConfig.java b/imagepipeline/src/main/java/com/facebook/imagepipeline/core/ImagePipelineConfig.java
+index 3d6a54fb3..d394b0663 100644
+--- a/imagepipeline/src/main/java/com/facebook/imagepipeline/core/ImagePipelineConfig.java
++++ b/imagepipeline/src/main/java/com/facebook/imagepipeline/core/ImagePipelineConfig.java
+@@ -67,6 +67,7 @@
+   // There are a lot of parameters in this class. Please follow strict alphabetical order.
+   private final Bitmap.Config mBitmapConfig;
+   private final Supplier<MemoryCacheParams> mBitmapMemoryCacheParamsSupplier;
++  private final Supplier<MemoryCacheParams> mOtherFrameMemoryCacheParamsSupplier;
+   private final CountingMemoryCache.CacheTrimStrategy mBitmapMemoryCacheTrimStrategy;
+   private final CacheKeyFactory mCacheKeyFactory;
+   private final Context mContext;
+@@ -101,6 +102,11 @@ private ImagePipelineConfig(Builder builder) {
+             new DefaultBitmapMemoryCacheParamsSupplier(
+                 (ActivityManager) builder.mContext.getSystemService(Context.ACTIVITY_SERVICE)) :
+             builder.mBitmapMemoryCacheParamsSupplier;
++    mOtherFrameMemoryCacheParamsSupplier =
++            builder.mOtherMemoryCacheParamsSupplier == null ?
++                    new DefaultBitmapMemoryCacheParamsSupplier(
++                            (ActivityManager) builder.mContext.getSystemService(Context.ACTIVITY_SERVICE)) :
++                    builder.mOtherMemoryCacheParamsSupplier;
+     mBitmapMemoryCacheTrimStrategy =
+         builder.mBitmapMemoryCacheTrimStrategy == null ?
+             new BitmapMemoryCacheTrimStrategy() :
+@@ -226,6 +232,10 @@ static void resetDefaultRequestConfig() {
+     return mBitmapMemoryCacheParamsSupplier;
+   }
+ 
++  public Supplier<MemoryCacheParams> getOtherFrameCacheParamsSupplier() {
++    return mOtherFrameMemoryCacheParamsSupplier;
++  }
++
+   public CountingMemoryCache.CacheTrimStrategy getBitmapMemoryCacheTrimStrategy() {
+     return mBitmapMemoryCacheTrimStrategy;
+   }
+@@ -344,6 +354,7 @@ public boolean isProgressiveRenderingEnabled() {
+ 
+     private Bitmap.Config mBitmapConfig;
+     private Supplier<MemoryCacheParams> mBitmapMemoryCacheParamsSupplier;
++    private Supplier<MemoryCacheParams> mOtherMemoryCacheParamsSupplier;
+     private CountingMemoryCache.CacheTrimStrategy mBitmapMemoryCacheTrimStrategy;
+     private CacheKeyFactory mCacheKeyFactory;
+     private final Context mContext;
+@@ -385,6 +396,13 @@ public Builder setBitmapMemoryCacheParamsSupplier(
+       return this;
+     }
+ 
++    public Builder setOtherFrameMemoryCacheParamsSupplier(
++            Supplier<MemoryCacheParams> bitmapMemoryCacheParamsSupplier) {
++      mOtherMemoryCacheParamsSupplier =
++              Preconditions.checkNotNull(bitmapMemoryCacheParamsSupplier);
++      return this;
++    }
++
+     public Builder setBitmapMemoryCacheTrimStrategy(
+         CountingMemoryCache.CacheTrimStrategy trimStrategy) {
+       mBitmapMemoryCacheTrimStrategy = trimStrategy;
+diff --git a/imagepipeline/src/main/java/com/facebook/imagepipeline/core/ImagePipelineFactory.java b/imagepipeline/src/main/java/com/facebook/imagepipeline/core/ImagePipelineFactory.java
+index 9c42abdb4..cf9dd1f8a 100644
+--- a/imagepipeline/src/main/java/com/facebook/imagepipeline/core/ImagePipelineFactory.java
++++ b/imagepipeline/src/main/java/com/facebook/imagepipeline/core/ImagePipelineFactory.java
+@@ -99,6 +99,8 @@ public static void shutDown() {
+   private final ImagePipelineConfig mConfig;
+   private CountingMemoryCache<CacheKey, CloseableImage>
+       mBitmapCountingMemoryCache;
++  private CountingMemoryCache<CacheKey, CloseableImage>
++      mOtherFrameCountingMemoryCahce;
+   private MemoryCache<CacheKey, CloseableImage> mBitmapMemoryCache;
+   private CountingMemoryCache<CacheKey, PooledByteBuffer> mEncodedCountingMemoryCache;
+   private MemoryCache<CacheKey, PooledByteBuffer> mEncodedMemoryCache;
+@@ -129,7 +131,8 @@ private AnimatedFactory getAnimatedFactory() {
+       mAnimatedFactory = AnimatedFactoryProvider.getAnimatedFactory(
+           getPlatformBitmapFactory(),
+           mConfig.getExecutorSupplier(),
+-          getBitmapCountingMemoryCache());
++          getBitmapCountingMemoryCache(),
++          getOtherFrameCountingMemoryCache());
+     }
+     return mAnimatedFactory;
+   }
+@@ -154,6 +157,20 @@ public DrawableFactory getAnimatedDrawableFactory(Context context) {
+     return mBitmapCountingMemoryCache;
+   }
+ 
++  public CountingMemoryCache<CacheKey, CloseableImage>
++  getOtherFrameCountingMemoryCache() {
++    if (mOtherFrameCountingMemoryCahce == null) {
++      mOtherFrameCountingMemoryCahce =
++              BitmapCountingMemoryCacheFactory.get(
++                      mConfig.getOtherFrameCacheParamsSupplier(),
++                      mConfig.getMemoryTrimmableRegistry(),
++                      getPlatformBitmapFactory(),
++                      mConfig.getExperiments().isExternalCreatedBitmapLogEnabled(),
++                      mConfig.getBitmapMemoryCacheTrimStrategy());
++    }
++    return mOtherFrameCountingMemoryCahce;
++  }
++
+   public MemoryCache<CacheKey, CloseableImage> getBitmapMemoryCache() {
+     if (mBitmapMemoryCache == null) {
+       mBitmapMemoryCache =
+@@ -252,6 +269,7 @@ public ImagePipeline getImagePipeline() {
+               mConfig.getIsPrefetchEnabledSupplier(),
+               getBitmapMemoryCache(),
+               getEncodedMemoryCache(),
++              getOtherFrameCountingMemoryCache(),
+               getMainBufferedDiskCache(),
+               getSmallImageBufferedDiskCache(),
+               mConfig.getCacheKeyFactory(),
+diff --git a/imagepipeline/src/main/java/com/facebook/imagepipeline/memory/BitmapPool.java b/imagepipeline/src/main/java/com/facebook/imagepipeline/memory/BitmapPool.java
+index c4be6dbf6..bf586dc36 100644
+--- a/imagepipeline/src/main/java/com/facebook/imagepipeline/memory/BitmapPool.java
++++ b/imagepipeline/src/main/java/com/facebook/imagepipeline/memory/BitmapPool.java
+@@ -9,6 +9,7 @@
+ 
+ import android.annotation.TargetApi;
+ import android.graphics.Bitmap;
++
+ import com.facebook.common.internal.Preconditions;
+ import com.facebook.common.memory.MemoryTrimmableRegistry;
+ import com.facebook.imageutils.BitmapUtil;
+diff --git a/samples/showcase/src/main/java/com/facebook/fresco/samples/showcase/MainActivity.java b/samples/showcase/src/main/java/com/facebook/fresco/samples/showcase/MainActivity.java
+index 6dbdf0956..a5bcd43da 100644
+--- a/samples/showcase/src/main/java/com/facebook/fresco/samples/showcase/MainActivity.java
++++ b/samples/showcase/src/main/java/com/facebook/fresco/samples/showcase/MainActivity.java
+@@ -47,6 +47,7 @@
+ import com.facebook.fresco.samples.showcase.imageformat.pjpeg.ImageFormatProgressiveJpegFragment;
+ import com.facebook.fresco.samples.showcase.imageformat.svg.ImageFormatSvgFragment;
+ import com.facebook.fresco.samples.showcase.imageformat.webp.ImageFormatWebpFragment;
++import com.facebook.fresco.samples.showcase.imageformat.webplist.ImageFormatWebpListFragment;
+ import com.facebook.fresco.samples.showcase.imagepipeline.ImagePipelineBitmapFactoryFragment;
+ import com.facebook.fresco.samples.showcase.imagepipeline.ImagePipelineNotificationFragment;
+ import com.facebook.fresco.samples.showcase.imagepipeline.ImagePipelinePostProcessorFragment;
+@@ -221,6 +222,9 @@ private void handleNavigationItemClick(int itemId) {
+       case R.id.nav_format_webp:
+         fragment = new ImageFormatWebpFragment();
+         break;
++      case R.id.nav_format_webp_list:
++        fragment = new ImageFormatWebpListFragment();
++        break;
+       case R.id.nav_format_svg:
+         fragment = new ImageFormatSvgFragment();
+         break;
+diff --git a/samples/showcase/src/main/java/com/facebook/fresco/samples/showcase/ShowcaseApplication.java b/samples/showcase/src/main/java/com/facebook/fresco/samples/showcase/ShowcaseApplication.java
+index e4a0630c9..a368f13e4 100644
+--- a/samples/showcase/src/main/java/com/facebook/fresco/samples/showcase/ShowcaseApplication.java
++++ b/samples/showcase/src/main/java/com/facebook/fresco/samples/showcase/ShowcaseApplication.java
+@@ -20,6 +20,7 @@
+ import com.facebook.drawee.backends.pipeline.Fresco;
+ import com.facebook.fresco.samples.showcase.misc.DebugOverlaySupplierSingleton;
+ import com.facebook.imagepipeline.backends.okhttp3.OkHttpImagePipelineConfigFactory;
++import com.facebook.imagepipeline.cache.MemoryCacheParams;
+ import com.facebook.imagepipeline.core.ImagePipelineConfig;
+ import com.facebook.imagepipeline.decoder.SimpleProgressiveJpegConfig;
+ import com.facebook.imagepipeline.listener.RequestListener;
+@@ -51,6 +52,7 @@ public void onCreate() {
+ 
+     ImagePipelineConfig imagePipelineConfig =
+         OkHttpImagePipelineConfigFactory.newBuilder(this, okHttpClient)
++            .setOtherFrameMemoryCacheParamsSupplier(getOtherMemSupper())
+             .setRequestListeners(listeners)
+             .setProgressiveJpegConfig(new SimpleProgressiveJpegConfig())
+             .setImageDecoderConfig(CustomImageFormatConfigurator.createImageDecoderConfig(this))
+@@ -93,4 +95,21 @@ public Boolean get() {
+             .enableWebKitInspector(Stetho.defaultInspectorModulesProvider(context))
+             .build());
+   }
++
++  /**
++   * config for the webp(Exclude frame 0)
++   */
++  private Supplier<MemoryCacheParams> getOtherMemSupper() {
++    return new Supplier<MemoryCacheParams>() {
++      @Override
++      public MemoryCacheParams get() {
++        return new MemoryCacheParams(
++                (int) Runtime.getRuntime().maxMemory() / 8,
++                Integer.MAX_VALUE,
++                (int) Runtime.getRuntime().maxMemory() / 16,
++                300,
++                Integer.MAX_VALUE);
++      }
++    };
++  }
+ }
+diff --git a/samples/showcase/src/main/java/com/facebook/fresco/samples/showcase/imageformat/webplist/ImageFormatWebpListFragment.java b/samples/showcase/src/main/java/com/facebook/fresco/samples/showcase/imageformat/webplist/ImageFormatWebpListFragment.java
+new file mode 100644
+index 000000000..8df02f755
+--- /dev/null
++++ b/samples/showcase/src/main/java/com/facebook/fresco/samples/showcase/imageformat/webplist/ImageFormatWebpListFragment.java
+@@ -0,0 +1,57 @@
++package com.facebook.fresco.samples.showcase.imageformat.webplist;
++
++import android.os.Bundle;
++import android.support.annotation.NonNull;
++import android.support.annotation.Nullable;
++import android.support.v7.widget.RecyclerView;
++import android.support.v7.widget.SwitchCompat;
++import android.view.LayoutInflater;
++import android.view.View;
++import android.view.ViewGroup;
++
++import com.facebook.fresco.samples.showcase.BaseShowcaseFragment;
++import com.facebook.fresco.samples.showcase.R;
++import com.facebook.fresco.samples.showcase.imageformat.webplist.controller.SwitchController;
++import com.facebook.fresco.samples.showcase.imageformat.webplist.controller.WebpListController;
++
++/**
++ * This Fragment is used to display a large number of webp pictures in a list
++ * will appear to be stuck while sliding.
++ */
++public class ImageFormatWebpListFragment extends BaseShowcaseFragment implements
++        SwitchController.OnEnableChangeListener {
++
++  private WebpListController mListController;
++
++  @Nullable
++  @Override
++  public View onCreateView(
++          @NonNull LayoutInflater inflater,
++          @Nullable ViewGroup container,
++          @Nullable Bundle savedInstanceState) {
++    return inflater.inflate(R.layout.framgent_format_webp_list,
++            container, false);
++  }
++
++  @Override
++  public void onViewCreated(@NonNull View view, @Nullable Bundle savedInstanceState) {
++    mListController = new WebpListController((RecyclerView) view.findViewById(R.id.rcy_webp_list));
++    SwitchController dropFrameController = new SwitchController(
++            (SwitchCompat) view.findViewById(R.id.sw_enable_drop_frame));
++
++    mListController.bindData();
++    dropFrameController.setDropChangeListener(this);
++  }
++
++  @Override
++  public int getTitleId() {
++    return R.string.format_webp_list_title;
++  }
++
++  @Override
++  public void onDropChanged(boolean enable) {
++    if (mListController != null) {
++      mListController.onDropChanged(enable);
++    }
++  }
++}
+diff --git a/samples/showcase/src/main/java/com/facebook/fresco/samples/showcase/imageformat/webplist/adapter/WebpAdapter.java b/samples/showcase/src/main/java/com/facebook/fresco/samples/showcase/imageformat/webplist/adapter/WebpAdapter.java
+new file mode 100644
+index 000000000..aff6da1f6
+--- /dev/null
++++ b/samples/showcase/src/main/java/com/facebook/fresco/samples/showcase/imageformat/webplist/adapter/WebpAdapter.java
+@@ -0,0 +1,88 @@
++package com.facebook.fresco.samples.showcase.imageformat.webplist.adapter;
++
++import android.net.Uri;
++import android.support.annotation.NonNull;
++import android.support.v7.widget.RecyclerView;
++import android.view.LayoutInflater;
++import android.view.View;
++import android.view.ViewGroup;
++import android.widget.TextView;
++
++import com.facebook.drawee.backends.pipeline.Fresco;
++import com.facebook.drawee.interfaces.DraweeController;
++import com.facebook.drawee.view.SimpleDraweeView;
++import com.facebook.fresco.samples.showcase.R;
++import com.facebook.fresco.samples.showcase.misc.ImageUriProvider;
++import com.facebook.imagepipeline.common.ImageDecodeOptions;
++import com.facebook.imagepipeline.request.ImageRequestBuilder;
++
++/**
++ * The Adapter for the webp list;
++ * In this example, only one webp is playing. For privacy reasons, the webp list I use cannot
++ * be uploaded. You can add more webp items to show the problem of Stuck.
++ */
++public class WebpAdapter extends RecyclerView.Adapter<WebpAdapter.WebpViewHolder> {
++
++  private static final int MAX_SIZE = 10000;
++
++  private volatile boolean mEnableDropFrame = false;
++
++  @NonNull
++  @Override
++  public WebpViewHolder onCreateViewHolder(@NonNull ViewGroup parent, int viewType) {
++    return new WebpViewHolder(LayoutInflater.from(parent.getContext())
++            .inflate(R.layout.item_rcy_webp, parent, false),
++            mEnableDropFrame);
++  }
++
++  @Override
++  public void onBindViewHolder(@NonNull WebpViewHolder holder, int position) {
++    holder.bind(position);
++  }
++
++  @Override
++  public int getItemCount() {
++    return MAX_SIZE;
++  }
++
++  public void setEnableDropFrame(boolean enableDropped) {
++    mEnableDropFrame = enableDropped;
++  }
++
++  static class WebpViewHolder extends RecyclerView.ViewHolder {
++
++    private final ImageUriProvider imageUriProvider;
++
++    private SimpleDraweeView mWebpIv;
++    private TextView mTitleTv;
++    private String mShowText;
++    private boolean mEnableDrop;
++
++    WebpViewHolder(View itemView, boolean enableDrop) {
++      super(itemView);
++      mTitleTv = itemView.findViewById(R.id.tv_webp_title);
++      mWebpIv = itemView.findViewById(R.id.iv_webp);
++      imageUriProvider = ImageUriProvider.getInstance(itemView.getContext());
++      mEnableDrop = enableDrop;
++    }
++
++    void bind(int position) {
++      mShowText = "Pos_" + position;
++      mTitleTv.setText(mShowText);
++
++      Uri uri = imageUriProvider.createWebpAnimatedUri();
++      DraweeController controller = Fresco.newDraweeControllerBuilder()
++              .setImageRequest(
++                    ImageRequestBuilder.newBuilderWithSource(uri)
++                        .setImageDecodeOptions(
++                              ImageDecodeOptions.newBuilder()
++                              .setEnableDropFrame(mEnableDrop)
++                              .build())
++                    .build())
++              .setOldController(mWebpIv.getController())
++              .setAutoPlayAnimations(true)
++              .build();
++      mWebpIv.setController(controller);
++    }
++  }
++}
+diff --git a/samples/showcase/src/main/java/com/facebook/fresco/samples/showcase/imageformat/webplist/controller/SwitchController.java b/samples/showcase/src/main/java/com/facebook/fresco/samples/showcase/imageformat/webplist/controller/SwitchController.java
+new file mode 100644
+index 000000000..db09747bf
+--- /dev/null
++++ b/samples/showcase/src/main/java/com/facebook/fresco/samples/showcase/imageformat/webplist/controller/SwitchController.java
+@@ -0,0 +1,35 @@
++package com.facebook.fresco.samples.showcase.imageformat.webplist.controller;
++
++import android.support.v7.widget.SwitchCompat;
++import android.widget.CompoundButton;
++
++/**
++ * The Switch to change Normal/Drop
++ * Normal : the webp playback is more complete, but it may too cause stuck.
++ * Drop : the playback may drop some frame, but no stuck.
++ */
++public class SwitchController implements CompoundButton.OnCheckedChangeListener {
++
++  private boolean mEnable;
++  private OnEnableChangeListener mChangeListener;
++
++  public SwitchController(SwitchCompat switchCompat) {
++    switchCompat.setOnCheckedChangeListener(this);
++  }
++
++  public void setDropChangeListener(OnEnableChangeListener listener) {
++    mChangeListener = listener;
++  }
++
++  @Override
++  public void onCheckedChanged(CompoundButton buttonView, boolean isChecked) {
++    if (mEnable != isChecked && mChangeListener != null) {
++      mChangeListener.onDropChanged(isChecked);
++    }
++    mEnable = isChecked;
++  }
++
++  public interface OnEnableChangeListener {
++    void onDropChanged(boolean enableDropped);
++  }
++}
+diff --git a/samples/showcase/src/main/java/com/facebook/fresco/samples/showcase/imageformat/webplist/controller/WebpListController.java b/samples/showcase/src/main/java/com/facebook/fresco/samples/showcase/imageformat/webplist/controller/WebpListController.java
+new file mode 100644
+index 000000000..1b3cb184a
+--- /dev/null
++++ b/samples/showcase/src/main/java/com/facebook/fresco/samples/showcase/imageformat/webplist/controller/WebpListController.java
+@@ -0,0 +1,26 @@
++package com.facebook.fresco.samples.showcase.imageformat.webplist.controller;
++
++import android.support.v7.widget.RecyclerView;
++
++import com.facebook.fresco.samples.showcase.imageformat.webplist.adapter.WebpAdapter;
++import com.facebook.fresco.samples.showcase.imageformat.webplist.utils.RecyclerListUtil;
++
++public class WebpListController {
++
++  private RecyclerView mWebpListRcy;
++
++  public WebpListController(RecyclerView recyclerView) {
++    mWebpListRcy = recyclerView;
++  }
++
++  public void bindData() {
++    RecyclerListUtil.bindData(mWebpListRcy, new WebpAdapter());
++  }
++
++  public void onDropChanged(boolean enableDropped) {
++    WebpAdapter adapter = new WebpAdapter();
++    adapter.setEnableDropFrame(enableDropped);
++    RecyclerListUtil.bindData(mWebpListRcy, adapter);
++  }
++
++}
+diff --git a/samples/showcase/src/main/java/com/facebook/fresco/samples/showcase/imageformat/webplist/utils/RecyclerListUtil.java b/samples/showcase/src/main/java/com/facebook/fresco/samples/showcase/imageformat/webplist/utils/RecyclerListUtil.java
+new file mode 100644
+index 000000000..c539692e5
+--- /dev/null
++++ b/samples/showcase/src/main/java/com/facebook/fresco/samples/showcase/imageformat/webplist/utils/RecyclerListUtil.java
+@@ -0,0 +1,16 @@
++package com.facebook.fresco.samples.showcase.imageformat.webplist.utils;
++
++import android.support.v7.widget.RecyclerView;
++import android.support.v7.widget.StaggeredGridLayoutManager;
++
++public class RecyclerListUtil {
++
++  public static void bindData(RecyclerView view, RecyclerView.Adapter adapter) {
++    view.setHasFixedSize(true);
++    view.setItemAnimator(null);
++    view.setLayoutManager(new StaggeredGridLayoutManager(4,
++            RecyclerView.VERTICAL));
++    view.setAdapter(adapter);
++  }
++
++}
+diff --git a/samples/showcase/src/main/res/layout/framgent_format_webp_list.xml b/samples/showcase/src/main/res/layout/framgent_format_webp_list.xml
+new file mode 100644
+index 000000000..eb3d75a1c
+--- /dev/null
++++ b/samples/showcase/src/main/res/layout/framgent_format_webp_list.xml
+@@ -0,0 +1,31 @@
++<?xml version="1.0" encoding="utf-8"?>
++<LinearLayout
++    xmlns:android="http://schemas.android.com/apk/res/android"
++    android:layout_width="match_parent"
++    android:layout_height="match_parent"
++    android:orientation="vertical"
++    >
++
++    <LinearLayout
++        android:layout_width="match_parent"
++        android:layout_height="wrap_content"
++        android:orientation="horizontal"
++        >
++
++        <android.support.v7.widget.SwitchCompat
++            android:id="@+id/sw_enable_drop_frame"
++            android:text="@string/format_name_webp_list_drop_enable"
++            android:layout_width="wrap_content"
++            android:layout_height="wrap_content"
++            />
++
++    </LinearLayout>
++
++    <android.support.v7.widget.RecyclerView
++        android:id="@+id/rcy_webp_list"
++        android:orientation="vertical"
++        android:layout_width="match_parent"
++        android:layout_height="match_parent"
++        />
++
++</LinearLayout>
+diff --git a/samples/showcase/src/main/res/layout/item_rcy_webp.xml b/samples/showcase/src/main/res/layout/item_rcy_webp.xml
+new file mode 100644
+index 000000000..5b16f4b66
+--- /dev/null
++++ b/samples/showcase/src/main/res/layout/item_rcy_webp.xml
+@@ -0,0 +1,21 @@
++<?xml version="1.0" encoding="utf-8"?>
++<FrameLayout xmlns:android="http://schemas.android.com/apk/res/android"
++    android:orientation="vertical"
++    android:layout_width="match_parent"
++    android:layout_height="140dp"
++    >
++
++    <com.facebook.drawee.view.SimpleDraweeView
++        android:id="@+id/iv_webp"
++        android:layout_width="match_parent"
++        android:layout_height="match_parent"
++        />
++
++    <TextView
++        android:id="@+id/tv_webp_title"
++        android:layout_gravity="center"
++        android:layout_width="wrap_content"
++        android:layout_height="wrap_content"
++        />
++
++</FrameLayout>
+\ No newline at end of file
+diff --git a/samples/showcase/src/main/res/menu/activity_main_drawer.xml b/samples/showcase/src/main/res/menu/activity_main_drawer.xml
+index 564d0a581..a2e9f1ff7 100644
+--- a/samples/showcase/src/main/res/menu/activity_main_drawer.xml
++++ b/samples/showcase/src/main/res/menu/activity_main_drawer.xml
+@@ -117,6 +117,10 @@
+             android:id="@+id/nav_format_webp"
+             android:title="@string/format_webp_title"
+             />
++        <item
++            android:id="@+id/nav_format_webp_list"
++            android:title="@string/format_webp_list_title"
++            />
+         <item
+             android:id="@+id/nav_format_svg"
+             android:title="@string/format_svg_title"
+diff --git a/samples/showcase/src/main/res/values/strings.xml b/samples/showcase/src/main/res/values/strings.xml
+index 3bd030b92..5186ed88e 100644
+--- a/samples/showcase/src/main/res/values/strings.xml
++++ b/samples/showcase/src/main/res/values/strings.xml
+@@ -120,6 +120,8 @@
+   <string name="format_webp_translucent_help">The above Drawee displays a loss-less WebP image with semi-transparent areas.</string>
+   <string name="format_webp_animated_help">The above Drawee displays an animated WebP image</string>
+ 
++  <string name="format_webp_list_title">WebP List</string>
++
+   <string name="format_pjpeg_title">Progressive JPEG</string>
+   <string name="format_pjpeg_help">Select a progressive JPEG from the spinner and enable or disable progessive JPEG support with the switch.</string>
+   <string name="format_pjpeg_switch_rendering_enabled">Progressive JPEG rendering enabled</string>
+@@ -228,6 +230,7 @@
+   <string name="format_name_png_landscape">PNG landscape</string>
+   <string name="format_name_png_portrait">PNG portrait</string>
+   <string name="format_name_webp">WebP</string>
++  <string name="format_name_webp_list_drop_enable">Drop frame</string>
+   <string name="format_name_animated_webp">animated WebP</string>
+   <string name="format_name_translucent_webp">translucent WebP</string>
+ 

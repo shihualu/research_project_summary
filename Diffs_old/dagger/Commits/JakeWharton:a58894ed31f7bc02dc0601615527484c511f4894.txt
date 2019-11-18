@@ -1,0 +1,665 @@
+diff --git a/reflect/build.gradle b/reflect/build.gradle
+index 0147b07a9..457e0132c 100644
+--- a/reflect/build.gradle
++++ b/reflect/build.gradle
+@@ -9,6 +9,8 @@ buildscript {
+     'truth': 'com.google.truth:truth:0.42',
+     'javaPoet': 'com.squareup:javapoet:1.11.1',
+     'autoService': 'com.google.auto.service:auto-service:1.0-rc4',
++    'autoValue': 'com.google.auto.value:auto-value:1.6.2',
++    'autoValueAnnotations': 'com.google.auto.value:auto-value-annotations:1.6.2',
+     'compileTesting': 'com.google.testing.compile:compile-testing:0.15',
+   ]
+ }
+diff --git a/reflect/reflect/build.gradle b/reflect/reflect/build.gradle
+index cd953e305..4fcb51f01 100644
+--- a/reflect/reflect/build.gradle
++++ b/reflect/reflect/build.gradle
+@@ -7,6 +7,9 @@ dependencies {
+   api deps.dagger.runtime
+   implementation deps.annotations
+ 
++  implementation deps.autoValueAnnotations
++  annotationProcessor deps.autoValue
++
+   testImplementation project(':codegen')
+   testImplementation deps.junit
+   testImplementation deps.truth
+diff --git a/reflect/reflect/src/main/java/dagger/reflect/Binding.java b/reflect/reflect/src/main/java/dagger/reflect/Binding.java
+new file mode 100644
+index 000000000..23370b6e0
+--- /dev/null
++++ b/reflect/reflect/src/main/java/dagger/reflect/Binding.java
+@@ -0,0 +1,32 @@
++package dagger.reflect;
++
++abstract class Binding<T> {
++  private Request[] requests;
++
++  protected abstract Request[] initialize();
++
++  protected abstract T resolve(Object[] dependencies);
++
++  final T resolve(InstanceGraph graph) {
++    Request[] requests = this.requests;
++    if (requests == null) {
++      synchronized (this) {
++        requests = this.requests;
++        if (requests == null) {
++          requests = initialize();
++          if (requests == null) {
++            throw new IllegalStateException("Binding " + this + " returned null from initialize()");
++          }
++          this.requests = requests;
++        }
++      }
++    }
++
++    int requestCount = requests.length;
++    Object[] dependencies = new Object[requestCount];
++    for (int i = 0; i < requestCount; i++) {
++      dependencies[i] = requests[i].resolve(graph);
++    }
++    return resolve(dependencies);
++  }
++}
+diff --git a/reflect/reflect/src/main/java/dagger/reflect/BindsBinding.java b/reflect/reflect/src/main/java/dagger/reflect/BindsBinding.java
+new file mode 100644
+index 000000000..c41f69bf0
+--- /dev/null
++++ b/reflect/reflect/src/main/java/dagger/reflect/BindsBinding.java
+@@ -0,0 +1,50 @@
++package dagger.reflect;
++
++import java.lang.annotation.Annotation;
++import java.lang.reflect.Method;
++
++import static dagger.reflect.Util.findScope;
++import static java.lang.reflect.Modifier.ABSTRACT;
++
++final class BindsBinding extends Binding<Object> {
++  private final Method method;
++  private final Annotation scope;
++
++  BindsBinding(Method method, Annotation scope) {
++    this.method = method;
++    this.scope = scope;
++  }
++
++  @Override protected Request[] initialize() {
++    int parameterCount = method.getParameterTypes().length;
++    if (parameterCount != 1) {
++      throw new IllegalStateException("@Binds must have single parameter: "
++          + method.getDeclaringClass().getName()
++          + '.'
++          + method.getName());
++    }
++    if ((method.getModifiers() & ABSTRACT) == 0) {
++      throw new IllegalStateException("@Binds methods must be abstract: "
++          + method.getDeclaringClass()
++          + '.'
++          + method.getName());
++    }
++
++    // TODO check visibility
++    method.setAccessible(true);
++
++    Annotation[] annotations = method.getDeclaredAnnotations();
++    Annotation methodScope = findScope(annotations);
++    if (!Util.equals(scope, methodScope)) {
++      // TODO real error message
++      throw new IllegalStateException("Cannot provide " + methodScope + " in " + scope);
++    }
++
++    Key delegate = Key.fromMethodParameter(method, 0);
++    return new Request[] { Request.of(delegate, Request.Lookup.INSTANCE) };
++  }
++
++  @Override protected Object resolve(Object[] dependencies) {
++    return dependencies[0];
++  }
++}
+diff --git a/reflect/reflect/src/main/java/dagger/reflect/ComponentInvocationHandler.java b/reflect/reflect/src/main/java/dagger/reflect/ComponentInvocationHandler.java
+index c18b41341..5ac3fc946 100644
+--- a/reflect/reflect/src/main/java/dagger/reflect/ComponentInvocationHandler.java
++++ b/reflect/reflect/src/main/java/dagger/reflect/ComponentInvocationHandler.java
+@@ -40,7 +40,7 @@
+         throw notImplemented("Subcomponents");
+       }
+ 
+-      Key key = new Key(findQualifier(annotations), returnType);
++      Key key = Key.of(findQualifier(annotations), returnType);
+       return instanceGraph.getInstance(key);
+     }
+ 
+diff --git a/reflect/reflect/src/main/java/dagger/reflect/DaggerReflect.java b/reflect/reflect/src/main/java/dagger/reflect/DaggerReflect.java
+index bab1cd2a2..4cc0bd00a 100644
+--- a/reflect/reflect/src/main/java/dagger/reflect/DaggerReflect.java
++++ b/reflect/reflect/src/main/java/dagger/reflect/DaggerReflect.java
+@@ -13,13 +13,10 @@
+ import java.util.Deque;
+ import java.util.LinkedHashSet;
+ import java.util.Set;
+-import javax.inject.Provider;
+ 
+ import static dagger.reflect.Util.findQualifier;
+ import static dagger.reflect.Util.findScope;
+ import static dagger.reflect.Util.hasAnnotation;
+-import static dagger.reflect.Util.tryInvoke;
+-import static java.lang.reflect.Modifier.ABSTRACT;
+ 
+ public final class DaggerReflect {
+   public static <C> C create(Class<C> componentClass) {
+@@ -55,75 +52,24 @@
+       if (module == null) {
+         throw new IllegalStateException("Module " + moduleClass + " missing @Module");
+       }
++      if (module.subcomponents().length != 0) {
++        throw notImplemented("Module subcomponents");
++      }
+       Collections.addAll(moduleQueue, module.includes());
+-      // TODO subcomponents
+ 
+       for (final Method method : moduleClass.getDeclaredMethods()) {
+         Type returnType = method.getGenericReturnType();
+         Annotation[] annotations = method.getDeclaredAnnotations();
+         Annotation qualifier = findQualifier(annotations);
+-        int parameterCount = method.getParameterTypes().length;
++        Key key = Key.of(qualifier, returnType);
+ 
+         if (hasAnnotation(annotations, Provides.class)) {
+-          final Request[] requests = new Request[parameterCount];
+-          for (int i = 0; i < parameterCount; i++) {
+-            requests[i] = Request.fromMethodParameter(method, i);
+-          }
+-
+-          // TODO check visibility
+-          method.setAccessible(true);
+-
+-          Annotation methodScope = findScope(annotations);
+-          if (!Util.equals(scope, methodScope)) {
+-            // TODO real error message
+-            throw new IllegalStateException("Cannot provide " + methodScope + " in " + scope);
+-          }
+-
+-          instanceGraph.put(new Key(qualifier, returnType), new Provider<Object>() {
+-            @Override public Object get() {
+-              Object[] arguments = new Object[requests.length];
+-              for (int i = 0; i < requests.length; i++) {
+-                arguments[i] = requests[i].resolve(instanceGraph);
+-              }
+-              return tryInvoke(method, null, arguments);
+-            }
+-          });
+-          continue;
+-        }
+-
+-        if (hasAnnotation(annotations, Binds.class)) {
+-          if (parameterCount != 1) {
+-            throw new IllegalStateException("@Binds must have single parameter: "
+-                + method.getDeclaringClass().getName()
+-                + '.'
+-                + method.getName());
+-          }
+-          if ((method.getModifiers() & ABSTRACT) == 0) {
+-            throw new IllegalStateException("@Binds methods must be abstract: "
+-                + method.getDeclaringClass()
+-                + '.'
+-                + method.getName());
+-          }
+-
+-          // TODO check visibility
+-          method.setAccessible(true);
+-
+-          Annotation methodScope = findScope(annotations);
+-          if (!Util.equals(scope, methodScope)) {
+-            // TODO real error message
+-            throw new IllegalStateException("Cannot provide " + methodScope + " in " + scope);
+-          }
+-
+-          final Key delegate = Key.fromMethodParameter(method, 0);
+-          instanceGraph.put(new Key(qualifier, returnType), new Provider<Object>() {
+-            @Override public Object get() {
+-              return instanceGraph.getInstance(delegate);
+-            }
+-          });
+-          continue;
++          instanceGraph.put(key, new ProvidesBinding(method, scope));
++        } else if (hasAnnotation(annotations, Binds.class)) {
++          instanceGraph.put(key, new BindsBinding(method, scope));
++        } else {
++          throw notImplemented("Method " + method);
+         }
+-
+-        throw notImplemented("Method " + method);
+       }
+     }
+ 
+diff --git a/reflect/reflect/src/main/java/dagger/reflect/InstanceGraph.java b/reflect/reflect/src/main/java/dagger/reflect/InstanceGraph.java
+index 923dc98aa..cbc68eb72 100644
+--- a/reflect/reflect/src/main/java/dagger/reflect/InstanceGraph.java
++++ b/reflect/reflect/src/main/java/dagger/reflect/InstanceGraph.java
+@@ -8,8 +8,8 @@
+ 
+ final class InstanceGraph {
+   private final @Nullable InstanceGraph parent;
+-  private final ConcurrentHashMap<Key, Provider<?>> bindings =
+-      new ConcurrentHashMap<Key, Provider<?>>();
++  private final ConcurrentHashMap<Key, Binding<?>> bindings =
++      new ConcurrentHashMap<Key, Binding<?>>();
+ 
+   InstanceGraph() {
+     this(null);
+@@ -19,25 +19,39 @@
+     this.parent = parent;
+   }
+ 
+-  void put(Key key, Provider<?> provider) {
++  void put(Key key, Binding<?> provider) {
+     if (bindings.put(key, provider) != null) {
+       throw new IllegalStateException("Duplicate binding for " + key);
+     }
+   }
+ 
++  private Binding<?> getBinding(Key key) {
++    Binding<?> binding = bindings.get(key);
++    if (binding != null) {
++      return binding;
++    }
++    if (parent != null) {
++      binding = parent.getBinding(key);
++      if (binding != null) {
++        return binding;
++      }
++    }
++
++    Binding<?> newBinding = new JustInTimeBinding(key);
++    Binding<?> oldBinding = bindings.putIfAbsent(key, newBinding);
++    return oldBinding != null ? oldBinding : newBinding;
++  }
++
+   Object getInstance(Key key) {
+-    return getProvider(key).get();
++    return getBinding(key).resolve(this);
+   }
+ 
+-  Provider<?> getProvider(Key key) {
+-    Provider<?> provider = bindings.get(key);
+-    if (provider == null && parent != null) {
+-      provider = parent.getProvider(key);
+-    }
+-    if (provider == null) {
+-      throw new IllegalStateException("No binding for " + key);
+-    }
+-    return provider;
++  Provider<?> getProvider(final Key key) {
++    return new Provider<Object>() {
++      @Override public Object get() {
++        return getInstance(key);
++      }
++    };
+   }
+ 
+   Lazy<?> getLazy(Key key) {
+diff --git a/reflect/reflect/src/main/java/dagger/reflect/JustInTimeBinding.java b/reflect/reflect/src/main/java/dagger/reflect/JustInTimeBinding.java
+new file mode 100644
+index 000000000..1537d5479
+--- /dev/null
++++ b/reflect/reflect/src/main/java/dagger/reflect/JustInTimeBinding.java
+@@ -0,0 +1,52 @@
++package dagger.reflect;
++
++import java.lang.reflect.Constructor;
++import javax.inject.Inject;
++
++import static dagger.reflect.Util.tryNewInstance;
++
++final class JustInTimeBinding extends Binding<Object> {
++  private final Key key;
++  private Constructor<?> constructor;
++
++  JustInTimeBinding(Key key) {
++    this.key = key;
++  }
++
++  @Override protected Request[] initialize() {
++    if (key.qualifer() == null && key.type() instanceof Class<?>) {
++      Class<?> target = (Class<?>) key.type();
++
++      Constructor<?> constructor = null;
++      for (Constructor<?> candidate : target.getDeclaredConstructors()) {
++        if (candidate.getAnnotation(Inject.class) != null) {
++          if (constructor != null) {
++            throw new IllegalStateException(target + " defines multiple @Inject constructors");
++          }
++          constructor = candidate;
++        }
++      }
++      if (constructor == null) {
++        throw new IllegalStateException(target + " has no @Inject constructor");
++      }
++
++      // TODO check visibility
++      constructor.setAccessible(true);
++
++      this.constructor = constructor;
++
++      int parameterCount = constructor.getParameterTypes().length;
++      Request[] requests = new Request[parameterCount];
++      for (int i = 0; i < parameterCount; i++) {
++        requests[i] = Request.fromConstructorParameter(constructor, i);
++      }
++      return requests;
++    }
++
++    throw new IllegalStateException("No binding for " + key);
++  }
++
++  @Override protected Object resolve(Object[] dependencies) {
++    return tryNewInstance(constructor, dependencies);
++  }
++}
+diff --git a/reflect/reflect/src/main/java/dagger/reflect/Key.java b/reflect/reflect/src/main/java/dagger/reflect/Key.java
+index a5dfcea4f..a759c1f06 100644
+--- a/reflect/reflect/src/main/java/dagger/reflect/Key.java
++++ b/reflect/reflect/src/main/java/dagger/reflect/Key.java
+@@ -1,42 +1,24 @@
+ package dagger.reflect;
+ 
++import com.google.auto.value.AutoValue;
+ import java.lang.annotation.Annotation;
+ import java.lang.reflect.Method;
+ import java.lang.reflect.Type;
+ import org.jetbrains.annotations.Nullable;
+ 
+ /** A type and optional qualifier. */
+-final class Key {
++@AutoValue
++abstract class Key {
+   static Key fromMethodParameter(Method method, int parameterIndex) {
+     Annotation qualifier = Util.findQualifier(method.getParameterAnnotations()[parameterIndex]);
+     Type type = method.getGenericParameterTypes()[parameterIndex];
+-    return new Key(qualifier, type);
++    return new AutoValue_Key(qualifier, type);
+   }
+ 
+-  private final @Nullable Annotation qualifer;
+-  private final Type type;
+-
+-  Key(@Nullable Annotation qualifer, Type type) {
+-    this.qualifer = qualifer;
+-    this.type = type;
+-  }
+-
+-  @Override public String toString() {
+-    if (qualifer != null) {
+-      return "@" + qualifer + " " + type;
+-    }
+-    return type.toString();
++  static Key of(@Nullable Annotation qualifier, Type type) {
++    return new AutoValue_Key(qualifier, type);
+   }
+ 
+-  @Override public boolean equals(Object obj) {
+-    if (obj == this) return true;
+-    if (!(obj instanceof Key)) return false;
+-    Key other = (Key) obj;
+-    return type.equals(other.type)
+-        && Util.equals(qualifer, other.qualifer);
+-  }
+-
+-  @Override public int hashCode() {
+-    return 31 * type.hashCode() + (qualifer != null ? qualifer.hashCode() : 0);
+-  }
++  abstract @Nullable Annotation qualifer();
++  abstract Type type();
+ }
+diff --git a/reflect/reflect/src/main/java/dagger/reflect/ProvidesBinding.java b/reflect/reflect/src/main/java/dagger/reflect/ProvidesBinding.java
+new file mode 100644
+index 000000000..715977850
+--- /dev/null
++++ b/reflect/reflect/src/main/java/dagger/reflect/ProvidesBinding.java
+@@ -0,0 +1,40 @@
++package dagger.reflect;
++
++import java.lang.annotation.Annotation;
++import java.lang.reflect.Method;
++
++import static dagger.reflect.Util.findScope;
++import static dagger.reflect.Util.tryInvoke;
++
++final class ProvidesBinding extends Binding<Object> {
++  private final Method method;
++  private final Annotation scope;
++
++  ProvidesBinding(Method method, Annotation scope) {
++    this.method = method;
++    this.scope = scope;
++  }
++
++  @Override protected Request[] initialize() {
++    // TODO check visibility
++    method.setAccessible(true);
++
++    Annotation[] annotations = method.getDeclaredAnnotations();
++    Annotation methodScope = findScope(annotations);
++    if (!Util.equals(scope, methodScope)) {
++      // TODO real error message
++      throw new IllegalStateException("Cannot provide " + methodScope + " in " + scope);
++    }
++
++    int parameterCount = method.getParameterTypes().length;
++    Request[] requests = new Request[parameterCount];
++    for (int i = 0; i < parameterCount; i++) {
++      requests[i] = Request.fromMethodParameter(method, i);
++    }
++    return requests;
++  }
++
++  @Override protected Object resolve(Object[] dependencies) {
++    return tryInvoke(method, null, dependencies);
++  }
++}
+diff --git a/reflect/reflect/src/main/java/dagger/reflect/Request.java b/reflect/reflect/src/main/java/dagger/reflect/Request.java
+index 327b0417b..1abcbb7e4 100644
+--- a/reflect/reflect/src/main/java/dagger/reflect/Request.java
++++ b/reflect/reflect/src/main/java/dagger/reflect/Request.java
+@@ -1,18 +1,31 @@
+ package dagger.reflect;
+ 
++import com.google.auto.value.AutoValue;
+ import dagger.Lazy;
+ import java.lang.annotation.Annotation;
++import java.lang.reflect.Constructor;
+ import java.lang.reflect.Method;
+ import java.lang.reflect.ParameterizedType;
+ import java.lang.reflect.Type;
+ import javax.inject.Provider;
++import org.jetbrains.annotations.NotNull;
+ 
+ /** A key and its lookup type. */
+-final class Request {
++@AutoValue
++abstract class Request {
+   static Request fromMethodParameter(Method method, int parameterIndex) {
+-    Annotation qualifier = Util.findQualifier(method.getParameterAnnotations()[parameterIndex]);
++    return fromTypeAndAnnotations(
++        method.getGenericParameterTypes()[parameterIndex],
++        method.getParameterAnnotations()[parameterIndex]);
++  }
++
++  static Request fromConstructorParameter(Constructor<?> constructor, int parameterIndex) {
++    return fromTypeAndAnnotations(
++        constructor.getGenericParameterTypes()[parameterIndex],
++        constructor.getParameterAnnotations()[parameterIndex]);
++  }
+ 
+-    Type type = method.getGenericParameterTypes()[parameterIndex];
++  private static Request fromTypeAndAnnotations(Type type, Annotation[] annotations) {
+     Lookup lookup = Lookup.INSTANCE;
+     if (type instanceof ParameterizedType) {
+       ParameterizedType parameterizedType = (ParameterizedType) type;
+@@ -26,19 +39,19 @@ static Request fromMethodParameter(Method method, int parameterIndex) {
+       }
+     }
+ 
+-    return new Request(new Key(qualifier, type), lookup);
++    Annotation qualifier = Util.findQualifier(annotations);
++    return new AutoValue_Request(Key.of(qualifier, type), lookup);
+   }
+ 
+-  private final Key key;
+-  private final Lookup lookup;
+-
+-  Request(Key key, Lookup lookup) {
+-    this.key = key;
+-    this.lookup = lookup;
++  static Request of(Key key, Lookup lookup) {
++    return new AutoValue_Request(key, lookup);
+   }
+ 
++  abstract Key key();
++  abstract Lookup lookup();
++
+   Object resolve(InstanceGraph instanceGraph) {
+-    return lookup.lookup(instanceGraph, key);
++    return lookup().lookup(instanceGraph, key());
+   }
+ 
+   enum Lookup {
+diff --git a/reflect/reflect/src/main/java/dagger/reflect/Util.java b/reflect/reflect/src/main/java/dagger/reflect/Util.java
+index dc4acf564..f3ed82e94 100644
+--- a/reflect/reflect/src/main/java/dagger/reflect/Util.java
++++ b/reflect/reflect/src/main/java/dagger/reflect/Util.java
+@@ -1,6 +1,7 @@
+ package dagger.reflect;
+ 
+ import java.lang.annotation.Annotation;
++import java.lang.reflect.Constructor;
+ import java.lang.reflect.InvocationTargetException;
+ import java.lang.reflect.Method;
+ import java.util.Arrays;
+@@ -70,5 +71,22 @@ static Object tryInvoke(Method method, Object target, Object... arguments) {
+             + Arrays.toString(arguments), cause);
+   }
+ 
++  static <T> T tryNewInstance(Constructor<T> constructor, Object... arguments) {
++    Throwable cause;
++    try {
++      return constructor.newInstance(arguments);
++    } catch (IllegalAccessException e) {
++      cause = e;
++    } catch (InstantiationException e) {
++      cause = e;
++    } catch (InvocationTargetException e) {
++      cause = e.getCause();
++      if (cause instanceof RuntimeException) throw (RuntimeException) cause;
++      if (cause instanceof Error) throw (Error) cause;
++    }
++    throw new RuntimeException(
++        "Unable to invoke " + constructor + " with arguments " + Arrays.toString(arguments), cause);
++  }
++
+   private Util() {}
+ }
+diff --git a/reflect/reflect/src/test/java/dagger/TestComponent.java b/reflect/reflect/src/test/java/dagger/TestComponent.java
+index 0bee03667..d428b838d 100644
+--- a/reflect/reflect/src/test/java/dagger/TestComponent.java
++++ b/reflect/reflect/src/test/java/dagger/TestComponent.java
+@@ -1,7 +1,52 @@
+ package dagger;
+ 
++import java.lang.annotation.Retention;
++import javax.inject.Inject;
++import javax.inject.Provider;
++import javax.inject.Qualifier;
++
++import static java.lang.annotation.RetentionPolicy.RUNTIME;
++
+ @Component(modules = TestModule.class)
+ interface TestComponent {
+   CharSequence hello();
+ }
+ 
++@Module
++abstract class TestModule {
++  @Provides static @Greeting String provideGreetingString(EnglishGreeting greeting) {
++    return greeting.get();
++  }
++
++  @Provides static @Target String provideTargetString() {
++    return "world";
++  }
++
++  @Provides static @Exclamation String provideExclaimationString() {
++    return "!";
++  }
++
++  @Provides static String provideString(
++      @Greeting String greeting,
++      @Target Provider<String> target,
++      @Exclamation Lazy<String> exclaimation) {
++    return greeting + ", " + target.get() + exclaimation.get();
++  }
++
++  @Binds abstract CharSequence provideCharSequence(String hello);
++
++  @Retention(RUNTIME)
++  @Qualifier @interface Greeting {}
++  @Retention(RUNTIME)
++  @Qualifier @interface Target {}
++  @Retention(RUNTIME)
++  @Qualifier @interface Exclamation {}
++}
++
++class EnglishGreeting {
++  @Inject EnglishGreeting() {}
++
++  String get() {
++    return "Hello";
++  }
++}
+diff --git a/reflect/reflect/src/test/java/dagger/TestModule.java b/reflect/reflect/src/test/java/dagger/TestModule.java
+deleted file mode 100644
+index 09d88f387..000000000
+--- a/reflect/reflect/src/test/java/dagger/TestModule.java
++++ /dev/null
+@@ -1,38 +0,0 @@
+-package dagger;
+-
+-import java.lang.annotation.Retention;
+-import javax.inject.Provider;
+-import javax.inject.Qualifier;
+-
+-import static java.lang.annotation.RetentionPolicy.RUNTIME;
+-
+-@Module
+-abstract class TestModule {
+-  @Provides static @Hello String provideHelloString() {
+-    return "Hello";
+-  }
+-
+-  @Provides static @World String provideWorldString() {
+-    return "world";
+-  }
+-
+-  @Provides static @Exclamation String provideExclaimationString() {
+-    return "!";
+-  }
+-
+-  @Provides static String provideString(
+-      @Hello String hello,
+-      @World Provider<String> world,
+-      @Exclamation Lazy<String> exclaimation) {
+-    return hello + ", " + world.get() + exclaimation.get();
+-  }
+-
+-  @Binds abstract CharSequence provideCharSequence(String hello);
+-
+-  @Retention(RUNTIME)
+-  @Qualifier @interface Hello {}
+-  @Retention(RUNTIME)
+-  @Qualifier @interface World {}
+-  @Retention(RUNTIME)
+-  @Qualifier @interface Exclamation {}
+-}

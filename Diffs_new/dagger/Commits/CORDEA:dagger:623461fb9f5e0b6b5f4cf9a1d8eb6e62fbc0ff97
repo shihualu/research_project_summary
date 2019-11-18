@@ -1,0 +1,370 @@
+diff --git a/java/dagger/internal/codegen/DuplicateBindingsValidator.java b/java/dagger/internal/codegen/DuplicateBindingsValidator.java
+index 3303e1f5b..acea15cbc 100644
+--- a/java/dagger/internal/codegen/DuplicateBindingsValidator.java
++++ b/java/dagger/internal/codegen/DuplicateBindingsValidator.java
+@@ -18,29 +18,34 @@
+ 
+ import static com.google.common.base.Verify.verify;
+ import static com.google.common.collect.Iterables.getOnlyElement;
++import static com.google.common.collect.Maps.filterValues;
++import static com.google.common.collect.Maps.transformValues;
+ import static dagger.internal.codegen.DaggerStreams.instancesOf;
+ import static dagger.internal.codegen.DaggerStreams.toImmutableSet;
+ import static dagger.internal.codegen.DaggerStreams.toImmutableSetMultimap;
+-import static dagger.internal.codegen.DuplicateBindingsValidator.SourceAndRequest.indexEdgesBySourceAndRequest;
+ import static dagger.internal.codegen.Formatter.INDENT;
+ import static dagger.internal.codegen.Optionals.emptiesLast;
+ import static java.util.Comparator.comparing;
+ import static javax.tools.Diagnostic.Kind.ERROR;
+ 
+ import com.google.auto.value.AutoValue;
++import com.google.common.base.Equivalence;
+ import com.google.common.collect.ImmutableList;
+ import com.google.common.collect.ImmutableSet;
+ import com.google.common.collect.ImmutableSetMultimap;
+ import com.google.common.collect.Iterables;
+-import com.google.common.collect.Multimaps;
+ import com.google.common.collect.Sets;
++import dagger.model.Binding;
+ import dagger.model.BindingGraph;
+-import dagger.model.BindingGraph.DependencyEdge;
+ import dagger.model.BindingGraph.Node;
+ import dagger.model.DependencyRequest;
++import dagger.model.Key;
+ import dagger.spi.BindingGraphPlugin;
+ import dagger.spi.DiagnosticReporter;
+ import java.util.Comparator;
++import java.util.HashSet;
++import java.util.Map;
++import java.util.Objects;
+ import java.util.Set;
+ import javax.inject.Inject;
+ import javax.lang.model.element.Element;
+@@ -65,6 +70,27 @@
+                   comparing((Element element) -> element.getSimpleName().toString())
+                       .thenComparing((Element element) -> element.asType().toString())));
+ 
++  /**
++   * An {@link Equivalence} between {@link Binding}s that ignores the {@link
++   * Binding#componentPath()}. (All other properties are essentially derived from the {@link
++   * Binding#bindingElement()} and {@link Binding#contributingModule()}, so only those two are
++   * compared.)
++   */
++  // TODO(dpb): Move to dagger.model?
++  private static final Equivalence<Binding> IGNORING_COMPONENT_PATH =
++      new Equivalence<Binding>() {
++        @Override
++        protected boolean doEquivalent(Binding a, Binding b) {
++          return a.bindingElement().equals(b.bindingElement())
++              && a.contributingModule().equals(b.contributingModule());
++        }
++
++        @Override
++        protected int doHash(Binding binding) {
++          return Objects.hash(binding.bindingElement(), binding.contributingModule());
++        }
++      };
++
+   private final BindingDeclarationFormatter bindingDeclarationFormatter;
+ 
+   @Inject
+@@ -79,61 +105,74 @@ public String pluginName() {
+ 
+   @Override
+   public void visitGraph(BindingGraph bindingGraph, DiagnosticReporter diagnosticReporter) {
+-    Multimaps.asMap(indexEdgesBySourceAndRequest(bindingGraph))
++    // If two unrelated subcomponents have the same duplicate bindings only because they install the
++    // same two modules, then fixing the error in one subcomponent will uncover the second
++    // subcomponent to fix.
++    // TODO(ronshapiro): Explore ways to address such underreporting without overreporting.
++    Set<ImmutableSet<Equivalence.Wrapper<Binding>>> reportedDuplicateBindingSets = new HashSet<>();
++    duplicateBindings(bindingGraph)
+         .forEach(
+-            (sourceAndRequest, dependencyEdges) -> {
+-              if (dependencyEdges.size() > 1) {
+-                reportDuplicateBindings(
+-                    sourceAndRequest.request(), dependencyEdges, bindingGraph, diagnosticReporter);
++            (sourceAndRequest, resolvedBindings) -> {
++              // Only report each set of duplicate bindings once, ignoring the installed component.
++              if (reportedDuplicateBindingSets.add(
++                  equivalentSetIgnoringComponentPath(resolvedBindings))) {
++                reportDuplicateBindings(resolvedBindings, bindingGraph, diagnosticReporter);
+               }
+             });
+   }
+ 
++  /**
++   * Returns duplicate bindings for each dependency request, counting the same dependency request
++   * separately when coming from separate source nodes.
++   */
++  private Map<SourceAndRequest, ImmutableSet<Binding>> duplicateBindings(
++      BindingGraph bindingGraph) {
++    ImmutableSetMultimap<SourceAndRequest, Binding> bindingsByDependencyRequest =
++        bindingGraph.dependencyEdges().stream()
++            .filter(edge -> bindingGraph.network().incidentNodes(edge).target() instanceof Binding)
++            .collect(
++                toImmutableSetMultimap(
++                    edge ->
++                        SourceAndRequest.create(
++                            bindingGraph.network().incidentNodes(edge).source(),
++                            edge.dependencyRequest()),
++                    edge -> ((Binding) bindingGraph.network().incidentNodes(edge).target())));
++    return transformValues(
++        filterValues(bindingsByDependencyRequest.asMap(), bindings -> bindings.size() > 1),
++        ImmutableSet::copyOf);
++  }
++
+   private void reportDuplicateBindings(
+-      DependencyRequest dependencyRequest,
+-      Set<DependencyEdge> duplicateDependencies,
++      ImmutableSet<Binding> duplicateBindings,
+       BindingGraph bindingGraph,
+       DiagnosticReporter diagnosticReporter) {
+-    ImmutableSet<dagger.model.Binding> duplicateBindings =
+-        duplicateDependencies.stream()
+-            .map(edge -> bindingGraph.network().incidentNodes(edge).target())
+-            .flatMap(instancesOf(dagger.model.Binding.class))
+-            .collect(toImmutableSet());
+-    diagnosticReporter.reportDependency(
++    Binding oneBinding = duplicateBindings.asList().get(0);
++    diagnosticReporter.reportBinding(
+         ERROR,
+-        Iterables.get(duplicateDependencies, 0),
++        oneBinding,
+         Iterables.any(duplicateBindings, binding -> binding.kind().isMultibinding())
+-            ? incompatibleBindingsMessage(dependencyRequest, duplicateBindings, bindingGraph)
+-            : duplicateBindingMessage(dependencyRequest, duplicateBindings, bindingGraph));
++            ? incompatibleBindingsMessage(oneBinding.key(), duplicateBindings, bindingGraph)
++            : duplicateBindingMessage(oneBinding.key(), duplicateBindings, bindingGraph));
+   }
+ 
+   private String duplicateBindingMessage(
+-      DependencyRequest dependencyRequest,
+-      ImmutableSet<dagger.model.Binding> duplicateBindings,
+-      BindingGraph graph) {
+-    StringBuilder message =
+-        new StringBuilder().append(dependencyRequest.key()).append(" is bound multiple times:");
++      Key key, ImmutableSet<Binding> duplicateBindings, BindingGraph graph) {
++    StringBuilder message = new StringBuilder().append(key).append(" is bound multiple times:");
+     formatDeclarations(message, 1, declarations(graph, duplicateBindings));
+     return message.toString();
+   }
+ 
+   private String incompatibleBindingsMessage(
+-      DependencyRequest dependencyRequest,
+-      ImmutableSet<dagger.model.Binding> duplicateBindings,
+-      BindingGraph graph) {
++      Key key, ImmutableSet<Binding> duplicateBindings, BindingGraph graph) {
+     ImmutableSet<dagger.model.Binding> multibindings =
+         duplicateBindings.stream()
+             .filter(binding -> binding.kind().isMultibinding())
+             .collect(toImmutableSet());
+     verify(
+-        multibindings.size() == 1,
+-        "expected only one multibinding for %s: %s",
+-        dependencyRequest,
+-        multibindings);
++        multibindings.size() == 1, "expected only one multibinding for %s: %s", key, multibindings);
+     StringBuilder message = new StringBuilder();
+     java.util.Formatter messageFormatter = new java.util.Formatter(message);
+-    messageFormatter.format(
+-        "%s has incompatible bindings or declarations:\n", dependencyRequest.key());
++    messageFormatter.format("%s has incompatible bindings or declarations:\n", key);
+     message.append(INDENT);
+     dagger.model.Binding multibinding = getOnlyElement(multibindings);
+     messageFormatter.format("%s bindings and declarations:", multibindingTypeString(multibinding));
+@@ -195,6 +234,11 @@ private String multibindingTypeString(dagger.model.Binding multibinding) {
+     }
+   }
+ 
++  private static ImmutableSet<Equivalence.Wrapper<Binding>> equivalentSetIgnoringComponentPath(
++      ImmutableSet<Binding> resolvedBindings) {
++    return resolvedBindings.stream().map(IGNORING_COMPONENT_PATH::wrap).collect(toImmutableSet());
++  }
++
+   @AutoValue
+   abstract static class SourceAndRequest {
+ 
+@@ -202,18 +246,6 @@ private String multibindingTypeString(dagger.model.Binding multibinding) {
+ 
+     abstract DependencyRequest request();
+ 
+-    static ImmutableSetMultimap<SourceAndRequest, DependencyEdge> indexEdgesBySourceAndRequest(
+-        BindingGraph bindingGraph) {
+-      return bindingGraph.dependencyEdges().stream()
+-          .collect(
+-              toImmutableSetMultimap(
+-                  edge ->
+-                      create(
+-                          bindingGraph.network().incidentNodes(edge).source(),
+-                          edge.dependencyRequest()),
+-                  edge -> edge));
+-    }
+-
+     static SourceAndRequest create(Node source, DependencyRequest request) {
+       return new AutoValue_DuplicateBindingsValidator_SourceAndRequest(source, request);
+     }
+diff --git a/java/dagger/model/Binding.java b/java/dagger/model/Binding.java
+index 5e113bf2c..81aba00a9 100644
+--- a/java/dagger/model/Binding.java
++++ b/java/dagger/model/Binding.java
+@@ -85,4 +85,5 @@
+ 
+   /** The kind of binding this instance represents. */
+   BindingKind kind();
++
+ }
+diff --git a/javatests/dagger/internal/codegen/DuplicateBindingsValidationTest.java b/javatests/dagger/internal/codegen/DuplicateBindingsValidationTest.java
+index 232445785..e980f2bed 100644
+--- a/javatests/dagger/internal/codegen/DuplicateBindingsValidationTest.java
++++ b/javatests/dagger/internal/codegen/DuplicateBindingsValidationTest.java
+@@ -78,33 +78,40 @@
+   }
+ 
+   @Test public void duplicateExplicitBindings_TwoProvidesMethods() {
+-    JavaFileObject component = JavaFileObjects.forSourceLines("test.Outer",
+-        "package test;",
+-        "",
+-        "import dagger.Component;",
+-        "import dagger.Module;",
+-        "import dagger.Provides;",
+-        "import javax.inject.Inject;",
+-        "",
+-        "final class Outer {",
+-        "  interface A {}",
+-        "",
+-        "  @Module",
+-        "  static class Module1 {",
+-        "    @Provides A provideA1() { return new A() {}; }",
+-        "  }",
+-        "",
+-        "  @Module",
+-        "  static class Module2 {",
+-        "    @Provides String provideString() { return \"\"; }",
+-        "    @Provides A provideA2(String s) { return new A() {}; }",
+-        "  }",
+-        "",
+-        "  @Component(modules = { Module1.class, Module2.class})",
+-        "  interface TestComponent {",
+-        "    A getA();",
+-        "  }",
+-        "}");
++    JavaFileObject component =
++        JavaFileObjects.forSourceLines(
++            "test.Outer",
++            "package test;",
++            "",
++            "import dagger.Component;",
++            "import dagger.Module;",
++            "import dagger.Provides;",
++            "import javax.inject.Inject;",
++            "",
++            "final class Outer {",
++            "  interface A {}",
++            "",
++            "  static class B {",
++            "    @Inject B(A a) {}",
++            "  }",
++            "",
++            "  @Module",
++            "  static class Module1 {",
++            "    @Provides A provideA1() { return new A() {}; }",
++            "  }",
++            "",
++            "  @Module",
++            "  static class Module2 {",
++            "    @Provides String provideString() { return \"\"; }",
++            "    @Provides A provideA2(String s) { return new A() {}; }",
++            "  }",
++            "",
++            "  @Component(modules = { Module1.class, Module2.class})",
++            "  interface TestComponent {",
++            "    A getA();",
++            "    B getB();",
++            "  }",
++            "}");
+ 
+     Compilation compilation = daggerCompiler().compile(component);
+     assertThat(compilation).failed();
+@@ -116,6 +123,8 @@
+                 "    @Provides test.Outer.A test.Outer.Module2.provideA2(String)"))
+         .inFile(component)
+         .onLineContaining("interface TestComponent");
++    // The duplicate bindngs are also requested from B, but we don't want to report them again.
++    assertThat(compilation).hadErrorCount(1);
+   }
+ 
+   @Test
+@@ -754,4 +763,72 @@ public void grandchildBindingConflictsWithParentWithNullableViolationAsWarning()
+         .inFile(parentConflictsWithChild)
+         .onLine(9);
+   }
++
++  @Test
++  public void reportedInParentAndChild() {
++    JavaFileObject parent =
++        JavaFileObjects.forSourceLines(
++            "test.Parent",
++            "package test;",
++            "",
++            "import dagger.Component;",
++            "",
++            "@Component(modules = ParentModule.class)",
++            "interface Parent {",
++            "  Child.Builder childBuilder();",
++            "  String duplicated();",
++            "}");
++    JavaFileObject parentModule =
++        JavaFileObjects.forSourceLines(
++            "test.ParentModule",
++            "package test;",
++            "",
++            "import dagger.BindsOptionalOf;",
++            "import dagger.Module;",
++            "import dagger.Provides;",
++            "import java.util.Optional;",
++            "",
++            "@Module",
++            "interface ParentModule {",
++            "  @Provides static String one(Optional<Object> optional) { return \"one\"; }",
++            "  @Provides static String two() { return \"two\"; }",
++            "  @BindsOptionalOf Object optional();",
++            "}");
++    JavaFileObject child =
++        JavaFileObjects.forSourceLines(
++            "test.Child",
++            "package test;",
++            "",
++            "import dagger.Subcomponent;",
++            "",
++            "@Subcomponent(modules = ChildModule.class)",
++            "interface Child {",
++            "  String duplicated();",
++            "",
++            "  @Subcomponent.Builder",
++            "  interface Builder {",
++            "    Child build();",
++            "  }",
++            "}");
++    JavaFileObject childModule =
++        JavaFileObjects.forSourceLines(
++            "test.ChildModule",
++            "package test;",
++            "",
++            "import dagger.Module;",
++            "import dagger.Provides;",
++            "import java.util.Optional;",
++            "",
++            "@Module",
++            "interface ChildModule {",
++            "  @Provides static Object object() { return \"object\"; }",
++            "}");
++    Compilation compilation = daggerCompiler().compile(parent, parentModule, child, childModule);
++    assertThat(compilation).failed();
++    assertThat(compilation)
++        .hadErrorContaining("java.lang.String is bound multiple times")
++        .inFile(parent)
++        .onLineContaining("interface Parent");
++    assertThat(compilation).hadErrorCount(1);
++  }
+ }

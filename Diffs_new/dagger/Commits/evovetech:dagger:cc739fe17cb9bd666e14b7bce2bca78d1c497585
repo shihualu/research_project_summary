@@ -1,0 +1,1109 @@
+diff --git a/java/dagger/internal/codegen/BUILD b/java/dagger/internal/codegen/BUILD
+index f348a2551..ce29e49c5 100644
+--- a/java/dagger/internal/codegen/BUILD
++++ b/java/dagger/internal/codegen/BUILD
+@@ -247,6 +247,7 @@ java_library(
+         "InaccessibleMapKeyProxyGenerator.java",
+         "InjectionMethods.java",
+         "InjectionOrProvisionProviderCreationExpression.java",
++        "InnerSwitchingProviders.java",
+         "InstanceFactoryCreationExpression.java",
+         "MapBindingExpression.java",
+         "MapFactoryCreationExpression.java",
+@@ -273,6 +274,7 @@ java_library(
+         "SimpleInvocationBindingExpression.java",
+         "SimpleMethodBindingExpression.java",
+         "SingleCheckedMethodImplementation.java",
++        "StaticSwitchingProviders.java",
+         "SubcomponentBuilderBindingExpression.java",
+         "SubcomponentBuilderProviderCreationExpression.java",
+         "SubcomponentNames.java",
+diff --git a/java/dagger/internal/codegen/CompilerOptions.java b/java/dagger/internal/codegen/CompilerOptions.java
+index d1aa53c90..7d97e2a26 100644
+--- a/java/dagger/internal/codegen/CompilerOptions.java
++++ b/java/dagger/internal/codegen/CompilerOptions.java
+@@ -16,6 +16,8 @@
+ 
+ package dagger.internal.codegen;
+ 
++import static com.google.common.base.Preconditions.checkState;
++
+ import com.google.auto.value.AutoValue;
+ import com.google.common.base.Ascii;
+ import com.google.common.collect.ImmutableSet;
+@@ -88,6 +90,11 @@ static Builder builder() {
+   }
+ 
+   static CompilerOptions create(ProcessingEnvironment processingEnv, DaggerElements elements) {
++    checkState(
++        !(experimentalAndroidModeFeatureStatus(processingEnv).equals(FeatureStatus.ENABLED)
++            && experimentalAndroidMode2FeatureStatus(processingEnv).equals(FeatureStatus.ENABLED)),
++        "experimentalAndroidMode and experimentalAndroidMode2 cannot be used together.");
++
+     return builder()
+         .usesProducers(elements.getTypeElement(Produces.class) != null)
+         .headerCompilation(processingEnv.getOptions().containsKey(HEADER_COMPILATION))
+diff --git a/java/dagger/internal/codegen/ComponentBindingExpressions.java b/java/dagger/internal/codegen/ComponentBindingExpressions.java
+index e86a85679..57a23ede9 100644
+--- a/java/dagger/internal/codegen/ComponentBindingExpressions.java
++++ b/java/dagger/internal/codegen/ComponentBindingExpressions.java
+@@ -68,7 +68,8 @@
+   private final DaggerElements elements;
+   private final CompilerOptions compilerOptions;
+   private final MembersInjectionMethods membersInjectionMethods;
+-  private final SwitchingProviders switchingProviders;
++  private final InnerSwitchingProviders innerSwitchingProviders;
++  private final StaticSwitchingProviders staticSwitchingProviders;
+   private final Table<Key, RequestKind, BindingExpression> expressions = HashBasedTable.create();
+ 
+   ComponentBindingExpressions(
+@@ -87,6 +88,7 @@
+         subcomponentNames,
+         componentRequirementFields,
+         new ReferenceReleasingManagerFields(graph, generatedComponentModel),
++        new StaticSwitchingProviders(generatedComponentModel, types),
+         optionalFactories,
+         types,
+         elements,
+@@ -100,6 +102,7 @@ private ComponentBindingExpressions(
+       SubcomponentNames subcomponentNames,
+       ComponentRequirementFields componentRequirementFields,
+       ReferenceReleasingManagerFields referenceReleasingManagerFields,
++      StaticSwitchingProviders staticSwitchingProviders,
+       OptionalFactories optionalFactories,
+       DaggerTypes types,
+       DaggerElements elements,
+@@ -116,7 +119,9 @@ private ComponentBindingExpressions(
+     this.compilerOptions = checkNotNull(compilerOptions);
+     this.membersInjectionMethods =
+         new MembersInjectionMethods(generatedComponentModel, this, graph, elements, types);
+-    this.switchingProviders = new SwitchingProviders(generatedComponentModel, this, types);
++    this.innerSwitchingProviders =
++        new InnerSwitchingProviders(generatedComponentModel, this, types);
++    this.staticSwitchingProviders = staticSwitchingProviders;
+   }
+ 
+   /**
+@@ -133,6 +138,7 @@ ComponentBindingExpressions forChildComponent(
+         subcomponentNames,
+         childComponentRequirementFields,
+         referenceReleasingManagerFields,
++        staticSwitchingProviders,
+         optionalFactories,
+         types,
+         elements,
+@@ -355,7 +361,9 @@ private FrameworkInstanceCreationExpression frameworkInstanceCreationExpression(
+ 
+       case INJECTION:
+       case PROVISION:
+-        return new InjectionOrProvisionProviderCreationExpression(binding, this);
++        return compilerOptions.experimentalAndroidMode2()
++            ? staticSwitchingProviders.newCreationExpression(binding, this)
++            : new InjectionOrProvisionProviderCreationExpression(binding, this);
+ 
+       case COMPONENT_PRODUCTION:
+         return new DependencyMethodProducerCreationExpression(
+@@ -589,7 +597,8 @@ private BindingExpression instanceBindingExpression(ResolvedBindings resolvedBin
+    * {@code SetFactory}.
+    */
+   private boolean useStaticFactoryCreation(ContributionBinding binding) {
+-    return !compilerOptions.experimentalAndroidMode()
++    return !(compilerOptions.experimentalAndroidMode2()
++            || compilerOptions.experimentalAndroidMode())
+         || binding.kind().equals(MULTIBOUND_MAP)
+         || binding.kind().equals(MULTIBOUND_SET);
+   }
+@@ -630,7 +639,7 @@ private BindingExpression providerBindingExpression(ResolvedBindings resolvedBin
+         return wrapInMethod(
+             resolvedBindings,
+             RequestKind.PROVIDER,
+-            switchingProviders.newBindingExpression(resolvedBindings.contributionBinding()));
++            innerSwitchingProviders.newBindingExpression(resolvedBindings.contributionBinding()));
+       }
+     } else if (resolvedBindings.contributionBinding().kind().equals(DELEGATE)
+         && !needsCaching(resolvedBindings)) {
+diff --git a/java/dagger/internal/codegen/FactoryGenerator.java b/java/dagger/internal/codegen/FactoryGenerator.java
+index 58833b79e..01dcd9e03 100644
+--- a/java/dagger/internal/codegen/FactoryGenerator.java
++++ b/java/dagger/internal/codegen/FactoryGenerator.java
+@@ -24,6 +24,7 @@
+ import static dagger.internal.codegen.AnnotationSpecs.Suppression.UNCHECKED;
+ import static dagger.internal.codegen.AnnotationSpecs.suppressWarnings;
+ import static dagger.internal.codegen.CodeBlocks.makeParametersCodeBlock;
++import static dagger.internal.codegen.CodeBlocks.toParametersCodeBlock;
+ import static dagger.internal.codegen.ContributionBinding.FactoryCreationStrategy.DELEGATE;
+ import static dagger.internal.codegen.ContributionBinding.FactoryCreationStrategy.SINGLETON_INSTANCE;
+ import static dagger.internal.codegen.ErrorMessages.CANNOT_RETURN_NULL_FROM_NON_NULLABLE_PROVIDES_METHOD;
+@@ -115,6 +116,7 @@ ClassName nameGeneratedType(ProvisionBinding binding) {
+ 
+     addConstructorAndFields(binding, factoryBuilder);
+     factoryBuilder.addMethod(getMethod(binding));
++    factoryBuilder.addMethod(provideInstanceMethod(binding));
+     addCreateMethod(binding, factoryBuilder);
+ 
+     factoryBuilder.addMethod(ProvisionMethod.create(binding, compilerOptions));
+@@ -211,12 +213,33 @@ private void addCreateMethod(ProvisionBinding binding, TypeSpec.Builder factoryB
+   }
+ 
+   private MethodSpec getMethod(ProvisionBinding binding) {
+-    TypeName providedTypeName = providedTypeName(binding);
+-    MethodSpec.Builder getMethodBuilder =
++    MethodSpec.Builder methodBuilder =
+         methodBuilder("get")
+-            .returns(providedTypeName)
+             .addAnnotation(Override.class)
+-            .addModifiers(PUBLIC);
++            .addModifiers(PUBLIC)
++            .returns(providedTypeName(binding))
++            .addStatement(
++                "return provideInstance($L)",
++                constructorParams(binding)
++                    .stream()
++                    .map(parameter -> CodeBlock.of("$N", parameter))
++                    .collect(toParametersCodeBlock()));
++
++    binding
++        .nullableType()
++        .ifPresent(nullableType -> CodeBlocks.addAnnotation(methodBuilder, nullableType));
++
++    return methodBuilder.build();
++  }
++
++  private MethodSpec provideInstanceMethod(ProvisionBinding binding) {
++    TypeName providedTypeName = providedTypeName(binding);
++    MethodSpec.Builder provideInstanceMethod =
++        methodBuilder("provideInstance")
++            .returns(providedTypeName)
++            .addTypeVariables(bindingTypeElementTypeVariableNames(binding))
++            .addParameters(constructorParams(binding))
++            .addModifiers(PUBLIC, STATIC);
+ 
+     ImmutableMap<Key, FieldSpec> frameworkFields = frameworkFields(binding);
+     CodeBlock parametersCodeBlock =
+@@ -226,8 +249,8 @@ private MethodSpec getMethod(ProvisionBinding binding) {
+     if (binding.kind().equals(PROVISION)) {
+       binding
+           .nullableType()
+-          .ifPresent(nullableType -> CodeBlocks.addAnnotation(getMethodBuilder, nullableType));
+-      getMethodBuilder.addStatement(
++          .ifPresent(nullableType -> CodeBlocks.addAnnotation(provideInstanceMethod, nullableType));
++      provideInstanceMethod.addStatement(
+           "return $L",
+           ProvisionMethod.invoke(
+               binding,
+@@ -241,7 +264,7 @@ private MethodSpec getMethod(ProvisionBinding binding) {
+               compilerOptions));
+     } else if (!binding.injectionSites().isEmpty()) {
+       CodeBlock instance = CodeBlock.of("instance");
+-      getMethodBuilder
++      provideInstanceMethod
+           .addStatement("$1T $2L = new $1T($3L)", providedTypeName, instance, parametersCodeBlock)
+           .addCode(
+               InjectionSiteMethod.invokeAll(
+@@ -253,9 +276,10 @@ private MethodSpec getMethod(ProvisionBinding binding) {
+                   frameworkFieldUsages(binding.dependencies(), frameworkFields)::get))
+           .addStatement("return $L", instance);
+     } else {
+-      getMethodBuilder.addStatement("return new $T($L)", providedTypeName, parametersCodeBlock);
++      provideInstanceMethod.addStatement(
++          "return new $T($L)", providedTypeName, parametersCodeBlock);
+     }
+-    return getMethodBuilder.build();
++    return provideInstanceMethod.build();
+   }
+ 
+   private static TypeName providedTypeName(ProvisionBinding binding) {
+diff --git a/java/dagger/internal/codegen/InnerSwitchingProviders.java b/java/dagger/internal/codegen/InnerSwitchingProviders.java
+new file mode 100644
+index 000000000..c3c590e3f
+--- /dev/null
++++ b/java/dagger/internal/codegen/InnerSwitchingProviders.java
+@@ -0,0 +1,103 @@
++/*
++ * Copyright (C) 2018 The Dagger Authors.
++ *
++ * Licensed under the Apache License, Version 2.0 (the "License");
++ * you may not use this file except in compliance with the License.
++ * You may obtain a copy of the License at
++ *
++ * http://www.apache.org/licenses/LICENSE-2.0
++ *
++ * Unless required by applicable law or agreed to in writing, software
++ * distributed under the License is distributed on an "AS IS" BASIS,
++ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++ * See the License for the specific language governing permissions and
++ * limitations under the License.
++ */
++
++package dagger.internal.codegen;
++
++import static com.squareup.javapoet.MethodSpec.constructorBuilder;
++import static dagger.model.RequestKind.INSTANCE;
++import static javax.lang.model.element.Modifier.FINAL;
++import static javax.lang.model.element.Modifier.PRIVATE;
++
++import com.squareup.javapoet.ClassName;
++import com.squareup.javapoet.CodeBlock;
++import com.squareup.javapoet.TypeName;
++import com.squareup.javapoet.TypeSpec;
++import dagger.model.Key;
++import javax.inject.Provider;
++import javax.lang.model.type.TypeMirror;
++
++/**
++ * Generates {@linkplain BindingExpression binding expressions} for a binding that is represented by
++ * an inner {@code SwitchingProvider} class.
++ */
++final class InnerSwitchingProviders extends SwitchingProviders {
++  private final ComponentBindingExpressions componentBindingExpressions;
++  private final DaggerTypes types;
++
++  InnerSwitchingProviders(
++      GeneratedComponentModel generatedComponentModel,
++      ComponentBindingExpressions componentBindingExpressions,
++      DaggerTypes types) {
++    super(generatedComponentModel, types);
++    this.componentBindingExpressions = componentBindingExpressions;
++    this.types = types;
++  }
++
++  /**
++   * Returns the binding expression for a binding that satisfies a {@link Provider} requests with a
++   * inner {@code SwitchingProvider} class.
++   */
++  BindingExpression newBindingExpression(ContributionBinding binding) {
++    return new BindingExpression() {
++      @Override
++      Expression getDependencyExpression(ClassName requestingClass) {
++        return getProviderExpression(new SwitchCase(binding, requestingClass));
++      }
++    };
++  }
++
++  @Override
++  protected TypeSpec createSwitchingProviderType(TypeSpec.Builder builder) {
++    return builder
++        .addModifiers(PRIVATE, FINAL)
++        .addField(TypeName.INT, "id", PRIVATE, FINAL)
++        .addMethod(
++            constructorBuilder()
++                .addParameter(TypeName.INT, "id")
++                .addStatement("this.id = id")
++                .build())
++        .build();
++  }
++
++  private final class SwitchCase implements SwitchingProviders.SwitchCase {
++    private final ContributionBinding binding;
++    private final ClassName requestingClass;
++
++    SwitchCase(ContributionBinding binding, ClassName requestingClass) {
++      this.binding = binding;
++      this.requestingClass = requestingClass;
++    }
++
++    @Override
++    public Key key() {
++      return binding.key();
++    }
++
++    @Override
++    public Expression getProviderExpression(ClassName switchType, int switchId) {
++      TypeMirror instanceType = types.accessibleType(binding.contributedType(), requestingClass);
++      return Expression.create(
++          types.wrapType(instanceType, Provider.class),
++          CodeBlock.of("new $T<>($L)", switchType, switchId));
++    }
++
++    @Override
++    public Expression getReturnExpression() {
++      return componentBindingExpressions.getDependencyExpression(
++          binding.key(), INSTANCE, requestingClass);
++    }
++  }
++}
+diff --git a/java/dagger/internal/codegen/StaticSwitchingProviders.java b/java/dagger/internal/codegen/StaticSwitchingProviders.java
+new file mode 100644
+index 000000000..f0918dec4
+--- /dev/null
++++ b/java/dagger/internal/codegen/StaticSwitchingProviders.java
+@@ -0,0 +1,159 @@
++/*
++ * Copyright (C) 2018 The Dagger Authors.
++ *
++ * Licensed under the Apache License, Version 2.0 (the "License");
++ * you may not use this file except in compliance with the License.
++ * You may obtain a copy of the License at
++ *
++ * http://www.apache.org/licenses/LICENSE-2.0
++ *
++ * Unless required by applicable law or agreed to in writing, software
++ * distributed under the License is distributed on an "AS IS" BASIS,
++ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++ * See the License for the specific language governing permissions and
++ * limitations under the License.
++ */
++
++package dagger.internal.codegen;
++
++import static com.squareup.javapoet.ClassName.OBJECT;
++import static com.squareup.javapoet.MethodSpec.constructorBuilder;
++import static com.squareup.javapoet.TypeName.INT;
++import static dagger.internal.codegen.CodeBlocks.makeParametersCodeBlock;
++import static dagger.internal.codegen.CodeBlocks.toParametersCodeBlock;
++import static dagger.internal.codegen.SourceFiles.generatedClassNameForBinding;
++import static javax.lang.model.element.Modifier.FINAL;
++import static javax.lang.model.element.Modifier.PRIVATE;
++import static javax.lang.model.element.Modifier.STATIC;
++
++import com.google.common.collect.ImmutableList;
++import com.squareup.javapoet.ArrayTypeName;
++import com.squareup.javapoet.ClassName;
++import com.squareup.javapoet.CodeBlock;
++import com.squareup.javapoet.TypeName;
++import com.squareup.javapoet.TypeSpec;
++import dagger.internal.codegen.FrameworkFieldInitializer.FrameworkInstanceCreationExpression;
++import dagger.model.Key;
++import java.util.stream.Stream;
++import javax.inject.Provider;
++import javax.lang.model.type.TypeMirror;
++
++/**
++ * Generates {@linkplain BindingExpression binding expressions} for a binding that is represented by
++ * a static {@code SwitchingProvider} class.
++ *
++ * <p>Currently, the generated {@code SwitchingProvider} class is generated as a static nested class
++ * in the root component. Ideally, each component would get its own {@code SwitchingProvider}, but
++ * since the subcomponents are inner classes they cannot contain static classes.
++ */
++final class StaticSwitchingProviders extends SwitchingProviders {
++  private final DaggerTypes types;
++  private final ClassName owningComponent;
++
++  StaticSwitchingProviders(GeneratedComponentModel generatedComponentModel, DaggerTypes types) {
++    super(generatedComponentModel, types);
++    this.types = types;
++    this.owningComponent = generatedComponentModel.name();
++  }
++
++  /**
++   * Returns the {@link FrameworkInstanceCreationExpression} for a binding that satisfies a {@link
++   * Provider} requests with a static {@code SwitchingProvider} class.
++   */
++  FrameworkInstanceCreationExpression newCreationExpression(
++      ContributionBinding binding, ComponentBindingExpressions componentBindingExpressions) {
++    return new FrameworkInstanceCreationExpression() {
++      @Override
++      public CodeBlock creationExpression() {
++        return getProviderExpression(new SwitchCase(binding, componentBindingExpressions))
++            .codeBlock();
++      }
++    };
++  }
++
++  @Override
++  protected TypeSpec createSwitchingProviderType(TypeSpec.Builder builder) {
++    return builder
++        .addModifiers(PRIVATE, FINAL, STATIC)
++        .addField(INT, "id", PRIVATE, FINAL)
++        .addField(ArrayTypeName.of(OBJECT), "dependencies", PRIVATE, FINAL)
++        .addMethod(
++            constructorBuilder()
++                .addParameter(INT, "id")
++                .addParameter(ArrayTypeName.of(OBJECT), "dependencies")
++                .varargs()
++                .addStatement("this.id = id")
++                .addStatement("this.dependencies = dependencies")
++                .build())
++        .build();
++  }
++
++  private final class SwitchCase implements SwitchingProviders.SwitchCase {
++    private final ComponentBindingExpressions componentBindingExpressions;
++    private final ContributionBinding binding;
++
++    SwitchCase(
++        ContributionBinding binding, ComponentBindingExpressions componentBindingExpressions) {
++      this.binding = binding;
++      this.componentBindingExpressions = componentBindingExpressions;
++    }
++
++    @Override
++    public Key key() {
++      return binding.key();
++    }
++
++    @Override
++    public Expression getProviderExpression(ClassName switchType, int switchId) {
++      TypeMirror accessibleType = types.accessibleType(binding.contributedType(), owningComponent);
++      // Java 7 type inference can't figure out that instance in
++      // DoubleCheck.provider(new SwitchingProvider<>()) is Provider<T> and not Provider<Object>
++      CodeBlock typeParameter = CodeBlock.of("$T", accessibleType);
++
++      CodeBlock arguments =
++          Stream.of(
++                  CodeBlock.of("$L", switchId),
++                  componentBindingExpressions.getCreateMethodArgumentsCodeBlock(binding))
++              .filter(codeBlock -> !codeBlock.isEmpty())
++              .collect(toParametersCodeBlock());
++
++      return Expression.create(
++          types.wrapType(accessibleType, Provider.class),
++          CodeBlock.of("new $T<$L>($L)", switchType, typeParameter, arguments));
++    }
++
++    @Override
++    public Expression getReturnExpression() {
++      return Expression.create(
++          binding.contributedType(),
++          CodeBlock.of(
++              "$T.provideInstance($L)",
++              generatedClassNameForBinding(binding),
++              getMethodArguments()));
++    }
++
++    private CodeBlock getMethodArguments() {
++      int i = 0;
++      ImmutableList.Builder<CodeBlock> arguments = ImmutableList.builder();
++      if (binding.requiresModuleInstance()) {
++        arguments.add(argument(binding.contributingModule().get().asType(), i++));
++      }
++
++      for (FrameworkDependency dependency : binding.frameworkDependencies()) {
++        TypeMirror type =
++            componentBindingExpressions.getDependencyExpression(dependency, owningComponent).type();
++        arguments.add(argument(type, i++));
++      }
++      return makeParametersCodeBlock(arguments.build());
++    }
++
++    private CodeBlock argument(TypeMirror type, int index) {
++      CodeBlock.Builder builder = CodeBlock.builder();
++      TypeName accessibleType = TypeName.get(types.accessibleType(type, owningComponent));
++      if (!accessibleType.equals(ClassName.OBJECT)) {
++        builder.add("($T) ", accessibleType);
++      }
++      return builder.add("dependencies[$L]", index).build();
++    }
++  }
++}
+diff --git a/java/dagger/internal/codegen/SwitchingProviders.java b/java/dagger/internal/codegen/SwitchingProviders.java
+index 4cb08f601..ba4dbc671 100644
+--- a/java/dagger/internal/codegen/SwitchingProviders.java
++++ b/java/dagger/internal/codegen/SwitchingProviders.java
+@@ -19,15 +19,12 @@
+ import static com.google.common.base.Preconditions.checkNotNull;
+ import static com.google.common.collect.Iterables.getLast;
+ import static com.google.common.collect.Iterables.getOnlyElement;
+-import static com.squareup.javapoet.MethodSpec.constructorBuilder;
+ import static com.squareup.javapoet.MethodSpec.methodBuilder;
+ import static com.squareup.javapoet.TypeSpec.classBuilder;
+ import static dagger.internal.codegen.AnnotationSpecs.Suppression.UNCHECKED;
+ import static dagger.internal.codegen.AnnotationSpecs.suppressWarnings;
+ import static dagger.internal.codegen.DaggerStreams.toImmutableList;
+ import static dagger.internal.codegen.TypeNames.providerOf;
+-import static dagger.model.RequestKind.INSTANCE;
+-import static javax.lang.model.element.Modifier.FINAL;
+ import static javax.lang.model.element.Modifier.PRIVATE;
+ import static javax.lang.model.element.Modifier.PUBLIC;
+ 
+@@ -36,7 +33,6 @@
+ import com.squareup.javapoet.ClassName;
+ import com.squareup.javapoet.CodeBlock;
+ import com.squareup.javapoet.MethodSpec;
+-import com.squareup.javapoet.TypeName;
+ import com.squareup.javapoet.TypeSpec;
+ import com.squareup.javapoet.TypeVariableName;
+ import dagger.model.Key;
+@@ -44,7 +40,6 @@
+ import java.util.LinkedHashMap;
+ import java.util.Map;
+ import java.util.TreeMap;
+-import javax.inject.Provider;
+ 
+ /**
+  * Keeps track of all provider expression requests for a component.
+@@ -52,7 +47,29 @@
+  * <p>The provider expression request will be satisfied by a single generated {@code Provider} inner
+  * class that can provide instances for all types by switching on an id.
+  */
+-final class SwitchingProviders {
++abstract class SwitchingProviders {
++  /**
++   * Defines the {@linkplain Expression expressions} for a switch case in a {@code SwitchProvider}
++   * for a particular binding.
++   */
++  // TODO(user): Consider handling SwitchingProviders with dependency arguments in this class,
++  // then we wouldn't need the getProviderExpression method.
++  // TODO(user): Consider making this an abstract class with equals/hashCode defined by the key
++  // and then using this class directly in Map types instead of Key.
++  interface SwitchCase {
++    /** Returns the {@link Key} for this switch case. */
++    Key key();
++
++    /** Returns the {@link Expression} that returns the provided instance for this case. */
++    Expression getReturnExpression();
++
++    /**
++     * Returns the {@link Expression} that returns the {@code SwitchProvider} instance for this
++     * case.
++     */
++    Expression getProviderExpression(ClassName switchType, int switchId);
++  }
++
+   /**
+    * Each switch size is fixed at 100 cases each and put in its own method. This is to limit the
+    * size of the methods so that we don't reach the "huge" method size limit for Android that will
+@@ -67,106 +84,84 @@
+   private static final TypeVariableName T = TypeVariableName.get("T");
+ 
+   /**
+-   * Maps a {@link Key} to an instance of a {@link SwitchingProviderExpressions}. Each group of
+-   * {@code MAX_CASES_PER_CLASS} keys will share the same instance.
++   * Maps a {@link Key} to an instance of a {@link SwitchingProviderBuilder}. Each group of {@code
++   * MAX_CASES_PER_CLASS} keys will share the same instance.
+    */
+-  private final Map<Key, SwitchingProviderExpressions> switchingProviderExpressionsMap =
++  private final Map<Key, SwitchingProviderBuilder> switchingProviderBuilders =
+       new LinkedHashMap<>();
+ 
+-  private final ComponentBindingExpressions componentBindingExpressions;
+   private final GeneratedComponentModel generatedComponentModel;
+   private final ClassName owningComponent;
+   private final DaggerTypes types;
+   private final UniqueNameSet switchingProviderNames = new UniqueNameSet();
+ 
+-  SwitchingProviders(
+-      GeneratedComponentModel generatedComponentModel,
+-      ComponentBindingExpressions componentBindingExpressions,
+-      DaggerTypes types) {
++  SwitchingProviders(GeneratedComponentModel generatedComponentModel, DaggerTypes types) {
+     this.generatedComponentModel = checkNotNull(generatedComponentModel);
+-    this.componentBindingExpressions = checkNotNull(componentBindingExpressions);
+     this.types = checkNotNull(types);
+     this.owningComponent = checkNotNull(generatedComponentModel).name();
+   }
+ 
++  /** Returns the {@link TypeSpec} for a {@code SwitchingProvider} based on the given builder. */
++  protected abstract TypeSpec createSwitchingProviderType(TypeSpec.Builder builder);
++
+   /**
+-   * Returns the binding expression for a binding that satisfies its {link Provider} requests with
+-   * the generated {@code SwitchingProvider}.
++   * Returns the {@link Expression} that returns the {@code SwitchProvider} instance for the case.
+    */
+-  BindingExpression newBindingExpression(ContributionBinding binding) {
+-    return new BindingExpression() {
+-      @Override
+-      Expression getDependencyExpression(ClassName requestingClass) {
+-        return switchingProviderExpressionsMap
+-            .computeIfAbsent(binding.key(), key -> getSwitchingProviderExpressions())
+-            .getExpression(binding);
+-      }
+-    };
++  protected final Expression getProviderExpression(SwitchCase switchCase) {
++    return switchingProviderBuilders
++        .computeIfAbsent(switchCase.key(), key -> getSwitchingProviderBuilder())
++        .getProviderExpression(switchCase);
+   }
+ 
+-  private SwitchingProviderExpressions getSwitchingProviderExpressions() {
+-    if (switchingProviderExpressionsMap.size() % MAX_CASES_PER_CLASS == 0) {
++  private SwitchingProviderBuilder getSwitchingProviderBuilder() {
++    if (switchingProviderBuilders.size() % MAX_CASES_PER_CLASS == 0) {
+       String name = switchingProviderNames.getUniqueName("SwitchingProvider");
+-      SwitchingProviderExpressions switchingProviderExpressions =
+-          new SwitchingProviderExpressions(owningComponent.nestedClass(name));
+-      generatedComponentModel.addSwitchingProvider(
+-          switchingProviderExpressions::createSwitchingProviderType);
+-      return switchingProviderExpressions;
++      SwitchingProviderBuilder switchingProviderBuilder =
++          new SwitchingProviderBuilder(owningComponent.nestedClass(name));
++      generatedComponentModel.addSwitchingProvider(switchingProviderBuilder::build);
++      return switchingProviderBuilder;
+     }
+-    return getLast(switchingProviderExpressionsMap.values());
++    return getLast(switchingProviderBuilders.values());
+   }
+ 
+   // TODO(user): Consider just merging this class with SwitchingProviders.
+-  private final class SwitchingProviderExpressions {
++  private final class SwitchingProviderBuilder {
+     // Keep the switch cases ordered by switch id. The switch Ids are assigned in pre-order
+     // traversal, but the switch cases are assigned in post-order traversal of the binding graph.
+     private final Map<Integer, CodeBlock> switchCases = new TreeMap<>();
+     private final Map<Key, Integer> switchIds = new HashMap<>();
+     private final ClassName switchingProviderType;
+ 
+-    SwitchingProviderExpressions(ClassName switchingProviderType) {
++    SwitchingProviderBuilder(ClassName switchingProviderType) {
+       this.switchingProviderType = checkNotNull(switchingProviderType);
+     }
+ 
+-    private Expression getExpression(ContributionBinding binding) {
+-      if (!switchIds.containsKey(binding.key())) {
++    Expression getProviderExpression(SwitchCase switchCase) {
++      Key key = switchCase.key();
++      if (!switchIds.containsKey(key)) {
+         int switchId = switchIds.size();
+-        switchIds.put(binding.key(), switchId);
+-        switchCases.put(switchId, createSwitchCaseCodeBlock(binding));
++        switchIds.put(key, switchId);
++        switchCases.put(switchId, createSwitchCaseCodeBlock(switchCase));
+       }
+-
+-      return Expression.create(
+-          types.wrapType(binding.key().type(), Provider.class),
+-          CodeBlock.of("new $T<>($L)", switchingProviderType, switchIds.get(binding.key())));
++      return switchCase.getProviderExpression(switchingProviderType, switchIds.get(key));
+     }
+ 
+-    private CodeBlock createSwitchCaseCodeBlock(ContributionBinding binding) {
+-      CodeBlock instanceCodeBlock =
+-          componentBindingExpressions
+-              .getDependencyExpression(binding.key(), INSTANCE, owningComponent)
+-              .box(types)
+-              .codeBlock();
++    private CodeBlock createSwitchCaseCodeBlock(SwitchCase switchCase) {
++      CodeBlock instanceCodeBlock = switchCase.getReturnExpression().box(types).codeBlock();
+ 
+       return CodeBlock.builder()
+           // TODO(user): Is there something else more useful than the key?
+-          .add("case $L: // $L \n", switchIds.get(binding.key()), binding.key())
++          .add("case $L: // $L \n", switchIds.get(switchCase.key()), switchCase.key())
+           .addStatement("return ($T) $L", T, instanceCodeBlock)
+           .build();
+     }
+ 
+-    private TypeSpec createSwitchingProviderType() {
+-      return classBuilder(switchingProviderType)
+-          .addModifiers(PRIVATE, FINAL)
+-          .addTypeVariable(T)
+-          .addSuperinterface(providerOf(T))
+-          .addField(TypeName.INT, "id", PRIVATE, FINAL)
+-          .addMethod(
+-              constructorBuilder()
+-                  .addParameter(TypeName.INT, "id")
+-                  .addStatement("this.id = id")
+-                  .build())
+-          .addMethods(getMethods())
+-          .build();
++    private TypeSpec build() {
++      return createSwitchingProviderType(
++          classBuilder(switchingProviderType)
++              .addTypeVariable(T)
++              .addSuperinterface(providerOf(T))
++              .addMethods(getMethods()));
+     }
+ 
+     private ImmutableList<MethodSpec> getMethods() {
+diff --git a/javatests/dagger/internal/codegen/ComponentProcessorTest.java b/javatests/dagger/internal/codegen/ComponentProcessorTest.java
+index f2884dc43..312a918e4 100644
+--- a/javatests/dagger/internal/codegen/ComponentProcessorTest.java
++++ b/javatests/dagger/internal/codegen/ComponentProcessorTest.java
+@@ -2564,6 +2564,10 @@ public void nullIncorrectlyReturnedFromNonNullableInlinedProvider() {
+                 "    implements Factory<String> {",
+                 "  @Override",
+                 "  public String get() {",
++                "    return provideInstance();",
++                "  }",
++                "",
++                "  public static String provideInstance() {",
+                 "    return proxyNonNullableString();",
+                 "  }",
+                 "",
+@@ -2656,6 +2660,10 @@ public void nullCheckingIgnoredWhenProviderReturnsPrimitive() {
+                 "",
+                 "  @Override",
+                 "  public Integer get() {",
++                "    return provideInstance();",
++                "  }",
++                "",
++                "  public static Integer provideInstance() {",
+                 "    return proxyPrimitiveInteger();",
+                 "  }",
+                 "",
+diff --git a/javatests/dagger/internal/codegen/InjectConstructorFactoryGeneratorTest.java b/javatests/dagger/internal/codegen/InjectConstructorFactoryGeneratorTest.java
+index a35fdc087..7941803af 100644
+--- a/javatests/dagger/internal/codegen/InjectConstructorFactoryGeneratorTest.java
++++ b/javatests/dagger/internal/codegen/InjectConstructorFactoryGeneratorTest.java
+@@ -152,6 +152,10 @@
+             "",
+             "  @Override",
+             "  public GenericClass<T> get() {",
++            "    return provideInstance(tProvider);",
++            "  }",
++            "",
++            "  public static <T> GenericClass<T> provideInstance(Provider<T> tProvider) {",
+             "    return new GenericClass<T>(tProvider.get());",
+             "  }",
+             "",
+@@ -204,6 +208,11 @@
+             "",
+             "  @Override",
+             "  public GenericClass<A, B> get() {",
++            "    return provideInstance(aProvider, bProvider);",
++            "  }",
++            "",
++            "  public static <A, B> GenericClass<A, B>  provideInstance(",
++            "      Provider<A> aProvider, Provider<B> bProvider) {",
+             "    GenericClass<A, B> instance = new GenericClass<A, B>();",
+             "    GenericClass_MembersInjector.injectA(instance, aProvider.get());",
+             "    GenericClass_MembersInjector.injectRegister(instance, bProvider.get());",
+@@ -249,6 +258,10 @@
+             "",
+             "  @Override",
+             "  public GenericClass<T> get() {",
++            "    return provideInstance();",
++            "  }",
++            "",
++            "  public static <T> GenericClass<T> provideInstance() {",
+             "    return new GenericClass<T>();",
+             "  }",
+             "",
+@@ -297,6 +310,11 @@
+             "",
+             "  @Override",
+             "  public GenericClass<A, B> get() {",
++            "    return provideInstance(aProvider, bProvider);",
++            "  }",
++            "",
++            "  public static <A, B> GenericClass<A, B> provideInstance(",
++            "      Provider<A> aProvider, Provider<B> bProvider) {",
+             "    return new GenericClass<A, B>(aProvider.get(), bProvider.get());",
+             "  }",
+             "",
+@@ -356,6 +374,13 @@
+             "",
+             "  @Override",
+             "  public GenericClass<A, B, C> get() {",
++            "    return provideInstance(aProvider, bProvider, cProvider);",
++            "  }",
++            "",
++            "  public static <A extends Number & Comparable<A>,",
++            "      B extends List<? extends String>,",
++            "      C extends List<? super String>> GenericClass<A, B, C> provideInstance(",
++            "          Provider<A> aProvider, Provider<B> bProvider, Provider<C> cProvider) {",
+             "    return new GenericClass<A, B, C>(",
+             "        aProvider.get(), bProvider.get(), cProvider.get());",
+             "  }",
+@@ -432,6 +457,22 @@
+             "",
+             "  @Override",
+             "  public GenericClass<A, B> get() {",
++            "    return provideInstance(",
++            "        aAndA2AndPaAndLaProvider,",
++            "        qaProvider,",
++            "        sAndS2AndPsAndLsProvider,",
++            "        qsProvider,",
++            "        bAndB2AndPbAndLbProvider,",
++            "        qbProvider);",
++            "  }",
++            "",
++            "  public static <A, B> GenericClass<A, B> provideInstance(",
++            "      Provider<A> aAndA2AndPaAndLaProvider,",
++            "      Provider<A> qaProvider,",
++            "      Provider<String> sAndS2AndPsAndLsProvider,",
++            "      Provider<String> qsProvider,",
++            "      Provider<B> bAndB2AndPbAndLbProvider,",
++            "      Provider<B> qbProvider) {",
+             "    return new GenericClass<A, B>(",
+             "      aAndA2AndPaAndLaProvider.get(),",
+             "      aAndA2AndPaAndLaProvider.get(),",
+@@ -987,6 +1028,10 @@
+             "  }",
+             "",
+             "  @Override public InjectConstructor get() {",
++            "    return provideInstance(sProvider);",
++            "  }",
++            "",
++            "  public static InjectConstructor provideInstance(Provider<String> sProvider) {",
+             "    return new InjectConstructor(sProvider.get());",
+             "  }",
+             "",
+@@ -1032,6 +1077,10 @@
+             "  }",
+             "",
+             "  @Override public AllInjections get() {",
++            "    return provideInstance(sProvider);",
++            "  }",
++            "",
++            "  public static AllInjections provideInstance(Provider<String> sProvider) {",
+             "    AllInjections instance = new AllInjections(sProvider.get());",
+             "    AllInjections_MembersInjector.injectS(instance, sProvider.get());",
+             "    AllInjections_MembersInjector.injectS2(instance, sProvider.get());",
+@@ -1079,6 +1128,10 @@ public void neitherTypeNorSupertypeRequiresMemberInjection() {
+             "  private static final B_Factory INSTANCE = new B_Factory();",
+             "",
+             "  @Override public B get() {",
++            "    return provideInstance();",
++            "  }",
++            "",
++            "  public static B provideInstance() {",
+             "    return new B();",
+             "  }",
+             "",
+@@ -1128,6 +1181,11 @@ public void wildcardDependency() {
+             "  }",
+             "",
+             "  @Override public InjectConstructor get() {",
++            "    return provideInstance(objectsProvider);",
++            "  }",
++            "",
++            "  public static InjectConstructor provideInstance(",
++            "      Provider<List<?>> objectsProvider) {",
+             "    return new InjectConstructor(objectsProvider.get());",
+             "  }",
+             "",
+@@ -1180,6 +1238,11 @@ public void basicNameCollision() {
+             "  }",
+             "",
+             "  @Override public InjectConstructor get() {",
++            "    return provideInstance(factoryProvider);",
++            "  }",
++            "",
++            "  public static InjectConstructor provideInstance(",
++            "      Provider<other.pkg.Factory> factoryProvider) {",
+             "    return new InjectConstructor(factoryProvider.get());",
+             "  }",
+             "",
+@@ -1237,6 +1300,11 @@ public void nestedNameCollision() {
+             "  }",
+             "",
+             "  @Override public InjectConstructor get() {",
++            "    return provideInstance(factoryProvider);",
++            "  }",
++            "",
++            "  public static InjectConstructor provideInstance(",
++            "      Provider<Outer.Factory> factoryProvider) {",
+             "    return new InjectConstructor(factoryProvider.get());",
+             "  }",
+             "",
+@@ -1299,6 +1367,12 @@ public void samePackageNameCollision() {
+             "  }",
+             "",
+             "  @Override public InjectConstructor get() {",
++            "    return provideInstance(otherPackageProvider, samePackageProvider);",
++            "  }",
++            "",
++            "  public static InjectConstructor provideInstance(",
++            "      Provider<other.pkg.CommonName> otherPackageProvider,",
++            "      Provider<CommonName> samePackageProvider) {",
+             "    return new InjectConstructor(",
+             "        otherPackageProvider.get(), samePackageProvider.get());",
+             "  }",
+@@ -1344,6 +1418,10 @@ public void noDeps() {
+             "  private static final SimpleType_Factory INSTANCE = new SimpleType_Factory();",
+             "",
+             "  @Override public SimpleType get() {",
++            "    return provideInstance();",
++            "  }",
++            "",
++            "  public static SimpleType provideInstance() {",
+             "    return new SimpleType();",
+             "  }",
+             "",
+@@ -1394,6 +1472,10 @@ public void noDeps() {
+             "  private static final OuterType_A_Factory INSTANCE = new OuterType_A_Factory();",
+             "",
+             "  @Override public OuterType.A get() {",
++            "    return provideInstance();",
++            "  }",
++            "",
++            "  public static OuterType.A provideInstance() {",
+             "    return new OuterType.A();",
+             "  }",
+             "",
+diff --git a/javatests/dagger/internal/codegen/MembersInjectionTest.java b/javatests/dagger/internal/codegen/MembersInjectionTest.java
+index 203249564..160005095 100644
+--- a/javatests/dagger/internal/codegen/MembersInjectionTest.java
++++ b/javatests/dagger/internal/codegen/MembersInjectionTest.java
+@@ -1132,6 +1132,11 @@ public void injectsPrimitive() {
+             "",
+             "  @Override",
+             "  public InjectedType get() {",
++            "    return provideInstance(boxedIntAndPrimitiveIntProvider);",
++            "  }",
++            "",
++            "  public static InjectedType provideInstance(",
++            "      Provider<Integer> boxedIntAndPrimitiveIntProvider) {",
+             "    InjectedType instance = new InjectedType();",
+             "    InjectedType_MembersInjector.injectPrimitiveInt(",
+             "        instance, boxedIntAndPrimitiveIntProvider.get());",
+diff --git a/javatests/dagger/internal/codegen/ModuleFactoryGeneratorTest.java b/javatests/dagger/internal/codegen/ModuleFactoryGeneratorTest.java
+index 34adab965..3c0751d4c 100644
+--- a/javatests/dagger/internal/codegen/ModuleFactoryGeneratorTest.java
++++ b/javatests/dagger/internal/codegen/ModuleFactoryGeneratorTest.java
+@@ -266,6 +266,10 @@ public void providesMethodReturnsProduced() {
+             "  }",
+             "",
+             "  @Override public String get() {",
++            "    return provideInstance(module);",
++            "  }",
++            "",
++            "  public static String provideInstance(TestModule module) {",
+             "    return proxyProvideString(module);",
+             "  }",
+             "",
+@@ -313,6 +317,10 @@ public void providesMethodReturnsProduced() {
+             "  }",
+             "",
+             "  @Override public String get() {",
++            "    return provideInstance(module);",
++            "  }",
++            "",
++            "  public static String provideInstance(TestModule module) {",
+             "    return proxyProvideString(module);",
+             "  }",
+             "",
+@@ -361,6 +369,11 @@ public void providesMethodReturnsProduced() {
+             "  @Override",
+             "  @Nullable",
+             "  public String get() {",
++            "    return provideInstance(module);",
++            "  }",
++            "",
++            "  @Nullable",
++            "  public static String provideInstance(TestModule module) {",
+             "    return proxyProvideString(module);",
+             "  }",
+             "",
+@@ -459,6 +472,14 @@ public void providesMethodReturnsProduced() {
+             "  }",
+             "",
+             "  @Override public List<Object> get() {",
++            "    return provideInstance(module, aProvider, bProvider, xInjectorProvider);",
++            "  }",
++            "",
++            "  public static List<Object> provideInstance(",
++            "      TestModule module,",
++            "      Provider<Object> aProvider,",
++            "      Provider<Object> bProvider,",
++            "      Provider<MembersInjector<X>> xInjectorProvider) {",
+             "    return proxyProvideObjects(",
+             "        module, aProvider.get(), bProvider.get(), xInjectorProvider.get());",
+             "  }",
+@@ -518,6 +539,10 @@ public void providesMethodReturnsProduced() {
+             "  }",
+             "",
+             "  @Override public String get() {",
++            "    return provideInstance(module);",
++            "  }",
++            "",
++            "  public static String provideInstance(TestModule module) {",
+             "    return proxyProvideString(module);",
+             "  }",
+             "",
+@@ -572,6 +597,10 @@ public void providesMethodReturnsProduced() {
+             "  }",
+             "",
+             "  @Override public List<List<?>> get() {",
++            "    return provideInstance(module);",
++            "  }",
++            "",
++            "  public static List<List<?>> provideInstance(TestModule module) {",
+             "    return proxyProvideWildcardList(module);",
+             "  }",
+             "",
+@@ -624,6 +653,10 @@ public void providesMethodReturnsProduced() {
+             "  }",
+             "",
+             "  @Override public Set<String> get() {",
++            "    return provideInstance(module);",
++            "  }",
++            "",
++            "  public static Set<String> provideInstance(TestModule module) {",
+             "    return proxyProvideStrings(module);",
+             "  }",
+             "",
+@@ -918,6 +951,11 @@ public void genericSubclassedModule() {
+             "",
+             "  @Override",
+             "  public List<B> get() {  ",
++            "    return provideInstance(module, bProvider);",
++            "  }",
++            "",
++            "  public static <A extends CharSequence, B, C extends Number & Comparable<C>>",
++            "      List<B> provideInstance(ParentModule<A, B, C> module, Provider<B> bProvider) {",
+             "    return proxyProvideListB(module, bProvider.get());",
+             "  }",
+             "",
+@@ -956,6 +994,11 @@ public void genericSubclassedModule() {
+             "",
+             "  @Override",
+             "  public B get() {  ",
++            "    return provideInstance(module, bProvider);",
++            "  }",
++            "",
++            "  public static <A extends CharSequence, B, C extends Number & Comparable<C>>",
++            "      B provideInstance(ParentModule<A, B, C> module, Provider<B> bProvider) {",
+             "    return proxyProvideBElement(module, bProvider.get());",
+             "  }",
+             "",
+@@ -996,6 +1039,11 @@ public void genericSubclassedModule() {
+             "",
+             "  @Override",
+             "  public B get() {  ",
++            "    return provideInstance(module, bProvider);",
++            "  }",
++            "",
++            "  public static <A extends CharSequence, B, C extends Number & Comparable<C>>",
++            "      B provideInstance(ParentModule<A, B, C> module, Provider<B> bProvider) {",
+             "    return proxyProvideBEntry(module, bProvider.get());",
+             "  }",
+             "",
+@@ -1032,6 +1080,10 @@ public void genericSubclassedModule() {
+             "",
+             "  @Override",
+             "  public Number get() {  ",
++            "    return provideInstance(module);",
++            "  }",
++            "",
++            "  public static Number provideInstance(ChildNumberModule module) {",
+             "    return proxyProvideNumber(module);",
+             "  }",
+             "",
+@@ -1064,6 +1116,10 @@ public void genericSubclassedModule() {
+             "",
+             "  @Override",
+             "  public Integer get() {  ",
++            "    return provideInstance(module);",
++            "  }",
++            "",
++            "  public static Integer provideInstance(ChildIntegerModule module) {",
+             "    return proxyProvideInteger(module);",
+             "  }",
+             "",
+@@ -1135,6 +1191,10 @@ public void genericSubclassedModule() {
+             "",
+             "  @Override",
+             "  public Map<String, Number> get() {",
++            "    return provideInstance();",
++            "  }",
++            "",
++            "  public static Map<String, Number> provideInstance() {",
+             "    return proxyProvideMapStringNumber();",
+             "  }",
+             "",
+@@ -1165,6 +1225,10 @@ public void genericSubclassedModule() {
+             "",
+             "  @Override",
+             "  public Object get() {",
++            "    return provideInstance();",
++            "  }",
++            "",
++            "  public static Object provideInstance() {",
+             "    return proxyProvideNonGenericType();",
+             "  }",
+             "",
+@@ -1200,6 +1264,10 @@ public void genericSubclassedModule() {
+             "",
+             "  @Override",
+             "  public String get() {",
++            "    return provideInstance(oProvider);",
++            "  }",
++            "",
++            "  public static String provideInstance(Provider<Object> oProvider) {",
+             "    return proxyProvideNonGenericTypeWithDeps(oProvider.get());",
+             "  }",
+             "",

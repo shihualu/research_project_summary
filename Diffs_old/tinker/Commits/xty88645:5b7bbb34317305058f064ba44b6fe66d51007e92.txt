@@ -1,0 +1,769 @@
+diff --git a/tinker-build/tinker-patch-gradle-plugin/src/main/groovy/com/tencent/tinker/build/gradle/task/TinkerMultidexConfigTask.groovy b/tinker-build/tinker-patch-gradle-plugin/src/main/groovy/com/tencent/tinker/build/gradle/task/TinkerMultidexConfigTask.groovy
+index a7384fa7..c52447dd 100644
+--- a/tinker-build/tinker-patch-gradle-plugin/src/main/groovy/com/tencent/tinker/build/gradle/task/TinkerMultidexConfigTask.groovy
++++ b/tinker-build/tinker-patch-gradle-plugin/src/main/groovy/com/tencent/tinker/build/gradle/task/TinkerMultidexConfigTask.groovy
+@@ -16,6 +16,7 @@
+ 
+ package com.tencent.tinker.build.gradle.task
+ 
++import com.tencent.tinker.build.auxiliaryclass.AuxiliaryClassInjector
+ import com.tencent.tinker.build.gradle.TinkerPatchPlugin
+ import org.gradle.api.DefaultTask
+ import org.gradle.api.tasks.TaskAction
+@@ -39,7 +40,7 @@ public class TinkerMultidexConfigTask extends DefaultTask {
+                     "\n" +
+                     "-keep public class * extends com.tencent.tinker.loader.app.TinkerApplication {\n" +
+                     "    *;\n" +
+-                    "}"
++                    "}\n"
+ 
+ 
+     def applicationVariant
+@@ -61,6 +62,17 @@ public class TinkerMultidexConfigTask extends DefaultTask {
+ 
+         fr.write(MULTIDEX_CONFIG_SETTINGS)
+         fr.write("\n")
++
++        // Write additional rules to keep auxiliary class in primary dex.
++        if (project.tinkerPatch.dex.usePreGeneratedPatchDex) {
++            final String additionalRules =
++                    "-keep class ${AuxiliaryClassInjector.AUXILIARY_CLASSNAME} {\n" +
++                            '    *;\n' +
++                            '}\n'
++            fr.write(additionalRules)
++            fr.write('\n')
++        }
++
+         //unlike proguard, if loader endwith *, we must change to **
+         fr.write("#your dex.loader patterns here\n")
+         Iterable<String> loader = project.extensions.tinkerPatch.dex.loader
+diff --git a/tinker-build/tinker-patch-gradle-plugin/src/main/groovy/com/tencent/tinker/build/gradle/task/TinkerProguardConfigTask.groovy b/tinker-build/tinker-patch-gradle-plugin/src/main/groovy/com/tencent/tinker/build/gradle/task/TinkerProguardConfigTask.groovy
+index 1b7accb4..4283b7b3 100644
+--- a/tinker-build/tinker-patch-gradle-plugin/src/main/groovy/com/tencent/tinker/build/gradle/task/TinkerProguardConfigTask.groovy
++++ b/tinker-build/tinker-patch-gradle-plugin/src/main/groovy/com/tencent/tinker/build/gradle/task/TinkerProguardConfigTask.groovy
+@@ -16,7 +16,7 @@
+ 
+ package com.tencent.tinker.build.gradle.task
+ 
+-import com.tencent.tinker.build.auxiliaryinject.AuxiliaryInjector
++import com.tencent.tinker.build.auxiliaryclass.AuxiliaryClassInjector
+ import com.tencent.tinker.build.gradle.TinkerPatchPlugin
+ import com.tencent.tinker.build.util.FileOperation
+ import org.gradle.api.DefaultTask
+@@ -88,15 +88,19 @@ public class TinkerProguardConfigTask extends DefaultTask {
+ 
+         fr.write(PROGUARD_CONFIG_SETTINGS)
+ 
+-        // write additional rules to keep <init> and <clinit>
++        // Write additional rules to keep auxiliary class, <init> and <clinit>
+         if (project.tinkerPatch.dex.usePreGeneratedPatchDex) {
+             def additionalKeptRules =
+-                    "-dontwarn ${AuxiliaryInjector.AUXILIARY_CLASSNAME} \n" +
++                    "-dontwarn ${AuxiliaryClassInjector.AUXILIARY_CLASSNAME} \n" +
+                             '-keepclassmembers class * { \n' +
+                             '    <init>(...); \n' +
+                             '    static void <clinit>(...); \n' +
+-                            '}\n\n'
++                            '}\n' +
++                            "-keep class ${AuxiliaryClassInjector.AUXILIARY_CLASSNAME} {\n" +
++                            '    *;\n' +
++                            '}\n'
+             fr.write(additionalKeptRules)
++            fr.write('\n')
+         }
+ 
+         fr.write("#your dex.loader patterns here\n")
+diff --git a/tinker-build/tinker-patch-gradle-plugin/src/main/groovy/com/tencent/tinker/build/gradle/transform/AuxiliaryInjectTransform.groovy b/tinker-build/tinker-patch-gradle-plugin/src/main/groovy/com/tencent/tinker/build/gradle/transform/AuxiliaryInjectTransform.groovy
+index e848fad8..8507e4e1 100644
+--- a/tinker-build/tinker-patch-gradle-plugin/src/main/groovy/com/tencent/tinker/build/gradle/transform/AuxiliaryInjectTransform.groovy
++++ b/tinker-build/tinker-patch-gradle-plugin/src/main/groovy/com/tencent/tinker/build/gradle/transform/AuxiliaryInjectTransform.groovy
+@@ -17,20 +17,23 @@
+ package com.tencent.tinker.build.gradle.transform
+ 
+ import com.android.build.api.transform.*
+-import com.google.common.collect.Sets
++import com.google.common.collect.ImmutableSet
+ import com.google.common.io.Files
+-import com.tencent.tinker.build.auxiliaryinject.AuxiliaryInjector
++import com.tencent.tinker.build.auxiliaryclass.AuxiliaryClassGenerator
++import com.tencent.tinker.build.auxiliaryclass.AuxiliaryClassInjector
++import com.tencent.tinker.build.auxiliaryclass.AuxiliaryClassInjector.ProcessJarCallback
+ import com.tencent.tinker.build.util.MD5
+ import com.tencent.tinker.commons.ziputil.Streams
+ import groovy.io.FileType
+ import org.gradle.api.Project
+ 
++import java.lang.reflect.Constructor
+ import java.util.zip.ZipEntry
+ import java.util.zip.ZipInputStream
+ import java.util.zip.ZipOutputStream
+ 
+ /**
+- * Transform for calling AuxiliaryInjector.
++ * Transform for calling AuxiliaryClassGenerator and AuxiliaryClassInjector.
+  *
+  * @author tangyinsheng
+  */
+@@ -38,8 +41,8 @@ public class AuxiliaryInjectTransform extends Transform {
+     private static final String TRANSFORM_NAME = 'AuxiliaryInject'
+ 
+     private final Project project
++    private final String auxiliaryClassPathName
+ 
+-    private AuxiliaryInjector auxiliaryInjector
+     private boolean isEnabled = false
+ 
+     def applicationVariants
+@@ -55,6 +58,9 @@ public class AuxiliaryInjectTransform extends Transform {
+ 
+     public AuxiliaryInjectTransform(Project project) {
+         this.project = project
++        this.auxiliaryClassPathName =
++                AuxiliaryClassInjector.AUXILIARY_CLASSNAME.replace('.', '/') + '.class'
++
+         project.afterEvaluate {
+             this.isEnabled = project.tinkerPatch.dex.usePreGeneratedPatchDex
+ 
+@@ -69,12 +75,12 @@ public class AuxiliaryInjectTransform extends Transform {
+ 
+     @Override
+     Set<QualifiedContent.ContentType> getInputTypes() {
+-        return Sets.immutableEnumSet(QualifiedContent.DefaultContentType.CLASSES)
++        return ImmutableSet.of(QualifiedContent.DefaultContentType.CLASSES)
+     }
+ 
+     @Override
+     Set<QualifiedContent.Scope> getScopes() {
+-        return Sets.immutableEnumSet(
++        return ImmutableSet.of(
+                 QualifiedContent.Scope.PROJECT,
+                 QualifiedContent.Scope.PROJECT_LOCAL_DEPS,
+                 QualifiedContent.Scope.SUB_PROJECTS,
+@@ -117,8 +123,13 @@ public class AuxiliaryInjectTransform extends Transform {
+         }
+ 
+         // Get manifest file path.
+-        def manifestTask = this.project.tasks.findByName("process${variantName.capitalize()}Manifest")
+-        this.manifestFile = manifestTask.outputs.files.files[0]
++        this.applicationVariants.any { variant ->
++            if (variant.name.equals(variantName)) {
++                def variantOutput = variant.outputs.first()
++                this.manifestFile = variantOutput.processManifest.manifestOutputFile
++                return true  // break out.
++            }
++        }
+ 
+         // Get application classname from manifest file.
+         def parsedManifest = new XmlParser().parse(this.manifestFile)
+@@ -132,129 +143,226 @@ public class AuxiliaryInjectTransform extends Transform {
+ 
+     @Override
+     public void transform(TransformInvocation transformInvocation) throws TransformException, InterruptedException, IOException {
+-        if (!this.isEnabled) {
+-            return
+-        }
+-
+         String variantName = decapitalize(transformInvocation.context.path.split(getTaskNamePrefix(this))[1])
+         initVariantRelatedParamsIfNeeded(variantName)
+ 
+-        File dirOutput = transformInvocation.outputProvider.getContentLocation(
+-                "classes", getOutputTypes(), getScopes(), Format.DIRECTORY)
+-        if (!dirOutput.exists()) {
+-            dirOutput.mkdirs()
+-        }
++        def dirInputs = new HashSet<>()
++        def jarInputs = new HashSet<>()
+ 
+-        File jarOutput = transformInvocation.outputProvider.getContentLocation(
+-                "combined", getOutputTypes(), getScopes(), Format.JAR
+-        )
+-        if (!jarOutput.exists()) {
+-            jarOutput.getParentFile().mkdirs()
++        // Collecting inputs.
++        transformInvocation.inputs.each { input ->
++            input.directoryInputs.each { dirInput ->
++                dirInputs.add(dirInput)
++            }
++            input.jarInputs.each { jarInput ->
++                jarInputs.add(jarInput)
++            }
+         }
+ 
+-        File tempJarOutputDir = new File(transformInvocation.context.temporaryDir, "combined-jars")
+-        if (!tempJarOutputDir.exists()) {
+-            tempJarOutputDir.mkdirs()
++        if (!this.isEnabled) {
++            printMsgLog("PreGeneratedPatchDex mode is disabled, skip transforming.")
+         }
+ 
+-        transformInvocation.inputs.each { input ->
+-            input.directoryInputs.each { dirInput ->
+-                if (transformInvocation.incremental) {
+-                    dirInput.changedFiles.each { entry ->
+-                        File fileInput = entry.getKey()
+-                        File fileOutput = new File(fileInput.getAbsolutePath().replace(
+-                                dirInput.file.getAbsolutePath(), dirOutput.getAbsolutePath()))
+-                        if (!fileOutput.exists()) {
+-                            fileOutput.getParentFile().mkdirs()
++        // Auxiliary class may be exist if user create it manually in his project.
++        boolean isAuxiliaryClassExists = false
++
++        if (!dirInputs.isEmpty() || !jarInputs.isEmpty()) {
++            File dirOutput = transformInvocation.outputProvider.getContentLocation(
++                    "classes", getOutputTypes(), getScopes(), Format.DIRECTORY)
++            if (!dirOutput.exists()) {
++                dirOutput.mkdirs()
++            }
++
++            if (!dirInputs.isEmpty()) {
++                dirInputs.each { dirInput ->
++                    if (transformInvocation.incremental) {
++                        dirInput.changedFiles.each { entry ->
++                            File fileInput = entry.getKey()
++                            File fileOutput = new File(fileInput.getAbsolutePath().replace(
++                                    dirInput.file.getAbsolutePath(), dirOutput.getAbsolutePath()))
++                            if (!fileOutput.exists()) {
++                                fileOutput.getParentFile().mkdirs()
++                            }
++                            final String relativeInputClassPath =
++                                    dirInput.file.toPath().relativize(fileInput.toPath())
++                                            .toString().replace('\\', '/')
++
++                            Status fileStatus = entry.getValue()
++                            switch(fileStatus) {
++                                case Status.ADDED:
++                                case Status.CHANGED:
++                                    if (fileInput.isDirectory()) {
++                                        return // continue.
++                                    }
++
++                                    // If disabled, skip all classes.
++                                    if (!this.isEnabled) {
++                                        Files.copy(fileInput, fileOutput)
++                                    } else {
++                                        // Skip application class.
++                                        if (relativeInputClassPath.equals(this.appClassPathName)) {
++                                            printWarnLog('Skipping Application class: %s',
++                                                    relativeInputClassPath)
++                                            Files.copy(fileInput, fileOutput)
++                                        } else
++                                        // Skip and mark auxiliary class.
++                                        if (relativeInputClassPath.equals(this.auxiliaryClassPathName)) {
++                                            isAuxiliaryClassExists = true
++                                            Files.copy(fileInput, fileOutput)
++                                        } else {
++                                            printMsgLog('Processing %s file %s',
++                                                    fileStatus,
++                                                    relativeInputClassPath)
++                                            AuxiliaryClassInjector.processClass(fileInput, fileOutput)
++                                        }
++                                    }
++                                    break
++                                case Status.REMOVED:
++                                    // Print log if it's enabled only.
++                                    if (this.isEnabled) {
++                                        printMsgLog('Removing %s file %s from result.', fileStatus,
++                                                dirOutput.toPath().relativize(fileOutput.toPath()).toString())
++                                    }
++
++                                    if (fileOutput.exists()) {
++                                        if (fileOutput.isDirectory()) {
++                                            fileOutput.deleteDir()
++                                        } else {
++                                            fileOutput.delete()
++                                        }
++                                    }
++                                    break
++                            }
++                        }
++                    } else {
++                        if (dirOutput.exists()) {
++                            dirOutput.deleteDir()
+                         }
+ 
+-                        Status fileStatus = entry.getValue()
+-                        switch(fileStatus) {
+-                            case Status.ADDED:
+-                            case Status.CHANGED:
++                        dirInput.file.traverse(type: FileType.FILES, nameFilter: ~/.*\.class$/) { fileInput ->
++                            File fileOutput = new File(fileInput.getAbsolutePath().replace(dirInput.file.getAbsolutePath(), dirOutput.getAbsolutePath()))
++                            if (!fileOutput.exists()) {
++                                fileOutput.getParentFile().mkdirs()
++                            }
++                            final String relativeInputClassPath =
++                                    dirInput.file.toPath().relativize(fileInput.toPath())
++                                            .toString().replace('\\', '/')
++
++                            // If disabled, skip all classes.
++                            if (!this.isEnabled) {
++                                Files.copy(fileInput, fileOutput)
++                            } else {
+                                 // Skip application class.
+-                                if (dirInput.file.toPath().relativize(fileInput.toPath())
+-                                        .toString().replace('\\', '/').endsWith(this.appClassPathName)) {
++                                if (relativeInputClassPath.equals(this.appClassPathName)) {
+                                     printWarnLog('Skipping Application class: %s',
+-                                            dirInput.file.toPath().relativize(fileInput.toPath()).toString())
++                                            relativeInputClassPath)
++                                    Files.copy(fileInput, fileOutput)
++                                } else
++                                // Skip and mark auxiliary class.
++                                if (relativeInputClassPath.equals(this.auxiliaryClassPathName)) {
++                                    isAuxiliaryClassExists = true
+                                     Files.copy(fileInput, fileOutput)
+                                 } else {
+                                     printMsgLog('Processing %s file %s',
+-                                            fileStatus,
+-                                            dirInput.file.toPath().relativize(fileInput.toPath()).toString())
+-                                    AuxiliaryInjector.processClass(fileInput, fileOutput)
++                                            Status.ADDED,
++                                            relativeInputClassPath)
++                                    AuxiliaryClassInjector.processClass(fileInput, fileOutput)
+                                 }
+-                                break
+-                            case Status.REMOVED:
+-                                printMsgLog('Removing %s file %s from result.', fileStatus,
+-                                        dirOutput.toPath().relativize(fileOutput.toPath()).toString())
+-                                if (fileOutput.exists()) {
+-                                    fileOutput.delete()
+-                                }
+-                                break
+-                        }
+-                    }
+-                } else {
+-                    if (dirOutput.exists()) {
+-                        dirOutput.deleteDir()
+-                    }
+-
+-                    dirInput.file.traverse(type: FileType.FILES, nameFilter: ~/.*\.class$/) { fileInput ->
+-                        File fileOutput = new File(fileInput.getAbsolutePath().replace(dirInput.file.getAbsolutePath(), dirOutput.getAbsolutePath()))
+-                        if (!fileOutput.exists()) {
+-                            fileOutput.getParentFile().mkdirs()
+-                        }
+-
+-                        // Skip application class.
+-                        if (dirInput.file.toPath().relativize(fileInput.toPath())
+-                                .toString().replace('\\', '/').endsWith(this.appClassPathName)) {
+-                            printWarnLog('Skipping Application class: %s',
+-                                    dirInput.file.toPath().relativize(fileInput.toPath()).toString())
+-                            Files.copy(fileInput, fileOutput)
+-                        } else {
+-                            printMsgLog('Processing %s file %s',
+-                                    Status.ADDED,
+-                                    dirInput.file.toPath().relativize(fileInput.toPath()).toString())
+-                            AuxiliaryInjector.processClass(fileInput, fileOutput)
++                            }
+                         }
+                     }
+                 }
+             }
+ 
+-            List<File> jarsToMerge = new ArrayList<>()
++            if (!jarInputs.isEmpty()) {
++                File jarOutput = transformInvocation.outputProvider.getContentLocation(
++                        "combined", getOutputTypes(), getScopes(), Format.JAR
++                )
++                if (!jarOutput.exists()) {
++                    jarOutput.getParentFile().mkdirs()
++                }
+ 
+-            input.jarInputs.each { jarInput ->
+-                File fileInput = jarInput.file
+-                File fileOutput = new File(tempJarOutputDir,
+-                        getUniqueHashName(fileInput))
+-                if (!fileOutput.exists()) {
+-                    fileOutput.getParentFile().mkdirs()
++                File tempJarOutputDir = new File(transformInvocation.context.temporaryDir, "combined-jars")
++                if (!tempJarOutputDir.exists()) {
++                    tempJarOutputDir.mkdirs()
+                 }
+ 
+-                switch (jarInput.status) {
+-                    case Status.NOTCHANGED:
+-                        if (transformInvocation.incremental) {
++                List<File> jarsToMerge = new ArrayList<>()
++
++                jarInputs.each { jarInput ->
++                    File fileInput = jarInput.file
++                    File fileOutput = new File(tempJarOutputDir,
++                            getUniqueHashName(fileInput))
++                    if (!fileOutput.exists()) {
++                        fileOutput.getParentFile().mkdirs()
++                    }
++
++                    switch (jarInput.status) {
++                        case Status.NOTCHANGED:
++                            if (transformInvocation.incremental) {
++                                break
++                            }
++                        case Status.ADDED:
++                        case Status.CHANGED:
++                            // Print log if it's enabled only.
++                            if (this.isEnabled) {
++                                printMsgLog('Processing %s file %s',
++                                        transformInvocation.incremental ? jarInput.status : Status.ADDED,
++                                        tempJarOutputDir.toPath().relativize(fileOutput.toPath()).toString())
++                            }
++
++                            AuxiliaryClassInjector.processJar(fileInput, fileOutput, new ProcessJarCallback() {
++                                @Override
++                                boolean onProcessClassEntry(String entryName) {
++                                    // If disabled, skip all classes.
++                                    if (!this.isEnabled) {
++                                        return false
++                                    } else {
++                                        // Skip application class.
++                                        if (entryName.equals(AuxiliaryInjectTransform.this.appClassPathName)) {
++                                            return false
++                                        } else
++                                        // Skip and mark auxiliary class.
++                                        if (entryName.equals(AuxiliaryInjectTransform.this.auxiliaryClassPathName)) {
++                                            isAuxiliaryClassExists = true
++                                            return false
++                                        } else {
++                                            return true;
++                                        }
++                                    }
++                                }
++                            })
++                            jarsToMerge.add(fileOutput)
+                             break
+-                        }
+-                    case Status.ADDED:
+-                    case Status.CHANGED:
+-                        printMsgLog('Processing %s file %s',
+-                                transformInvocation.incremental ? jarInput.status : Status.ADDED,
+-                                tempJarOutputDir.toPath().relativize(fileOutput.toPath()).toString())
+-                        AuxiliaryInjector.processJar(fileInput, fileOutput)
+-                        jarsToMerge.add(fileOutput)
+-                        break
+-                    case Status.REMOVED:
+-                        printMsgLog('Removing %s file %s from result.', fileStatus,
+-                                tempJarOutputDir.toPath().relativize(fileOutput.toPath()).toString())
+-                        if (fileOutput.exists()) {
+-                            fileOutput.delete()
+-                        }
+-                        break
++                        case Status.REMOVED:
++                            // Print log if it's enabled only.
++                            if (this.isEnabled) {
++                                printMsgLog('Removing %s file %s from result.', fileStatus,
++                                        tempJarOutputDir.toPath().relativize(fileOutput.toPath()).toString())
++                            }
++
++                            if (fileOutput.exists()) {
++                                fileOutput.delete()
++                            }
++                            break
++                    }
+                 }
++
++                mergeJars(jarsToMerge, jarOutput)
+             }
+ 
+-            mergeJars(jarsToMerge, jarOutput)
++            if (this.isEnabled) {
++                if (!isAuxiliaryClassExists) {
++                    printMsgLog('Generating auxiliary class %s.', this.auxiliaryClassPathName)
++                    AuxiliaryClassGenerator.generateAuxiliaryClass(
++                            dirOutput, AuxiliaryClassInjector.AUXILIARY_CLASSNAME)
++                } else {
++                    printWarnLog(
++                            'Found auxiliary class %s in your source codes, skip generating.',
++                            this.auxiliaryClassPathName
++                    )
++                }
++            }
+         }
+     }
+ 
+diff --git a/tinker-build/tinker-patch-lib/src/main/java/com/tencent/tinker/build/auxiliaryclass/AuxiliaryClassGenerator.java b/tinker-build/tinker-patch-lib/src/main/java/com/tencent/tinker/build/auxiliaryclass/AuxiliaryClassGenerator.java
+new file mode 100644
+index 00000000..f19c2c69
+--- /dev/null
++++ b/tinker-build/tinker-patch-lib/src/main/java/com/tencent/tinker/build/auxiliaryclass/AuxiliaryClassGenerator.java
+@@ -0,0 +1,130 @@
++/*
++ * Tencent is pleased to support the open source community by making Tinker available.
++ *
++ * Copyright (C) 2016 THL A29 Limited, a Tencent company. All rights reserved.
++ *
++ * Licensed under the BSD 3-Clause License (the "License"); you may not use this file except in
++ * compliance with the License. You may obtain a copy of the License at
++ *
++ * https://opensource.org/licenses/BSD-3-Clause
++ *
++ * Unless required by applicable law or agreed to in writing, software distributed under the License is
++ * distributed on an "AS IS" basis, WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND,
++ * either express or implied. See the License for the specific language governing permissions and
++ * limitations under the License.
++ */
++
++package com.tencent.tinker.build.auxiliaryclass;
++
++import org.objectweb.asm.ClassWriter;
++import org.objectweb.asm.MethodVisitor;
++import org.objectweb.asm.Opcodes;
++
++import java.io.BufferedOutputStream;
++import java.io.File;
++import java.io.FileOutputStream;
++import java.io.IOException;
++import java.io.OutputStream;
++import java.util.regex.Pattern;
++
++/**
++ * Created by tangyinsheng on 2016/10/13.
++ */
++
++public final class AuxiliaryClassGenerator {
++    private static final String JAVA_IDENTIFIER_PATTERN_STR =
++            "(?:\\p{javaJavaIdentifierStart}\\p{javaJavaIdentifierPart}*)";
++
++    private static final String JAVA_FULL_CLASSNAME_PATTERN_STR =
++            String.format("(%s(?:\\.%s)*)", JAVA_IDENTIFIER_PATTERN_STR,
++                    JAVA_IDENTIFIER_PATTERN_STR);
++
++    private static final Pattern JAVA_FULL_CLASSNAME_PATTERN =
++            Pattern.compile(JAVA_FULL_CLASSNAME_PATTERN_STR);
++
++    public static void generateAuxiliaryClass(File dirOutput, String dotClassName) throws IOException {
++        if (!JAVA_FULL_CLASSNAME_PATTERN.matcher(dotClassName).matches()) {
++            throw new IllegalArgumentException("Bad dotClassName: " + dotClassName);
++        }
++        if (isPrimitiveClass(dotClassName)) {
++            throw new UnsupportedOperationException("Cannot generate primitive class.");
++        }
++        if (isArrayClass(dotClassName)) {
++            throw new UnsupportedOperationException("Cannot generate array class.");
++        }
++
++        final int lastDotSepPos = dotClassName.lastIndexOf('.');
++        final String classPkgPart =
++                (lastDotSepPos >= 0 ? dotClassName.substring(0, lastDotSepPos) : "");
++        final String classNamePart = dotClassName.substring(lastDotSepPos + 1);
++
++        final File realDirOutput = new File(dirOutput, classPkgPart.replace('.', '/'));
++        if (!realDirOutput.exists()) {
++            realDirOutput.mkdirs();
++        }
++        final File fileOut = new File(realDirOutput, classNamePart + ".class");
++
++        generateClass(dotClassName, fileOut);
++    }
++
++    private static void generateClass(String dotClassName, File fileOut) throws IOException {
++        final String classDesc = dotClassName.replace('.', '/');
++        ClassWriter cw = new ClassWriter(0);
++        cw.visit(
++                Opcodes.V1_7,
++                Opcodes.ACC_PUBLIC | Opcodes.ACC_SUPER,
++                classDesc,
++                null,
++                "java/lang/Object",
++                null
++        );
++        cw.visitSource(fileOut.getName(), null);
++        {
++            MethodVisitor mv = cw.visitMethod(
++                    Opcodes.ACC_PUBLIC, "<init>", "()V", null, null
++            );
++            mv.visitVarInsn(Opcodes.ALOAD, 0);
++            mv.visitMethodInsn(Opcodes.INVOKESPECIAL,
++                    "java/lang/Object",
++                    "<init>",
++                    "()V",
++                    false
++            );
++            mv.visitInsn(Opcodes.RETURN);
++            mv.visitMaxs(1, 1);
++            mv.visitEnd();
++        }
++        cw.visitEnd();
++        byte[] classBytes = cw.toByteArray();
++
++        OutputStream os = null;
++        try {
++            os = new BufferedOutputStream(new FileOutputStream(fileOut));
++            os.write(classBytes);
++        } finally {
++            if (os != null) {
++                try {
++                    os.close();
++                } catch (Exception e) {
++                    // Ignored.
++                }
++            }
++        }
++    }
++
++    private static boolean isPrimitiveClass(String className) {
++        try {
++            return Class.forName(className).isPrimitive();
++        } catch (ClassNotFoundException e) {
++            return false;
++        }
++    }
++
++    private static boolean isArrayClass(String className) {
++        try {
++            return Class.forName(className).isArray();
++        } catch (ClassNotFoundException e) {
++            return false;
++        }
++    }
++}
+diff --git a/tinker-build/tinker-patch-lib/src/main/java/com/tencent/tinker/build/auxiliaryinject/AuxiliaryInjectAdapter.java b/tinker-build/tinker-patch-lib/src/main/java/com/tencent/tinker/build/auxiliaryclass/AuxiliaryClassInjectAdapter.java
+similarity index 91%
+rename from tinker-build/tinker-patch-lib/src/main/java/com/tencent/tinker/build/auxiliaryinject/AuxiliaryInjectAdapter.java
+rename to tinker-build/tinker-patch-lib/src/main/java/com/tencent/tinker/build/auxiliaryclass/AuxiliaryClassInjectAdapter.java
+index f90ea582..a840654a 100644
+--- a/tinker-build/tinker-patch-lib/src/main/java/com/tencent/tinker/build/auxiliaryinject/AuxiliaryInjectAdapter.java
++++ b/tinker-build/tinker-patch-lib/src/main/java/com/tencent/tinker/build/auxiliaryclass/AuxiliaryClassInjectAdapter.java
+@@ -14,7 +14,7 @@
+  * limitations under the License.
+  */
+ 
+-package com.tencent.tinker.build.auxiliaryinject;
++package com.tencent.tinker.build.auxiliaryclass;
+ 
+ import org.objectweb.asm.ClassVisitor;
+ import org.objectweb.asm.ClassWriter;
+@@ -26,14 +26,14 @@
+  * Created by tangyinsheng on 2016/10/10.
+  */
+ 
+-public final class AuxiliaryInjectAdapter extends ClassVisitor {
++public final class AuxiliaryClassInjectAdapter extends ClassVisitor {
+     private final String auxiliaryClassDesc;
+     private boolean isClInitExists;
+     private boolean isInitExists;
+     private boolean isTargetClass;
+     private boolean isInjected;
+ 
+-    public AuxiliaryInjectAdapter(String auxiliaryClassName, ClassWriter cw) {
++    public AuxiliaryClassInjectAdapter(String auxiliaryClassName, ClassWriter cw) {
+         super(Opcodes.ASM5, cw);
+         this.auxiliaryClassDesc = fastClassNameToDesc(auxiliaryClassName);
+     }
+@@ -104,7 +104,7 @@ public void visitEnd() {
+         if (!this.isClInitExists && !this.isInitExists) {
+             MethodVisitor mv = super.visitMethod(Opcodes.ACC_STATIC, "<clinit>", "()V", null, null);
+             mv.visitCode();
+-            mv.visitLdcInsn(Type.getType(AuxiliaryInjectAdapter.this.auxiliaryClassDesc));
++            mv.visitLdcInsn(Type.getType(AuxiliaryClassInjectAdapter.this.auxiliaryClassDesc));
+             mv.visitVarInsn(Opcodes.ASTORE, 0);
+             mv.visitInsn(Opcodes.RETURN);
+             mv.visitMaxs(1, 1);
+@@ -121,7 +121,7 @@ public void visitEnd() {
+         @Override
+         public void visitInsn(int opcode) {
+             if (opcode == Opcodes.RETURN) {
+-                super.visitLdcInsn(Type.getType(AuxiliaryInjectAdapter.this.auxiliaryClassDesc));
++                super.visitLdcInsn(Type.getType(AuxiliaryClassInjectAdapter.this.auxiliaryClassDesc));
+                 super.visitVarInsn(Opcodes.ASTORE, 0);
+             }
+             super.visitInsn(opcode);
+diff --git a/tinker-build/tinker-patch-lib/src/main/java/com/tencent/tinker/build/auxiliaryinject/AuxiliaryInjector.java b/tinker-build/tinker-patch-lib/src/main/java/com/tencent/tinker/build/auxiliaryclass/AuxiliaryClassInjector.java
+similarity index 79%
+rename from tinker-build/tinker-patch-lib/src/main/java/com/tencent/tinker/build/auxiliaryinject/AuxiliaryInjector.java
+rename to tinker-build/tinker-patch-lib/src/main/java/com/tencent/tinker/build/auxiliaryclass/AuxiliaryClassInjector.java
+index 574f98f1..88979366 100644
+--- a/tinker-build/tinker-patch-lib/src/main/java/com/tencent/tinker/build/auxiliaryinject/AuxiliaryInjector.java
++++ b/tinker-build/tinker-patch-lib/src/main/java/com/tencent/tinker/build/auxiliaryclass/AuxiliaryClassInjector.java
+@@ -14,7 +14,7 @@
+  * limitations under the License.
+  */
+ 
+-package com.tencent.tinker.build.auxiliaryinject;
++package com.tencent.tinker.build.auxiliaryclass;
+ 
+ import com.tencent.tinker.commons.ziputil.Streams;
+ 
+@@ -39,9 +39,13 @@
+  * Created by tangyinsheng on 2016/10/9.
+  */
+ 
+-public final class AuxiliaryInjector {
++public final class AuxiliaryClassInjector {
+     public static final String AUXILIARY_CLASSNAME = "dalvik.system.PathClassLoader";
+ 
++    public interface ProcessJarCallback {
++        boolean onProcessClassEntry(String entryName);
++    }
++
+     public static void processClass(File classIn, File classOut) throws IOException {
+         InputStream is = null;
+         OutputStream os = null;
+@@ -55,12 +59,12 @@ public static void processClass(File classIn, File classOut) throws IOException
+         }
+     }
+ 
+-    public static void processJar(File jarIn, File jarOut) throws IOException {
++    public static void processJar(File jarIn, File jarOut, ProcessJarCallback cb) throws IOException {
+         try {
+-            processJarHelper(jarIn, jarOut, Charset.forName("UTF-8"), Charset.forName("UTF-8"));
++            processJarHelper(jarIn, jarOut, cb, Charset.forName("UTF-8"), Charset.forName("UTF-8"));
+         } catch (IllegalArgumentException e) {
+             if ("MALFORMED".equals(e.getMessage())) {
+-                processJarHelper(jarIn, jarOut, Charset.forName("GBK"), Charset.forName("UTF-8"));
++                processJarHelper(jarIn, jarOut, cb, Charset.forName("GBK"), Charset.forName("UTF-8"));
+             } else {
+                 throw e;
+             }
+@@ -68,7 +72,7 @@ public static void processJar(File jarIn, File jarOut) throws IOException {
+     }
+ 
+     @SuppressWarnings("NewApi")
+-    private static void processJarHelper(File jarIn, File jarOut, Charset charsetIn, Charset charsetOut) throws IOException {
++    private static void processJarHelper(File jarIn, File jarOut, ProcessJarCallback cb, Charset charsetIn, Charset charsetOut) throws IOException {
+         ZipInputStream zis = null;
+         ZipOutputStream zos = null;
+         try {
+@@ -81,7 +85,11 @@ private static void processJarHelper(File jarIn, File jarOut, Charset charsetIn,
+                 zos.putNextEntry(entryOut);
+                 if (!entryIn.isDirectory()) {
+                     if (entryName.endsWith(".class")) {
+-                        processClass(zis, zos);
++                        if (cb == null || cb.onProcessClassEntry(entryName)) {
++                            processClass(zis, zos);
++                        } else {
++                            Streams.copy(zis, zos);
++                        }
+                     } else {
+                         Streams.copy(zis, zos);
+                     }
+@@ -97,7 +105,7 @@ private static void processJarHelper(File jarIn, File jarOut, Charset charsetIn,
+     private static void processClass(InputStream classIn, OutputStream classOut) throws IOException {
+         ClassReader cr = new ClassReader(classIn);
+         ClassWriter cw = new ClassWriter(0);
+-        AuxiliaryInjectAdapter aia = new AuxiliaryInjectAdapter(AUXILIARY_CLASSNAME, cw);
++        AuxiliaryClassInjectAdapter aia = new AuxiliaryClassInjectAdapter(AUXILIARY_CLASSNAME, cw);
+         cr.accept(aia, 0);
+         classOut.write(cw.toByteArray());
+         classOut.flush();
+diff --git a/tinker-sample-android/app/build.gradle b/tinker-sample-android/app/build.gradle
+index 474a367a..d119cc42 100644
+--- a/tinker-sample-android/app/build.gradle
++++ b/tinker-sample-android/app/build.gradle
+@@ -292,12 +292,16 @@ if (buildWithTinker()) {
+             dexMode = "jar"
+             /**
+              * optional，default 'false'
+-             * if usePreGeneratedPatchDex is true, tinker framework will insert auxiliary instruction
+-             * when compiling base package using assemble{Debug/Release} task to prevent class
+-             * pre-verified issue in dvm. Besides, a real dex file contains necessary class
+-             * will be generated and packed into patch package instead of any patch info files.
++             * if usePreGeneratedPatchDex is true, tinker framework will generate auxiliary class
++             * and insert auxiliary instruction when compiling base package using
++             * assemble{Debug/Release} task to prevent class pre-verified issue in dvm.
++             * Besides, a real dex file contains necessary class will be generated and packed into
++             * patch package instead of any patch info files.
+              *
+              * Use this mode if you have to use any dex encryption solutions.
++             *
++             * Notice: If you change this value, please trigger clean task
++             * and regenerate base package.
+              */
+             usePreGeneratedPatchDex = false
+             /**

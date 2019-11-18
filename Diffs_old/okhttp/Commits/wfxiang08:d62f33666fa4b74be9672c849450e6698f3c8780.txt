@@ -1,0 +1,209 @@
+diff --git a/okhttp-tests/src/test/java/okhttp3/internal/DiskLruCacheTest.java b/okhttp-tests/src/test/java/okhttp3/internal/DiskLruCacheTest.java
+index 3e7c9771c5..be2d0be61d 100644
+--- a/okhttp-tests/src/test/java/okhttp3/internal/DiskLruCacheTest.java
++++ b/okhttp-tests/src/test/java/okhttp3/internal/DiskLruCacheTest.java
+@@ -1536,6 +1536,80 @@ private void createNewCacheWithSize(int maxSize) throws IOException {
+     assertNull(cache.get("a"));
+   }
+ 
++  @Test public void noSizeCorruptionAfterCreatorDetached() throws Exception {
++    // Create an editor for k1. Detach it by clearing the cache.
++    DiskLruCache.Editor editor = cache.edit("k1");
++    setString(editor, 0, "a");
++    setString(editor, 1, "a");
++    cache.evictAll();
++
++    // Create a new value in its place.
++    set("k1", "bb", "bb");
++    assertEquals(4, cache.size());
++
++    // Committing the detached editor should not change the cache's size.
++    editor.commit();
++    assertEquals(4, cache.size());
++    assertValue("k1", "bb", "bb");
++  }
++
++  @Test public void noSizeCorruptionAfterEditorDetached() throws Exception {
++    set("k1", "a", "a");
++
++    // Create an editor for k1. Detach it by clearing the cache.
++    DiskLruCache.Editor editor = cache.edit("k1");
++    setString(editor, 0, "bb");
++    setString(editor, 1, "bb");
++    cache.evictAll();
++
++    // Create a new value in its place.
++    set("k1", "ccc", "ccc");
++    assertEquals(6, cache.size());
++
++    // Committing the detached editor should not change the cache's size.
++    editor.commit();
++    assertEquals(6, cache.size());
++    assertValue("k1", "ccc", "ccc");
++  }
++
++  @Test public void noNewSourceAfterEditorDetached() throws Exception {
++    set("k1", "a", "a");
++
++    DiskLruCache.Editor editor = cache.edit("k1");
++    cache.evictAll();
++
++    assertNull(editor.newSource(0));
++  }
++
++  @Test public void editsDiscardedAfterEditorDetached() throws Exception {
++    set("k1", "a", "a");
++
++    // Create an editor, then detach it.
++    DiskLruCache.Editor editor = cache.edit("k1");
++    BufferedSink sink = Okio.buffer(editor.newSink(0));
++    cache.evictAll();
++
++    // Create another value in its place.
++    set("k1", "ccc", "ccc");
++
++    // Complete the original edit. It goes into a black hole.
++    sink.writeUtf8("bb");
++    sink.close();
++
++    assertValue("k1", "ccc", "ccc");
++  }
++
++  @Test public void abortAfterDetach() throws Exception {
++    set("k1", "a", "a");
++
++    DiskLruCache.Editor editor = cache.edit("k1");
++    cache.evictAll();
++
++    editor.abort();
++    assertEquals(0, cache.size());
++    assertAbsent("k1");
++  }
++
+   private void assertJournalEquals(String... expectedBodyLines) throws Exception {
+     List<String> expectedLines = new ArrayList<>();
+     expectedLines.add(MAGIC);
+diff --git a/okhttp/src/main/java/okhttp3/internal/DiskLruCache.java b/okhttp/src/main/java/okhttp3/internal/DiskLruCache.java
+index b7964baf9f..51ce88e9fc 100644
+--- a/okhttp/src/main/java/okhttp3/internal/DiskLruCache.java
++++ b/okhttp/src/main/java/okhttp3/internal/DiskLruCache.java
+@@ -612,7 +612,7 @@ public synchronized boolean remove(String key) throws IOException {
+ 
+   private boolean removeEntry(Entry entry) throws IOException {
+     if (entry.currentEditor != null) {
+-      entry.currentEditor.hasErrors = true; // Prevent the edit from completing normally.
++      entry.currentEditor.detach(); // Prevent the edit from completing normally.
+     }
+ 
+     for (int i = 0; i < valueCount; i++) {
+@@ -838,24 +838,42 @@ public void close() {
+   public final class Editor {
+     private final Entry entry;
+     private final boolean[] written;
+-    private boolean hasErrors;
+-    private boolean committed;
++    private boolean done;
+ 
+     private Editor(Entry entry) {
+       this.entry = entry;
+       this.written = (entry.readable) ? null : new boolean[valueCount];
+     }
+ 
++    /**
++     * Prevents this editor from completing normally. This is necessary either when the edit causes
++     * an I/O error, or if the target entry is evicted while this editor is active. In either case
++     * we delete the editor's created files and prevent new files from being created. Note that once
++     * an editor has been detached it is possible for another editor to edit the entry.
++     */
++    void detach() {
++      if (entry.currentEditor == this) {
++        for (int i = 0; i < valueCount; i++) {
++          try {
++            fileSystem.delete(entry.dirtyFiles[i]);
++          } catch (IOException e) {
++            // This file is potentially leaked. Not much we can do about that.
++          }
++        }
++        entry.currentEditor = null;
++      }
++    }
++
+     /**
+      * Returns an unbuffered input stream to read the last committed value, or null if no value has
+      * been committed.
+      */
+     public Source newSource(int index) throws IOException {
+       synchronized (DiskLruCache.this) {
+-        if (entry.currentEditor != this) {
++        if (done) {
+           throw new IllegalStateException();
+         }
+-        if (!entry.readable) {
++        if (!entry.readable || entry.currentEditor != this) {
+           return null;
+         }
+         try {
+@@ -873,9 +891,12 @@ public Source newSource(int index) throws IOException {
+      */
+     public Sink newSink(int index) throws IOException {
+       synchronized (DiskLruCache.this) {
+-        if (entry.currentEditor != this) {
++        if (done) {
+           throw new IllegalStateException();
+         }
++        if (entry.currentEditor != this) {
++          return NULL_SINK;
++        }
+         if (!entry.readable) {
+           written[index] = true;
+         }
+@@ -889,7 +910,7 @@ public Sink newSink(int index) throws IOException {
+         return new FaultHidingSink(sink) {
+           @Override protected void onException(IOException e) {
+             synchronized (DiskLruCache.this) {
+-              hasErrors = true;
++              detach();
+             }
+           }
+         };
+@@ -902,13 +923,13 @@ public Sink newSink(int index) throws IOException {
+      */
+     public void commit() throws IOException {
+       synchronized (DiskLruCache.this) {
+-        if (hasErrors) {
+-          completeEdit(this, false);
+-          removeEntry(entry); // The previous entry is stale.
+-        } else {
++        if (done) {
++          throw new IllegalStateException();
++        }
++        if (entry.currentEditor == this) {
+           completeEdit(this, true);
+         }
+-        committed = true;
++        done = true;
+       }
+     }
+ 
+@@ -918,13 +939,19 @@ public void commit() throws IOException {
+      */
+     public void abort() throws IOException {
+       synchronized (DiskLruCache.this) {
+-        completeEdit(this, false);
++        if (done) {
++          throw new IllegalStateException();
++        }
++        if (entry.currentEditor == this) {
++          completeEdit(this, false);
++        }
++        done = true;
+       }
+     }
+ 
+     public void abortUnlessCommitted() {
+       synchronized (DiskLruCache.this) {
+-        if (!committed) {
++        if (!done && entry.currentEditor == this) {
+           try {
+             completeEdit(this, false);
+           } catch (IOException ignored) {

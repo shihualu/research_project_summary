@@ -1,0 +1,391 @@
+diff --git a/CHANGELOG.md b/CHANGELOG.md
+index 4dcbcb1f..e41f4100 100644
+--- a/CHANGELOG.md
++++ b/CHANGELOG.md
+@@ -1,3 +1,19 @@
++### Development
++
++Bug Fixes:
++ - Stop running scheduled jobs to do sscans after last consumer unbound. (#702, David G. Young)
++
++### 2.15 / 2018-07-04
++
++Enhancements:
++ - Optional foreground beacon scanning service for faster background detections on Android 8+
++   (#663, David G. Young)
++
++Bug Fixes:
++ - Fixes inability to detect on some 5.x Samsung Devices without scan filters. (#693, David G. Young)
++ - Fix inverted logic for "disable ScanJob" warning (#700, Marcel Schnelle)
++ - Fix crash on scanning an Eddystone-URL packet with a negative-length URL. (#703, David G. Young)
++
+ ### 2.14 / 2018-05-17
+ 
+ Enhancements:
+diff --git a/build.gradle b/build.gradle
+index 11451f85..caf80a62 100644
+--- a/build.gradle
++++ b/build.gradle
+@@ -60,8 +60,8 @@ allprojects {
+ }
+ 
+ android {
+-    compileSdkVersion 26
+-    buildToolsVersion '26.0.2'
++    compileSdkVersion 27
++    buildToolsVersion '27.0.3'
+ 
+     defaultConfig {
+         // Unfortunately 'com.android.support:appcompat-v7:26.0.0'
+@@ -69,7 +69,7 @@ android {
+         // But since only 0.8% of Android devices have < SDK 14 as of Une 2017, this will become
+         // the new min version for this library in order to target Android O
+         minSdkVersion 14
+-        targetSdkVersion 26
++        targetSdkVersion 27
+         versionCode 1
+         versionName version
+         consumerProguardFiles 'proguard-rules.pro'
+@@ -101,9 +101,9 @@ configurations {
+ 
+ 
+ dependencies {
+-    implementation fileTree ( dir: 'libs', include: ['*.jar'] )
+-    implementation 'com.android.support:appcompat-v7:26.0.0'
+-    implementation 'com.android.support:support-annotations:26.0.0'
++    compile fileTree ( dir: 'libs', include: ['*.jar'] )
++    compile 'com.android.support:support-v4:27.0.0'
++    compile 'com.android.support:support-annotations:26.0.0'
+ 
+     testImplementation('junit:junit:4.12') {
+         exclude group: 'org.hamcrest'
+diff --git a/circle.yml b/circle.yml
+index 74b551da..622e3df3 100644
+--- a/circle.yml
++++ b/circle.yml
+@@ -3,7 +3,7 @@ machine:
+     version: openjdk8
+ dependencies:
+   pre:
+-    - echo y | android update sdk --no-ui --all --filter "tools,android-26,build-tools-26.0.2,platform-tools,extra-android-m2repository,extra-google-m2repository"
++    - echo y | android update sdk --no-ui --all --filter "tools,android-27,build-tools-27.0.3,platform-tools,extra-android-m2repository,extra-google-m2repository"
+ general:
+   branches:
+     ignore:
+diff --git a/src/main/java/org/altbeacon/beacon/BeaconManager.java b/src/main/java/org/altbeacon/beacon/BeaconManager.java
+index 75678aaa..5b443650 100644
+--- a/src/main/java/org/altbeacon/beacon/BeaconManager.java
++++ b/src/main/java/org/altbeacon/beacon/BeaconManager.java
+@@ -24,6 +24,7 @@
+ package org.altbeacon.beacon;
+ 
+ import android.annotation.TargetApi;
++import android.app.Notification;
+ import android.bluetooth.BluetoothManager;
+ import android.content.ComponentName;
+ import android.content.Context;
+@@ -158,6 +159,10 @@
+     private static boolean sAndroidLScanningDisabled = false;
+     private static boolean sManifestCheckingDisabled = false;
+ 
++    @Nullable
++    private Notification mForegroundServiceNotification = null;
++    private int mForegroundServiceNotificationId = -1;
++
+     /**
+      * Private lock object for singleton initialization protecting against denial-of-service attack.
+      */
+@@ -321,7 +326,7 @@ protected BeaconManager(@NonNull Context context) {
+            verifyServiceDeclaration();
+          }
+         this.beaconParsers.add(new AltBeaconParser());
+-        mScheduledScanJobsEnabled = android.os.Build.VERSION.SDK_INT >= Build.VERSION_CODES.O;
++        setScheduledScanJobsEnabledDefault();
+     }
+ 
+     /***
+@@ -458,8 +463,10 @@ public void unbind(@NonNull BeaconConsumer consumer) {
+                     mBackgroundMode = false;
+                     // If we are using scan jobs, we cancel the active scan job
+                     if (mScheduledScanJobsEnabled) {
+-                        // TODO: Cancel the active scan job.  Without this is keeps scanning as if
+-                        // a consumer is bound.
++                        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.LOLLIPOP) {
++                            LogManager.i(TAG, "Cancelling scheduled jobs after unbind of last consumer.");
++                            ScanJobScheduler.getInstance().cancelSchedule(mContext);
++                        }
+                     }
+                 }
+             }
+@@ -568,8 +575,8 @@ public void setEnableScheduledScanJobs(boolean enabled) {
+                     " availble prior to Android 5.0");
+             return;
+         }
+-        if (enabled && android.os.Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+-            LogManager.w(TAG, "Disabling ScanJobs on Android 8+ may disable delivery of " +
++        if (!enabled && android.os.Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
++            LogManager.w(TAG, "Disabling ScanJobs on Android 8+ may disable delivery of "+
+                     "beacon callbacks in the background unless a foreground service is active.");
+         }
+         mScheduledScanJobsEnabled = enabled;
+@@ -1332,6 +1339,81 @@ public static boolean getManifestCheckingDisabled() {
+         return sManifestCheckingDisabled;
+     }
+ 
++
++    /**
++     * Configures the library to use a foreground service for bacon scanning.  This allows nearly
++     * constant scanning on most Android versions to get around background limits, and displays an
++     * icon to the user to indicate that the app is doing something in the background, even on
++     * Android 8+.  This will disable the user of the JobScheduler on Android 8 to do scans.  Note
++     * that this method does not by itself enable constant scanning.  The scan intervals will work
++     * as normal and must be configurd to specific values depending on how often you wish to scan.
++     *
++     * @see #setForegroundScanPeriod(long)
++     * @see #setForegroundBetweenScanPeriod(long)
++     *
++     * This method requires a notification to display a message to the user about why the app is
++     * scanning in the background.  The notification must include an icon that will be displayed
++     * in the top bar whenever the scanning service is running.
++     *
++     * If the BeaconService is configured to run in a different process, this call will have no
++     * effect.
++     *
++     * @param notification - the notification that will be displayed when beacon scanning is active,
++     *                       along with the icon that shows up in the status bar.
++     *
++     * @throws IllegalStateException if called after consumers are already bound to the scanning
++     * service
++     */
++    public void enableForegroundServiceScanning(Notification notification, int notificationId)
++            throws IllegalStateException {
++        if (isAnyConsumerBound()) {
++            throw new IllegalStateException("May not be called after consumers are already bound.");
++        }
++        if (notification == null) {
++            throw new NullPointerException("Notification cannot be null");
++        }
++        setEnableScheduledScanJobs(false);
++        mForegroundServiceNotification = notification;
++        mForegroundServiceNotificationId = notificationId;
++    }
++
++    /**
++     * Disables a foreground scanning service, if previously configured.
++     *
++     * @see #enableForegroundServiceScanning
++     *
++     * In order to call this method to disable a foreground service, you must  unbind from the
++     * BeaconManager.  You can then rebind after this call is made.
++     *
++     * @throws IllegalStateException if called after consumers are already bound to the scanning
++     * service
++     */
++    public void disableForegroundServiceScanning() throws IllegalStateException {
++        if (isAnyConsumerBound()) {
++            throw new IllegalStateException("May not be called after consumers are already bound");
++        }
++        mForegroundServiceNotification = null;
++        setScheduledScanJobsEnabledDefault();
++    }
++
++    /**
++     * @see #enableForegroundServiceScanning
++     * @return The notification shown for the beacon scanning service, if so configured
++     */
++    public Notification getForegroundServiceNotification() {
++        return mForegroundServiceNotification;
++    }
++
++
++    /**
++     * @see #enableForegroundServiceScanning
++     * @return The notification shown for the beacon scanning service, if so configured
++     */
++    public int getForegroundServiceNotificationId() {
++        return mForegroundServiceNotificationId;
++    }
++
++
+     private boolean determineIfCalledFromSeparateScannerProcess() {
+         if (isScannerInDifferentProcess() && !isMainProcess()) {
+             LogManager.w(TAG, "Ranging/Monitoring may not be controlled from a separate "+
+@@ -1350,4 +1432,7 @@ private static void warnIfScannerNotInSameProcess() {
+         }
+     }
+ 
++    private void setScheduledScanJobsEnabledDefault() {
++        mScheduledScanJobsEnabled = android.os.Build.VERSION.SDK_INT >= Build.VERSION_CODES.O;
++    }
+ }
+diff --git a/src/main/java/org/altbeacon/beacon/BeaconParser.java b/src/main/java/org/altbeacon/beacon/BeaconParser.java
+index 61fc1a64..24641739 100644
+--- a/src/main/java/org/altbeacon/beacon/BeaconParser.java
++++ b/src/main/java/org/altbeacon/beacon/BeaconParser.java
+@@ -516,7 +516,13 @@ protected Beacon fromScanData(byte[] bytesToProcess, int rssi, BluetoothDevice d
+                         }
+                         // If this is a variable length identifier, we truncate it to the size that
+                         // is available in the packet
+-                        Identifier identifier = Identifier.fromBytes(bytesToProcess, mIdentifierStartOffsets.get(i) + startByte, pduToParse.getEndIndex()+1, mIdentifierLittleEndianFlags.get(i));
++                        int start = mIdentifierStartOffsets.get(i) + startByte;
++                        int end = pduToParse.getEndIndex()+1;
++                        if (end <= start) {
++                            LogManager.d(TAG, "PDU is too short for identifer.  Packet is malformed");
++                            return null;
++                        }
++                        Identifier identifier = Identifier.fromBytes(bytesToProcess, start, end, mIdentifierLittleEndianFlags.get(i));
+                         identifiers.add(identifier);
+                     }
+                     else if (endIndex > pduToParse.getEndIndex() && !mAllowPduOverflow) {
+diff --git a/src/main/java/org/altbeacon/beacon/service/BeaconService.java b/src/main/java/org/altbeacon/beacon/service/BeaconService.java
+index 37ae6ff2..f7bc12a7 100644
+--- a/src/main/java/org/altbeacon/beacon/service/BeaconService.java
++++ b/src/main/java/org/altbeacon/beacon/service/BeaconService.java
+@@ -25,6 +25,7 @@
+ 
+ 
+ import android.app.AlarmManager;
++import android.app.Notification;
+ import android.app.PendingIntent;
+ import android.app.Service;
+ import android.content.ComponentName;
+@@ -216,14 +217,11 @@ public void onCreate() {
+             LogManager.i(TAG, "beaconService PID is "+processUtils.getPid()+" with process name "+processUtils.getProcessName());
+         }
+ 
+-        try {
+-            PackageItemInfo info = this.getPackageManager().getServiceInfo(new ComponentName(this, BeaconService.class), PackageManager.GET_META_DATA);
+-            if (info != null && info.metaData != null && info.metaData.get("longScanForcingEnabled") != null &&
+-                    info.metaData.get("longScanForcingEnabled").toString().equals("true")) {
+-                LogManager.i(TAG, "longScanForcingEnabled to keep scans going on Android N for > 30 minutes");
+-                mScanHelper.getCycledScanner().setLongScanForcingEnabled(true);
+-            }
+-        } catch (PackageManager.NameNotFoundException e) {}
++        String longScanForcingEnabled = getManifestMetadataValue("longScanForcingEnabled");
++        if (longScanForcingEnabled != null && longScanForcingEnabled.equals("true")) {
++            LogManager.i(TAG, "longScanForcingEnabled to keep scans going on Android N for > 30 minutes");
++            mScanHelper.getCycledScanner().setLongScanForcingEnabled(true);
++        }
+ 
+         mScanHelper.reloadParsers();
+ 
+@@ -240,6 +238,37 @@ public void onCreate() {
+         } catch (Exception e) {
+             LogManager.e(e, TAG, "Cannot get simulated Scan data.  Make sure your org.altbeacon.beacon.SimulatedScanData class defines a field with the signature 'public static List<Beacon> beacons'");
+         }
++        this.startForegroundIfConfigured();
++    }
++
++    /*
++     * This starts the scanning service as a foreground service if it is so configured in the
++     * manifest
++     */
++    private void startForegroundIfConfigured() {
++        BeaconManager beaconManager = BeaconManager.getInstanceForApplication(
++                this.getApplicationContext());
++        Notification notification = beaconManager
++                .getForegroundServiceNotification();
++        int notificationId = beaconManager
++                .getForegroundServiceNotificationId();
++        if (notification != null &&
++                Build.VERSION.SDK_INT >= Build.VERSION_CODES.JELLY_BEAN) {
++            this.startForeground(notificationId, notification);
++        }
++    }
++
++    private String getManifestMetadataValue(String key) {
++        String value = null;
++        try {
++            PackageItemInfo info = this.getPackageManager().getServiceInfo(new ComponentName(this, BeaconService.class), PackageManager.GET_META_DATA);
++            if (info != null && info.metaData != null) {
++                return info.metaData.get(key).toString();
++            }
++        }
++        catch (PackageManager.NameNotFoundException e) {
++        }
++        return null;
+     }
+ 
+     @Override
+@@ -277,6 +306,7 @@ public void onDestroy() {
+             LogManager.w(TAG, "Not supported prior to API 18.");
+             return;
+         }
++        stopForeground(true);
+         bluetoothCrashResolver.stop();
+         LogManager.i(TAG, "onDestroy called.  stopping scanning");
+         handler.removeCallbacksAndMessages(null);
+diff --git a/src/main/java/org/altbeacon/beacon/service/ScanJobScheduler.java b/src/main/java/org/altbeacon/beacon/service/ScanJobScheduler.java
+index 30709d4c..6e8b592e 100644
+--- a/src/main/java/org/altbeacon/beacon/service/ScanJobScheduler.java
++++ b/src/main/java/org/altbeacon/beacon/service/ScanJobScheduler.java
+@@ -92,6 +92,12 @@ public void applySettingsToScheduledJob(Context context, BeaconManager beaconMan
+         applySettingsToScheduledJob(context, beaconManager, scanState);
+     }
+ 
++    public void cancelSchedule(Context context) {
++        JobScheduler jobScheduler = (JobScheduler) context.getSystemService(Context.JOB_SCHEDULER_SERVICE);
++        jobScheduler.cancel(ScanJob.getImmediateScanJobId(context));
++        jobScheduler.cancel(ScanJob.getPeriodicScanJobId(context));
++    }
++
+     // This method appears to be never used, because it is only used by Android O APIs, which
+     // must exist on another branch until the SDKs are released.
+     public void scheduleAfterBackgroundWakeup(Context context, List<ScanResult> scanResults) {
+diff --git a/src/main/java/org/altbeacon/beacon/service/scanner/CycledLeScannerForLollipop.java b/src/main/java/org/altbeacon/beacon/service/scanner/CycledLeScannerForLollipop.java
+index 011c890d..280fa056 100644
+--- a/src/main/java/org/altbeacon/beacon/service/scanner/CycledLeScannerForLollipop.java
++++ b/src/main/java/org/altbeacon/beacon/service/scanner/CycledLeScannerForLollipop.java
+@@ -9,6 +9,7 @@
+ import android.bluetooth.le.ScanSettings;
+ import android.content.Context;
+ import android.content.Intent;
++import android.os.Build;
+ import android.os.ParcelUuid;
+ import android.os.SystemClock;
+ import android.support.annotation.MainThread;
+@@ -183,7 +184,11 @@ protected void startScan() {
+             // for a change in Android 8.1 that blocks scan results when the screen is off unless
+             // there is a scan filter associatd with the scan.  Prior to 8.1, filters could just be
+             // left null.  The wildcard filter matches everything.
+-            filters = new ScanFilterUtils().createWildcardScanFilters();
++            // We only add these filters on 8.1+ devices, because adding scan filters has been reported
++            // to cause scan failures on some Samsung devices with Android 5.x
++            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O_MR1) {
++                filters = new ScanFilterUtils().createWildcardScanFilters();
++            }
+         }
+ 
+         if (settings != null) {
+diff --git a/src/test/java/org/altbeacon/beacon/GattBeaconTest.java b/src/test/java/org/altbeacon/beacon/GattBeaconTest.java
+index 57329ad7..d38e1a80 100644
+--- a/src/test/java/org/altbeacon/beacon/GattBeaconTest.java
++++ b/src/test/java/org/altbeacon/beacon/GattBeaconTest.java
+@@ -15,6 +15,7 @@
+ 
+ import static junit.framework.Assert.assertEquals;
+ import static junit.framework.Assert.assertNotNull;
++import static junit.framework.Assert.assertNull;
+ 
+ @Config(sdk = 18)
+ 
+@@ -157,6 +158,19 @@ public void testDetectsUriBeacon() {
+     }
+ 
+ 
++    @Test
++    public void doesNotCrashOnMalformedEddystoneBeacon() {
++        org.robolectric.shadows.ShadowLog.stream = System.err;
++        LogManager.setLogger(Loggers.verboseLogger());
++        LogManager.setVerboseLoggingEnabled(true);
++        LogManager.d("GattBeaconTest", "Parsing malformed packet");
++        byte[] bytes = hexStringToByteArray("0201060303aafe0416aafe100000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000");
++        BeaconParser parser = new BeaconParser().setBeaconLayout("s:0-1=feaa,m:2-2=10,p:3-3:-41,i:4-20v");
++        LogManager.d("xxx", "------");
++        Beacon gattBeacon = parser.fromScanData(bytes, -55, null);
++        assertNull("GattBeacon should be null when not parsed successfully", gattBeacon);
++    }
++
+ 
+ 
+ 

@@ -1,0 +1,389 @@
+diff --git a/imagepipeline/src/main/java/com/facebook/imagepipeline/cache/DiskCache.java b/imagepipeline/src/main/java/com/facebook/imagepipeline/cache/DiskCache.java
+index 903460ac1..f0353e8d2 100644
+--- a/imagepipeline/src/main/java/com/facebook/imagepipeline/cache/DiskCache.java
++++ b/imagepipeline/src/main/java/com/facebook/imagepipeline/cache/DiskCache.java
+@@ -1,27 +1,24 @@
+ package com.facebook.imagepipeline.cache;
+ 
+ import android.content.Context;
+-import android.support.annotation.Nullable;
++import android.support.annotation.NonNull;
+ 
+ import com.facebook.common.logging.FLog;
+ 
+ import java.io.File;
+ import java.io.FileInputStream;
+-import java.io.FileNotFoundException;
+ import java.io.FileOutputStream;
+ import java.io.IOException;
+ import java.io.InputStream;
+ import java.io.OutputStream;
+ import java.util.Arrays;
+ import java.util.LinkedList;
++import java.util.Map;
+ import java.util.concurrent.ConcurrentHashMap;
+ import java.util.concurrent.Semaphore;
+ 
+-/**
+- * Created by art on 2/5/16.
+- */
+ public class DiskCache implements DiskCacheInterface {
+-  private static final String DISK_CACHE_SUBDIR = "thumbnails";
++  private static final String DISK_CACHE_SUBDIR = "intermediate";
+   public static final String TAG = DiskCache.class.getName();
+ 
+   //Singleton
+@@ -31,93 +28,121 @@
+   private final ConcurrentHashMap<Integer, Boolean> fileLocks = new ConcurrentHashMap<>(6);
+ 
+   private File cacheDir;
++  private final int maximumSimultaneouslyFilesInCache;
+ 
+-  public static DiskCache getInstance(Context context) {
++  public static void initInstance(Context context, int maximumSimultaneouslyFilesInCache) {
+     if (diskCache == null) {
+       synchronized (DiskCache.class) {
+         if (diskCache == null) {
+-          diskCache = new DiskCache(context);
++          diskCache = new DiskCache(context, maximumSimultaneouslyFilesInCache);
+         }
+       }
+     }
++  }
++
++  public static DiskCache getInstance() {
++    if (diskCache == null) {
++      throw new IllegalStateException("initInstance should be called before getInstance");
++    }
+     return diskCache;
+   }
+ 
+-  private DiskCache(Context context) {
++  private DiskCache(Context context, int maximumSimultaneouslyFilesInCache) {
++    this.maximumSimultaneouslyFilesInCache = maximumSimultaneouslyFilesInCache;
++
+     cacheDir = new File(context.getCacheDir(), DISK_CACHE_SUBDIR);
+     cacheDir.mkdirs();
+ 
+     //Init blocker
+-    try {
+-      writeLock.acquire();
++    writeLock.acquireUninterruptibly();
+ 
+-      File[] files = cacheDir.listFiles();
+-      for (File file : files) {
+-        if (!file.isDirectory()) {
+-          fileLocks.put(file.getName().hashCode(), false);
+-        }
++    File[] files = cacheDir.listFiles();
++    for (File file : files) {
++      if (!file.isDirectory()) {
++        fileLocks.put(file.getName().hashCode(), false);
+       }
+-    } catch (InterruptedException e) {
+-      e.printStackTrace();
+-    } finally {
+-      writeLock.release();
+     }
++
++    writeLock.release();
+   }
+ 
+ 
++  @NonNull
+   @Override
+   public CacheInfo getCacheInfo(String url) {
+     CacheInfo cacheInfo = new CacheInfo();
++    int fileName = url.hashCode();
+ 
+-    cacheInfo.setFileName(url.hashCode());
++    cacheInfo.setFileName(fileName);
+ 
+     //
+-    File fileInp = new File(cacheDir, String.valueOf(cacheInfo.getFileName()));
++    File fileInp = new File(cacheDir, String.valueOf(fileName));
+ 
+     if(fileInp.exists()) {
+-      try {
+-        writeLock.acquire();
+-        Boolean isProcessing = fileLocks.putIfAbsent(cacheInfo.getFileName(), false);
+-
+-        //Somebody have taken this file before us
+-        if (isProcessing != null && isProcessing) {
+-          FLog.e(TAG, " File already lock readers for one file!");
+-          cacheInfo.setFileOffset(0);
+-        } else {
++      writeLock.acquireUninterruptibly();
++      Boolean isProcessing = fileLocks.putIfAbsent(fileName, false);
++
++      //Somebody have taken this file before us
++      if (isProcessing != null && isProcessing) {
++        FLog.e(TAG, "File already locked by readers!");
++        cacheInfo.setFileOffset(CacheInfo.NO_OFFSET);
++        cacheInfo.setFile(null);
++      } else {
++        if(keepCacheSmall()) {
+           fileLocks.put(cacheInfo.getFileName(), true);
+           cacheInfo.setFileOffset(fileInp.length());
++          cacheInfo.setFile(fileInp);
++        } else {
++          FLog.e(TAG, "Cache is full");
++          cacheInfo.setFileOffset(0);
++          cacheInfo.setFile(null);
+         }
+-      } catch (InterruptedException e) {
+-        e.printStackTrace();
+-      } finally {
+-        writeLock.release();
+       }
++      writeLock.release();
+     } else {
+       //Atomic fileCreate will deal with this if there are multiply
+-      // simultaneously not created files
++      //simultaneously not created files
+       cacheInfo.setFileOffset(0);
++      cacheInfo.setFile(fileInp);
+     }
+ 
+-    cacheInfo.setFile(fileInp);
+-
+     return cacheInfo;
+   }
+ 
+-  @Override
+-  public InputStream getInputStream(CacheInfo cacheInfo) {
+-    if(cacheInfo == null){
+-      return null;
++  /**
++   * Removes somebody from cache if necessary. DO NOT CALL IT WITHOUT SYNCHRONIZING ON {@link #writeLock}
++   * @return true if there is space in cache, false if cache is full
++   */
++  private boolean keepCacheSmall() {
++    if(fileLocks.size() < maximumSimultaneouslyFilesInCache) {
++      return true;
++    } else {
++      for(Map.Entry<Integer, Boolean> fileLock: fileLocks.entrySet()) {
++        if(!fileLock.getValue()) {
++          File fileInp = new File(cacheDir, String.valueOf(fileLock.getValue()));
++          if (fileInp.delete()) {
++            fileLocks.remove(fileLock.getKey());
++            return false;
++          }
++        }
++      }
++      return false;
+     }
++  }
+ 
++  @Override
++  public InputStream getInputStream(@NonNull CacheInfo cacheInfo) {
+     InputStream is = null;
+     try {
+       File file = cacheInfo.getFile();
+-      if (!file.exists()) {
+-        if (file.createNewFile()) {
++      if (file != null) {
++        if (!file.exists()) {
++          if (file.createNewFile()) {
++            is = new FileInputStream(file);
++          }
++        } else {
+           is = new FileInputStream(file);
+         }
+-      } else {
+-        is = new FileInputStream(file);
+       }
+     } catch (IOException e) {
+       e.printStackTrace();
+@@ -126,21 +151,19 @@ public InputStream getInputStream(CacheInfo cacheInfo) {
+   }
+ 
+   @Override
+-  public OutputStream getOutputStream(CacheInfo cacheInfo) {
++  public OutputStream getOutputStream(@NonNull CacheInfo cacheInfo) {
+     FileOutputStream fileOutputStream = null;
+ 
+-    if(cacheInfo == null){
+-      return null;
+-    }
+-
+     try {
+       File file = cacheInfo.getFile();
+-      if (!file.exists()) {
+-        if (file.createNewFile()) {
+-          fileOutputStream = new FileOutputStream(cacheInfo.getFile());
++      if (file != null) {
++        if (!file.exists()) {
++          if (file.createNewFile()) {
++            fileOutputStream = new FileOutputStream(cacheInfo.getFile(), true);
++          }
++        } else {
++          fileOutputStream = new FileOutputStream(cacheInfo.getFile(), true);
+         }
+-      } else {
+-        fileOutputStream = new FileOutputStream(cacheInfo.getFile());
+       }
+     } catch (IOException e) {
+       e.printStackTrace();
+@@ -155,30 +178,23 @@ public void clearCache() {
+ 
+   @Override
+   public void onFinished(CacheInfo cacheInfo) {
+-    try {
+-      writeLock.acquire();
++    if (cacheInfo.getFile() != null) {
++      writeLock.acquireUninterruptibly();
+ 
+       if (cacheInfo.getFile().delete()) {
+         fileLocks.remove(cacheInfo.getFileName());
+       }
+-    } catch (InterruptedException e) {
+-      e.printStackTrace();
+-    } finally {
++
+       writeLock.release();
+     }
+   }
+ 
+   @Override
+   public void onError(CacheInfo cacheInfo, Throwable throwable) {
+-    try {
+-      writeLock.acquire();
++    writeLock.acquireUninterruptibly();
+ 
+-      fileLocks.put(cacheInfo.getFileName(), false);
+-    } catch (InterruptedException e) {
+-      e.printStackTrace();
+-    } finally {
+-      writeLock.release();
+-    }
++    fileLocks.put(cacheInfo.getFileName(), false);
++    writeLock.release();
+   }
+ 
+   /**
+diff --git a/imagepipeline/src/main/java/com/facebook/imagepipeline/cache/DiskCacheInterface.java b/imagepipeline/src/main/java/com/facebook/imagepipeline/cache/DiskCacheInterface.java
+index 53c389ccd..e0fc047ee 100644
+--- a/imagepipeline/src/main/java/com/facebook/imagepipeline/cache/DiskCacheInterface.java
++++ b/imagepipeline/src/main/java/com/facebook/imagepipeline/cache/DiskCacheInterface.java
+@@ -1,5 +1,8 @@
+ package com.facebook.imagepipeline.cache;
+ 
++import android.support.annotation.NonNull;
++import android.support.annotation.Nullable;
++
+ import java.io.File;
+ import java.io.InputStream;
+ import java.io.OutputStream;
+@@ -17,7 +20,7 @@
+  *  * Closing files is also important.
+  */
+ public interface DiskCacheInterface {
+-  CacheInfo getCacheInfo(String url);
++  @NonNull CacheInfo getCacheInfo(String url);
+ 
+   InputStream getInputStream(CacheInfo cacheInfo);
+ 
+@@ -35,11 +38,11 @@
+ 
+     private int fileName;
+     private long fileOffset;
+-    private File file;
++    private @Nullable File file;
+ 
+     public CacheInfo() {
+-      fileName = NO_OFFSET;
+-      fileOffset = NO_FILENAME;
++      fileName = NO_FILENAME;
++      fileOffset = NO_OFFSET;
+       file = null;
+     }
+ 
+@@ -59,11 +62,12 @@ public void setFileOffset(long fileOffset) {
+       this.fileOffset = fileOffset;
+     }
+ 
++    @Nullable
+     public File getFile() {
+       return file;
+     }
+ 
+-    public void setFile(File file) {
++    public void setFile(@Nullable File  file) {
+       this.file = file;
+     }
+   }
+@@ -72,7 +76,8 @@ public void setFile(File file) {
+   /**
+    * Cache which do nothing but still works!
+    */
+-  public static class DumbDiskCache implements DiskCacheInterface {
++  class DumbDiskCache implements DiskCacheInterface {
++    @NonNull
+     @Override
+     public CacheInfo getCacheInfo(String url) {
+       return new CacheInfo();
+diff --git a/imagepipeline/src/main/java/com/facebook/imagepipeline/producers/DoubleSourceStream.java b/imagepipeline/src/main/java/com/facebook/imagepipeline/producers/DoubleSourceStream.java
+index 16c79034e..b621e09ae 100644
+--- a/imagepipeline/src/main/java/com/facebook/imagepipeline/producers/DoubleSourceStream.java
++++ b/imagepipeline/src/main/java/com/facebook/imagepipeline/producers/DoubleSourceStream.java
+@@ -15,20 +15,18 @@
+ public class DoubleSourceStream extends InputStream {
+   private static final String TAG = DoubleSourceStream.class.getName();
+ 
+-  private static final int INFINITY_LENGTH = -4567;
+-
+   private InputStream firstInputStream;
+-  private final int firstInputStreamLength;
++  private final long firstInputStreamLength;
+   private InputStream secondInputStream;
+ 
+   private OutputStream firstOutputStream;
+ 
+   private boolean firstEnds = false;
+-  private int firstInputStreamTotalRead = 0;
+-  private int secondInputStreamTotalRead = 0;
++  private long firstInputStreamTotalRead = 0;
++  private long secondInputStreamTotalRead = 0;
+ 
+   public DoubleSourceStream(InputStream firstInputStream,
+-                            int firstInputStreamLength, @NonNull InputStream secondInputStream,
++                            long firstInputStreamLength, @NonNull InputStream secondInputStream,
+                             OutputStream firstOutputStream) {
+     this.firstInputStream = firstInputStream;
+     this.firstInputStreamLength = firstInputStreamLength;
+@@ -107,7 +105,8 @@ public int read(@NonNull byte[] buffer, int byteOffset, int byteCount) throws IO
+       int byteCountCorrected = byteCount;
+ 
+       if(firstInputStreamTotalRead + byteCount >= firstInputStreamLength) {
+-        byteCountCorrected = firstInputStreamLength - firstInputStreamTotalRead;
++        //bytesCorrected is always less or equals byteCount - so int
++        byteCountCorrected = (int) (firstInputStreamLength - firstInputStreamTotalRead);
+         firstEnds = true;
+ 
+         FLog.w(TAG, "FirstInputStream ended. Totally read " + firstInputStreamTotalRead);
+@@ -128,6 +127,10 @@ public int read(@NonNull byte[] buffer, int byteOffset, int byteCount) throws IO
+     if (bytesRead != -1) {
+       secondInputStreamTotalRead += bytesRead;
+       FLog.w(TAG, "Read from secondInputStream " + bytesRead + " bytes. Totally read from source: " + secondInputStreamTotalRead + " bytes");
++    } else {
++      FLog.w(TAG, "Finished. Totally read from firstInputStream: " + firstInputStreamTotalRead +
++               " bytes. Totally read from secondInputStream: " + secondInputStreamTotalRead +
++              " bytes. Total size: " + (firstInputStreamTotalRead+secondInputStreamTotalRead));
+     }
+ 
+     if (firstOutputStream != null && bytesRead != -1) {
+diff --git a/samples/redownloadingapp/src/main/java/com/facebook/samples/redownloadingapp/MainActivity.java b/samples/redownloadingapp/src/main/java/com/facebook/samples/redownloadingapp/MainActivity.java
+index 31c5850ec..33f94d3a5 100644
+--- a/samples/redownloadingapp/src/main/java/com/facebook/samples/redownloadingapp/MainActivity.java
++++ b/samples/redownloadingapp/src/main/java/com/facebook/samples/redownloadingapp/MainActivity.java
+@@ -54,7 +54,8 @@ protected void onCreate(Bundle savedInstanceState) {
+     Set<RequestListener> listeners = new HashSet<>();
+     listeners.add(new RequestLoggingListener());
+ 
+-    final DiskCacheInterface diskCache = DiskCache.getInstance(this);
++    DiskCache.initInstance(this, 10);
++    final DiskCacheInterface diskCache = DiskCache.getInstance();
+ 
+     ImagePipelineConfig config = ImagePipelineConfig.newBuilder(this)
+             .setNetworkFetcher(new ResumeDownloadFetcher(diskCache))

@@ -1,0 +1,376 @@
+diff --git a/compiler/src/main/java/dagger/internal/codegen/ComponentDescriptor.java b/compiler/src/main/java/dagger/internal/codegen/ComponentDescriptor.java
+index 9ec96ff74..f54b0e8d5 100644
+--- a/compiler/src/main/java/dagger/internal/codegen/ComponentDescriptor.java
++++ b/compiler/src/main/java/dagger/internal/codegen/ComponentDescriptor.java
+@@ -22,6 +22,8 @@
+ import com.google.common.collect.ImmutableMap;
+ import com.google.common.collect.ImmutableSet;
+ import dagger.Component;
++import dagger.producers.ProductionComponent;
++import java.lang.annotation.Annotation;
+ import java.util.List;
+ import javax.lang.model.element.AnnotationMirror;
+ import javax.lang.model.element.ExecutableElement;
+@@ -38,7 +40,7 @@
+ import static javax.lang.model.type.TypeKind.VOID;
+ 
+ /**
+- * The logical representation of a {@link Component} definition.
++ * The logical representation of a {@link Component} or {@link ProductionComponent} definition.
+  *
+  * @author Gregory Kick
+  * @since 2.0
+@@ -47,6 +49,23 @@
+ abstract class ComponentDescriptor {
+   ComponentDescriptor() {}
+ 
++  enum Kind {
++    COMPONENT(Component.class),
++    PRODUCTION_COMPONENT(ProductionComponent.class);
++
++    private final Class<? extends Annotation> annotationType;
++
++    Kind(Class<? extends Annotation> annotationType) {
++      this.annotationType = annotationType;
++    }
++
++    Class<? extends Annotation> annotationType() {
++      return annotationType;
++    }
++  }
++
++  abstract Kind kind();
++
+   abstract AnnotationMirror componentAnnotation();
+ 
+   /**
+@@ -62,8 +81,8 @@
+ 
+   /**
+    * An index of the type to which this component holds a reference (the type listed in
+-   * {@link Component#dependencies} as opposed to the enclosing type) for each method from a
+-   * component dependency that can be used for binding.
++   * {@link Component#dependencies} or {@link ProductionComponent#dependencies} as opposed to the
++   * enclosing type) for each method from a component dependency that can be used for binding.
+    */
+   abstract ImmutableMap<ExecutableElement, TypeElement> dependencyMethodIndex();
+ 
+@@ -90,9 +109,17 @@
+       this.types = types;
+     }
+ 
+-    ComponentDescriptor create(TypeElement componentDefinitionType) {
++    ComponentDescriptor forComponent(TypeElement componentDefinitionType) {
++      return create(componentDefinitionType, Kind.COMPONENT);
++    }
++
++    ComponentDescriptor forProductionComponent(TypeElement componentDefinitionType) {
++      return create(componentDefinitionType, Kind.PRODUCTION_COMPONENT);
++    }
++
++    private ComponentDescriptor create(TypeElement componentDefinitionType, Kind kind) {
+       AnnotationMirror componentMirror =
+-          getAnnotationMirror(componentDefinitionType, Component.class).get();
++          getAnnotationMirror(componentDefinitionType, kind.annotationType()).get();
+       ImmutableSet<TypeElement> componentDependencyTypes =
+           MoreTypes.asTypeElements(types, getComponentDependencies(componentMirror));
+ 
+@@ -111,6 +138,7 @@ ComponentDescriptor create(TypeElement componentDefinitionType) {
+ 
+       Optional<AnnotationMirror> scope = getScopeAnnotation(componentDefinitionType);
+       return new AutoValue_ComponentDescriptor(
++          kind,
+           componentMirror,
+           componentDefinitionType,
+           componentDependencyTypes,
+diff --git a/compiler/src/main/java/dagger/internal/codegen/ComponentProcessingStep.java b/compiler/src/main/java/dagger/internal/codegen/ComponentProcessingStep.java
+index 99724987b..8de95fd34 100644
+--- a/compiler/src/main/java/dagger/internal/codegen/ComponentProcessingStep.java
++++ b/compiler/src/main/java/dagger/internal/codegen/ComponentProcessingStep.java
+@@ -71,7 +71,7 @@ public void process(SetMultimap<Class<? extends Annotation>, Element> elementsBy
+       componentReport.printMessagesTo(messager);
+       if (componentReport.isClean()) {
+         ComponentDescriptor componentDescriptor =
+-            componentDescriptorFactory.create(componentTypeElement);
++            componentDescriptorFactory.forComponent(componentTypeElement);
+         BindingGraph bindingGraph = bindingGraphFactory.create(componentDescriptor);
+         ValidationReport<BindingGraph> graphReport =
+             bindingGraphValidator.validate(bindingGraph);
+diff --git a/compiler/src/main/java/dagger/internal/codegen/ComponentProcessor.java b/compiler/src/main/java/dagger/internal/codegen/ComponentProcessor.java
+index ffacaea74..7908beb92 100644
+--- a/compiler/src/main/java/dagger/internal/codegen/ComponentProcessor.java
++++ b/compiler/src/main/java/dagger/internal/codegen/ComponentProcessor.java
+@@ -75,6 +75,7 @@ public SourceVersion getSupportedSourceVersion() {
+     ModuleValidator producerModuleValidator = new ModuleValidator(
+         types, ProducerModule.class, Produces.class);
+     ProducesMethodValidator producesMethodValidator = new ProducesMethodValidator(elements);
++    ProductionComponentValidator productionComponentValidator = new ProductionComponentValidator();
+ 
+     Key.Factory keyFactory = new Key.Factory(types, elements);
+ 
+@@ -146,7 +147,11 @@ public SourceVersion getSupportedSourceVersion() {
+             producerModuleValidator,
+             producesMethodValidator,
+             productionBindingFactory,
+-            producerFactoryGenerator));
++            producerFactoryGenerator),
++        new ProductionComponentProcessingStep(
++            messager,
++            productionComponentValidator,
++            componentDescriptorFactory));
+   }
+ 
+   @Override
+diff --git a/compiler/src/main/java/dagger/internal/codegen/ProductionComponentProcessingStep.java b/compiler/src/main/java/dagger/internal/codegen/ProductionComponentProcessingStep.java
+new file mode 100644
+index 000000000..00248037b
+--- /dev/null
++++ b/compiler/src/main/java/dagger/internal/codegen/ProductionComponentProcessingStep.java
+@@ -0,0 +1,68 @@
++/*
++ * Copyright (C) 2014 Google, Inc.
++ *
++ * Licensed under the Apache License, Version 2.0 (the "License");
++ * you may not use this file except in compliance with the License.
++ * You may obtain a copy of the License at
++ *
++ * http://www.apache.org/licenses/LICENSE-2.0
++ *
++ * Unless required by applicable law or agreed to in writing, software
++ * distributed under the License is distributed on an "AS IS" BASIS,
++ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++ * See the License for the specific language governing permissions and
++ * limitations under the License.
++ */
++package dagger.internal.codegen;
++
++import com.google.auto.common.MoreElements;
++import com.google.common.collect.ImmutableSet;
++import com.google.common.collect.SetMultimap;
++import dagger.producers.ProductionComponent;
++import dagger.internal.codegen.ComponentDescriptor.Factory;
++import java.lang.annotation.Annotation;
++import java.util.Set;
++import javax.annotation.processing.Messager;
++import javax.lang.model.element.Element;
++import javax.lang.model.element.TypeElement;
++
++/**
++ * A {@link ProcessingStep} that is responsible for dealing with the {@link ProductionComponent}
++ * annotation as part of the {@link ComponentProcessor}.
++ *
++ * @author Jesse Beder
++ */
++final class ProductionComponentProcessingStep implements BasicAnnotationProcessor.ProcessingStep {
++  private final Messager messager;
++  private final ProductionComponentValidator componentValidator;
++  private final ComponentDescriptor.Factory componentDescriptorFactory;
++
++  ProductionComponentProcessingStep(
++      Messager messager,
++      ProductionComponentValidator componentValidator,
++      Factory componentDescriptorFactory) {
++    this.messager = messager;
++    this.componentValidator = componentValidator;
++    this.componentDescriptorFactory = componentDescriptorFactory;
++  }
++
++  @Override
++  public Set<Class<? extends Annotation>> annotations() {
++    return ImmutableSet.<Class<? extends Annotation>>of(ProductionComponent.class);
++  }
++
++  @Override
++  public void process(SetMultimap<Class<? extends Annotation>, Element> elementsByAnnotation) {
++    Set<? extends Element> componentElements = elementsByAnnotation.get(ProductionComponent.class);
++
++    for (Element element : componentElements) {
++      TypeElement componentTypeElement = MoreElements.asType(element);
++      ValidationReport<TypeElement> componentReport =
++          componentValidator.validate(componentTypeElement);
++      componentReport.printMessagesTo(messager);
++      if (componentReport.isClean()) {
++        componentDescriptorFactory.forProductionComponent(componentTypeElement);
++      }
++    }
++  }
++}
+diff --git a/compiler/src/main/java/dagger/internal/codegen/ProductionComponentValidator.java b/compiler/src/main/java/dagger/internal/codegen/ProductionComponentValidator.java
+new file mode 100644
+index 000000000..6107280e4
+--- /dev/null
++++ b/compiler/src/main/java/dagger/internal/codegen/ProductionComponentValidator.java
+@@ -0,0 +1,81 @@
++/*
++ * Copyright (C) 2014 Google, Inc.
++ *
++ * Licensed under the Apache License, Version 2.0 (the "License");
++ * you may not use this file except in compliance with the License.
++ * You may obtain a copy of the License at
++ *
++ * http://www.apache.org/licenses/LICENSE-2.0
++ *
++ * Unless required by applicable law or agreed to in writing, software
++ * distributed under the License is distributed on an "AS IS" BASIS,
++ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++ * See the License for the specific language governing permissions and
++ * limitations under the License.
++ */
++package dagger.internal.codegen;
++
++import com.google.auto.common.MoreElements;
++import com.google.common.collect.ImmutableList;
++import dagger.Module;
++import dagger.producers.ProducerModule;
++import dagger.producers.ProductionComponent;
++import javax.lang.model.element.AnnotationMirror;
++import javax.lang.model.element.TypeElement;
++import javax.lang.model.type.DeclaredType;
++import javax.lang.model.type.TypeMirror;
++import javax.lang.model.util.SimpleTypeVisitor6;
++
++import static com.google.auto.common.MoreElements.getAnnotationMirror;
++import static com.google.common.base.Preconditions.checkState;
++import static dagger.internal.codegen.ConfigurationAnnotations.getComponentModules;
++import static javax.lang.model.element.ElementKind.CLASS;
++import static javax.lang.model.element.ElementKind.INTERFACE;
++import static javax.lang.model.element.Modifier.ABSTRACT;
++
++/**
++ * Performs superficial validation of the contract of the {@link ProductionComponent} annotation.
++ *
++ * @author Jesse Beder
++ */
++final class ProductionComponentValidator implements Validator<TypeElement> {
++  @Override public ValidationReport<TypeElement> validate(final TypeElement subject) {
++    final ValidationReport.Builder<TypeElement> builder = ValidationReport.Builder.about(subject);
++
++    if (!subject.getKind().equals(INTERFACE)
++        && !(subject.getKind().equals(CLASS) && subject.getModifiers().contains(ABSTRACT))) {
++      builder.addItem("@ProductionComponent may only be applied to an interface or abstract class",
++          subject);
++    }
++
++    AnnotationMirror componentMirror =
++        getAnnotationMirror(subject, ProductionComponent.class).get();
++    ImmutableList<TypeMirror> moduleTypes = getComponentModules(componentMirror);
++
++    // TODO(gak): make unused modules an error
++    for (TypeMirror moduleType : moduleTypes) {
++      moduleType.accept(new SimpleTypeVisitor6<Void, Void>() {
++        @Override
++        protected Void defaultAction(TypeMirror mirror, Void p) {
++          builder.addItem(mirror + " is not a valid module type.", subject);
++          return null;
++        }
++
++        @Override
++        public Void visitDeclared(DeclaredType t, Void p) {
++          checkState(t.getTypeArguments().isEmpty());
++          TypeElement moduleElement = MoreElements.asType(t.asElement());
++          if (!getAnnotationMirror(moduleElement, Module.class).isPresent()
++              && !getAnnotationMirror(moduleElement, ProducerModule.class).isPresent()) {
++            builder.addItem(moduleElement.getQualifiedName()
++                + " is listed as a module, but is not annotated with @Module or @ProducerModule",
++                subject);
++          }
++          return null;
++        }
++      }, null);
++    }
++
++    return builder.build();
++  }
++}
+diff --git a/compiler/src/test/java/dagger/internal/codegen/ProductionComponentProcessorTest.java b/compiler/src/test/java/dagger/internal/codegen/ProductionComponentProcessorTest.java
+new file mode 100644
+index 000000000..ed29f0036
+--- /dev/null
++++ b/compiler/src/test/java/dagger/internal/codegen/ProductionComponentProcessorTest.java
+@@ -0,0 +1,86 @@
++/*
++ * Copyright (C) 2014 Google, Inc.
++ *
++ * Licensed under the Apache License, Version 2.0 (the "License");
++ * you may not use this file except in compliance with the License.
++ * You may obtain a copy of the License at
++ *
++ * http://www.apache.org/licenses/LICENSE-2.0
++ *
++ * Unless required by applicable law or agreed to in writing, software
++ * distributed under the License is distributed on an "AS IS" BASIS,
++ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++ * See the License for the specific language governing permissions and
++ * limitations under the License.
++ */
++package dagger.internal.codegen;
++
++import com.google.testing.compile.JavaFileObjects;
++import javax.tools.JavaFileObject;
++import org.junit.Test;
++import org.junit.runner.RunWith;
++import org.junit.runners.JUnit4;
++
++import static com.google.common.truth.Truth.assertAbout;
++import static com.google.testing.compile.JavaSourceSubjectFactory.javaSource;
++
++@RunWith(JUnit4.class)
++public class ProductionComponentProcessorTest {
++  @Test public void componentOnConcreteClass() {
++    JavaFileObject componentFile = JavaFileObjects.forSourceLines("test.NotAComponent",
++        "package test;",
++        "",
++        "import dagger.producers.ProductionComponent;",
++        "",
++        "@ProductionComponent",
++        "final class NotAComponent {}");
++    assertAbout(javaSource()).that(componentFile)
++        .processedWith(new ComponentProcessor())
++        .failsToCompile()
++        .withErrorContaining("interface");
++  }
++
++  @Test public void componentOnEnum() {
++    JavaFileObject componentFile = JavaFileObjects.forSourceLines("test.NotAComponent",
++        "package test;",
++        "",
++        "import dagger.producers.ProductionComponent;",
++        "",
++        "@ProductionComponent",
++        "enum NotAComponent {",
++        "  INSTANCE",
++        "}");
++    assertAbout(javaSource()).that(componentFile)
++        .processedWith(new ComponentProcessor())
++        .failsToCompile()
++        .withErrorContaining("interface");
++  }
++
++  @Test public void componentOnAnnotation() {
++    JavaFileObject componentFile = JavaFileObjects.forSourceLines("test.NotAComponent",
++        "package test;",
++        "",
++        "import dagger.producers.ProductionComponent;",
++        "",
++        "@ProductionComponent",
++        "@interface NotAComponent {}");
++    assertAbout(javaSource()).that(componentFile)
++        .processedWith(new ComponentProcessor())
++        .failsToCompile()
++        .withErrorContaining("interface");
++  }
++
++  @Test public void nonModuleModule() {
++    JavaFileObject componentFile = JavaFileObjects.forSourceLines("test.NotAComponent",
++        "package test;",
++        "",
++        "import dagger.producers.ProductionComponent;",
++        "",
++        "@ProductionComponent(modules = Object.class)",
++        "interface NotAComponent {}");
++    assertAbout(javaSource()).that(componentFile)
++        .processedWith(new ComponentProcessor())
++        .failsToCompile()
++        .withErrorContaining("is not annotated with @Module or @ProducerModule");
++  }
++}

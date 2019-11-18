@@ -1,0 +1,383 @@
+diff --git a/CHANGELOG.md b/CHANGELOG.md
+index 6bbe4fb953..9134f567ec 100644
+--- a/CHANGELOG.md
++++ b/CHANGELOG.md
+@@ -6,12 +6,17 @@
+ 
+ * [ObjectServer] Added support for `SyncUser.isAdmin()` (#4353).
+ * Transient fields are now allowed in model classes, but are implicitly treated as having the `@Ignore` annotation (#4279).
++* Added `Realm.refresh()` and `DynamicRealm.refresh()` (#3476).
+ 
+ ### Bug Fixes
+ 
+ ### Internal
+ 
+-## 3.1.3 (YYYY-MM-DD)
++## 3.1.3 (2017-04-20)
++
++### Enhancements
++
++* [ObjectServer] Resume synchronization as soon as the connectivity is back (#4141).
+ 
+ ### Bug Fixes
+ 
+@@ -20,10 +25,13 @@
+ * Now throws `IllegalStateException` when a getter of linking objects is called against deleted or not yet loaded `RealmObject`s (#4499).
+ * `NullPointerException` caused by local transaction inside the listener of `findFirstAsync()`'s results (#4495).
+ * Native crash when adding listeners to `RealmObject` after removing listeners from the same `RealmObject` before (#4502).
++* Native crash with "Invalid argument" error happened on some Android 7.1.1 devices when opening Realm on external storage (#4461).
++* `OrderedRealmCollectionChangeListener` didn't report change ranges correctly when circular link's field changed (#4474).
+ 
+ ### Internal
+ 
+-* Upgraded to Realm Sync 1.5.2.
++* Upgraded to Realm Sync 1.6.0.
++* Upgraded to Realm Core 2.6.1.
+ 
+ ## 3.1.2 (2017-04-12)
+ 
+diff --git a/dependencies.list b/dependencies.list
+index 9d4d44080f..06db1eeb3f 100644
+--- a/dependencies.list
++++ b/dependencies.list
+@@ -1,7 +1,7 @@
+ # Realm Sync Core release used by Realm Java
+ # https://github.com/realm/realm-sync/releases
+-REALM_SYNC_VERSION=1.5.2
+-REALM_SYNC_SHA256=e7a0134b5b69c5a571e3f49901bb8d8ca634b166873c5a422909e7d2016a00e7
++REALM_SYNC_VERSION=1.6.0
++REALM_SYNC_SHA256=e8a973dbe6ab33ac49d3d0e45d6b63d69cec8d1d87d9a2311fcdd02767f76cf8
+ 
+ # Object Server Release used by Integration tests
+ # `realm` is stable releases, `realm-testing` is developer builds.
+diff --git a/realm/realm-library/src/androidTest/java/io/realm/ObjectChangeSetTests.java b/realm/realm-library/src/androidTest/java/io/realm/ObjectChangeSetTests.java
+index 947b197eea..2069ec6eee 100644
+--- a/realm/realm-library/src/androidTest/java/io/realm/ObjectChangeSetTests.java
++++ b/realm/realm-library/src/androidTest/java/io/realm/ObjectChangeSetTests.java
+@@ -30,6 +30,7 @@
+ 
+ import io.realm.entities.AllTypes;
+ import io.realm.entities.Dog;
++import io.realm.entities.Owner;
+ import io.realm.rule.RunInLooperThread;
+ import io.realm.rule.RunTestInLooperThread;
+ 
+@@ -417,4 +418,49 @@ public void onChange(DynamicRealmObject object, ObjectChangeSet changeSet) {
+         }
+         realm.commitTransaction();
+     }
++
++    // For https://github.com/realm/realm-java/issues/4474
++    @Test
++    @RunTestInLooperThread
++    public void allParentObjectShouldBeInChangeSet() {
++        Realm realm = looperThread.realm;
++
++        realm.beginTransaction();
++        Owner owner = realm.createObject(Owner.class);
++        Dog dog1 = realm.createObject(Dog.class);
++        dog1.setOwner(owner);
++        dog1.setHasTail(true);
++        owner.getDogs().add(dog1);
++        Dog dog2 = realm.createObject(Dog.class);
++        dog2.setOwner(owner);
++        dog2.setHasTail(true);
++        owner.getDogs().add(dog2);
++        Dog dog3 = realm.createObject(Dog.class);
++        dog3.setOwner(owner);
++        dog3.setHasTail(true);
++        owner.getDogs().add(dog3);
++
++        realm.commitTransaction();
++
++        RealmResults<Dog> dogs = realm.where(Dog.class).equalTo(Dog.FIELD_HAS_TAIL, true).findAll();
++        looperThread.keepStrongReference.add(dogs);
++        dogs.addChangeListener(new OrderedRealmCollectionChangeListener<RealmResults<Dog>>() {
++            @Override
++            public void onChange(RealmResults<Dog> collection, OrderedCollectionChangeSet changeSet) {
++                assertEquals(1, changeSet.getDeletions().length);
++                assertEquals(0, changeSet.getInsertions().length);
++
++                assertEquals(1, changeSet.getChangeRanges().length);
++                assertEquals(0, changeSet.getChangeRanges()[0].startIndex);
++                assertEquals(2, changeSet.getChangeRanges()[0].length);
++
++                looperThread.testComplete();
++            }
++        });
++
++        realm.beginTransaction();
++        dog3.setHasTail(false);
++        realm.commitTransaction();
++        looperThread.testComplete();
++    }
+ }
+diff --git a/realm/realm-library/src/androidTest/java/io/realm/RealmTests.java b/realm/realm-library/src/androidTest/java/io/realm/RealmTests.java
+index f95147ab65..22ad7a1231 100644
+--- a/realm/realm-library/src/androidTest/java/io/realm/RealmTests.java
++++ b/realm/realm-library/src/androidTest/java/io/realm/RealmTests.java
+@@ -57,6 +57,7 @@
+ import java.util.concurrent.Executors;
+ import java.util.concurrent.Future;
+ import java.util.concurrent.atomic.AtomicBoolean;
++import java.util.concurrent.atomic.AtomicInteger;
+ import java.util.concurrent.atomic.AtomicLong;
+ import java.util.concurrent.atomic.AtomicReference;
+ 
+@@ -3829,4 +3830,108 @@ public boolean accept(File dir, String name) {
+         realmOnExternalStorage = Realm.getInstance(config);
+         realmOnExternalStorage.close();
+     }
++
++    @Test
++    @RunTestInLooperThread
++    public void refresh_triggerNotifications() {
++        final CountDownLatch bgThreadDone = new CountDownLatch(1);
++        final AtomicBoolean listenerCalled = new AtomicBoolean(false);
++        Realm realm = looperThread.realm;
++        RealmResults<AllTypes> results = realm.where(AllTypes.class).findAll();
++        assertEquals(0, results.size());
++        results.addChangeListener(new RealmChangeListener<RealmResults<AllTypes>>() {
++            @Override
++            public void onChange(RealmResults<AllTypes> results) {
++                assertEquals(1, results.size());
++                listenerCalled.set(true);
++            }
++        });
++
++        // Advance the Realm on a background while blocking this thread. When we refresh, it should trigger
++        // the listener.
++        new Thread(new Runnable() {
++            @Override
++            public void run() {
++                Realm realm = Realm.getInstance(looperThread.realmConfiguration);
++                realm.beginTransaction();
++                realm.createObject(AllTypes.class);
++                realm.commitTransaction();
++                realm.close();
++                bgThreadDone.countDown();
++            }
++        }).run();
++        TestHelper.awaitOrFail(bgThreadDone);
++
++        realm.refresh();
++        assertTrue(listenerCalled.get());
++        looperThread.testComplete();
++    }
++
++    @Test
++    public void refresh_nonLooperThreadAdvances() {
++        final CountDownLatch bgThreadDone = new CountDownLatch(1);
++        RealmResults<AllTypes> results = realm.where(AllTypes.class).findAll();
++        assertEquals(0, results.size());
++
++        new Thread(new Runnable() {
++            @Override
++            public void run() {
++                Realm realm = Realm.getInstance(RealmTests.this.realm.getConfiguration());
++                realm.beginTransaction();
++                realm.createObject(AllTypes.class);
++                realm.commitTransaction();
++                realm.close();
++                bgThreadDone.countDown();
++            }
++        }).run();
++        TestHelper.awaitOrFail(bgThreadDone);
++
++        realm.refresh();
++        assertEquals(1, results.size());
++    }
++
++    @Test
++    @RunTestInLooperThread
++    public void refresh_forceSynchronousNotifications() {
++        final CountDownLatch bgThreadDone = new CountDownLatch(1);
++        final AtomicBoolean listenerCalled = new AtomicBoolean(false);
++        Realm realm = looperThread.realm;
++        RealmResults<AllTypes> results = realm.where(AllTypes.class).findAllAsync();
++        results.addChangeListener(new RealmChangeListener<RealmResults<AllTypes>>() {
++            @Override
++            public void onChange(RealmResults<AllTypes> results) {
++                // Will be forced synchronous
++                assertEquals(1, results.size());
++                listenerCalled.set(true);
++            }
++        });
++
++        new Thread(new Runnable() {
++            @Override
++            public void run() {
++                Realm realm = Realm.getInstance(looperThread.realmConfiguration);
++                realm.beginTransaction();
++                realm.createObject(AllTypes.class);
++                realm.commitTransaction();
++                realm.close();
++                bgThreadDone.countDown();
++            }
++        }).start();
++        TestHelper.awaitOrFail(bgThreadDone);
++
++        realm.refresh();
++        assertTrue(listenerCalled.get());
++        looperThread.testComplete();
++    }
++
++    @Test
++    public void refresh_insideTransactionThrows() {
++        realm.beginTransaction();
++        try {
++            realm.refresh();
++            fail();
++        } catch (IllegalStateException ignored) {
++        }
++        realm.cancelTransaction();
++    }
+ }
+diff --git a/realm/realm-library/src/androidTest/java/io/realm/entities/Dog.java b/realm/realm-library/src/androidTest/java/io/realm/entities/Dog.java
+index d6b2046a9f..4064e2b395 100644
+--- a/realm/realm-library/src/androidTest/java/io/realm/entities/Dog.java
++++ b/realm/realm-library/src/androidTest/java/io/realm/entities/Dog.java
+@@ -30,6 +30,7 @@
+     public static final String FIELD_HEIGHT = "height";
+     public static final String FIELD_WEIGHT = "weight";
+     public static final String FIELD_BIRTHDAY = "birthday";
++    public static final String FIELD_HAS_TAIL = "hasTail";
+ 
+     @Index
+     private String name;
+diff --git a/realm/realm-library/src/main/cpp/io_realm_SyncManager.cpp b/realm/realm-library/src/main/cpp/io_realm_SyncManager.cpp
+index 2e80fe147e..d9f15dd859 100644
+--- a/realm/realm-library/src/main/cpp/io_realm_SyncManager.cpp
++++ b/realm/realm-library/src/main/cpp/io_realm_SyncManager.cpp
+@@ -100,3 +100,12 @@ JNIEXPORT void JNICALL Java_io_realm_SyncManager_nativeSimulateSyncError(JNIEnv*
+     }
+     CATCH_STD()
+ }
++
++JNIEXPORT void JNICALL Java_io_realm_SyncManager_nativeReconnect(JNIEnv* env, jclass)
++{
++    TR_ENTER()
++    try {
++        SyncManager::shared().reconnect();
++    }
++    CATCH_STD()
++}
+diff --git a/realm/realm-library/src/main/cpp/object-store b/realm/realm-library/src/main/cpp/object-store
+index 7a1924b4cf..dfddfa7f7b 160000
+--- a/realm/realm-library/src/main/cpp/object-store
++++ b/realm/realm-library/src/main/cpp/object-store
+@@ -1 +1 @@
+-Subproject commit 7a1924b4cf24f823825e9bc32b236b8a67ad52fe
++Subproject commit dfddfa7f7bf564619e2257243c252ffad6d5c9c3
+diff --git a/realm/realm-library/src/main/java/io/realm/BaseRealm.java b/realm/realm-library/src/main/java/io/realm/BaseRealm.java
+index 894e581e0a..047a29377a 100644
+--- a/realm/realm-library/src/main/java/io/realm/BaseRealm.java
++++ b/realm/realm-library/src/main/java/io/realm/BaseRealm.java
+@@ -113,6 +113,24 @@ public boolean isAutoRefresh() {
+         return sharedRealm.isAutoRefresh();
+     }
+ 
++    /**
++     * Refreshes the Realm instance and all the RealmResults and RealmObjects instances coming from it.
++     * It also calls any listeners associated with the Realm if neeeded.
++     * <p>
++     * WARNING: Calling this on a thread with async queries will turn those queries into synchronous queries.
++     * In most cases it is better to use {@link RealmChangeListener}s to be notified about changes to the
++     * Realm on a given thread than it is to use this method. 
++     *
++     * @throws IllegalStateException if attempting to refresh from within a transaction.
++     */
++    public void refresh() {
++        checkIfValid();
++        if (isInTransaction()) {
++            throw new IllegalStateException("Cannot refresh a Realm instance inside a transaction.");
++        }
++        sharedRealm.refresh();
++    }
++
+     /**
+      * Checks if the Realm is currently in a transaction.
+      *
+diff --git a/realm/realm-library/src/objectServer/java/io/realm/SyncManager.java b/realm/realm-library/src/objectServer/java/io/realm/SyncManager.java
+index 0d37ce79eb..8ef5862f5f 100644
+--- a/realm/realm-library/src/objectServer/java/io/realm/SyncManager.java
++++ b/realm/realm-library/src/objectServer/java/io/realm/SyncManager.java
+@@ -26,6 +26,7 @@
+ import edu.umd.cs.findbugs.annotations.SuppressFBWarnings;
+ import io.realm.internal.Keep;
+ import io.realm.internal.network.AuthenticationServer;
++import io.realm.internal.network.NetworkStateReceiver;
+ import io.realm.internal.network.OkHttpAuthenticationServer;
+ import io.realm.log.RealmLog;
+ 
+@@ -98,6 +99,19 @@ public void onError(SyncSession session, ObjectServerError error) {
+     private static volatile AuthenticationServer authServer = new OkHttpAuthenticationServer();
+     private static volatile UserStore userStore;
+ 
++    private static NetworkStateReceiver.ConnectionListener networkListener = new NetworkStateReceiver.ConnectionListener() {
++        @Override
++        public void onChange(boolean connectionAvailable) {
++            if (connectionAvailable) {
++                RealmLog.debug("NetworkListener: Connection available");
++                // notify all sessions
++                notifyNetworkIsBack();
++            } else {
++                RealmLog.debug("NetworkListener: Connection lost");
++            }
++        }
++    };
++
+     static volatile SyncSession.ErrorHandler defaultSessionErrorHandler = SESSION_NO_OP_ERROR_HANDLER;
+ 
+     // Initialize the SyncManager
+@@ -181,6 +195,10 @@ public static synchronized SyncSession getSession(SyncConfiguration syncConfigur
+         if (session == null) {
+             session = new SyncSession(syncConfiguration);
+             sessions.put(syncConfiguration.getPath(), session);
++            if (sessions.size() == 1) {
++                RealmLog.debug("first session created add network listener");
++                NetworkStateReceiver.addListener(networkListener);
++            }
+         }
+ 
+         return session;
+@@ -199,6 +217,10 @@ private static synchronized void removeSession(SyncConfiguration syncConfigurati
+         if (syncSession != null) {
+             syncSession.close();
+         }
++        if (sessions.isEmpty()) {
++            RealmLog.debug("last session dropped, remove network listener");
++            NetworkStateReceiver.removeListener(networkListener);
++        }
+     }
+ 
+     static AuthenticationServer getAuthServer() {
+@@ -248,6 +270,14 @@ private static synchronized void notifyErrorHandler(int errorCode, String errorM
+         }
+     }
+ 
++    private static synchronized void notifyNetworkIsBack() {
++        try {
++            nativeReconnect();
++        } catch (Exception exception) {
++            RealmLog.error(exception);
++        }
++    }
++
+     /**
+      * This is called from the Object Store (through JNI) to request an {@code access_token} for
+      * the session specified by sessionPath.
+@@ -303,4 +333,5 @@ static void simulateClientReset(SyncSession session) {
+     protected static native void nativeInitializeSyncManager(String syncBaseDir);
+     private static native void nativeReset();
+     private static native void nativeSimulateSyncError(String realmPath, int errorCode, String errorMessage, boolean isFatal);
++    private static native void nativeReconnect();
+ }
+diff --git a/version.txt b/version.txt
+index 4395ff5923..e1f3bbde86 100644
+--- a/version.txt
++++ b/version.txt
+@@ -1 +1 @@
+-3.2.0-SNAPSHOT
+\ No newline at end of file
++3.2.0-SNAPSHOT

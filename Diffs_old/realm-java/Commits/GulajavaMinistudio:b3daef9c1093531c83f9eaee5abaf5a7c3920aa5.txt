@@ -1,0 +1,499 @@
+diff --git a/CHANGELOG.md b/CHANGELOG.md
+index 6f1a46d781..b6be996ce7 100644
+--- a/CHANGELOG.md
++++ b/CHANGELOG.md
+@@ -1,6 +1,7 @@
+-## 5.13.0(YYYY-MM-DD)
++## 5.13.0(2019-07-23)
+ 
+ ### Enhancements
++* [ObjectServer] Added support for faster initial synchronization for fully synchronized Realms. (Issue [#6469](https://github.com/realm/realm-java/issues/6469)) 
+ * [ObjectServer] Improved session lifecycle debug output. (Issue [#6552](https://github.com/realm/realm-java/pull/6552)).
+ 
+ ### Fixed
+@@ -12,7 +13,9 @@
+ * APIs are backwards compatible with all previous release of realm-java in the 5.x.y series.
+ 
+ ### Internal
+-* None.
++* Updated to Realm Core 5.22.0.
++* Updated to Realm Sync 4.6.1.
++* Updated to Object Store commit f0d75261fc8d332c20dc82f643dd795c0f4c7aec
+ 
+ 
+ ## 5.12.0(2019-06-20)
+diff --git a/realm/realm-library/src/main/cpp/CMakeLists.txt b/realm/realm-library/src/main/cpp/CMakeLists.txt
+index 035b359150..95e1fbfded 100644
+--- a/realm/realm-library/src/main/cpp/CMakeLists.txt
++++ b/realm/realm-library/src/main/cpp/CMakeLists.txt
+@@ -90,11 +90,11 @@ if (build_SYNC)
+     list(APPEND classes_LIST
+         io.realm.ClientResetRequiredError io.realm.RealmFileUserStore
+         io.realm.SyncManager io.realm.SyncSession io.realm.SyncUser
++        io.realm.internal.objectstore.OsAsyncOpenTask
+     )
+ endif()
+ create_javah(TARGET jni_headers
+     CLASSES ${classes_LIST}
+-
+     CLASSPATH ${classes_PATH}
+     OUTPUT_DIR ${jni_headers_PATH}
+     DEPENDS ${classes_PATH}
+@@ -188,6 +188,7 @@ if (NOT build_SYNC)
+         ${CMAKE_CURRENT_SOURCE_DIR}/io_realm_RealmFileUserStore.cpp
+         ${CMAKE_CURRENT_SOURCE_DIR}/io_realm_SyncManager.cpp
+         ${CMAKE_CURRENT_SOURCE_DIR}/io_realm_SyncSession.cpp
++        ${CMAKE_CURRENT_SOURCE_DIR}/io_realm_internal_objectstore_OsAsyncOpenTask.cpp
+         ${CMAKE_CURRENT_SOURCE_DIR}/io_realm_internal_sync_OsSubscription.cpp
+     )
+ endif()
+diff --git a/realm/realm-library/src/main/cpp/io_realm_internal_objectstore_OsAsyncOpenTask.cpp b/realm/realm-library/src/main/cpp/io_realm_internal_objectstore_OsAsyncOpenTask.cpp
+new file mode 100644
+index 0000000000..f48435bf64
+--- /dev/null
++++ b/realm/realm-library/src/main/cpp/io_realm_internal_objectstore_OsAsyncOpenTask.cpp
+@@ -0,0 +1,83 @@
++/*
++ * Copyright 2019 Realm Inc.
++ *
++ * Licensed under the Apache License, Version 2.0 (the "License");
++ * you may not use this file except in compliance with the License.
++ * You may obtain a copy of the License at
++ *
++ * http://www.apache.org/licenses/LICENSE-2.0
++ *
++ * Unless required by applicable law or agreed to in writing, software
++ * distributed under the License is distributed on an "AS IS" BASIS,
++ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++ * See the License for the specific language governing permissions and
++ * limitations under the License.
++ */
++
++#include "io_realm_internal_objectstore_OsAsyncOpenTask.h"
++
++#include "util.hpp"
++#include "thread_safe_reference.hpp"
++#include "jni_util/java_method.hpp"
++#include "jni_util/java_class.hpp"
++#include "jni_util/jni_utils.hpp"
++#include "object-store/src/sync/async_open_task.hpp"
++#include "object-store/src/sync/sync_config.hpp"
++
++#include <shared_realm.hpp>
++#include <sync/async_open_task.hpp>
++#include <memory>
++
++using namespace realm;
++using namespace realm::jni_util;
++using namespace realm::_impl;
++
++JNIEXPORT jlong JNICALL Java_io_realm_internal_objectstore_OsAsyncOpenTask_start(JNIEnv* env, jobject obj, jlong config_ptr)
++{
++    TR_ENTER()
++    try {
++
++        static JavaClass java_async_open_task_class(env, "io/realm/internal/objectstore/OsAsyncOpenTask");
++        static JavaMethod java_notify_realm_ready(env, java_async_open_task_class, "notifyRealmReady", "()V", false);
++        static JavaMethod java_notify_error(env, java_async_open_task_class, "notifyError", "(Ljava/lang/String;)V", false);
++
++        auto global_obj = env->NewGlobalRef(obj);
++        auto& config = *reinterpret_cast<Realm::Config*>(config_ptr);
++
++        std::shared_ptr<realm::AsyncOpenTask> task = Realm::get_synchronized_realm(config);
++
++        auto deleter = [](jobject obj) {
++            jni_util::JniUtils::get_env(true)->DeleteGlobalRef(obj);
++        };
++        std::shared_ptr<_jobject> task_obj(env->NewGlobalRef(global_obj), deleter);
++        task->start([task=std::move(task_obj)](realm::ThreadSafeReference<realm::Realm> realm_ref, std::exception_ptr error) {
++            JNIEnv* local_env = jni_util::JniUtils::get_env(true);
++            if (error) {
++                try {
++                    std::rethrow_exception(error);
++                }
++                catch (const std::exception& e) {
++                    jstring j_error_msg = to_jstring(local_env, e.what());
++                    local_env->CallObjectMethod(task.get(), java_notify_error, j_error_msg);
++                    local_env->DeleteLocalRef(j_error_msg);
++                }
++            }
++            else {
++                auto realm = Realm::get_shared_realm(std::move(realm_ref));
++                realm->close();
++                local_env->CallVoidMethod(task.get(), java_notify_realm_ready);
++            }
++            const_cast<std::shared_ptr<_jobject>&>(task).reset();
++        });
++        return reinterpret_cast<jlong>(&(*task));
++    }
++    CATCH_STD()
++    return 0;
++}
++
++JNIEXPORT void JNICALL Java_io_realm_internal_objectstore_OsAsyncOpenTask_cancel(JNIEnv*, jobject, jlong task_ptr)
++{
++    TR_ENTER()
++    AsyncOpenTask* task = reinterpret_cast<AsyncOpenTask*>(task_ptr);
++    task->cancel();
++}
+\ No newline at end of file
+diff --git a/realm/realm-library/src/main/cpp/object-store b/realm/realm-library/src/main/cpp/object-store
+index 7c3ff82355..f0d75261fc 160000
+--- a/realm/realm-library/src/main/cpp/object-store
++++ b/realm/realm-library/src/main/cpp/object-store
+@@ -1 +1 @@
+-Subproject commit 7c3ff8235579550a3e3c6060c47140b2005174f5
++Subproject commit f0d75261fc8d332c20dc82f643dd795c0f4c7aec
+diff --git a/realm/realm-library/src/main/java/io/realm/RealmCache.java b/realm/realm-library/src/main/java/io/realm/RealmCache.java
+index 4434c7d9d1..4a2ac0a7c1 100644
+--- a/realm/realm-library/src/main/java/io/realm/RealmCache.java
++++ b/realm/realm-library/src/main/java/io/realm/RealmCache.java
+@@ -38,6 +38,7 @@
+ import io.realm.internal.Capabilities;
+ import io.realm.internal.ObjectServerFacade;
+ import io.realm.internal.OsObjectStore;
++import io.realm.internal.OsRealmConfig;
+ import io.realm.internal.OsSharedRealm;
+ import io.realm.internal.RealmNotifier;
+ import io.realm.internal.Table;
+@@ -300,16 +301,29 @@ private static RealmCache getCache(String realmPath, boolean createIfNotExist) {
+                     // before proceeding. We need to open the Realm instance first to start any potential underlying
+                     // SyncSession so this will work.
+                     if (realmFileIsBeingCreated) {
+-                        sharedRealm = OsSharedRealm.getInstance(configuration);
+-                        try {
++
++                        // Manually create the Java session wrapper session as this might otherwise
++                        // not be created
++                        OsRealmConfig osConfig = new OsRealmConfig.Builder(configuration).build();
++                        ObjectServerFacade.getSyncFacadeIfPossible().wrapObjectStoreSessionIfRequired(osConfig);
++
++                        if (ObjectServerFacade.getSyncFacadeIfPossible().isPartialRealm(configuration)) {
++                            // Partial Realms are not supported by async open yet, so continue to
++                            // use the old way of opening those Realms.
++                            sharedRealm = OsSharedRealm.getInstance(configuration);
++                            try {
++                                ObjectServerFacade.getSyncFacadeIfPossible().downloadInitialRemoteChanges(configuration);
++                            } catch (Throwable t) {
++                                // If an error happened while downloading initial data, we need to reset the file so we can
++                                // download it again on the next attempt.
++                                sharedRealm.close();
++                                sharedRealm = null;
++                                deleteRealmFileOnDisk(configuration);
++                                throw t;
++                            }
++                        } else {
++                            // Fully synchronized Realms are supported by AsyncOpen
+                             ObjectServerFacade.getSyncFacadeIfPossible().downloadInitialRemoteChanges(configuration);
+-                        } catch (Throwable t) {
+-                            // If an error happened while downloading initial data, we need to reset the file so we can
+-                            // download it again on the next attempt.
+-                            sharedRealm.close();
+-                            sharedRealm = null;
+-                            deleteRealmFileOnDisk(configuration);
+-                            throw t;
+                         }
+                     }
+                 } else {
+diff --git a/realm/realm-library/src/main/java/io/realm/internal/ObjectServerFacade.java b/realm/realm-library/src/main/java/io/realm/internal/ObjectServerFacade.java
+index 51fc48ad73..4d1914053b 100644
+--- a/realm/realm-library/src/main/java/io/realm/internal/ObjectServerFacade.java
++++ b/realm/realm-library/src/main/java/io/realm/internal/ObjectServerFacade.java
+@@ -102,6 +102,7 @@ public String getSyncServerCertificateFilePath(RealmConfiguration config) {
+      *
+      * @throws {@code DownloadingRealmInterruptedException} if the thread was interrupted while blocked waiting for
+      * this to complete.
++     * @throws {@code ObjectServerException } In any other kind of error is reported.
+      */
+     @SuppressWarnings("JavaDoc")
+     public void downloadInitialRemoteChanges(RealmConfiguration config) {
+diff --git a/realm/realm-library/src/main/java/io/realm/internal/OsRealmConfig.java b/realm/realm-library/src/main/java/io/realm/internal/OsRealmConfig.java
+index 2ef03d1046..2ad76beb4a 100644
+--- a/realm/realm-library/src/main/java/io/realm/internal/OsRealmConfig.java
++++ b/realm/realm-library/src/main/java/io/realm/internal/OsRealmConfig.java
+@@ -145,7 +145,7 @@ public Builder autoUpdateNotification(boolean autoUpdateNotification) {
+ 
+         // Package private because of the OsRealmConfig needs to carry the NativeContext. This should only be called
+         // by the OsSharedRealm.
+-        OsRealmConfig build() {
++        public OsRealmConfig build() {
+             return new OsRealmConfig(configuration, fifoFallbackDir, autoUpdateNotification, schemaInfo,
+                     migrationCallback, initializationCallback);
+         }
+diff --git a/realm/realm-library/src/main/java/io/realm/sync/Subscription.java b/realm/realm-library/src/main/java/io/realm/sync/Subscription.java
+index aab282847d..ff2f5e9fa3 100644
+--- a/realm/realm-library/src/main/java/io/realm/sync/Subscription.java
++++ b/realm/realm-library/src/main/java/io/realm/sync/Subscription.java
+@@ -146,6 +146,7 @@ public Subscription(String name, RealmQuery<?> query) {
+     /**
+      * Field indicating when this subscription was created.
+      */
++    @Required
+     @RealmField("created_at")
+     private Date createdAt;
+ 
+@@ -160,6 +161,7 @@ public Subscription(String name, RealmQuery<?> query) {
+      * <p>
+      * This field plus {@link #timeToLive} defines {@link #expiresAt}.
+      */
++    @Required
+     @RealmField("updated_at")
+     private Date updatedAt;
+ 
+diff --git a/realm/realm-library/src/objectServer/java/io/realm/SyncManager.java b/realm/realm-library/src/objectServer/java/io/realm/SyncManager.java
+index 8031816a87..eb2c6622aa 100644
+--- a/realm/realm-library/src/objectServer/java/io/realm/SyncManager.java
++++ b/realm/realm-library/src/objectServer/java/io/realm/SyncManager.java
+@@ -16,8 +16,6 @@
+ 
+ package io.realm;
+ 
+-import android.os.SystemClock;
+-
+ import java.io.ByteArrayInputStream;
+ import java.io.IOException;
+ import java.io.InputStream;
+@@ -46,7 +44,6 @@
+ import javax.net.ssl.X509TrustManager;
+ 
+ import edu.umd.cs.findbugs.annotations.SuppressFBWarnings;
+-import io.realm.exceptions.RealmError;
+ import io.realm.internal.Keep;
+ import io.realm.internal.Util;
+ import io.realm.internal.network.AuthenticationServer;
+diff --git a/realm/realm-library/src/objectServer/java/io/realm/internal/SyncObjectServerFacade.java b/realm/realm-library/src/objectServer/java/io/realm/internal/SyncObjectServerFacade.java
+index 8663635ab7..a5949843ab 100644
+--- a/realm/realm-library/src/objectServer/java/io/realm/internal/SyncObjectServerFacade.java
++++ b/realm/realm-library/src/objectServer/java/io/realm/internal/SyncObjectServerFacade.java
+@@ -36,7 +36,9 @@
+ import io.realm.SyncUser;
+ import io.realm.exceptions.DownloadingRealmInterruptedException;
+ import io.realm.exceptions.RealmException;
++import io.realm.internal.android.AndroidCapabilities;
+ import io.realm.internal.network.NetworkStateReceiver;
++import io.realm.internal.objectstore.OsAsyncOpenTask;
+ import io.realm.internal.sync.permissions.ObjectPermissionsModule;
+ import io.realm.sync.Subscription;
+ 
+@@ -182,30 +184,52 @@ public void downloadInitialRemoteChanges(RealmConfiguration config) {
+         if (config instanceof SyncConfiguration) {
+             SyncConfiguration syncConfig = (SyncConfiguration) config;
+             if (syncConfig.shouldWaitForInitialRemoteData()) {
+-                SyncSession session = SyncManager.getSession(syncConfig);
+-                try {
+-                    long timeoutMillis = syncConfig.getInitialRemoteDataTimeout(TimeUnit.MILLISECONDS);
+-                    if (!syncConfig.isFullySynchronizedRealm()) {
+-                        // For Query-based Realms we want to upload all our local changes
+-                        // first since those might include subscriptions the server needs to process.
+-                        // This means that once `downloadAllServerChanges` completes, all initial
+-                        // subscriptions will also have been downloaded.
+-                        //
+-                        // Note that we are reusing the same timeout for uploading and downloading.
+-                        // This means that in the worst case you end up with 2x the timeout for
+-                        // Query-based Realms. This is probably an acceptable trade-of as trying
+-                        // to expose this would not only complicate the API surface quite a lot,
+-                        // but in most (almost all?) cases the amount of data to upload will be trivial.
+-                        if (!session.uploadAllLocalChanges(timeoutMillis, TimeUnit.MILLISECONDS)) {
+-                            throw new DownloadingRealmInterruptedException(syncConfig, "Failed to first upload local changes in " + timeoutMillis + " milliseconds");
+-                        };
+-                    }
+-                    if (!session.downloadAllServerChanges(timeoutMillis, TimeUnit.MILLISECONDS)) {
+-                        throw new DownloadingRealmInterruptedException(syncConfig, "Failed to download remote changes in " + timeoutMillis + " milliseconds");
+-                    }
+-                } catch (InterruptedException e) {
+-                    throw new DownloadingRealmInterruptedException(syncConfig, e);
++                if (new AndroidCapabilities().isMainThread()) {
++                    throw new IllegalStateException("waitForInitialRemoteData() cannot be used synchronously on the main thread. Use Realm.getInstanceAsync() instead.");
++                }
++                if (syncConfig.isFullySynchronizedRealm()) {
++                    downloadInitialFullRealm(syncConfig);
++                } else {
++                    downloadInitialQueryBasedRealm(syncConfig);
++                }
++            }
++        }
++    }
++
++    private void downloadInitialFullRealm(SyncConfiguration syncConfig) {
++        OsAsyncOpenTask task = new OsAsyncOpenTask(new OsRealmConfig.Builder(syncConfig).build());
++        try {
++            task.start(syncConfig.getInitialRemoteDataTimeout(TimeUnit.MILLISECONDS), TimeUnit.MILLISECONDS);
++        } catch (InterruptedException e) {
++            throw new DownloadingRealmInterruptedException(syncConfig, e);
++        }
++    }
++
++    private void downloadInitialQueryBasedRealm(SyncConfiguration syncConfig) {
++        if (syncConfig.shouldWaitForInitialRemoteData()) {
++            SyncSession session = SyncManager.getSession(syncConfig);
++            try {
++                long timeoutMillis = syncConfig.getInitialRemoteDataTimeout(TimeUnit.MILLISECONDS);
++                if (!syncConfig.isFullySynchronizedRealm()) {
++                    // For Query-based Realms we want to upload all our local changes
++                    // first since those might include subscriptions the server needs to process.
++                    // This means that once `downloadAllServerChanges` completes, all initial
++                    // subscriptions will also have been downloaded.
++                    //
++                    // Note that we are reusing the same timeout for uploading and downloading.
++                    // This means that in the worst case you end up with 2x the timeout for
++                    // Query-based Realms. This is probably an acceptable trade-of as trying
++                    // to expose this would not only complicate the API surface quite a lot,
++                    // but in most (almost all?) cases the amount of data to upload will be trivial.
++                    if (!session.uploadAllLocalChanges(timeoutMillis, TimeUnit.MILLISECONDS)) {
++                        throw new DownloadingRealmInterruptedException(syncConfig, "Failed to first upload local changes in " + timeoutMillis + " milliseconds");
++                    };
++                }
++                if (!session.downloadAllServerChanges(timeoutMillis, TimeUnit.MILLISECONDS)) {
++                    throw new DownloadingRealmInterruptedException(syncConfig, "Failed to download remote changes in " + timeoutMillis + " milliseconds");
+                 }
++            } catch (InterruptedException e) {
++                throw new DownloadingRealmInterruptedException(syncConfig, e);
+             }
+         }
+     }
+diff --git a/realm/realm-library/src/objectServer/java/io/realm/internal/objectstore/OsAsyncOpenTask.java b/realm/realm-library/src/objectServer/java/io/realm/internal/objectstore/OsAsyncOpenTask.java
+new file mode 100644
+index 0000000000..115022d3a0
+--- /dev/null
++++ b/realm/realm-library/src/objectServer/java/io/realm/internal/objectstore/OsAsyncOpenTask.java
+@@ -0,0 +1,70 @@
++package io.realm.internal.objectstore;
++
++
++import java.util.concurrent.CountDownLatch;
++import java.util.concurrent.TimeUnit;
++import java.util.concurrent.atomic.AtomicReference;
++
++import io.realm.ErrorCode;
++import io.realm.ObjectServerError;
++import io.realm.internal.Keep;
++import io.realm.internal.KeepMember;
++import io.realm.internal.OsRealmConfig;
++
++/**
++ * Wrapper for the ASyncOpenTask in ObjectStore, which also support timeouts.
++ *
++ * This ObjectStore class controls its own lifecycle, i.e. discards itself once complete, so the
++ * Java object does not need to implement {@link io.realm.internal.NativeObject}.
++ */
++@KeepMember
++public class OsAsyncOpenTask {
++
++    private final OsRealmConfig config;
++    private long nativePtr;
++    private final CountDownLatch taskComplete = new CountDownLatch(1);
++    private final AtomicReference<String> error = new AtomicReference<>(null);
++
++    public OsAsyncOpenTask(OsRealmConfig config) {
++        this.config = config;
++    }
++
++    public void start(long timeOut, TimeUnit unit) throws InterruptedException {
++        this.nativePtr = start(config.getNativePtr());
++
++        try {
++            taskComplete.await(timeOut, unit);
++        } catch (InterruptedException e) {
++            cancel(nativePtr);
++            throw e;
++        }
++
++        String errorMessage = error.get();
++        if (errorMessage != null) {
++            throw new ObjectServerError(ErrorCode.UNKNOWN, errorMessage);
++        }
++    }
++
++    /**
++     * Called from JNI when the underlying async task has successfully downloaded the Realm.
++     */
++    @KeepMember
++    @SuppressWarnings("unused")
++    private void notifyRealmReady() {
++        error.set(null);
++        taskComplete.countDown();
++    }
++
++    /**
++     * Called from JNI when the underlying async task encounters an error.
++     */
++    @KeepMember
++    @SuppressWarnings("unused")
++    private void notifyError(String errorMessage) {
++        error.set(errorMessage);
++        taskComplete.countDown();
++    }
++
++    private native long start(long configPtr);
++    private native void cancel(long nativePtr);
++}
+diff --git a/realm/realm-library/src/syncIntegrationTest/java/io/realm/SyncSessionTests.java b/realm/realm-library/src/syncIntegrationTest/java/io/realm/SyncSessionTests.java
+index f137814068..a4bbc0edfb 100644
+--- a/realm/realm-library/src/syncIntegrationTest/java/io/realm/SyncSessionTests.java
++++ b/realm/realm-library/src/syncIntegrationTest/java/io/realm/SyncSessionTests.java
+@@ -408,19 +408,22 @@ public void run() {
+                         .build();
+                 final Realm adminRealm = Realm.getInstance(adminConfig);
+                 RealmResults<StringOnly> all = adminRealm.where(StringOnly.class).findAll();
+-                strongRefs.add(all);
+-                OrderedRealmCollectionChangeListener<RealmResults<StringOnly>> realmChangeListener = (results, changeSet) -> {
+-                    RealmLog.info("Size: " + results.size() + ", state: " + changeSet.getState().toString());
+-                    if (results.size() == 5) {
+-                        for (int i = 0; i < 5; i++) {
+-                            assertEquals(1_000_000, results.get(i).getChars().length());
++
++                if (all.size() == 5) {
++                    adminRealm.close();
++                    testCompleted.countDown();
++                    handlerThread.quit();
++                } else {
++                    strongRefs.add(all);
++                    OrderedRealmCollectionChangeListener<RealmResults<StringOnly>> realmChangeListener = (results, changeSet) -> {
++                        if (results.size() == 5) {
++                            adminRealm.close();
++                            testCompleted.countDown();
++                            handlerThread.quit();
+                         }
+-                        adminRealm.close();
+-                        testCompleted.countDown();
+-                        handlerThread.quit();
+-                    }
+-                };
+-                all.addChangeListener(realmChangeListener);
++                    };
++                    all.addChangeListener(realmChangeListener);
++                }
+             }
+         });
+ 
+diff --git a/realm/realm-library/src/syncIntegrationTest/java/io/realm/SyncedRealmIntegrationTests.java b/realm/realm-library/src/syncIntegrationTest/java/io/realm/SyncedRealmIntegrationTests.java
+index b411ed3100..f57fdca082 100644
+--- a/realm/realm-library/src/syncIntegrationTest/java/io/realm/SyncedRealmIntegrationTests.java
++++ b/realm/realm-library/src/syncIntegrationTest/java/io/realm/SyncedRealmIntegrationTests.java
+@@ -115,9 +115,7 @@ public void waitForInitialRemoteData_mainThreadThrows() {
+         try {
+             realm = Realm.getInstance(config);
+             fail();
+-        } catch (IllegalStateException expected) {
+-            assertThat(expected.getMessage(), CoreMatchers.containsString(
+-                    "downloadAllServerChanges() cannot be called from the main thread."));
++        } catch (IllegalStateException ignore) {
+         } finally {
+             if (realm != null) {
+                 realm.close();
+@@ -306,7 +304,7 @@ public void waitForInitialRemoteData_readOnlyTrue_throwsIfWrongServerSchema() {
+             // schema.
+             realm = Realm.getInstance(configNew);
+             fail();
+-        } catch (RealmMigrationNeededException ignored) {
++        } catch (IllegalStateException ignored) {
+         } finally {
+             if (realm != null) {
+                 realm.close();
+diff --git a/version.txt b/version.txt
+index 9e323a785b..7041f18668 100644
+--- a/version.txt
++++ b/version.txt
+@@ -1 +1 @@
+-5.13.0-SNAPSHOT
++5.14.0-SNAPSHOT

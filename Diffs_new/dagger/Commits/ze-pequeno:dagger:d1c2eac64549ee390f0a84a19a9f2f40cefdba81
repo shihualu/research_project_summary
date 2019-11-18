@@ -1,0 +1,811 @@
+diff --git a/java/dagger/internal/codegen/BUILD b/java/dagger/internal/codegen/BUILD
+index 2006fb3b9..45597b0f4 100644
+--- a/java/dagger/internal/codegen/BUILD
++++ b/java/dagger/internal/codegen/BUILD
+@@ -128,6 +128,7 @@ java_library(
+         "BindingVariableNamer.java",  # needed by FrameworkField
+         "BindsTypeChecker.java",
+         "ComponentDescriptor.java",
++        "ComponentNodeImpl.java",
+         "ComponentRequirement.java",
+         "ComponentTreeTraverser.java",
+         "ConfigurationAnnotations.java",  # Uses ModuleDescriptors
+@@ -164,7 +165,6 @@ java_library(
+     srcs = [
+         "AnyBindingMethodValidator.java",
+         "BindingDeclarationFormatter.java",
+-        "BindingGraphValidator.java",
+         "BindingMethodProcessingStep.java",
+         "BindingMethodValidator.java",
+         "BindsInstanceProcessingStep.java",
+@@ -209,6 +209,7 @@ java_library(
+         "MissingBindingValidation.java",
+         "NonNullableRequestForNullableBindingValidation.java",
+         "ProvisionDependencyOnProducerBindingValidation.java",
++        "SubcomponentFactoryMethodValidation.java",
+         "Validation.java",
+     ],
+     tags = ["maven:merged"],
+diff --git a/java/dagger/internal/codegen/BindingGraphConverter.java b/java/dagger/internal/codegen/BindingGraphConverter.java
+index f35b5ce7f..cb8f7e15a 100644
+--- a/java/dagger/internal/codegen/BindingGraphConverter.java
++++ b/java/dagger/internal/codegen/BindingGraphConverter.java
+@@ -18,7 +18,6 @@
+ 
+ import static dagger.internal.codegen.DaggerStreams.instancesOf;
+ import static dagger.model.BindingGraphProxies.childFactoryMethodEdge;
+-import static dagger.model.BindingGraphProxies.componentNode;
+ import static dagger.model.BindingGraphProxies.dependencyEdge;
+ 
+ import com.google.common.collect.ImmutableSet;
+@@ -74,10 +73,8 @@ protected void visitComponent(BindingGraph graph) {
+       ComponentNode grandparentComponent = parentComponent;
+       parentComponent = currentComponent;
+       currentComponent =
+-          componentNode(
+-              componentTreePath().toComponentPath(),
+-              graph.componentDescriptor().entryPoints(),
+-              graph.componentDescriptor().scopes());
++          ComponentNodeImpl.create(
++              componentTreePath().toComponentPath(), graph.componentDescriptor());
+ 
+       network.addNode(currentComponent);
+ 
+diff --git a/java/dagger/internal/codegen/BindingGraphPlugins.java b/java/dagger/internal/codegen/BindingGraphPlugins.java
+index f21abac4f..9b2a38b8c 100644
+--- a/java/dagger/internal/codegen/BindingGraphPlugins.java
++++ b/java/dagger/internal/codegen/BindingGraphPlugins.java
+@@ -22,6 +22,7 @@
+ import static java.lang.annotation.ElementType.METHOD;
+ import static java.lang.annotation.ElementType.PARAMETER;
+ import static java.lang.annotation.RetentionPolicy.RUNTIME;
++import static javax.tools.Diagnostic.Kind.ERROR;
+ 
+ import com.google.common.collect.ImmutableSet;
+ import com.google.common.collect.Maps;
+@@ -110,4 +111,9 @@ private void initializePlugin(BindingGraphPlugin plugin) {
+     }
+     return diagnosticKinds.build();
+   }
++
++  /** Returns {@code true} if any errors are reported by any of the plugins for {@code graph}. */
++  boolean pluginsReportErrors(BindingGraph graph) {
++    return visitGraph(graph).contains(ERROR);
++  }
+ }
+diff --git a/java/dagger/internal/codegen/BindingGraphValidationModule.java b/java/dagger/internal/codegen/BindingGraphValidationModule.java
+index e1137c47c..7ed179f63 100644
+--- a/java/dagger/internal/codegen/BindingGraphValidationModule.java
++++ b/java/dagger/internal/codegen/BindingGraphValidationModule.java
+@@ -75,4 +75,9 @@
+   @Validation
+   BindingGraphPlugin providerDependsOnProducer(
+       ProvisionDependencyOnProducerBindingValidation validation);
++
++  @Binds
++  @IntoSet
++  @Validation
++  BindingGraphPlugin subcomponentFactoryMethod(SubcomponentFactoryMethodValidation validation);
+ }
+diff --git a/java/dagger/internal/codegen/BindingGraphValidator.java b/java/dagger/internal/codegen/BindingGraphValidator.java
+deleted file mode 100644
+index 3881439ff..000000000
+--- a/java/dagger/internal/codegen/BindingGraphValidator.java
++++ /dev/null
+@@ -1,114 +0,0 @@
+-/*
+- * Copyright (C) 2015 The Dagger Authors.
+- *
+- * Licensed under the Apache License, Version 2.0 (the "License");
+- * you may not use this file except in compliance with the License.
+- * You may obtain a copy of the License at
+- *
+- * http://www.apache.org/licenses/LICENSE-2.0
+- *
+- * Unless required by applicable law or agreed to in writing, software
+- * distributed under the License is distributed on an "AS IS" BASIS,
+- * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+- * See the License for the specific language governing permissions and
+- * limitations under the License.
+- */
+-
+-package dagger.internal.codegen;
+-
+-import static com.google.auto.common.MoreTypes.asDeclared;
+-import static com.google.auto.common.MoreTypes.asExecutable;
+-import static com.google.auto.common.MoreTypes.asTypeElements;
+-import static dagger.internal.codegen.ComponentRequirement.Kind.MODULE;
+-import static dagger.internal.codegen.Util.componentCanMakeNewInstances;
+-import static dagger.internal.codegen.Util.reentrantComputeIfAbsent;
+-import static java.util.stream.Collectors.joining;
+-import static java.util.stream.Collectors.toSet;
+-
+-import com.google.common.collect.ImmutableSet;
+-import java.util.LinkedHashMap;
+-import java.util.Map;
+-import java.util.Set;
+-import javax.inject.Inject;
+-import javax.lang.model.element.ExecutableElement;
+-import javax.lang.model.element.TypeElement;
+-import javax.lang.model.type.DeclaredType;
+-import javax.lang.model.type.ExecutableType;
+-
+-/** Reports errors in the shape of the binding graph. */
+-final class BindingGraphValidator {
+-
+-  private final DaggerTypes types;
+-
+-  @Inject
+-  BindingGraphValidator(DaggerTypes types) {
+-    this.types = types;
+-  }
+-
+-  ValidationReport<TypeElement> validate(BindingGraph graph) {
+-    ComponentValidation validation = new ComponentValidation(graph);
+-    validation.traverseComponents();
+-    return validation.buildReport();
+-  }
+-
+-  private final class ComponentValidation extends ComponentTreeTraverser {
+-    final BindingGraph rootGraph;
+-    final Map<ComponentDescriptor, ValidationReport.Builder<TypeElement>> reports =
+-        new LinkedHashMap<>();
+-
+-    ComponentValidation(BindingGraph rootGraph) {
+-      super(rootGraph);
+-      this.rootGraph = rootGraph;
+-    }
+-
+-    /** Returns a report that contains all validation messages found during traversal. */
+-    ValidationReport<TypeElement> buildReport() {
+-      ValidationReport.Builder<TypeElement> report =
+-          ValidationReport.about(rootGraph.componentType());
+-      reports.values().forEach(subreport -> report.addSubreport(subreport.build()));
+-      return report.build();
+-    }
+-
+-    /** Returns the report builder for a (sub)component. */
+-    private ValidationReport.Builder<TypeElement> report(ComponentDescriptor component) {
+-      return reentrantComputeIfAbsent(
+-          reports,
+-          component,
+-          descriptor -> ValidationReport.about(descriptor.componentDefinitionType()));
+-    }
+-
+-    @Override
+-    protected void visitSubcomponentFactoryMethod(
+-        BindingGraph graph, BindingGraph parent, ExecutableElement factoryMethod) {
+-      Set<TypeElement> missingModules =
+-          graph
+-              .componentRequirements()
+-              .stream()
+-              .filter(componentRequirement -> componentRequirement.kind().equals(MODULE))
+-              .map(ComponentRequirement::typeElement)
+-              .filter(
+-                  moduleType ->
+-                      !subgraphFactoryMethodParameters(parent, factoryMethod).contains(moduleType))
+-              .filter(moduleType -> !componentCanMakeNewInstances(moduleType))
+-              .collect(toSet());
+-      if (!missingModules.isEmpty()) {
+-        report(parent.componentDescriptor())
+-            .addError(
+-                String.format(
+-                    "%s requires modules which have no visible default constructors. "
+-                        + "Add the following modules as parameters to this method: %s",
+-                    graph.componentType().getQualifiedName(),
+-                    missingModules.stream().map(Object::toString).collect(joining(", "))),
+-                factoryMethod);
+-      }
+-    }
+-
+-    private ImmutableSet<TypeElement> subgraphFactoryMethodParameters(
+-        BindingGraph parent, ExecutableElement childFactoryMethod) {
+-      DeclaredType componentType = asDeclared(parent.componentType().asType());
+-      ExecutableType factoryMethodType =
+-          asExecutable(types.asMemberOf(componentType, childFactoryMethod));
+-      return asTypeElements(factoryMethodType.getParameterTypes());
+-    }
+-  }
+-}
+diff --git a/java/dagger/internal/codegen/BuilderValidator.java b/java/dagger/internal/codegen/BuilderValidator.java
+index 2d6906f5d..f69806ddf 100644
+--- a/java/dagger/internal/codegen/BuilderValidator.java
++++ b/java/dagger/internal/codegen/BuilderValidator.java
+@@ -162,7 +162,7 @@
+       builder.addError(msgs.missingBuildMethod(), subject);
+     }
+ 
+-    // Note: there's more validation in BindingGraphValidator:
++    // Note: there's more validation in ComponentDescriptorValidator:
+     // - to make sure the setter methods mirror the deps
+     // - to make sure each type or key is set by only one method
+ 
+diff --git a/java/dagger/internal/codegen/ComponentNodeImpl.java b/java/dagger/internal/codegen/ComponentNodeImpl.java
+new file mode 100644
+index 000000000..7b624aa17
+--- /dev/null
++++ b/java/dagger/internal/codegen/ComponentNodeImpl.java
+@@ -0,0 +1,50 @@
++/*
++ * Copyright (C) 2018 The Dagger Authors.
++ *
++ * Licensed under the Apache License, Version 2.0 (the "License");
++ * you may not use this file except in compliance with the License.
++ * You may obtain a copy of the License at
++ *
++ * http://www.apache.org/licenses/LICENSE-2.0
++ *
++ * Unless required by applicable law or agreed to in writing, software
++ * distributed under the License is distributed on an "AS IS" BASIS,
++ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++ * See the License for the specific language governing permissions and
++ * limitations under the License.
++ */
++
++package dagger.internal.codegen;
++
++import com.google.auto.value.AutoValue;
++import com.google.common.collect.ImmutableSet;
++import dagger.model.BindingGraph.ComponentNode;
++import dagger.model.ComponentPath;
++import dagger.model.DependencyRequest;
++import dagger.model.Scope;
++
++/** An implementation of {@link ComponentNode} that also exposes the {@link ComponentDescriptor}. */
++@AutoValue
++abstract class ComponentNodeImpl implements ComponentNode {
++  static ComponentNode create(
++      ComponentPath componentPath, ComponentDescriptor componentDescriptor) {
++    return new AutoValue_ComponentNodeImpl(componentPath, componentDescriptor);
++  }
++
++  @Override
++  public ImmutableSet<DependencyRequest> entryPoints() {
++    return componentDescriptor().entryPoints();
++  }
++
++  @Override
++  public ImmutableSet<Scope> scopes() {
++    return componentDescriptor().scopes();
++  }
++
++  abstract ComponentDescriptor componentDescriptor();
++
++  @Override
++  public final String toString() {
++    return componentPath().toString();
++  }
++}
+diff --git a/java/dagger/internal/codegen/ComponentProcessingStep.java b/java/dagger/internal/codegen/ComponentProcessingStep.java
+index 9c744d92c..0b5ba2699 100644
+--- a/java/dagger/internal/codegen/ComponentProcessingStep.java
++++ b/java/dagger/internal/codegen/ComponentProcessingStep.java
+@@ -17,7 +17,6 @@
+ package dagger.internal.codegen;
+ 
+ import static javax.lang.model.util.ElementFilter.typesIn;
+-import static javax.tools.Diagnostic.Kind.ERROR;
+ 
+ import com.google.auto.common.BasicAnnotationProcessor.ProcessingStep;
+ import com.google.auto.common.MoreElements;
+@@ -48,7 +47,6 @@
+   private final ComponentValidator componentValidator;
+   private final BuilderValidator builderValidator;
+   private final ComponentDescriptorValidator componentDescriptorValidator;
+-  private final BindingGraphValidator bindingGraphValidator;
+   private final ComponentDescriptor.Factory componentDescriptorFactory;
+   private final BindingGraphFactory bindingGraphFactory;
+   private final ComponentGenerator componentGenerator;
+@@ -62,7 +60,6 @@
+       ComponentValidator componentValidator,
+       BuilderValidator builderValidator,
+       ComponentDescriptorValidator componentDescriptorValidator,
+-      BindingGraphValidator bindingGraphValidator,
+       ComponentDescriptor.Factory componentDescriptorFactory,
+       BindingGraphFactory bindingGraphFactory,
+       ComponentGenerator componentGenerator,
+@@ -73,7 +70,6 @@
+     this.componentValidator = componentValidator;
+     this.builderValidator = builderValidator;
+     this.componentDescriptorValidator = componentDescriptorValidator;
+-    this.bindingGraphValidator = bindingGraphValidator;
+     this.componentDescriptorFactory = componentDescriptorFactory;
+     this.bindingGraphFactory = bindingGraphFactory;
+     this.componentGenerator = componentGenerator;
+@@ -154,14 +150,9 @@
+   }
+ 
+   private boolean isValid(BindingGraph bindingGraph) {
+-    ValidationReport<TypeElement> graphReport = bindingGraphValidator.validate(bindingGraph);
+-    graphReport.printMessagesTo(messager);
+-
+     dagger.model.BindingGraph modelGraph = bindingGraphConverter.convert(bindingGraph);
+-    if (validationPlugins.visitGraph(modelGraph).contains(ERROR) || !graphReport.isClean()) {
+-      return false;
+-    }
+-    return !spiPlugins.visitGraph(modelGraph).contains(ERROR);
++    return !validationPlugins.pluginsReportErrors(modelGraph)
++        && !spiPlugins.pluginsReportErrors(modelGraph);
+   }
+ 
+   private void generateComponent(BindingGraph bindingGraph) {
+diff --git a/java/dagger/internal/codegen/DaggerElements.java b/java/dagger/internal/codegen/DaggerElements.java
+index 314c26db7..92bf2a3ca 100644
+--- a/java/dagger/internal/codegen/DaggerElements.java
++++ b/java/dagger/internal/codegen/DaggerElements.java
+@@ -32,6 +32,8 @@
+ import com.google.common.annotations.VisibleForTesting;
+ import com.google.common.collect.FluentIterable;
+ import com.google.common.collect.ImmutableSet;
++import com.google.common.collect.Iterables;
++import com.google.common.graph.Traverser;
+ import dagger.Reusable;
+ import java.io.Writer;
+ import java.lang.annotation.Annotation;
+@@ -74,6 +76,17 @@
+     this(processingEnv.getElementUtils(), processingEnv.getTypeUtils());
+   }
+ 
++  /**
++   * Returns {@code true} if {@code encloser} is equal to {@code enclosed} or recursively encloses
++   * it.
++   */
++  static boolean elementEncloses(TypeElement encloser, Element enclosed) {
++    return Iterables.contains(GET_ENCLOSED_ELEMENTS.breadthFirst(encloser), enclosed);
++  }
++
++  private static final Traverser<Element> GET_ENCLOSED_ELEMENTS =
++      Traverser.forTree(Element::getEnclosedElements);
++
+   ImmutableSet<ExecutableElement> getUnimplementedMethods(TypeElement type) {
+     return FluentIterable.from(getLocalAndInheritedMethods(type, types, elements))
+         .filter(hasModifiers(ABSTRACT))
+diff --git a/java/dagger/internal/codegen/DiagnosticReporterFactory.java b/java/dagger/internal/codegen/DiagnosticReporterFactory.java
+index 62f940ee7..1b295b7e4 100644
+--- a/java/dagger/internal/codegen/DiagnosticReporterFactory.java
++++ b/java/dagger/internal/codegen/DiagnosticReporterFactory.java
+@@ -18,6 +18,7 @@
+ 
+ import static com.google.common.base.Preconditions.checkArgument;
+ import static com.google.common.collect.Lists.asList;
++import static dagger.internal.codegen.DaggerElements.elementEncloses;
+ import static dagger.internal.codegen.DaggerElements.elementToString;
+ import static dagger.internal.codegen.DaggerGraphs.shortestPath;
+ 
+@@ -29,6 +30,7 @@
+ import com.google.errorprone.annotations.FormatMethod;
+ import dagger.model.BindingGraph;
+ import dagger.model.BindingGraph.BindingNode;
++import dagger.model.BindingGraph.ChildFactoryMethodEdge;
+ import dagger.model.BindingGraph.ComponentNode;
+ import dagger.model.BindingGraph.DependencyEdge;
+ import dagger.model.BindingGraph.Edge;
+@@ -151,6 +153,26 @@ public void reportDependency(
+           diagnosticKind, dependencyEdge, formatMessage(messageFormat, firstArg, moreArgs));
+     }
+ 
++    @Override
++    public void reportSubcomponentFactoryMethod(
++        Diagnostic.Kind diagnosticKind,
++        ChildFactoryMethodEdge childFactoryMethodEdge,
++        String message) {
++      printMessage(
++          diagnosticKind, new StringBuilder(message), childFactoryMethodEdge.factoryMethod());
++    }
++
++    @Override
++    public void reportSubcomponentFactoryMethod(
++        Diagnostic.Kind diagnosticKind,
++        ChildFactoryMethodEdge childFactoryMethodEdge,
++        String messageFormat,
++        Object firstArg,
++        Object... moreArgs) {
++      reportSubcomponentFactoryMethod(
++          diagnosticKind, childFactoryMethodEdge, formatMessage(messageFormat, firstArg, moreArgs));
++    }
++
+     private String formatMessage(String messageFormat, Object firstArg, Object[] moreArgs) {
+       return String.format(messageFormat, asList(firstArg, moreArgs).toArray());
+     }
+@@ -209,22 +231,18 @@ private void printAtEntryPoint(
+       if (!component.equals(graph.rootComponentNode())) {
+         appendComponentPath(messageBuilder, component);
+       }
+-
+-      // TODO(ronshapiro): should we create a HashSet out of getEnclosedElements() so we don't
+-      // need to do an O(n) contains() each time?
+-      if (rootComponent.getEnclosedElements().contains(entryPointElement)) {
+-        printMessage(diagnosticKind, messageBuilder, entryPointElement);
+-      } else {
+-        printMessage(
+-            diagnosticKind,
+-            insertBracketPrefix(messageBuilder, elementToString(entryPointElement)),
+-            rootComponent);
+-      }
++      printMessage(diagnosticKind, messageBuilder, entryPointElement);
+     }
+ 
+     private void printMessage(
+         Diagnostic.Kind diagnosticKind, StringBuilder message, Element elementToReport) {
+       reportedDiagnosticKinds.add(diagnosticKind);
++      // TODO(ronshapiro): should we create a HashSet out of elementEncloses() so we don't
++      // need to do an O(n) contains() each time?
++      if (!elementEncloses(rootComponent, elementToReport)) {
++        insertBracketPrefix(message, elementToString(elementToReport));
++        elementToReport = rootComponent;
++      }
+       messager.printMessage(diagnosticKind, insertBracketPrefix(message, plugin), elementToReport);
+     }
+ 
+diff --git a/java/dagger/internal/codegen/SubcomponentFactoryMethodValidation.java b/java/dagger/internal/codegen/SubcomponentFactoryMethodValidation.java
+new file mode 100644
+index 000000000..f958c9556
+--- /dev/null
++++ b/java/dagger/internal/codegen/SubcomponentFactoryMethodValidation.java
+@@ -0,0 +1,148 @@
++/*
++ * Copyright (C) 2018 The Dagger Authors.
++ *
++ * Licensed under the Apache License, Version 2.0 (the "License");
++ * you may not use this file except in compliance with the License.
++ * You may obtain a copy of the License at
++ *
++ * http://www.apache.org/licenses/LICENSE-2.0
++ *
++ * Unless required by applicable law or agreed to in writing, software
++ * distributed under the License is distributed on an "AS IS" BASIS,
++ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++ * See the License for the specific language governing permissions and
++ * limitations under the License.
++ */
++
++package dagger.internal.codegen;
++
++import static com.google.auto.common.MoreTypes.asDeclared;
++import static com.google.auto.common.MoreTypes.asExecutable;
++import static com.google.auto.common.MoreTypes.asTypeElements;
++import static com.google.common.collect.Sets.union;
++import static dagger.internal.codegen.DaggerStreams.instancesOf;
++import static dagger.internal.codegen.DaggerStreams.toImmutableSet;
++import static dagger.internal.codegen.Util.componentCanMakeNewInstances;
++import static javax.tools.Diagnostic.Kind.ERROR;
++
++import com.google.common.base.Joiner;
++import com.google.common.collect.ImmutableSet;
++import com.google.common.collect.Sets;
++import com.google.common.collect.Sets.SetView;
++import dagger.model.BindingGraph;
++import dagger.model.BindingGraph.ChildFactoryMethodEdge;
++import dagger.model.BindingGraph.ComponentNode;
++import dagger.spi.BindingGraphPlugin;
++import dagger.spi.DiagnosticReporter;
++import java.util.HashMap;
++import java.util.Map;
++import java.util.Set;
++import java.util.function.Function;
++import javax.inject.Inject;
++import javax.lang.model.element.TypeElement;
++import javax.lang.model.type.DeclaredType;
++import javax.lang.model.type.ExecutableType;
++
++/** Reports an error if a subcomponent factory method is missing required modules. */
++final class SubcomponentFactoryMethodValidation implements BindingGraphPlugin {
++
++  private final DaggerTypes types;
++  private final Map<ComponentNode, Set<TypeElement>> inheritedModulesCache = new HashMap<>();
++
++  @Inject
++  SubcomponentFactoryMethodValidation(DaggerTypes types) {
++    this.types = types;
++  }
++
++  @Override
++  public String pluginName() {
++    return "Dagger/SubcomponentFactoryMethodMissingModule";
++  }
++
++  @Override
++  public void visitGraph(BindingGraph bindingGraph, DiagnosticReporter diagnosticReporter) {
++    bindingGraph
++        .edges()
++        .stream()
++        .flatMap(instancesOf(ChildFactoryMethodEdge.class))
++        .forEach(
++            edge -> {
++              ImmutableSet<TypeElement> missingModules = findMissingModules(edge, bindingGraph);
++              if (!missingModules.isEmpty()) {
++                reportMissingModuleParameters(
++                    edge, missingModules, bindingGraph, diagnosticReporter);
++              }
++            });
++  }
++
++  private ImmutableSet<TypeElement> findMissingModules(
++      ChildFactoryMethodEdge edge, BindingGraph graph) {
++    ImmutableSet<TypeElement> factoryMethodParameters =
++        subgraphFactoryMethodParameters(edge, graph);
++    ComponentNode child = (ComponentNode) graph.incidentNodes(edge).target();
++    SetView<TypeElement> modulesOwnedByChild = ownedModules(child, graph);
++    return graph
++        .bindingNodes()
++        .stream()
++        // bindings owned by child
++        .filter(node -> node.componentPath().equals(child.componentPath()))
++        // that require a module instance
++        .filter(
++            node ->
++                node.binding() instanceof ContributionBinding
++                    && ((ContributionBinding) node.binding()).requiresModuleInstance())
++        .map(node -> node.binding().contributingModule().get())
++        .distinct()
++        // module owned by child
++        .filter(module -> modulesOwnedByChild.contains(module))
++        // module not in the method parameters
++        .filter(module -> !factoryMethodParameters.contains(module))
++        // module doesn't have an accessible no-arg constructor
++        .filter(moduleType -> !componentCanMakeNewInstances(moduleType))
++        .collect(toImmutableSet());
++  }
++
++  private ImmutableSet<TypeElement> subgraphFactoryMethodParameters(
++      ChildFactoryMethodEdge edge, BindingGraph bindingGraph) {
++    ComponentNode parent = (ComponentNode) bindingGraph.incidentNodes(edge).source();
++    DeclaredType parentType = asDeclared(parent.componentPath().currentComponent().asType());
++    ExecutableType factoryMethodType =
++        asExecutable(types.asMemberOf(parentType, edge.factoryMethod()));
++    return asTypeElements(factoryMethodType.getParameterTypes());
++  }
++
++  private SetView<TypeElement> ownedModules(ComponentNode component, BindingGraph graph) {
++    return Sets.difference(
++        ((ComponentNodeImpl) component).componentDescriptor().transitiveModuleTypes(),
++        inheritedModules(component, graph));
++  }
++
++  private Set<TypeElement> inheritedModules(ComponentNode component, BindingGraph graph) {
++    return Util.reentrantComputeIfAbsent(
++        inheritedModulesCache, component, uncachedInheritedModules(graph));
++  }
++
++  private Function<ComponentNode, Set<TypeElement>> uncachedInheritedModules(BindingGraph graph) {
++    return componentNode ->
++        componentNode.componentPath().atRoot()
++            ? ImmutableSet.of()
++            : graph
++                .componentNode(componentNode.componentPath().parent())
++                .map(parent -> union(ownedModules(parent, graph), inheritedModules(parent, graph)))
++                .get();
++  }
++
++  private void reportMissingModuleParameters(
++      ChildFactoryMethodEdge edge,
++      ImmutableSet<TypeElement> missingModules,
++      BindingGraph graph,
++      DiagnosticReporter diagnosticReporter) {
++    diagnosticReporter.reportSubcomponentFactoryMethod(
++        ERROR,
++        edge,
++        "%s requires modules which have no visible default constructors. "
++            + "Add the following modules as parameters to this method: %s",
++        graph.incidentNodes(edge).target().componentPath().currentComponent().getQualifiedName(),
++        Joiner.on(", ").join(missingModules));
++  }
++}
+diff --git a/java/dagger/model/BindingGraph.java b/java/dagger/model/BindingGraph.java
+index 9ed3158c2..7e49da620 100644
+--- a/java/dagger/model/BindingGraph.java
++++ b/java/dagger/model/BindingGraph.java
+@@ -340,28 +340,16 @@ public String toString() {
+    * A <b>component node</b> in the graph. Every entry point {@linkplain DependencyEdge dependency
+    * edge}'s source node is a component node for the component containing the entry point.
+    */
+-  @AutoValue
+-  public abstract static class ComponentNode implements Node {
+-    static ComponentNode create(
+-        ComponentPath componentPath,
+-        ImmutableSet<DependencyRequest> entryPoints,
+-        ImmutableSet<Scope> scopes) {
+-      return new AutoValue_BindingGraph_ComponentNode(componentPath, entryPoints, scopes);
+-    }
++  public interface ComponentNode extends Node {
+ 
+     /** The component represented by this node. */
+     @Override
+-    public abstract ComponentPath componentPath();
++    ComponentPath componentPath();
+ 
+     /** The entry points on this component. */
+-    public abstract ImmutableSet<DependencyRequest> entryPoints();
++    ImmutableSet<DependencyRequest> entryPoints();
+ 
+     /** The scopes declared on this component. */
+-    public abstract ImmutableSet<Scope> scopes();
+-
+-    @Override
+-    public final String toString() {
+-      return componentPath().toString();
+-    }
++    ImmutableSet<Scope> scopes();
+   }
+ }
+diff --git a/java/dagger/model/BindingGraphProxies.java b/java/dagger/model/BindingGraphProxies.java
+index a5e24ff3e..9c3b60150 100644
+--- a/java/dagger/model/BindingGraphProxies.java
++++ b/java/dagger/model/BindingGraphProxies.java
+@@ -16,10 +16,8 @@
+ 
+ package dagger.model;
+ 
+-import com.google.common.collect.ImmutableSet;
+ import com.google.common.graph.Network;
+ import dagger.model.BindingGraph.ChildFactoryMethodEdge;
+-import dagger.model.BindingGraph.ComponentNode;
+ import dagger.model.BindingGraph.DependencyEdge;
+ import dagger.model.BindingGraph.Edge;
+ import dagger.model.BindingGraph.MissingBindingNode;
+@@ -44,14 +42,6 @@ public static MissingBindingNode missingBindingNode(ComponentPath component, Key
+     return MissingBindingNode.create(component, key);
+   }
+ 
+-  /** Creates a new {@link ComponentNode}. */
+-  public static ComponentNode componentNode(
+-      ComponentPath component,
+-      ImmutableSet<DependencyRequest> entryPoints,
+-      ImmutableSet<Scope> scopes) {
+-    return ComponentNode.create(component, entryPoints, scopes);
+-  }
+-
+   /** Creates a new {@link DependencyEdge}. */
+   public static DependencyEdge dependencyEdge(
+       DependencyRequest dependencyRequest, boolean entryPoint) {
+diff --git a/java/dagger/model/ComponentPath.java b/java/dagger/model/ComponentPath.java
+index 5ef7b41f9..722595049 100644
+--- a/java/dagger/model/ComponentPath.java
++++ b/java/dagger/model/ComponentPath.java
+@@ -61,6 +61,16 @@ public final TypeElement parentComponent() {
+     return components().reverse().get(1);
+   }
+ 
++  /**
++   * Returns this path's parent path.
++   *
++   * @throws IllegalStateException if the current graph is the {@linkplain #atRoot() root component}
++   */
++  public final ComponentPath parent() {
++    checkState(!atRoot());
++    return create(components().subList(0, components().size() - 1));
++  }
++
+   /**
+    * Returns {@code true} if the {@linkplain #currentComponent()} current component} is the
+    * {@linkplain #rootComponent()} root component}.
+diff --git a/java/dagger/spi/DiagnosticReporter.java b/java/dagger/spi/DiagnosticReporter.java
+index 05e1d3fba..d4b0d7a75 100644
+--- a/java/dagger/spi/DiagnosticReporter.java
++++ b/java/dagger/spi/DiagnosticReporter.java
+@@ -19,6 +19,7 @@
+ import com.google.errorprone.annotations.FormatMethod;
+ import dagger.model.BindingGraph;
+ import dagger.model.BindingGraph.BindingNode;
++import dagger.model.BindingGraph.ChildFactoryMethodEdge;
+ import dagger.model.BindingGraph.ComponentNode;
+ import dagger.model.BindingGraph.DependencyEdge;
+ import javax.tools.Diagnostic;
+@@ -82,4 +83,19 @@ void reportDependency(
+       String messageFormat,
+       Object firstArg,
+       Object... moreArgs);
++
++  /** Reports a diagnostic for a subcomponent factory method. */
++  void reportSubcomponentFactoryMethod(
++      Diagnostic.Kind diagnosticKind,
++      ChildFactoryMethodEdge childFactoryMethodEdge,
++      String message);
++
++  /** Reports a diagnostic for a subcomponent factory method. */
++  @FormatMethod
++  void reportSubcomponentFactoryMethod(
++      Diagnostic.Kind diagnosticKind,
++      ChildFactoryMethodEdge childFactoryMethodEdge,
++      String messageFormat,
++      Object firstArg,
++      Object... moreArgs);
+ }
+diff --git a/javatests/dagger/internal/codegen/ProductionGraphValidationTest.java b/javatests/dagger/internal/codegen/ProductionGraphValidationTest.java
+index 32f984b81..1ea56dbe1 100644
+--- a/javatests/dagger/internal/codegen/ProductionGraphValidationTest.java
++++ b/javatests/dagger/internal/codegen/ProductionGraphValidationTest.java
+@@ -26,9 +26,7 @@
+ import org.junit.runner.RunWith;
+ import org.junit.runners.JUnit4;
+ 
+-/**
+- * Unit tests for {@link BindingGraphValidator} that exercise producer-specific logic.
+- */
++/** Producer-specific validation tests. */
+ @RunWith(JUnit4.class)
+ public class ProductionGraphValidationTest {
+   private static final JavaFileObject EXECUTOR_MODULE =
+diff --git a/javatests/dagger/internal/codegen/SubcomponentValidationTest.java b/javatests/dagger/internal/codegen/SubcomponentValidationTest.java
+index 0d74314ed..1842fb2fb 100644
+--- a/javatests/dagger/internal/codegen/SubcomponentValidationTest.java
++++ b/javatests/dagger/internal/codegen/SubcomponentValidationTest.java
+@@ -93,7 +93,77 @@ public SubcomponentValidationTest(CompilerMode compilerMode) {
+                 + "Add the following modules as parameters to this method: "
+                 + "test.ModuleWithParameters")
+         .inFile(componentFile)
+-        .onLine(7);
++        .onLineContaining("ChildComponent newChildComponent();");
++  }
++
++  @Test
++  public void factoryMethod_grandchild() {
++    JavaFileObject component =
++        JavaFileObjects.forSourceLines(
++            "test.TestComponent",
++            "package test;",
++            "",
++            "import dagger.Component;",
++            "",
++            "@Component",
++            "interface TestComponent {",
++            "  ChildComponent newChildComponent();",
++            "}");
++    JavaFileObject childComponent =
++        JavaFileObjects.forSourceLines(
++            "test.ChildComponent",
++            "package test;",
++            "",
++            "import dagger.Subcomponent;",
++            "",
++            "@Subcomponent",
++            "interface ChildComponent {",
++            "  GrandchildComponent newGrandchildComponent();",
++            "}");
++    JavaFileObject grandchildComponent =
++        JavaFileObjects.forSourceLines(
++            "test.GrandchildComponent",
++            "package test;",
++            "",
++            "import dagger.Subcomponent;",
++            "",
++            "@Subcomponent(modules = GrandchildModule.class)",
++            "interface GrandchildComponent {",
++            "  Object object();",
++            "}");
++    JavaFileObject grandchildModule =
++        JavaFileObjects.forSourceLines(
++            "test.GrandchildModule",
++            "package test;",
++            "",
++            "import dagger.Module;",
++            "import dagger.Provides;",
++            "",
++            "@Module",
++            "final class GrandchildModule {",
++            "  private final Object object;",
++            "",
++            "  GrandchildModule(Object object) {",
++            "    this.object = object;",
++            "  }",
++            "",
++            "  @Provides Object object() {",
++            "    return object;",
++            "  }",
++            "}");
++    Compilation compilation =
++        daggerCompiler()
++            .withOptions(compilerMode.javacopts())
++            .compile(component, childComponent, grandchildComponent, grandchildModule);
++    assertThat(compilation).failed();
++    assertThat(compilation)
++        .hadErrorContaining(
++            "[test.ChildComponent.newGrandchildComponent()] "
++                + "test.GrandchildComponent requires modules which have no visible default "
++                + "constructors. Add the following modules as parameters to this method: "
++                + "test.GrandchildModule")
++        .inFile(component)
++        .onLineContaining("interface TestComponent");
+   }
+ 
+   @Test public void factoryMethod_nonModuleParameter() {

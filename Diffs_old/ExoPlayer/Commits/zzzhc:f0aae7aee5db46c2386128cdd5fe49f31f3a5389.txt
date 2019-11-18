@@ -1,0 +1,553 @@
+diff --git a/RELEASENOTES.md b/RELEASENOTES.md
+index 8415f57c9a..6b5f4a0002 100644
+--- a/RELEASENOTES.md
++++ b/RELEASENOTES.md
+@@ -41,6 +41,7 @@
+ * Fix issue where player errors are thrown too early at playlist transitions
+   ([#5407](https://github.com/google/ExoPlayer/issues/5407)).
+ * Deprecate `setTag` parameter of `Timeline.getWindow`. Tags will always be set.
++* Support out-of-band HDR10+ metadata for VP9 in WebM/Matroska.
+ 
+ ### 2.10.4 ###
+ 
+diff --git a/extensions/vp9/src/main/java/com/google/android/exoplayer2/ext/vp9/VpxDecoder.java b/extensions/vp9/src/main/java/com/google/android/exoplayer2/ext/vp9/VpxDecoder.java
+index 1392e782f8..462e6ea044 100644
+--- a/extensions/vp9/src/main/java/com/google/android/exoplayer2/ext/vp9/VpxDecoder.java
++++ b/extensions/vp9/src/main/java/com/google/android/exoplayer2/ext/vp9/VpxDecoder.java
+@@ -139,7 +139,10 @@ protected VpxDecoderException decode(
+     }
+ 
+     if (!inputBuffer.isDecodeOnly()) {
+-      outputBuffer.init(inputBuffer.timeUs, outputMode);
++      @Nullable
++      ByteBuffer supplementalData =
++          inputBuffer.hasSupplementalData() ? inputBuffer.supplementalData : null;
++      outputBuffer.init(inputBuffer.timeUs, outputMode, supplementalData);
+       int getFrameResult = vpxGetFrame(vpxDecContext, outputBuffer);
+       if (getFrameResult == 1) {
+         outputBuffer.addFlag(C.BUFFER_FLAG_DECODE_ONLY);
+diff --git a/library/core/src/main/java/com/google/android/exoplayer2/C.java b/library/core/src/main/java/com/google/android/exoplayer2/C.java
+index cd862e503f..d073eb4ee0 100644
+--- a/library/core/src/main/java/com/google/android/exoplayer2/C.java
++++ b/library/core/src/main/java/com/google/android/exoplayer2/C.java
+@@ -480,6 +480,7 @@ private C() {}
+       value = {
+         BUFFER_FLAG_KEY_FRAME,
+         BUFFER_FLAG_END_OF_STREAM,
++        BUFFER_FLAG_HAS_SUPPLEMENTAL_DATA,
+         BUFFER_FLAG_LAST_SAMPLE,
+         BUFFER_FLAG_ENCRYPTED,
+         BUFFER_FLAG_DECODE_ONLY
+@@ -493,6 +494,8 @@ private C() {}
+    * Flag for empty buffers that signal that the end of the stream was reached.
+    */
+   public static final int BUFFER_FLAG_END_OF_STREAM = MediaCodec.BUFFER_FLAG_END_OF_STREAM;
++  /** Indicates that a buffer has supplemental data. */
++  public static final int BUFFER_FLAG_HAS_SUPPLEMENTAL_DATA = 1 << 28; // 0x10000000
+   /** Indicates that a buffer is known to contain the last media sample of the stream. */
+   public static final int BUFFER_FLAG_LAST_SAMPLE = 1 << 29; // 0x20000000
+   /** Indicates that a buffer is (at least partially) encrypted. */
+diff --git a/library/core/src/main/java/com/google/android/exoplayer2/decoder/Buffer.java b/library/core/src/main/java/com/google/android/exoplayer2/decoder/Buffer.java
+index 773959fbfc..8fd25f2cf9 100644
+--- a/library/core/src/main/java/com/google/android/exoplayer2/decoder/Buffer.java
++++ b/library/core/src/main/java/com/google/android/exoplayer2/decoder/Buffer.java
+@@ -53,6 +53,11 @@ public final boolean isKeyFrame() {
+     return getFlag(C.BUFFER_FLAG_KEY_FRAME);
+   }
+ 
++  /** Returns whether the {@link C#BUFFER_FLAG_HAS_SUPPLEMENTAL_DATA} flag is set. */
++  public final boolean hasSupplementalData() {
++    return getFlag(C.BUFFER_FLAG_HAS_SUPPLEMENTAL_DATA);
++  }
++
+   /**
+    * Replaces this buffer's flags with {@code flags}.
+    *
+diff --git a/library/core/src/main/java/com/google/android/exoplayer2/decoder/DecoderInputBuffer.java b/library/core/src/main/java/com/google/android/exoplayer2/decoder/DecoderInputBuffer.java
+index c31ae92cfc..7a19d85aa8 100644
+--- a/library/core/src/main/java/com/google/android/exoplayer2/decoder/DecoderInputBuffer.java
++++ b/library/core/src/main/java/com/google/android/exoplayer2/decoder/DecoderInputBuffer.java
+@@ -68,6 +68,12 @@
+    */
+   public long timeUs;
+ 
++  /**
++   * Supplemental data related to the buffer, if {@link #hasSupplementalData()} returns true. If
++   * present, the buffer is populated with supplemental data from position 0 to its limit.
++   */
++  @Nullable public ByteBuffer supplementalData;
++
+   @BufferReplacementMode private final int bufferReplacementMode;
+ 
+   /**
+@@ -89,6 +95,16 @@ public DecoderInputBuffer(@BufferReplacementMode int bufferReplacementMode) {
+     this.bufferReplacementMode = bufferReplacementMode;
+   }
+ 
++  /** Resets {@link #supplementalData} in preparation for storing {@code length} bytes. */
++  @EnsuresNonNull("supplementalData")
++  public void resetSupplementalData(int length) {
++    if (supplementalData == null || supplementalData.capacity() < length) {
++      supplementalData = ByteBuffer.allocate(length);
++    }
++    supplementalData.position(0);
++    supplementalData.limit(length);
++  }
++
+   /**
+    * Ensures that {@link #data} is large enough to accommodate a write of a given length at its
+    * current position.
+@@ -148,6 +164,9 @@ public final boolean isEncrypted() {
+    */
+   public final void flip() {
+     data.flip();
++    if (supplementalData != null) {
++      supplementalData.flip();
++    }
+   }
+ 
+   @Override
+diff --git a/library/core/src/main/java/com/google/android/exoplayer2/extractor/mkv/MatroskaExtractor.java b/library/core/src/main/java/com/google/android/exoplayer2/extractor/mkv/MatroskaExtractor.java
+index c785865f6a..e4f42fcf91 100644
+--- a/library/core/src/main/java/com/google/android/exoplayer2/extractor/mkv/MatroskaExtractor.java
++++ b/library/core/src/main/java/com/google/android/exoplayer2/extractor/mkv/MatroskaExtractor.java
+@@ -149,6 +149,10 @@
+   private static final int ID_BLOCK_GROUP = 0xA0;
+   private static final int ID_BLOCK = 0xA1;
+   private static final int ID_BLOCK_DURATION = 0x9B;
++  private static final int ID_BLOCK_ADDITIONS = 0x75A1;
++  private static final int ID_BLOCK_MORE = 0xA6;
++  private static final int ID_BLOCK_ADD_ID = 0xEE;
++  private static final int ID_BLOCK_ADDITIONAL = 0xA5;
+   private static final int ID_REFERENCE_BLOCK = 0xFB;
+   private static final int ID_TRACKS = 0x1654AE6B;
+   private static final int ID_TRACK_ENTRY = 0xAE;
+@@ -157,6 +161,7 @@
+   private static final int ID_FLAG_DEFAULT = 0x88;
+   private static final int ID_FLAG_FORCED = 0x55AA;
+   private static final int ID_DEFAULT_DURATION = 0x23E383;
++  private static final int ID_MAX_BLOCK_ADDITION_ID = 0x55EE;
+   private static final int ID_NAME = 0x536E;
+   private static final int ID_CODEC_ID = 0x86;
+   private static final int ID_CODEC_PRIVATE = 0x63A2;
+@@ -215,6 +220,12 @@
+   private static final int ID_LUMNINANCE_MAX = 0x55D9;
+   private static final int ID_LUMNINANCE_MIN = 0x55DA;
+ 
++  /**
++   * BlockAddID value for ITU T.35 metadata in a VP9 track. See also
++   * https://www.webmproject.org/docs/container/.
++   */
++  private static final int BLOCK_ADD_ID_VP9_ITU_T_35 = 4;
++
+   private static final int LACING_NONE = 0;
+   private static final int LACING_XIPH = 1;
+   private static final int LACING_FIXED_SIZE = 2;
+@@ -323,6 +334,7 @@
+   private final ParsableByteArray subtitleSample;
+   private final ParsableByteArray encryptionInitializationVector;
+   private final ParsableByteArray encryptionSubsampleData;
++  private final ParsableByteArray blockAddData;
+   private ByteBuffer encryptionSubsampleDataBuffer;
+ 
+   private long segmentContentSize;
+@@ -361,6 +373,7 @@
+   private int blockTrackNumberLength;
+   @C.BufferFlags
+   private int blockFlags;
++  private int blockAddId;
+ 
+   // Sample reading state.
+   private int sampleBytesRead;
+@@ -401,6 +414,7 @@ public MatroskaExtractor(@Flags int flags) {
+     subtitleSample = new ParsableByteArray();
+     encryptionInitializationVector = new ParsableByteArray(ENCRYPTION_IV_SIZE);
+     encryptionSubsampleData = new ParsableByteArray();
++    blockAddData = new ParsableByteArray();
+   }
+ 
+   @Override
+@@ -479,6 +493,8 @@ protected int getElementType(int id) {
+       case ID_CUE_POINT:
+       case ID_CUE_TRACK_POSITIONS:
+       case ID_BLOCK_GROUP:
++      case ID_BLOCK_ADDITIONS:
++      case ID_BLOCK_MORE:
+       case ID_PROJECTION:
+       case ID_COLOUR:
+       case ID_MASTERING_METADATA:
+@@ -499,6 +515,7 @@ protected int getElementType(int id) {
+       case ID_FLAG_DEFAULT:
+       case ID_FLAG_FORCED:
+       case ID_DEFAULT_DURATION:
++      case ID_MAX_BLOCK_ADDITION_ID:
+       case ID_CODEC_DELAY:
+       case ID_SEEK_PRE_ROLL:
+       case ID_CHANNELS:
+@@ -518,6 +535,7 @@ protected int getElementType(int id) {
+       case ID_MAX_CLL:
+       case ID_MAX_FALL:
+       case ID_PROJECTION_TYPE:
++      case ID_BLOCK_ADD_ID:
+         return EbmlProcessor.ELEMENT_TYPE_UNSIGNED_INT;
+       case ID_DOC_TYPE:
+       case ID_NAME:
+@@ -531,6 +549,7 @@ protected int getElementType(int id) {
+       case ID_BLOCK:
+       case ID_CODEC_PRIVATE:
+       case ID_PROJECTION_PRIVATE:
++      case ID_BLOCK_ADDITIONAL:
+         return EbmlProcessor.ELEMENT_TYPE_BINARY;
+       case ID_DURATION:
+       case ID_SAMPLING_FREQUENCY:
+@@ -760,6 +779,9 @@ protected void integerElement(int id, long value) throws ParserException {
+       case ID_DEFAULT_DURATION:
+         currentTrack.defaultSampleDurationNs = (int) value;
+         break;
++      case ID_MAX_BLOCK_ADDITION_ID:
++        currentTrack.maxBlockAdditionId = (int) value;
++        break;
+       case ID_CODEC_DELAY:
+         currentTrack.codecDelayNs = value;
+         break;
+@@ -914,6 +936,9 @@ protected void integerElement(int id, long value) throws ParserException {
+             break;
+         }
+         break;
++      case ID_BLOCK_ADD_ID:
++        blockAddId = (int) value;
++        break;
+       default:
+         break;
+     }
+@@ -1171,12 +1196,30 @@ protected void binaryElement(int id, int contentSize, ExtractorInput input)
+           writeSampleData(input, track, blockLacingSampleSizes[0]);
+         }
+ 
++        break;
++      case ID_BLOCK_ADDITIONAL:
++        if (blockState != BLOCK_STATE_DATA) {
++          return;
++        }
++        handleBlockAdditionalData(tracks.get(blockTrackNumber), blockAddId, input, contentSize);
+         break;
+       default:
+         throw new ParserException("Unexpected id: " + id);
+     }
+   }
+ 
++  protected void handleBlockAdditionalData(
++      Track track, int blockAddId, ExtractorInput input, int contentSize)
++      throws IOException, InterruptedException {
++    if (blockAddId == BLOCK_ADD_ID_VP9_ITU_T_35 && CODEC_ID_VP9.equals(track.codecId)) {
++      blockAddData.reset(contentSize);
++      input.readFully(blockAddData.data, 0, contentSize);
++    } else {
++      // Unhandled block additional data.
++      input.skipFully(contentSize);
++    }
++  }
++
+   private void commitSampleToOutput(Track track, long timeUs) {
+     if (track.trueHdSampleRechunker != null) {
+       track.trueHdSampleRechunker.sampleMetadata(track, timeUs);
+@@ -1196,6 +1239,12 @@ private void commitSampleToOutput(Track track, long timeUs) {
+             SSA_TIMECODE_LAST_VALUE_SCALING_FACTOR,
+             SSA_TIMECODE_EMPTY);
+       }
++      if ((blockFlags & C.BUFFER_FLAG_HAS_SUPPLEMENTAL_DATA) != 0) {
++        // Append supplemental data.
++        int size = blockAddData.limit();
++        track.output.sampleData(blockAddData, size);
++        sampleBytesWritten += size;
++      }
+       track.output.sampleMetadata(timeUs, blockFlags, sampleBytesWritten, 0, track.cryptoData);
+     }
+     sampleRead = true;
+@@ -1328,6 +1377,21 @@ private void writeSampleData(ExtractorInput input, Track track, int size)
+         // If the sample has header stripping, prepare to read/output the stripped bytes first.
+         sampleStrippedBytes.reset(track.sampleStrippedBytes, track.sampleStrippedBytes.length);
+       }
++
++      if (track.maxBlockAdditionId > 0) {
++        blockFlags |= C.BUFFER_FLAG_HAS_SUPPLEMENTAL_DATA;
++        blockAddData.reset();
++        // If there is supplemental data, the structure of the sample data is:
++        // sample size (4 bytes) || sample data || supplemental data
++        scratch.reset(/* limit= */ 4);
++        scratch.data[0] = (byte) ((size >> 24) & 0xFF);
++        scratch.data[1] = (byte) ((size >> 16) & 0xFF);
++        scratch.data[2] = (byte) ((size >> 8) & 0xFF);
++        scratch.data[3] = (byte) (size & 0xFF);
++        output.sampleData(scratch, 4);
++        sampleBytesWritten += 4;
++      }
++
+       sampleEncodingHandled = true;
+     }
+     size += sampleStrippedBytes.limit();
+@@ -1713,6 +1777,7 @@ public void outputPendingSampleMetadata(Track track) {
+     public int number;
+     public int type;
+     public int defaultSampleDurationNs;
++    public int maxBlockAdditionId;
+     public boolean hasContentEncryption;
+     public byte[] sampleStrippedBytes;
+     public TrackOutput.CryptoData cryptoData;
+diff --git a/library/core/src/main/java/com/google/android/exoplayer2/mediacodec/MediaCodecInfo.java b/library/core/src/main/java/com/google/android/exoplayer2/mediacodec/MediaCodecInfo.java
+index d07def1894..c700259b13 100644
+--- a/library/core/src/main/java/com/google/android/exoplayer2/mediacodec/MediaCodecInfo.java
++++ b/library/core/src/main/java/com/google/android/exoplayer2/mediacodec/MediaCodecInfo.java
+@@ -264,6 +264,18 @@ public boolean isCodecSupported(Format format) {
+     return false;
+   }
+ 
++  /** Whether the codec handles HDR10+ out-of-band metadata. */
++  public boolean isHdr10PlusOutOfBandMetadataSupported() {
++    if (Util.SDK_INT >= 29 && MimeTypes.VIDEO_VP9.equals(mimeType)) {
++      for (CodecProfileLevel capabilities : getProfileLevels()) {
++        if (capabilities.profile == CodecProfileLevel.VP9Profile2HDR10Plus) {
++          return true;
++        }
++      }
++    }
++    return false;
++  }
++
+   /**
+    * Returns whether it may be possible to adapt to playing a different format when the codec is
+    * configured to play media in the specified {@code format}. For adaptation to succeed, the codec
+diff --git a/library/core/src/main/java/com/google/android/exoplayer2/mediacodec/MediaCodecRenderer.java b/library/core/src/main/java/com/google/android/exoplayer2/mediacodec/MediaCodecRenderer.java
+index ee2c9ad1a3..c077d8d227 100644
+--- a/library/core/src/main/java/com/google/android/exoplayer2/mediacodec/MediaCodecRenderer.java
++++ b/library/core/src/main/java/com/google/android/exoplayer2/mediacodec/MediaCodecRenderer.java
+@@ -1140,6 +1140,9 @@ private boolean feedInputBuffer() throws ExoPlaybackException {
+           Math.max(largestQueuedPresentationTimeUs, presentationTimeUs);
+ 
+       buffer.flip();
++      if (buffer.hasSupplementalData()) {
++        handleInputBufferSupplementalData(buffer);
++      }
+       onQueueInputBuffer(buffer);
+ 
+       if (bufferEncrypted) {
+@@ -1297,10 +1300,23 @@ protected void onOutputFormatChanged(MediaCodec codec, MediaFormat outputFormat)
+     // Do nothing.
+   }
+ 
++  /**
++   * Handles supplemental data associated with an input buffer.
++   *
++   * <p>The default implementation is a no-op.
++   *
++   * @param buffer The input buffer that is about to be queued.
++   * @throws ExoPlaybackException Thrown if an error occurs handling supplemental data.
++   */
++  protected void handleInputBufferSupplementalData(DecoderInputBuffer buffer)
++      throws ExoPlaybackException {
++    // Do nothing.
++  }
++
+   /**
+    * Called immediately before an input buffer is queued into the codec.
+-   * <p>
+-   * The default implementation is a no-op.
++   *
++   * <p>The default implementation is a no-op.
+    *
+    * @param buffer The buffer to be queued.
+    */
+diff --git a/library/core/src/main/java/com/google/android/exoplayer2/source/SampleQueue.java b/library/core/src/main/java/com/google/android/exoplayer2/source/SampleQueue.java
+index 921afcdf2f..fa4a26aa3c 100644
+--- a/library/core/src/main/java/com/google/android/exoplayer2/source/SampleQueue.java
++++ b/library/core/src/main/java/com/google/android/exoplayer2/source/SampleQueue.java
+@@ -393,13 +393,7 @@ public int read(
+             buffer.addFlag(C.BUFFER_FLAG_DECODE_ONLY);
+           }
+           if (!buffer.isFlagsOnly()) {
+-            // Read encryption data if the sample is encrypted.
+-            if (buffer.isEncrypted()) {
+-              readEncryptionData(buffer, extrasHolder);
+-            }
+-            // Write the sample data into the holder.
+-            buffer.ensureSpaceForWrite(extrasHolder.size);
+-            readData(extrasHolder.offset, buffer.data, extrasHolder.size);
++            readToBuffer(buffer, extrasHolder);
+           }
+         }
+         return C.RESULT_BUFFER_READ;
+@@ -410,12 +404,48 @@ public int read(
+     }
+   }
+ 
++  /**
++   * Reads data from the rolling buffer to populate a decoder input buffer.
++   *
++   * @param buffer The buffer to populate.
++   * @param extrasHolder The extras holder whose offset should be read and subsequently adjusted.
++   */
++  private void readToBuffer(DecoderInputBuffer buffer, SampleExtrasHolder extrasHolder) {
++    // Read encryption data if the sample is encrypted.
++    if (buffer.isEncrypted()) {
++      readEncryptionData(buffer, extrasHolder);
++    }
++    // Read sample data, extracting supplemental data into a separate buffer if needed.
++    if (buffer.hasSupplementalData()) {
++      // If there is supplemental data, the sample data is prefixed by its size.
++      scratch.reset(4);
++      readData(extrasHolder.offset, scratch.data, 4);
++      int sampleSize = scratch.readUnsignedIntToInt();
++      extrasHolder.offset += 4;
++      extrasHolder.size -= 4;
++
++      // Write the sample data.
++      buffer.ensureSpaceForWrite(sampleSize);
++      readData(extrasHolder.offset, buffer.data, sampleSize);
++      extrasHolder.offset += sampleSize;
++      extrasHolder.size -= sampleSize;
++
++      // Write the remaining data as supplemental data.
++      buffer.resetSupplementalData(extrasHolder.size);
++      readData(extrasHolder.offset, buffer.supplementalData, extrasHolder.size);
++    } else {
++      // Write the sample data.
++      buffer.ensureSpaceForWrite(extrasHolder.size);
++      readData(extrasHolder.offset, buffer.data, extrasHolder.size);
++    }
++  }
++
+   /**
+    * Reads encryption data for the current sample.
+-   * <p>
+-   * The encryption data is written into {@link DecoderInputBuffer#cryptoInfo}, and
+-   * {@link SampleExtrasHolder#size} is adjusted to subtract the number of bytes that were read. The
+-   * same value is added to {@link SampleExtrasHolder#offset}.
++   *
++   * <p>The encryption data is written into {@link DecoderInputBuffer#cryptoInfo}, and {@link
++   * SampleExtrasHolder#size} is adjusted to subtract the number of bytes that were read. The same
++   * value is added to {@link SampleExtrasHolder#offset}.
+    *
+    * @param buffer The buffer into which the encryption data should be written.
+    * @param extrasHolder The extras holder whose offset should be read and subsequently adjusted.
+diff --git a/library/core/src/main/java/com/google/android/exoplayer2/video/MediaCodecVideoRenderer.java b/library/core/src/main/java/com/google/android/exoplayer2/video/MediaCodecVideoRenderer.java
+index de77e8318d..0310800876 100644
+--- a/library/core/src/main/java/com/google/android/exoplayer2/video/MediaCodecVideoRenderer.java
++++ b/library/core/src/main/java/com/google/android/exoplayer2/video/MediaCodecVideoRenderer.java
+@@ -23,6 +23,7 @@
+ import android.media.MediaCodecInfo.CodecCapabilities;
+ import android.media.MediaCrypto;
+ import android.media.MediaFormat;
++import android.os.Bundle;
+ import android.os.Handler;
+ import android.os.SystemClock;
+ import androidx.annotation.CallSuper;
+@@ -123,6 +124,7 @@ public VideoDecoderException(
+ 
+   private CodecMaxValues codecMaxValues;
+   private boolean codecNeedsSetOutputSurfaceWorkaround;
++  private boolean codecHandlesHdr10PlusOutOfBandMetadata;
+ 
+   private Surface surface;
+   private Surface dummySurface;
+@@ -683,6 +685,8 @@ protected void onCodecInitialized(String name, long initializedTimestampMs,
+       long initializationDurationMs) {
+     eventDispatcher.decoderInitialized(name, initializedTimestampMs, initializationDurationMs);
+     codecNeedsSetOutputSurfaceWorkaround = codecNeedsSetOutputSurfaceWorkaround(name);
++    codecHandlesHdr10PlusOutOfBandMetadata =
++        Assertions.checkNotNull(getCodecInfo()).isHdr10PlusOutOfBandMetadataSupported();
+   }
+ 
+   @Override
+@@ -727,6 +731,37 @@ protected void onOutputFormatChanged(MediaCodec codec, MediaFormat outputFormat)
+     processOutputFormat(codec, width, height);
+   }
+ 
++  @Override
++  protected void handleInputBufferSupplementalData(DecoderInputBuffer buffer)
++      throws ExoPlaybackException {
++    if (!codecHandlesHdr10PlusOutOfBandMetadata) {
++      return;
++    }
++    ByteBuffer data = Assertions.checkNotNull(buffer.supplementalData);
++    if (data.remaining() >= 7) {
++      // Check for HDR10+ out-of-band metadata. See User_data_registered_itu_t_t35 in ST 2094-40.
++      byte ituTT35CountryCode = data.get();
++      int ituTT35TerminalProviderCode = data.getShort();
++      int ituTT35TerminalProviderOrientedCode = data.getShort();
++      byte applicationIdentifier = data.get();
++      byte applicationVersion = data.get();
++      data.position(0);
++      if (ituTT35CountryCode == (byte) 0xB5
++          && ituTT35TerminalProviderCode == 0x003C
++          && ituTT35TerminalProviderOrientedCode == 0x0001
++          && applicationIdentifier == 4
++          && applicationVersion == 0) {
++        // The metadata size may vary so allocate a new array every time. This is not too
++        // inefficient because the metadata is only a few tens of bytes.
++        byte[] hdr10PlusInfo = new byte[data.remaining()];
++        data.get(hdr10PlusInfo);
++        data.position(0);
++        // If codecHandlesHdr10PlusOutOfBandMetadata is true, this is an API 29 or later build.
++        setHdr10PlusInfoV29(getCodec(), hdr10PlusInfo);
++      }
++    }
++  }
++
+   @Override
+   protected boolean processOutputBuffer(
+       long positionUs,
+@@ -1153,6 +1188,13 @@ private static boolean isBufferVeryLate(long earlyUs) {
+     return earlyUs < -500000;
+   }
+ 
++  @TargetApi(29)
++  private static void setHdr10PlusInfoV29(MediaCodec codec, byte[] hdr10PlusInfo) {
++    Bundle codecParameters = new Bundle();
++    codecParameters.putByteArray(MediaCodec.PARAMETER_KEY_HDR10_PLUS_INFO, hdr10PlusInfo);
++    codec.setParameters(codecParameters);
++  }
++
+   @TargetApi(23)
+   private static void setOutputSurfaceV23(MediaCodec codec, Surface surface) {
+     codec.setOutputSurface(surface);
+diff --git a/library/core/src/main/java/com/google/android/exoplayer2/video/VideoDecoderOutputBuffer.java b/library/core/src/main/java/com/google/android/exoplayer2/video/VideoDecoderOutputBuffer.java
+index b4b09b20a2..10ccb4eba2 100644
+--- a/library/core/src/main/java/com/google/android/exoplayer2/video/VideoDecoderOutputBuffer.java
++++ b/library/core/src/main/java/com/google/android/exoplayer2/video/VideoDecoderOutputBuffer.java
+@@ -46,16 +46,35 @@
+   @Nullable public int[] yuvStrides;
+   public int colorspace;
+ 
++  /**
++   * Supplemental data related to the output frame, if {@link #hasSupplementalData()} returns true.
++   * If present, the buffer is populated with supplemental data from position 0 to its limit.
++   */
++  @Nullable public ByteBuffer supplementalData;
++
+   /**
+    * Initializes the buffer.
+    *
+    * @param timeUs The presentation timestamp for the buffer, in microseconds.
+    * @param mode The output mode. One of {@link C#VIDEO_OUTPUT_MODE_NONE}, {@link
+    *     C#VIDEO_OUTPUT_MODE_YUV} and {@link C#VIDEO_OUTPUT_MODE_SURFACE_YUV}.
++   * @param supplementalData Supplemental data associated with the frame, or {@code null} if not
++   *     present. It is safe to reuse the provided buffer after this method returns.
+    */
+-  public void init(long timeUs, @C.VideoOutputMode int mode) {
++  public void init(
++      long timeUs, @C.VideoOutputMode int mode, @Nullable ByteBuffer supplementalData) {
+     this.timeUs = timeUs;
+     this.mode = mode;
++    if (supplementalData != null) {
++      int size = supplementalData.limit();
++      if (this.supplementalData == null || this.supplementalData.capacity() < size) {
++        this.supplementalData = ByteBuffer.allocate(size);
++      }
++      this.supplementalData.position(0);
++      this.supplementalData.put(supplementalData);
++      this.supplementalData.flip();
++      supplementalData.position(0);
++    }
+   }
+ 
+   /**

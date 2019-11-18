@@ -1,0 +1,378 @@
+diff --git a/client/src/main/java/org/asynchttpclient/netty/request/body/NettyBodyBody.java b/client/src/main/java/org/asynchttpclient/netty/request/body/NettyBodyBody.java
+index 728e2ec89..abfb6aba7 100755
+--- a/client/src/main/java/org/asynchttpclient/netty/request/body/NettyBodyBody.java
++++ b/client/src/main/java/org/asynchttpclient/netty/request/body/NettyBodyBody.java
+@@ -54,7 +54,13 @@ public void write(final Channel channel, NettyResponseFuture<?> future) {
+ 
+     Object msg;
+     if (body instanceof RandomAccessBody && !ChannelManager.isSslHandlerConfigured(channel.pipeline()) && !config.isDisableZeroCopy()) {
+-      msg = new BodyFileRegion((RandomAccessBody) body);
++      long contentLength = getContentLength();
++      if (contentLength < 0) {
++        // contentLength unknown in advance, use chunked input
++        msg = new BodyChunkedInput(body);
++      } else {
++        msg = new BodyFileRegion((RandomAccessBody) body);
++      }
+ 
+     } else {
+       msg = new BodyChunkedInput(body);
+diff --git a/client/src/main/java/org/asynchttpclient/request/body/multipart/part/InputStreamMultipartPart.java b/client/src/main/java/org/asynchttpclient/request/body/multipart/part/InputStreamMultipartPart.java
+index 52e35f234..7340dc6e7 100644
+--- a/client/src/main/java/org/asynchttpclient/request/body/multipart/part/InputStreamMultipartPart.java
++++ b/client/src/main/java/org/asynchttpclient/request/body/multipart/part/InputStreamMultipartPart.java
+@@ -1,10 +1,14 @@
+ package org.asynchttpclient.request.body.multipart.part;
+ 
+ import io.netty.buffer.ByteBuf;
++import org.asynchttpclient.netty.request.body.BodyChunkedInput;
+ import org.asynchttpclient.request.body.multipart.InputStreamPart;
+ 
+ import java.io.IOException;
+ import java.io.InputStream;
++import java.nio.ByteBuffer;
++import java.nio.channels.Channels;
++import java.nio.channels.ReadableByteChannel;
+ import java.nio.channels.WritableByteChannel;
+ 
+ import static org.asynchttpclient.util.MiscUtils.closeSilently;
+@@ -12,11 +16,27 @@
+ public class InputStreamMultipartPart extends FileLikeMultipartPart<InputStreamPart> {
+ 
+   private long position = 0L;
++  private ByteBuffer buffer;
++  private ReadableByteChannel channel;
+ 
+   public InputStreamMultipartPart(InputStreamPart part, byte[] boundary) {
+     super(part, boundary);
+   }
+ 
++  private ByteBuffer getBuffer() {
++    if (buffer == null) {
++      buffer = ByteBuffer.allocateDirect(BodyChunkedInput.DEFAULT_CHUNK_SIZE);
++    }
++    return buffer;
++  }
++
++  private ReadableByteChannel getChannel() {
++    if (channel == null) {
++      channel = Channels.newChannel(part.getInputStream());
++    }
++    return channel;
++  }
++
+   @Override
+   protected long getContentLength() {
+     return part.getContentLength();
+@@ -38,13 +58,35 @@ protected long transferContentTo(ByteBuf target) throws IOException {
+ 
+   @Override
+   protected long transferContentTo(WritableByteChannel target) throws IOException {
+-    throw new UnsupportedOperationException("InputStreamPart does not support zero-copy transfers");
++    ReadableByteChannel channel = getChannel();
++    ByteBuffer buffer = getBuffer();
++
++    int transferred = 0;
++    int read = channel.read(buffer);
++
++    if (read > 0) {
++      buffer.flip();
++      while (buffer.hasRemaining()) {
++        transferred += target.write(buffer);
++      }
++      buffer.compact();
++      position += transferred;
++    }
++    if (position == getContentLength() || read < 0) {
++      state = MultipartState.POST_CONTENT;
++      if (channel.isOpen()) {
++        channel.close();
++      }
++    }
++
++    return transferred;
+   }
+ 
+   @Override
+   public void close() {
+     super.close();
+     closeSilently(part.getInputStream());
++    closeSilently(channel);
+   }
+ 
+ }
+diff --git a/client/src/test/java/org/asynchttpclient/request/body/InputStreamPartLargeFileTest.java b/client/src/test/java/org/asynchttpclient/request/body/InputStreamPartLargeFileTest.java
+index 320b0289f..19992b89a 100644
+--- a/client/src/test/java/org/asynchttpclient/request/body/InputStreamPartLargeFileTest.java
++++ b/client/src/test/java/org/asynchttpclient/request/body/InputStreamPartLargeFileTest.java
+@@ -24,7 +24,6 @@
+ import javax.servlet.http.HttpServletRequest;
+ import javax.servlet.http.HttpServletResponse;
+ import java.io.*;
+-import java.util.concurrent.ExecutionException;
+ 
+ import static java.nio.charset.StandardCharsets.UTF_8;
+ import static org.asynchttpclient.Dsl.asyncHttpClient;
+@@ -60,71 +59,30 @@ public void handle(String target, Request baseRequest, HttpServletRequest req, H
+     };
+   }
+ 
+-  @Test(expectedExceptions = ExecutionException.class)
+-  public void testPutImageFileThrowsExecutionException() throws Exception {
+-    // Should throw ExecutionException when zero-copy is enabled
+-    try (AsyncHttpClient client = asyncHttpClient(config().setRequestTimeout(100 * 6000))) {
+-      InputStream inputStream = new BufferedInputStream(new FileInputStream(LARGE_IMAGE_FILE));
+-      client.preparePut(getTargetUrl()).addBodyPart(new InputStreamPart("test", inputStream, LARGE_IMAGE_FILE.getName(), LARGE_IMAGE_FILE.length(), "application/octet-stream", UTF_8)).execute().get();
+-    }
+-  }
+-
+-  @Test(expectedExceptions = ExecutionException.class)
+-  public void testPutImageFileUnknownSizeThrowsExecutionException() throws Exception {
+-    // Should throw ExecutionException when zero-copy is enabled
+-    try (AsyncHttpClient client = asyncHttpClient(config().setRequestTimeout(100 * 6000))) {
+-      InputStream inputStream = new BufferedInputStream(new FileInputStream(LARGE_IMAGE_FILE));
+-      client.preparePut(getTargetUrl()).addBodyPart(new InputStreamPart("test", inputStream, LARGE_IMAGE_FILE.getName(), -1, "application/octet-stream", UTF_8)).execute().get();
+-    }
+-  }
+-
+   @Test
+   public void testPutImageFile() throws Exception {
+-    try (AsyncHttpClient client = asyncHttpClient(config().setRequestTimeout(100 * 6000).setDisableZeroCopy(true))) {
++    try (AsyncHttpClient client = asyncHttpClient(config().setRequestTimeout(100 * 6000))) {
+       InputStream inputStream = new BufferedInputStream(new FileInputStream(LARGE_IMAGE_FILE));
+-      client.preparePut(getTargetUrl()).addBodyPart(new InputStreamPart("test", inputStream, LARGE_IMAGE_FILE.getName(), LARGE_IMAGE_FILE.length(), "application/octet-stream", UTF_8)).execute().get();
++      Response response = client.preparePut(getTargetUrl()).addBodyPart(new InputStreamPart("test", inputStream, LARGE_IMAGE_FILE.getName(), LARGE_IMAGE_FILE.length(), "application/octet-stream", UTF_8)).execute().get();
++      assertEquals(response.getStatusCode(), 200);
+     }
+   }
+ 
+   @Test
+   public void testPutImageFileUnknownSize() throws Exception {
+-    try (AsyncHttpClient client = asyncHttpClient(config().setRequestTimeout(100 * 6000).setDisableZeroCopy(true))) {
++    try (AsyncHttpClient client = asyncHttpClient(config().setRequestTimeout(100 * 6000))) {
+       InputStream inputStream = new BufferedInputStream(new FileInputStream(LARGE_IMAGE_FILE));
+       Response response = client.preparePut(getTargetUrl()).addBodyPart(new InputStreamPart("test", inputStream, LARGE_IMAGE_FILE.getName(), -1, "application/octet-stream", UTF_8)).execute().get();
+       assertEquals(response.getStatusCode(), 200);
+     }
+   }
+ 
+-  @Test(expectedExceptions = ExecutionException.class)
+-  public void testPutLargeTextFileThrowsExecutionException() throws Exception {
+-    File file = createTempFile(1024 * 1024);
+-    InputStream inputStream = new BufferedInputStream(new FileInputStream(file));
+-
+-    try (AsyncHttpClient client = asyncHttpClient(config().setRequestTimeout(100 * 6000))) {
+-      Response response = client.preparePut(getTargetUrl())
+-              .addBodyPart(new InputStreamPart("test", inputStream, file.getName(), file.length(), "application/octet-stream", UTF_8)).execute().get();
+-      assertEquals(response.getStatusCode(), 200);
+-    }
+-  }
+-
+-  @Test(expectedExceptions = ExecutionException.class)
+-  public void testPutLargeTextFileUnknownSizeThrowsExecutionException() throws Exception {
+-    File file = createTempFile(1024 * 1024);
+-    InputStream inputStream = new BufferedInputStream(new FileInputStream(file));
+-
+-    try (AsyncHttpClient client = asyncHttpClient(config().setRequestTimeout(100 * 6000))) {
+-      Response response = client.preparePut(getTargetUrl())
+-              .addBodyPart(new InputStreamPart("test", inputStream, file.getName(), -1, "application/octet-stream", UTF_8)).execute().get();
+-      assertEquals(response.getStatusCode(), 200);
+-    }
+-  }
+-
+   @Test
+   public void testPutLargeTextFile() throws Exception {
+     File file = createTempFile(1024 * 1024);
+     InputStream inputStream = new BufferedInputStream(new FileInputStream(file));
+ 
+-    try (AsyncHttpClient client = asyncHttpClient(config().setRequestTimeout(100 * 6000).setDisableZeroCopy(true))) {
++    try (AsyncHttpClient client = asyncHttpClient(config().setRequestTimeout(100 * 6000))) {
+       Response response = client.preparePut(getTargetUrl())
+               .addBodyPart(new InputStreamPart("test", inputStream, file.getName(), file.length(), "application/octet-stream", UTF_8)).execute().get();
+       assertEquals(response.getStatusCode(), 200);
+@@ -136,7 +94,7 @@ public void testPutLargeTextFileUnknownSize() throws Exception {
+     File file = createTempFile(1024 * 1024);
+     InputStream inputStream = new BufferedInputStream(new FileInputStream(file));
+ 
+-    try (AsyncHttpClient client = asyncHttpClient(config().setRequestTimeout(100 * 6000).setDisableZeroCopy(true))) {
++    try (AsyncHttpClient client = asyncHttpClient(config().setRequestTimeout(100 * 6000))) {
+       Response response = client.preparePut(getTargetUrl())
+               .addBodyPart(new InputStreamPart("test", inputStream, file.getName(), -1, "application/octet-stream", UTF_8)).execute().get();
+       assertEquals(response.getStatusCode(), 200);
+diff --git a/client/src/test/java/org/asynchttpclient/request/body/multipart/MultipartBodyTest.java b/client/src/test/java/org/asynchttpclient/request/body/multipart/MultipartBodyTest.java
+index 382f2d208..fc54d396a 100644
+--- a/client/src/test/java/org/asynchttpclient/request/body/multipart/MultipartBodyTest.java
++++ b/client/src/test/java/org/asynchttpclient/request/body/multipart/MultipartBodyTest.java
+@@ -36,7 +36,6 @@
+ 
+   private static final List<Part> PARTS = new ArrayList<>();
+   private static long MAX_MULTIPART_CONTENT_LENGTH_ESTIMATE;
+-  private static long MAX_MULTIPART_CONTENT_LENGTH_WITH_INPUT_STREAM_PART_ESTIMATE;
+ 
+   static {
+     try {
+@@ -55,13 +54,6 @@
+     }
+   }
+ 
+-  static {
+-    try (MultipartBody dummyBody = buildMultipartWithInputStreamPart()) {
+-      // separator is random
+-      MAX_MULTIPART_CONTENT_LENGTH_WITH_INPUT_STREAM_PART_ESTIMATE = dummyBody.getContentLength() + 100;
+-    }
+-  }
+-
+   private static File getTestfile() throws URISyntaxException {
+     final ClassLoader cl = MultipartBodyTest.class.getClassLoader();
+     final URL url = cl.getResource("textfile.txt");
+@@ -70,10 +62,6 @@ private static File getTestfile() throws URISyntaxException {
+   }
+ 
+   private static MultipartBody buildMultipart() {
+-    return MultipartUtils.newMultipartBody(PARTS, EmptyHttpHeaders.INSTANCE);
+-  }
+-
+-  private static MultipartBody buildMultipartWithInputStreamPart() {
+     List<Part> parts = new ArrayList<>(PARTS);
+     try {
+       File testFile = getTestfile();
+@@ -140,16 +128,6 @@ public void transferWithCopy() throws Exception {
+     }
+   }
+ 
+-  @Test
+-  public void transferWithCopyAndInputStreamPart() throws Exception {
+-    for (int bufferLength = 1; bufferLength < MAX_MULTIPART_CONTENT_LENGTH_WITH_INPUT_STREAM_PART_ESTIMATE + 1; bufferLength++) {
+-      try (MultipartBody multipartBody = buildMultipartWithInputStreamPart()) {
+-        long transferred = transferWithCopy(multipartBody, bufferLength);
+-        assertEquals(transferred, multipartBody.getContentLength());
+-      }
+-    }
+-  }
+-
+   @Test
+   public void transferZeroCopy() throws Exception {
+     for (int bufferLength = 1; bufferLength < MAX_MULTIPART_CONTENT_LENGTH_ESTIMATE + 1; bufferLength++) {
+@@ -159,13 +137,4 @@ public void transferZeroCopy() throws Exception {
+       }
+     }
+   }
+-
+-  @Test(expectedExceptions = UnsupportedOperationException.class)
+-  public void transferZeroCopyWithInputStreamPart() throws Exception {
+-    for (int bufferLength = 1; bufferLength < MAX_MULTIPART_CONTENT_LENGTH_WITH_INPUT_STREAM_PART_ESTIMATE + 1; bufferLength++) {
+-      try (MultipartBody multipartBody = buildMultipartWithInputStreamPart()) {
+-        transferZeroCopy(multipartBody, bufferLength);
+-      }
+-    }
+-  }
+ }
+diff --git a/client/src/test/java/org/asynchttpclient/request/body/multipart/MultipartUploadTest.java b/client/src/test/java/org/asynchttpclient/request/body/multipart/MultipartUploadTest.java
+index f8729b294..879a40a9d 100644
+--- a/client/src/test/java/org/asynchttpclient/request/body/multipart/MultipartUploadTest.java
++++ b/client/src/test/java/org/asynchttpclient/request/body/multipart/MultipartUploadTest.java
+@@ -41,7 +41,6 @@
+ import java.util.Arrays;
+ import java.util.List;
+ import java.util.UUID;
+-import java.util.concurrent.ExecutionException;
+ import java.util.zip.GZIPInputStream;
+ 
+ import static java.nio.charset.StandardCharsets.UTF_8;
+@@ -86,16 +85,25 @@ public void testSendingSmallFilesAndByteArray() throws Exception {
+     testFiles.add(testResource1File);
+     testFiles.add(testResource2File);
+     testFiles.add(testResource3File);
++    testFiles.add(testResource3File);
++    testFiles.add(testResource2File);
++    testFiles.add(testResource1File);
+ 
+     List<String> expected = new ArrayList<>();
+     expected.add(expectedContents);
+     expected.add(expectedContents2);
+     expected.add(expectedContents3);
++    expected.add(expectedContents3);
++    expected.add(expectedContents2);
++    expected.add(expectedContents);
+ 
+     List<Boolean> gzipped = new ArrayList<>();
+     gzipped.add(false);
+     gzipped.add(true);
+     gzipped.add(false);
++    gzipped.add(false);
++    gzipped.add(true);
++    gzipped.add(false);
+ 
+     File tmpFile = File.createTempFile("textbytearray", ".txt");
+     try (OutputStream os = Files.newOutputStream(tmpFile.toPath())) {
+@@ -113,41 +121,10 @@ public void testSendingSmallFilesAndByteArray() throws Exception {
+               .addBodyPart(new StringPart("Name", "Dominic"))
+               .addBodyPart(new FilePart("file3", testResource3File, "text/plain", UTF_8))
+               .addBodyPart(new StringPart("Age", "3")).addBodyPart(new StringPart("Height", "shrimplike"))
+-              .addBodyPart(new StringPart("Hair", "ridiculous")).addBodyPart(new ByteArrayPart("file4",
+-                      expectedContents.getBytes(UTF_8), "text/plain", UTF_8, "bytearray.txt"))
+-              .build();
+-
+-      Response res = c.executeRequest(r).get();
+-
+-      assertEquals(res.getStatusCode(), 200);
+-
+-      testSentFile(expected, testFiles, res, gzipped);
+-    }
+-
+-    testFiles.add(testResource3File);
+-    testFiles.add(testResource2File);
+-    testFiles.add(testResource1File);
+-
+-    expected.add(expectedContents3);
+-    expected.add(expectedContents2);
+-    expected.add(expectedContents);
+-
+-    gzipped.add(false);
+-    gzipped.add(true);
+-    gzipped.add(false);
+-
+-    // Zero-copy should be disabled when using InputStreamPart
+-    try (AsyncHttpClient c = asyncHttpClient(config().setDisableZeroCopy(true))) {
+-      Request r = post("http://localhost" + ":" + port1 + "/upload")
+-              .addBodyPart(new FilePart("file1", testResource1File, "text/plain", UTF_8))
+-              .addBodyPart(new FilePart("file2", testResource2File, "application/x-gzip", null))
+-              .addBodyPart(new StringPart("Name", "Dominic"))
+-              .addBodyPart(new FilePart("file3", testResource3File, "text/plain", UTF_8))
+-              .addBodyPart(new StringPart("Age", "3")).addBodyPart(new StringPart("Height", "shrimplike"))
+-              .addBodyPart(new ByteArrayPart("file4", expectedContents.getBytes(UTF_8), "text/plain", UTF_8, "bytearray.txt"))
+               .addBodyPart(new InputStreamPart("inputStream3", inputStreamFile3, testResource3File.getName(), testResource3File.length(), "text/plain", UTF_8))
+               .addBodyPart(new InputStreamPart("inputStream2", inputStreamFile2, testResource2File.getName(), testResource2File.length(), "application/x-gzip", null))
+-              .addBodyPart(new StringPart("Hair", "ridiculous"))
++              .addBodyPart(new StringPart("Hair", "ridiculous")).addBodyPart(new ByteArrayPart("file4",
++                      expectedContents.getBytes(UTF_8), "text/plain", UTF_8, "bytearray.txt"))
+               .addBodyPart(new InputStreamPart("inputStream1", inputStreamFile1, testResource1File.getName(), testResource1File.length(), "text/plain", UTF_8))
+               .build();
+ 
+@@ -197,7 +174,7 @@ public void testSendEmptyFileInputStream() throws Exception {
+     sendEmptyFileInputStream(true);
+   }
+ 
+-  @Test(expectedExceptions = ExecutionException.class)
++  @Test
+   public void testSendEmptyFileInputStreamZeroCopy() throws Exception {
+     sendEmptyFileInputStream(false);
+   }
+@@ -224,7 +201,7 @@ public void testSendFileInputStreamUnknownContentLength() throws Exception {
+     sendFileInputStream(false, true);
+   }
+ 
+-  @Test(expectedExceptions = ExecutionException.class)
++  @Test
+   public void testSendFileInputStreamZeroCopyUnknownContentLength() throws Exception {
+     sendFileInputStream(false, false);
+   }
+@@ -234,7 +211,7 @@ public void testSendFileInputStreamKnownContentLength() throws Exception {
+     sendFileInputStream(true, true);
+   }
+ 
+-  @Test(expectedExceptions = ExecutionException.class)
++  @Test
+   public void testSendFileInputStreamZeroCopyKnownContentLength() throws Exception {
+     sendFileInputStream(true, false);
+   }

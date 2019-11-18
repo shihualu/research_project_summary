@@ -1,0 +1,314 @@
+diff --git a/CHANGELOG.md b/CHANGELOG.md
+index 7a4aa9f..e599306 100644
+--- a/CHANGELOG.md
++++ b/CHANGELOG.md
+@@ -2,6 +2,10 @@
+ 
+ * Add test option to override minimum interval and flex for testing purposes
+ 
++## 1.0.14 (2016-10-19)
++
++* Fix issue that periodic jobs were accidentally canceled
++
+ ## 1.1.0 (2016-09-23)
+ 
+ * Bump SDK version to 24
+diff --git a/library/src/androidTest/java/com/evernote/android/job/JobExecutionTest.java b/library/src/androidTest/java/com/evernote/android/job/JobExecutionTest.java
+new file mode 100644
+index 0000000..8e71048
+--- /dev/null
++++ b/library/src/androidTest/java/com/evernote/android/job/JobExecutionTest.java
+@@ -0,0 +1,143 @@
++package com.evernote.android.job;
++
++import android.content.Context;
++import android.os.SystemClock;
++import android.support.annotation.NonNull;
++import android.support.test.InstrumentationRegistry;
++import android.support.test.filters.LargeTest;
++import android.support.test.runner.AndroidJUnit4;
++
++import org.junit.After;
++import org.junit.AfterClass;
++import org.junit.Before;
++import org.junit.BeforeClass;
++import org.junit.Test;
++import org.junit.runner.RunWith;
++
++import java.util.HashSet;
++import java.util.Set;
++import java.util.concurrent.TimeUnit;
++
++import static org.assertj.core.api.Assertions.assertThat;
++
++/**
++ * @author rwondratschek
++ */
++@RunWith(AndroidJUnit4.class)
++@LargeTest
++public class JobExecutionTest {
++
++    private static Set<Integer> cachedJobIds;
++
++    @BeforeClass
++    public static void beforeClass() {
++        JobManager.create(InstrumentationRegistry.getContext()).addJobCreator(new JobCreator() {
++            @Override
++            public Job create(String tag) {
++                return new TestJob();
++            }
++        });
++        cachedJobIds = new HashSet<>();
++    }
++
++    @AfterClass
++    public static void afterClass() {
++        Context context = InstrumentationRegistry.getContext();
++        for (Integer jobId : cachedJobIds) {
++            JobManager.instance().getApi().getCachedProxy(context).cancel(jobId);
++        }
++    }
++
++    @Before
++    public void beforeTest() {
++        JobManager.instance().cancelAll();
++    }
++
++    @After
++    public void afterTest() {
++        JobManager.instance().cancelAll();
++    }
++
++    @Test
++    public void testSimpleJob() {
++        final int jobId = getBuilder()
++                .setExecutionWindow(200_000L, 400_000L)
++                .setPersisted(true)
++                .build()
++                .schedule();
++
++        cachedJobIds.add(jobId);
++
++        JobProxy.Common common = getCommon(jobId);
++        JobRequest pendingRequest = common.getPendingRequest(true);
++        assertThat(pendingRequest).isNotNull();
++
++        new Thread() {
++            @Override
++            public void run() {
++                SystemClock.sleep(200);
++                assertThat(JobManager.instance().getJobRequest(jobId)).isNull();
++
++                JobRequest transientRequest = JobManager.instance().getJobRequest(jobId, true);
++                assertThat(transientRequest).isNotNull();
++                assertThat(transientRequest.isTransient()).isTrue();
++            }
++        }.start();
++
++        Job.Result result = common.executeJobRequest(pendingRequest);
++        assertThat(result).isEqualTo(Job.Result.FAILURE);
++
++        assertThat(JobManager.instance().getAllJobRequestsForTag(TestJob.TAG)).isEmpty();
++
++        pendingRequest = common.getPendingRequest(true);
++        assertThat(pendingRequest).isNull();
++    }
++
++    @Test
++    public void testPeriodicJob() {
++        int jobId = getBuilder()
++                .setPeriodic(TimeUnit.MINUTES.toMillis(15))
++                .setPersisted(true)
++                .build()
++                .schedule();
++
++        cachedJobIds.add(jobId);
++
++        JobProxy.Common common = getCommon(jobId);
++        JobRequest pendingRequest = common.getPendingRequest(true);
++        assertThat(pendingRequest).isNotNull();
++
++        Job.Result result = common.executeJobRequest(pendingRequest);
++        assertThat(result).isEqualTo(Job.Result.FAILURE);
++
++        pendingRequest = common.getPendingRequest(true);
++        assertThat(pendingRequest).isNull();
++
++        assertThat(JobManager.instance().getAllJobRequestsForTag(TestJob.TAG)).hasSize(1);
++
++        SystemClock.sleep(15_000);
++
++        pendingRequest = common.getPendingRequest(true);
++        assertThat(pendingRequest).isNotNull();
++    }
++
++    private JobRequest.Builder getBuilder() {
++        return new JobRequest.Builder(TestJob.TAG);
++    }
++
++    private JobProxy.Common getCommon(int jobId) {
++        return new JobProxy.Common(InstrumentationRegistry.getContext(), "JobExecutionTest", jobId);
++    }
++
++    private static final class TestJob extends Job {
++
++        private static final String TAG = "tag";
++
++        @NonNull
++        @Override
++        protected Result onRunJob(@NonNull Params params) {
++            SystemClock.sleep(1_000L);
++            return Result.FAILURE;
++        }
++    }
++}
+diff --git a/library/src/androidTest/res/values/integers.xml b/library/src/androidTest/res/values/integers.xml
+index 5ba1911..3da3d41 100644
+--- a/library/src/androidTest/res/values/integers.xml
++++ b/library/src/androidTest/res/values/integers.xml
+@@ -1,5 +1,5 @@
+ <?xml version="1.0" encoding="utf-8"?>
+ <resources>
+     <!-- required to make test project compile with provided dependency -->
+-    <integer name="google_play_services_version">7895000</integer>
++    <integer name="google_play_services_version">9683000</integer>
+ </resources>
+\ No newline at end of file
+diff --git a/library/src/main/java/com/evernote/android/job/JobProxy.java b/library/src/main/java/com/evernote/android/job/JobProxy.java
+index 37ad398..20a1316 100644
+--- a/library/src/main/java/com/evernote/android/job/JobProxy.java
++++ b/library/src/main/java/com/evernote/android/job/JobProxy.java
+@@ -99,38 +99,49 @@ public static long getAverageDelayMsSupportFlex(JobRequest request) {
+ 
+         private final JobManager mJobManager;
+ 
+-        public Common(Service service, int jobId) {
+-            mContext = service;
++        public Common(@NonNull Service service, int jobId) {
++            this(service, service.getClass().getSimpleName(), jobId);
++        }
++
++        /*package*/ Common(@NonNull Context context, String loggingTag, int jobId) {
++            mContext = context;
+             mJobId = jobId;
+-            mCat = new JobCat(service.getClass());
++            mCat = new JobCat(loggingTag);
+ 
+-            mJobManager = JobManager.create(service);
++            mJobManager = JobManager.create(context);
+         }
+ 
+-        public JobRequest getPendingRequest() {
++        public JobRequest getPendingRequest(boolean cleanUpOrphanedJob) {
+             // order is important for logging purposes
+             JobRequest request = mJobManager.getJobRequest(mJobId, true);
+             Job job = mJobManager.getJob(mJobId);
+             boolean periodic = request != null && request.isPeriodic();
+ 
+             if (job != null && !job.isFinished()) {
++                // that's probably a platform bug http://stackoverflow.com/questions/33235754/jobscheduler-posting-jobs-twice-not-expected
+                 mCat.d("Job %d is already running, %s", mJobId, request);
++                // not necessary to clean up, the running instance will do that
+                 return null;
+ 
+             } else if (job != null && !periodic) {
+                 mCat.d("Job %d already finished, %s", mJobId, request);
++                cleanUpOrphanedJob(cleanUpOrphanedJob);
+                 return null;
+ 
+-            } else if (job != null && System.currentTimeMillis() - job.getFinishedTimeStamp() < JobRequest.getMinInterval() / 2) {
++            } else if (job != null && System.currentTimeMillis() - job.getFinishedTimeStamp() < 2_000) {
++                // that's probably a platform bug http://stackoverflow.com/questions/33235754/jobscheduler-posting-jobs-twice-not-expected
+                 mCat.d("Job %d is periodic and just finished, %s", mJobId, request);
++                // don't clean up, periodic job
+                 return null;
+ 
+             } else if (request != null && request.isTransient()) {
+                 mCat.d("Request %d is transient, %s", mJobId, request);
++                // not necessary to clean up, the JobManager will do this for transient jobs
+                 return null;
+ 
+             } else if (request == null) {
+                 mCat.d("Request for ID %d was null", mJobId);
++                cleanUpOrphanedJob(cleanUpOrphanedJob);
+                 return null;
+             }
+ 
+@@ -198,8 +209,10 @@ public JobRequest getPendingRequest() {
+             }
+         }
+ 
+-        public void cleanUpOrphanedJob() {
+-            cleanUpOrphanedJob(mContext, mJobId);
++        private void cleanUpOrphanedJob(boolean cleanUp) {
++            if (cleanUp) {
++                cleanUpOrphanedJob(mContext, mJobId);
++            }
+         }
+ 
+         public static void cleanUpOrphanedJob(Context context, int jobId) {
+diff --git a/library/src/main/java/com/evernote/android/job/JobRequest.java b/library/src/main/java/com/evernote/android/job/JobRequest.java
+index 70086f1..4105520 100644
+--- a/library/src/main/java/com/evernote/android/job/JobRequest.java
++++ b/library/src/main/java/com/evernote/android/job/JobRequest.java
+@@ -306,6 +306,15 @@ public boolean isExact() {
+         return mNumFailures;
+     }
+ 
++    /**
++     * Only non-periodic jobs can be in a transient state. The transient state means, that
++     * the job is running and is about to be removed. A job can get stuck in a transient state,
++     * if the app terminates while the job is running. Then the job isn't scheduled anymore, but
++     * entry is still in the database. Since the job didn't finish successfully, reschedule
++     * the job if necessary and treat it as it wouldn't have run, yet.
++     *
++     * @return Whether the job is in a transient state.
++     */
+     /*package*/ boolean isTransient() {
+         return mTransient;
+     }
+diff --git a/library/src/main/java/com/evernote/android/job/gcm/PlatformGcmService.java b/library/src/main/java/com/evernote/android/job/gcm/PlatformGcmService.java
+index 7b2c33a..0d069a2 100644
+--- a/library/src/main/java/com/evernote/android/job/gcm/PlatformGcmService.java
++++ b/library/src/main/java/com/evernote/android/job/gcm/PlatformGcmService.java
+@@ -42,9 +42,8 @@ public int onRunTask(TaskParams taskParams) {
+         int jobId = Integer.parseInt(taskParams.getTag());
+         JobProxy.Common common = new JobProxy.Common(this, jobId);
+ 
+-        JobRequest request = common.getPendingRequest();
++        JobRequest request = common.getPendingRequest(true);
+         if (request == null) {
+-            common.cleanUpOrphanedJob();
+             return GcmNetworkManager.RESULT_FAILURE;
+         }
+ 
+diff --git a/library/src/main/java/com/evernote/android/job/v14/PlatformAlarmService.java b/library/src/main/java/com/evernote/android/job/v14/PlatformAlarmService.java
+index 275628a..65cd5d9 100644
+--- a/library/src/main/java/com/evernote/android/job/v14/PlatformAlarmService.java
++++ b/library/src/main/java/com/evernote/android/job/v14/PlatformAlarmService.java
+@@ -65,9 +65,8 @@ protected void onHandleIntent(final Intent intent) {
+         final JobProxy.Common common = new JobProxy.Common(this, jobId);
+ 
+         // create the JobManager. Seeing sometimes exceptions, that it wasn't created, yet.
+-        final JobRequest request = common.getPendingRequest();
++        final JobRequest request = common.getPendingRequest(true);
+         if (request == null) {
+-            common.cleanUpOrphanedJob();
+             return;
+         }
+ 
+diff --git a/library/src/main/java/com/evernote/android/job/v21/PlatformJobService.java b/library/src/main/java/com/evernote/android/job/v21/PlatformJobService.java
+index fb5d914..437d328 100644
+--- a/library/src/main/java/com/evernote/android/job/v21/PlatformJobService.java
++++ b/library/src/main/java/com/evernote/android/job/v21/PlatformJobService.java
+@@ -59,9 +59,8 @@ public boolean onStartJob(final JobParameters params) {
+         final int jobId = params.getJobId();
+         final JobProxy.Common common = new JobProxy.Common(this, jobId);
+ 
+-        final JobRequest request = common.getPendingRequest();
++        final JobRequest request = common.getPendingRequest(true);
+         if (request == null) {
+-            common.cleanUpOrphanedJob();
+             return false;
+         }
+ 

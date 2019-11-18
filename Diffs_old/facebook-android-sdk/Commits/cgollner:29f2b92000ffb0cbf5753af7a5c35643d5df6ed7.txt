@@ -1,0 +1,2013 @@
+diff --git a/facebook/src/com/facebook/AppEventsLogger.java b/facebook/src/com/facebook/AppEventsLogger.java
+index 37a36c736..baf7472ee 100644
+--- a/facebook/src/com/facebook/AppEventsLogger.java
++++ b/facebook/src/com/facebook/AppEventsLogger.java
+@@ -124,6 +124,33 @@
+         EXPLICIT_ONLY,
+     }
+ 
++    private enum SuppressionTimeoutBehavior {
++        // Successfully logging an event will reset the timeout period (i.e., events will log no more than every N
++        // seconds).
++        RESET_TIMEOUT_WHEN_LOG_SUCCESSFUL,
++        // Attempting to log an event, even if it is suppressed, will reset the timeout period (i.e., events will not
++        // be logged until they have been "silent" for at least N seconds).
++        RESET_TIMEOUT_WHEN_LOG_ATTEMPTED,
++    }
++
++    private static class EventSuppression {
++        // Timeout period in seconds
++        private int timeoutPeriod;
++        private SuppressionTimeoutBehavior behavior;
++
++        EventSuppression(int timeoutPeriod, SuppressionTimeoutBehavior behavior) {
++            this.timeoutPeriod = timeoutPeriod;
++            this.behavior = behavior;
++        }
++
++        int getTimeoutPeriod() {
++            return timeoutPeriod;
++        }
++
++        SuppressionTimeoutBehavior getBehavior() {
++            return behavior;
++        }
++    }
+ 
+     // Constants
+     private static final String TAG = AppEventsLogger.class.getCanonicalName();
+@@ -131,6 +158,8 @@
+     private static final int NUM_LOG_EVENTS_TO_TRY_TO_FLUSH_AFTER                  = 100;
+     private static final int FLUSH_PERIOD_IN_SECONDS                               = 60;
+     private static final int APP_SUPPORTS_ATTRIBUTION_ID_RECHECK_PERIOD_IN_SECONDS = 60 * 60 * 24;
++    private static final int APP_ACTIVATE_SUPPRESSION_PERIOD_IN_SECONDS            = 5 * 60;
++
+     private static final String APP_EVENT_PREFERENCES = "com.facebook.sdk.appEventPreferences";
+ 
+     // Instance member variables
+@@ -145,6 +174,15 @@
+     private static boolean requestInFlight;
+     private static Context applicationContext;
+     private static Object staticLock = new Object();
++    private static Map<String, Date> mapEventsToSuppressionTime = new HashMap<String, Date>();
++    @SuppressWarnings("serial")
++    private static Map<String, EventSuppression> mapEventNameToSuppress = new HashMap<String, EventSuppression>() {
++        {
++            put(AppEventsConstants.EVENT_NAME_ACTIVATED_APP,
++                    new EventSuppression(APP_ACTIVATE_SUPPRESSION_PERIOD_IN_SECONDS,
++                            SuppressionTimeoutBehavior.RESET_TIMEOUT_WHEN_LOG_ATTEMPTED));
++        }
++    };
+ 
+     // Rather than retaining Sessions, we extract the information we need and track app events by
+     // application ID and access token (which may be null for Session-less calls). This avoids needing to
+@@ -642,12 +680,42 @@ private void logEvent(String eventName, Double valueToSum, Bundle parameters, bo
+     }
+ 
+     private static void logEvent(Context context, AppEvent event, AccessTokenAppIdPair accessTokenAppId) {
++        if(shouldSuppressEvent(event)) {
++            return;
++        }
++
+         SessionEventsState state = getSessionEventsState(context, accessTokenAppId);
+         state.addEvent(event);
+ 
+         flushIfNecessary();
+     }
+ 
++    // This will also update the timestamp based on specified behavior.
++    private static boolean shouldSuppressEvent(AppEvent event) {
++        EventSuppression suppressionInfo = mapEventNameToSuppress.get(event.getName());
++        if (suppressionInfo == null) {
++            return false;
++        }
++
++        Date timestamp = mapEventsToSuppressionTime.get(event.getName());
++        boolean suppressed;
++        if (timestamp == null) {
++            suppressed = false;
++        } else {
++            long delta = new Date().getTime() - timestamp.getTime();
++            suppressed = delta < (suppressionInfo.getTimeoutPeriod() * 1000);
++        }
++
++        // Update the time if we're not suppressed, OR if we are suppressed but the behavior is to reset even on
++        // suppressed events.
++        if (!suppressed ||
++                suppressionInfo.getBehavior() == SuppressionTimeoutBehavior.RESET_TIMEOUT_WHEN_LOG_ATTEMPTED) {
++            mapEventsToSuppressionTime.put(event.getName(), new Date());
++        }
++
++        return suppressed;
++    }
++
+     static void eagerFlush() {
+         if (getFlushBehavior() != FlushBehavior.EXPLICIT_ONLY) {
+             flush(FlushReason.EAGER_FLUSHING_EVENT);
+@@ -1034,11 +1102,14 @@ private void populateRequest(Request request, int numSkipped, JSONArray events,
+         private JSONObject jsonObject;
+         private boolean isImplicit;
+         private static final HashSet<String> validatedIdentifiers = new HashSet<String>();
++        private String name;
+ 
+         public AppEvent(String eventName, Double valueToSum, Bundle parameters, boolean isImplicitlyLogged) {
+ 
+             validateIdentifier(eventName);
+ 
++            this.name = eventName;
++
+             isImplicit = isImplicitlyLogged;
+             jsonObject = new JSONObject();
+ 
+@@ -1090,6 +1161,10 @@ public AppEvent(String eventName, Double valueToSum, Bundle parameters, boolean
+             }
+         }
+ 
++        public String getName() {
++            return name;
++        }
++
+         private AppEvent(String jsonString, boolean isImplicit) throws JSONException {
+             jsonObject = new JSONObject(jsonString);
+             this.isImplicit = isImplicit;
+diff --git a/facebook/src/com/facebook/AuthorizationClient.java b/facebook/src/com/facebook/AuthorizationClient.java
+index cccb48f96..60a87d3d7 100644
+--- a/facebook/src/com/facebook/AuthorizationClient.java
++++ b/facebook/src/com/facebook/AuthorizationClient.java
+@@ -132,10 +132,6 @@ public Activity getActivityContext() {
+     }
+ 
+     void startOrContinueAuth(AuthorizationRequest request) {
+-        if (appEventsLogger == null || appEventsLogger.getApplicationId() != request.getApplicationId()) {
+-            appEventsLogger = AppEventsLogger.newLogger(context, request.getApplicationId());
+-        }
+-
+         if (getInProgress()) {
+             continueAuth();
+         } else {
+@@ -457,6 +453,13 @@ Request createGetProfileIdRequest(String accessToken) {
+         return new Request(null, "me", parameters, HttpMethod.GET, null);
+     }
+ 
++    private AppEventsLogger getAppEventsLogger() {
++        if (appEventsLogger == null || appEventsLogger.getApplicationId() != pendingRequest.getApplicationId()) {
++            appEventsLogger = AppEventsLogger.newLogger(context, pendingRequest.getApplicationId());
++        }
++        return appEventsLogger;
++    }
++
+     private void notifyOnCompleteListener(Result outcome) {
+         if (onCompletedListener != null) {
+             onCompletedListener.onCompleted(outcome);
+@@ -480,7 +483,7 @@ private void logAuthorizationMethodStart(String method) {
+         bundle.putLong(EVENT_PARAM_TIMESTAMP, System.currentTimeMillis());
+         bundle.putString(EVENT_PARAM_METHOD, method);
+ 
+-        appEventsLogger.logSdkEvent(EVENT_NAME_LOGIN_METHOD_START, null, bundle);
++        getAppEventsLogger().logSdkEvent(EVENT_NAME_LOGIN_METHOD_START, null, bundle);
+     }
+ 
+     private void logAuthorizationMethodComplete(String method, Result result, Map<String, String> loggingExtras) {
+@@ -516,7 +519,7 @@ private void logAuthorizationMethodComplete(String method, String result, String
+         bundle.putString(EVENT_PARAM_METHOD, method);
+         bundle.putLong(EVENT_PARAM_TIMESTAMP, System.currentTimeMillis());
+ 
+-        appEventsLogger.logSdkEvent(EVENT_NAME_LOGIN_METHOD_COMPLETE, null, bundle);
++        getAppEventsLogger().logSdkEvent(EVENT_NAME_LOGIN_METHOD_COMPLETE, null, bundle);
+     }
+ 
+     static Bundle newAuthorizationLoggingBundle(String authLoggerId) {
+@@ -555,11 +558,11 @@ boolean needsInternetPermission() {
+         void cancel() {
+         }
+ 
+-        protected void addLoggingExtra(String key, String value) {
++        protected void addLoggingExtra(String key, Object value) {
+             if (methodLoggingExtras == null) {
+                 methodLoggingExtras = new HashMap<String, String>();
+             }
+-            methodLoggingExtras.put(key, value);
++            methodLoggingExtras.put(key, value == null ? null : value.toString());
+         }
+     }
+ 
+@@ -818,7 +821,7 @@ boolean tryAuthorize(AuthorizationRequest request) {
+ 
+             addLoggingExtra(EVENT_EXTRAS_APP_CALL_ID, callId);
+             addLoggingExtra(EVENT_EXTRAS_PROTOCOL_VERSION,
+-                    intent.getStringExtra(NativeProtocol.EXTRA_PROTOCOL_VERSION));
++                    intent.getIntExtra(NativeProtocol.EXTRA_PROTOCOL_VERSION, 0));
+             addLoggingExtra(EVENT_EXTRAS_PERMISSIONS,
+                     TextUtils.join(",", intent.getStringArrayListExtra(NativeProtocol.EXTRA_PERMISSIONS)));
+             addLoggingExtra(EVENT_EXTRAS_WRITE_PRIVACY, intent.getStringExtra(NativeProtocol.EXTRA_WRITE_PRIVACY));
+diff --git a/facebook/src/com/facebook/FacebookSdkVersion.java b/facebook/src/com/facebook/FacebookSdkVersion.java
+index a835a9239..bdda281f9 100644
+--- a/facebook/src/com/facebook/FacebookSdkVersion.java
++++ b/facebook/src/com/facebook/FacebookSdkVersion.java
+@@ -17,6 +17,6 @@
+ package com.facebook;
+ 
+ final class FacebookSdkVersion {
+-    public static final String BUILD = "3.5.0";
++    public static final String BUILD = "3.5.2";
+     public static final String MIGRATION_BUNDLE = "fbsdk:20130708";
+ }
+diff --git a/facebook/src/com/facebook/NativeAppCallAttachmentStore.java b/facebook/src/com/facebook/NativeAppCallAttachmentStore.java
+index 11212f285..dc4108656 100644
+--- a/facebook/src/com/facebook/NativeAppCallAttachmentStore.java
++++ b/facebook/src/com/facebook/NativeAppCallAttachmentStore.java
+@@ -59,7 +59,59 @@ public void addAttachmentsForCall(Context context, UUID callId, Map<String, Bitm
+         Validate.containsNoNulls(imageAttachments.values(), "imageAttachments");
+         Validate.containsNoNullOrEmpty(imageAttachments.keySet(), "imageAttachments");
+ 
+-        if (imageAttachments.size() == 0) {
++        addAttachments(context, callId, imageAttachments, new ProcessAttachment<Bitmap>() {
++            @Override
++            public void processAttachment(Bitmap attachment, File outputFile) throws IOException {
++                FileOutputStream outputStream = new FileOutputStream(outputFile);
++                try {
++                    attachment.compress(Bitmap.CompressFormat.JPEG, 100, outputStream);
++                } finally {
++                    Utility.closeQuietly(outputStream);
++                }
++            }
++        });
++    }
++
++    /**
++     * Adds a number of bitmap attachment files associated with a native app call. The attachments will be
++     * served via {@link NativeAppCallContentProvider#openFile(android.net.Uri, String) openFile}.
++     *
++     * @param context the Context the call is being made from
++     * @param callId the unique ID of the call
++     * @param imageAttachments a Map of attachment names to Files containing the bitmaps; the attachment names will be
++     *                         part of the URI processed by openFile
++     * @throws java.io.IOException
++     */
++    public void addAttachmentFilesForCall(Context context, UUID callId, Map<String, File> imageAttachmentFiles) {
++        Validate.notNull(context, "context");
++        Validate.notNull(callId, "callId");
++        Validate.containsNoNulls(imageAttachmentFiles.values(), "imageAttachmentFiles");
++        Validate.containsNoNullOrEmpty(imageAttachmentFiles.keySet(), "imageAttachmentFiles");
++
++        addAttachments(context, callId, imageAttachmentFiles, new ProcessAttachment<File>() {
++            @Override
++            public void processAttachment(File attachment, File outputFile) throws IOException {
++                FileOutputStream outputStream = new FileOutputStream(outputFile);
++                FileInputStream inputStream = null;
++                try {
++                    inputStream = new FileInputStream(attachment);
++
++                    byte[] buffer = new byte[1024];
++                    int len;
++                    while ((len = inputStream.read(buffer)) > 0) {
++                        outputStream.write(buffer, 0, len);
++                    }
++                } finally {
++                    Utility.closeQuietly(outputStream);
++                    Utility.closeQuietly(inputStream);
++                }
++            }
++        });
++    }
++
++    private <T> void addAttachments(Context context, UUID callId, Map<String, T> attachments,
++            ProcessAttachment<T> processor) {
++        if (attachments.size() == 0) {
+             return;
+         }
+ 
+@@ -73,19 +125,14 @@ public void addAttachmentsForCall(Context context, UUID callId, Map<String, Bitm
+         List<File> filesToCleanup = new ArrayList<File>();
+ 
+         try {
+-            for (Map.Entry<String, Bitmap> entry : imageAttachments.entrySet()) {
++            for (Map.Entry<String, T> entry : attachments.entrySet()) {
+                 String attachmentName = entry.getKey();
+-                Bitmap attachment = entry.getValue();
++                T attachment = entry.getValue();
+ 
+                 File file = getAttachmentFile(callId, attachmentName, true);
+                 filesToCleanup.add(file);
+ 
+-                FileOutputStream outputStream = new FileOutputStream(file);
+-                try {
+-                    attachment.compress(Bitmap.CompressFormat.JPEG, 100, outputStream);
+-                } finally {
+-                    Utility.closeQuietly(outputStream);
+-                }
++                processor.processAttachment(attachment, file);
+             }
+         } catch (IOException exception) {
+             Log.e(TAG, "Got unexpected exception:" + exception);
+@@ -98,6 +145,11 @@ public void addAttachmentsForCall(Context context, UUID callId, Map<String, Bitm
+             }
+             throw new FacebookException(exception);
+         }
++
++    }
++
++    interface ProcessAttachment<T> {
++        void processAttachment(T attachment, File outputFile) throws IOException;
+     }
+ 
+     /**
+diff --git a/facebook/src/com/facebook/Request.java b/facebook/src/com/facebook/Request.java
+index 331e7e4b3..3993d48e9 100644
+--- a/facebook/src/com/facebook/Request.java
++++ b/facebook/src/com/facebook/Request.java
+@@ -76,6 +76,7 @@
+     private static final String MY_FEED = "me/feed";
+     private static final String MY_STAGING_RESOURCES = "me/staging_resources";
+     private static final String MY_OBJECTS_FORMAT = "me/objects/%s";
++    private static final String MY_ACTION_FORMAT = "me/%s";
+ 
+     private static final String USER_AGENT_BASE = "FBAndroidSDK";
+     private static final String USER_AGENT_HEADER = "User-Agent";
+@@ -505,7 +506,9 @@ public static Request newStatusUpdateRequest(Session session, String message, Gr
+      * The ID retrieved represents the Facebook user identified in the following way: if the specified session
+      * (or activeSession if the specified session is `null`) is open, the ID will represent the user associated with
+      * the activeSession; otherwise the ID will represent the user logged into the native Facebook app on the device.
+-     * If there is no native Facebook app, no one is logged into it, then a `null` ID will be returned.
++     * A `null` ID will be provided into the callback if a) there is no native Facebook app, b) no one is logged into
++     * it, or c) the app has previously called
++     * {@link AppEventsLogger#setLimitEventUsage(android.content.Context, boolean)} with `true` for this user.
+      *
+      * @param session
+      *            the Session to issue the Request on, or null; if non-null, the session must be in an opened state.
+@@ -537,7 +540,9 @@ public static Request newCustomAudienceThirdPartyIdRequest(Session session, Cont
+      * The ID retrieved represents the Facebook user identified in the following way: if the specified session
+      * (or activeSession if the specified session is `null`) is open, the ID will represent the user associated with
+      * the activeSession; otherwise the ID will represent the user logged into the native Facebook app on the device.
+-     * If there is no native Facebook app, no one is logged into it, then a `null` ID will be returned.
++     * A `null` ID will be provided into the callback if a) there is no native Facebook app, b) no one is logged into
++     * it, or c) the app has previously called
++     * {@link AppEventsLogger#setLimitEventUsage(android.content.Context, boolean)} with `true` for this user.
+      *
+      * @param session
+      *            the Session to issue the Request on, or null; if non-null, the session must be in an opened state.
+@@ -590,6 +595,12 @@ public static Request newCustomAudienceThirdPartyIdRequest(Session session,
+             }
+         }
+ 
++        // Server will choose to not provide the App User ID in the event that event usage has been limited for
++        // this user for this app.
++        if (AppEventsLogger.getLimitEventUsage(context)) {
++            parameters.putString("limit_event_usage", "1");
++        }
++
+         return new Request(session, endpoint, parameters, HttpMethod.GET, callback);
+     }
+ 
+@@ -645,7 +656,7 @@ public static Request newUploadStagingResourceWithImageRequest(Session session,
+      * @param session
+      *            the Session to use, or null; if non-null, the session must be in an opened state
+      * @param openGraphObject
+-     *            the Open Graph object to create
++     *            the Open Graph object to create; must not be null, and must have a non-empty type and title
+      * @param callback
+      *            a callback that will be called when the request is completed to handle success or error conditions
+      * @return a Request that is ready to execute
+@@ -653,13 +664,13 @@ public static Request newUploadStagingResourceWithImageRequest(Session session,
+     public static Request newPostOpenGraphObjectRequest(Session session,
+             OpenGraphObject openGraphObject, Callback callback) {
+         if (openGraphObject == null) {
+-            throw new IllegalArgumentException("OpenGraphObject cannot be null");
++            throw new FacebookException("openGraphObject cannot be null");
+         }
+-        if (openGraphObject.getType() == null) {
+-            throw new IllegalArgumentException("OpenGraphObject must have non-null 'type' property");
++        if (Utility.isNullOrEmpty(openGraphObject.getType())) {
++            throw new FacebookException("openGraphObject must have non-null 'type' property");
+         }
+-        if (openGraphObject.getTitle() == null) {
+-            throw new IllegalArgumentException("OpenGraphObject must have non-null 'title' property");
++        if (Utility.isNullOrEmpty(openGraphObject.getTitle())) {
++            throw new FacebookException("openGraphObject must have non-null 'title' property");
+         }
+ 
+         String path = String.format(MY_OBJECTS_FORMAT, openGraphObject.getType());
+@@ -701,6 +712,30 @@ public static Request newPostOpenGraphObjectRequest(Session session, String type
+         return newPostOpenGraphObjectRequest(session, openGraphObject, callback);
+     }
+ 
++    /**
++     * Creates a new Request configured to publish an Open Graph action.
++     *
++     * @param session
++     *            the Session to use, or null; if non-null, the session must be in an opened state
++     * @param openGraphAction
++     *            the Open Graph object to create; must not be null, and must have a non-empty 'type'
++     * @param callback
++     *            a callback that will be called when the request is completed to handle success or error conditions
++     * @return a Request that is ready to execute
++     */
++    public static Request newPostOpenGraphActionRequest(Session session, OpenGraphAction openGraphAction,
++            Callback callback) {
++        if (openGraphAction == null) {
++            throw new FacebookException("openGraphAction cannot be null");
++        }
++        if (Utility.isNullOrEmpty(openGraphAction.getType())) {
++            throw new FacebookException("openGraphAction must have non-null 'type' property");
++        }
++
++        String path = String.format(MY_ACTION_FORMAT, openGraphAction.getType());
++        return newPostRequest(session, path, openGraphAction, callback);
++    }
++
+     /**
+      * Creates a new Request configured to delete a resource through the Graph API.
+      *
+@@ -730,12 +765,12 @@ public static Request newDeleteObjectRequest(Session session, String id, Callbac
+     public static Request newUpdateOpenGraphObjectRequest(Session session, OpenGraphObject openGraphObject,
+             Callback callback) {
+         if (openGraphObject == null) {
+-            throw new IllegalArgumentException("OpenGraphObject cannot be null");
++            throw new FacebookException("openGraphObject cannot be null");
+         }
+ 
+         String path = openGraphObject.getId();
+         if (path == null) {
+-            throw new IllegalArgumentException("OpenGraphObject must have an id");
++            throw new FacebookException("openGraphObject must have an id");
+         }
+ 
+         Bundle bundle = new Bundle();
+diff --git a/facebook/src/com/facebook/Settings.java b/facebook/src/com/facebook/Settings.java
+index 3f3bd6314..734dfefac 100644
+--- a/facebook/src/com/facebook/Settings.java
++++ b/facebook/src/com/facebook/Settings.java
+@@ -414,14 +414,19 @@ static Response publishInstallAndWaitForResponse(
+      * @return returns null if the facebook app is not present on the phone.
+      */
+     public static String getAttributionId(ContentResolver contentResolver) {
+-        String [] projection = {ATTRIBUTION_ID_COLUMN_NAME};
+-        Cursor c = contentResolver.query(ATTRIBUTION_ID_CONTENT_URI, projection, null, null, null);
+-        if (c == null || !c.moveToFirst()) {
++        try {
++            String [] projection = {ATTRIBUTION_ID_COLUMN_NAME};
++            Cursor c = contentResolver.query(ATTRIBUTION_ID_CONTENT_URI, projection, null, null, null);
++            if (c == null || !c.moveToFirst()) {
++                return null;
++            }
++            String attributionId = c.getString(c.getColumnIndex(ATTRIBUTION_ID_COLUMN_NAME));
++            c.close();
++            return attributionId;
++        } catch (Exception e) {
++            Log.d(TAG, "Caught unexpected exception in getAttributionId(): " + e.toString());
+             return null;
+         }
+-        String attributionId = c.getString(c.getColumnIndex(ATTRIBUTION_ID_COLUMN_NAME));
+-        c.close();
+-        return attributionId;
+     }
+ 
+     /**
+diff --git a/facebook/src/com/facebook/internal/FileLruCache.java b/facebook/src/com/facebook/internal/FileLruCache.java
+index ab2998454..dba6a5e0e 100644
+--- a/facebook/src/com/facebook/internal/FileLruCache.java
++++ b/facebook/src/com/facebook/internal/FileLruCache.java
+@@ -78,10 +78,10 @@ public FileLruCache(Context context, String tag, Limits limits) {
+         this.lock = new Object();
+ 
+         // Ensure the cache dir exists
+-        this.directory.mkdirs();
+-
+-        // Remove any stale partially-written files from a previous run
+-        BufferFile.deleteAll(this.directory);
++        if (this.directory.mkdirs() || this.directory.isDirectory()) {
++            // Remove any stale partially-written files from a previous run
++            BufferFile.deleteAll(this.directory);
++        }
+     }
+ 
+     // This is not robust to files changing dynamically underneath it and should therefore only be used
+@@ -102,8 +102,10 @@ long sizeInBytesForTest() {
+ 
+         File[] files = this.directory.listFiles();
+         long total = 0;
+-        for (File file : files) {
+-            total += file.length();
++        if (files != null) {
++            for (File file : files) {
++                total += file.length();
++            }
+         }
+         return total;
+     }
+@@ -221,14 +223,16 @@ public void clearCache() {
+         // get the current directory listing of files to delete
+         final File[] filesToDelete = directory.listFiles(BufferFile.excludeBufferFiles());
+         lastClearCacheTime.set(System.currentTimeMillis());
+-        Settings.getExecutor().execute(new Runnable() {
+-            @Override
+-            public void run() {
+-                for (File file : filesToDelete) {
+-                    file.delete();
++        if (filesToDelete != null) {
++            Settings.getExecutor().execute(new Runnable() {
++                @Override
++                public void run() {
++                    for (File file : filesToDelete) {
++                        file.delete();
++                    }
+                 }
+-            }
+-        });
++            });
++        }
+     }
+ 
+     private void renameToTargetAndTrim(String key, File buffer) {
+@@ -278,14 +282,17 @@ private void trim() {
+             PriorityQueue<ModifiedFile> heap = new PriorityQueue<ModifiedFile>();
+             long size = 0;
+             long count = 0;
+-            for (File file : this.directory.listFiles(BufferFile.excludeBufferFiles())) {
+-                ModifiedFile modified = new ModifiedFile(file);
+-                heap.add(modified);
+-                Logger.log(LoggingBehavior.CACHE, TAG, "  trim considering time=" + Long.valueOf(modified.getModified())
+-                        + " name=" + modified.getFile().getName());
+-
+-                size += file.length();
+-                count++;
++            File[] filesToTrim =this.directory.listFiles(BufferFile.excludeBufferFiles());
++            if (filesToTrim != null) {
++                for (File file : filesToTrim) {
++                    ModifiedFile modified = new ModifiedFile(file);
++                    heap.add(modified);
++                    Logger.log(LoggingBehavior.CACHE, TAG, "  trim considering time=" + Long.valueOf(modified.getModified())
++                            + " name=" + modified.getFile().getName());
++
++                    size += file.length();
++                    count++;
++                }
+             }
+ 
+             while ((size > limits.getByteCount()) || (count > limits.getFileCount())) {
+@@ -319,8 +326,11 @@ public boolean accept(File dir, String filename) {
+         };
+ 
+         static void deleteAll(final File root) {
+-            for (File file : root.listFiles(excludeNonBufferFiles())) {
+-                file.delete();
++            File[] filesToDelete = root.listFiles(excludeNonBufferFiles());
++            if (filesToDelete != null) {
++                for (File file : filesToDelete) {
++                    file.delete();
++                }
+             }
+         }
+ 
+diff --git a/facebook/src/com/facebook/model/OpenGraphAction.java b/facebook/src/com/facebook/model/OpenGraphAction.java
+index 36b85fff7..d82d34a80 100644
+--- a/facebook/src/com/facebook/model/OpenGraphAction.java
++++ b/facebook/src/com/facebook/model/OpenGraphAction.java
+@@ -245,6 +245,26 @@
+      */
+     void setData(GraphObject data);
+ 
++
++    /**
++     * Gets whether the action has been explicitly shared by the user. See
++     * <a href="https://developers.facebook.com/docs/opengraph/guides/explicit-sharing/">Explicit Sharing</a> for
++     * more information.
++     * @return true if this action was explicitly shared
++     */
++    @PropertyName("fb:explicitly_shared")
++    boolean getExplicitlyShared();
++
++    /**
++     * Sets whether the action has been explicitly shared by the user. See
++     * <a href="https://developers.facebook.com/docs/opengraph/guides/explicit-sharing/">Explicit Sharing</a> for
++     * more information. You should only specify this property if explicit sharing has been enabled for an
++     * Open Graph action type.
++     * @param explicitlyShared true if this action was explicitly shared
++     */
++    @PropertyName("fb:explicitly_shared")
++    void setExplicitlyShared(boolean explicitlyShared);
++
+     /**
+      * Exposes helpers for creating instances of OpenGraphAction.
+      */
+@@ -253,8 +273,34 @@
+          * Creates an OpenGraphAction suitable for posting via, e.g., a native Share dialog.
+          * @return an OpenGraphAction
+          */
++        @Deprecated
+         public static OpenGraphAction createForPost() {
+-            return GraphObject.Factory.create(OpenGraphAction.class);
++            return createForPost(OpenGraphAction.class, null);
++        }
++
++        /**
++         * Creates an OpenGraphAction suitable for posting via, e.g., a native Share dialog.
++         * @param type the Open Graph action type for the action, or null if it will be specified later
++         * @return an OpenGraphAction
++         */
++        public static OpenGraphAction createForPost(String type) {
++            return createForPost(OpenGraphAction.class, type);
++        }
++
++        /**
++         * Creates an OpenGraphAction suitable for posting via, e.g., a native Share dialog.
++         * @param type the Open Graph action type for the action, or null if it will be specified later
++         * @param graphObjectClass the OpenGraphAction-derived type to return
++         * @return an OpenGraphAction
++         */
++        public static <T extends OpenGraphAction> T createForPost(Class<T> graphObjectClass, String type) {
++            T object = GraphObject.Factory.create(graphObjectClass);
++
++            if (type != null) {
++                object.setType(type);
++            }
++
++            return object;
+         }
+     }
+ }
+diff --git a/facebook/src/com/facebook/widget/FacebookDialog.java b/facebook/src/com/facebook/widget/FacebookDialog.java
+index 5e32a7afe..058a9f145 100644
+--- a/facebook/src/com/facebook/widget/FacebookDialog.java
++++ b/facebook/src/com/facebook/widget/FacebookDialog.java
+@@ -33,6 +33,7 @@
+ import org.json.JSONException;
+ import org.json.JSONObject;
+ 
++import java.io.File;
+ import java.util.*;
+ 
+ /*
+@@ -566,9 +567,10 @@ Intent handleBuild(Bundle extras) {
+      */
+     public static class OpenGraphActionDialogBuilder extends Builder<OpenGraphActionDialogBuilder> {
+         private String previewPropertyName;
+-        private String actionType;
+         private OpenGraphAction action;
++        private String actionType;
+         private HashMap<String, Bitmap> imageAttachments;
++        private HashMap<String, File> imageAttachmentFiles;
+         private boolean dataErrorsFatal;
+ 
+         /**
+@@ -576,12 +578,15 @@ Intent handleBuild(Bundle extras) {
+          * @param activity the Activity which is presenting the native Open Graph action publish dialog;
+          *                 must not be null
+          * @param action the Open Graph action to be published, which must contain a reference to at least one
+-         *               Open Graph object with the property name specified by setPreviewPropertyName
++         *               Open Graph object with the property name specified by setPreviewPropertyName; the action
++         *               must have had its type specified via the {@link OpenGraphAction#setType(String)} method
+          * @param actionType the type of the Open Graph action to be published, which should be the namespace-qualified
+-         *                   name of the action type (e.g., "myappnamespace:myactiontype").
++         *                   name of the action type (e.g., "myappnamespace:myactiontype"); this will override the type
++         *                   of the action passed in.
+          * @param previewPropertyName the name of a property on the Open Graph action that contains the
+          *                            Open Graph object which will be displayed as a preview to the user
+          */
++        @Deprecated
+         public OpenGraphActionDialogBuilder(Activity activity, OpenGraphAction action, String actionType,
+                 String previewPropertyName) {
+             super(activity);
+@@ -589,6 +594,38 @@ public OpenGraphActionDialogBuilder(Activity activity, OpenGraphAction action, S
+             Validate.notNull(action, "action");
+             Validate.notNullOrEmpty(actionType, "actionType");
+             Validate.notNullOrEmpty(previewPropertyName, "previewPropertyName");
++            if (action.getProperty(previewPropertyName) == null) {
++                throw new IllegalArgumentException(
++                        "A property named \"" + previewPropertyName + "\" was not found on the action.  The name of " +
++                                "the preview property must match the name of an action property.");
++            }
++            String typeOnAction = action.getType();
++            if (!Utility.isNullOrEmpty(typeOnAction) && !typeOnAction.equals(actionType)) {
++                throw new IllegalArgumentException("'actionType' must match the type of 'action' if it is specified. " +
++                        "Consider using OpenGraphActionDialogBuilder(Activity activity, OpenGraphAction action, " +
++                        "String previewPropertyName) instead.");
++            }
++            this.action = action;
++            this.actionType = actionType;
++            this.previewPropertyName = previewPropertyName;
++        }
++
++        /**
++         * Constructor.
++         * @param activity the Activity which is presenting the native Open Graph action publish dialog;
++         *                 must not be null
++         * @param action the Open Graph action to be published, which must contain a reference to at least one
++         *               Open Graph object with the property name specified by setPreviewPropertyName; the action
++         *               must have had its type specified via the {@link OpenGraphAction#setType(String)} method
++         * @param previewPropertyName the name of a property on the Open Graph action that contains the
++         *                            Open Graph object which will be displayed as a preview to the user
++         */
++        public OpenGraphActionDialogBuilder(Activity activity, OpenGraphAction action, String previewPropertyName) {
++            super(activity);
++
++            Validate.notNull(action, "action");
++            Validate.notNullOrEmpty(action.getType(), "action.getType()");
++            Validate.notNullOrEmpty(previewPropertyName, "previewPropertyName");
+             if (action.getProperty(previewPropertyName) == null) {
+                 throw new IllegalArgumentException(
+                         "A property named \"" + previewPropertyName + "\" was not found on the action.  The name of " +
+@@ -596,7 +633,7 @@ public OpenGraphActionDialogBuilder(Activity activity, OpenGraphAction action, S
+             }
+ 
+             this.action = action;
+-            this.actionType = actionType;
++            this.actionType = action.getType();
+             this.previewPropertyName = previewPropertyName;
+         }
+ 
+@@ -612,14 +649,15 @@ public OpenGraphActionDialogBuilder setDataErrorsFatal(boolean dataErrorsFatal)
+         }
+ 
+         /**
+-         * Specifies a list of images for the Open Graph action that should be uploaded prior to publishing the action.
+-         * The action must already have been set prior to calling this method. This method will generate unique
++         * <p>Specifies a list of images for the Open Graph action that should be uploaded prior to publishing the
++         * action. The action must already have been set prior to calling this method. This method will generate unique
+          * names for the image attachments and update the action to refer to these attachments. Note that calling
+          * setAction again after calling this method will not clear the image attachments already set, but the new
+-         * action will have no reference to the existing attachments.
++         * action will have no reference to the existing attachments. The images will not be marked as being
++         * user-generated.</p>
+          *
+-         * In order for the images to be provided to the Facebook application as part of the app call, the
+-         * NativeAppCallContentProvider must be specified correctly in the application's AndroidManifest.xml.
++         * <p>In order for the images to be provided to the Facebook application as part of the app call, the
++         * NativeAppCallContentProvider must be specified correctly in the application's AndroidManifest.xml.</p>
+          *
+          * @param bitmaps a list of Bitmaps to be uploaded and attached to the Open Graph action
+          * @return this instance of the builder
+@@ -628,53 +666,155 @@ public OpenGraphActionDialogBuilder setImageAttachmentsForAction(List<Bitmap> bi
+             return setImageAttachmentsForAction(bitmaps, false);
+         }
+ 
+-        public OpenGraphActionDialogBuilder setImageAttachmentsForAction(List<Bitmap> bitmaps, boolean isUserGenerated) {
++        /**
++         * <p>Specifies a list of images for the Open Graph action that should be uploaded prior to publishing the
++         * action. The action must already have been set prior to calling this method. This method will generate unique
++         * names for the image attachments and update the action to refer to these attachments. Note that calling
++         * setAction again after calling this method will not clear the image attachments already set, but the new
++         * action will have no reference to the existing attachments. The images may be marked as being
++         * user-generated -- refer to
++         * <a href="https://developers.facebook.com/docs/opengraph/howtos/adding-photos-to-stories/">this article</a>
++         * for more information.</p>
++         *
++         * <p>In order for the images to be provided to the Facebook application as part of the app call, the
++         * NativeAppCallContentProvider must be specified correctly in the application's AndroidManifest.xml.</p>
++         *
++         * @param bitmaps a list of Bitmaps to be uploaded and attached to the Open Graph action
++         * @param isUserGenerated if true, specifies that the user_generated flag should be set for these images
++         * @return this instance of the builder
++         */
++        public OpenGraphActionDialogBuilder setImageAttachmentsForAction(List<Bitmap> bitmaps,
++                boolean isUserGenerated) {
+             Validate.containsNoNulls(bitmaps, "bitmaps");
+             if (action == null) {
+                 throw new FacebookException("Can not set attachments prior to setting action.");
+             }
+ 
+             List<String> attachmentUrls = addImageAttachments(bitmaps);
++            updateActionAttachmentUrls(attachmentUrls, isUserGenerated);
+ 
+-            if (isUserGenerated) {
+-                List<JSONObject> attachments = new ArrayList<JSONObject>(attachmentUrls.size());
+-                for (String url : attachmentUrls) {
+-                    JSONObject jsonObject = new JSONObject();
+-                    try {
+-                        jsonObject.put(NativeProtocol.IMAGE_URL_KEY, url);
++            return this;
++        }
++
++        /**
++         * <p>Specifies a list of images for the Open Graph action that should be uploaded prior to publishing the
++         * action. The action must already have been set prior to calling this method.  The images will not be marked
++         * as being user-generated. This method will generate unique names for the image attachments and update the
++         * action to refer to these attachments. Note that calling setAction again after calling this method will
++         * not clear the image attachments already set, but the new action will have no reference to the existing
++         * attachments.</p>
++         *
++         * <p>In order for the images to be provided to the Facebook application as part of the app call, the
++         * NativeAppCallContentProvider must be specified correctly in the application's AndroidManifest.xml.</p>
++         *
++         * @param bitmapFiles a list of Files containing bitmaps to be uploaded and attached to the Open Graph action
++         * @return this instance of the builder
++         */
++        public OpenGraphActionDialogBuilder setImageAttachmentFilesForAction(List<File> bitmapFiles) {
++            return setImageAttachmentFilesForAction(bitmapFiles, false);
++        }
++
++        /**
++         * <p>Specifies a list of images for the Open Graph action that should be uploaded prior to publishing the
++         * action. The action must already have been set prior to calling this method. The images may be marked as being
++         * user-generated -- refer to
++         * <a href="https://developers.facebook.com/docs/opengraph/howtos/adding-photos-to-stories/">this article</a>
++         * for more information. This method will generate unique
++         * names for the image attachments and update the action to refer to these attachments. Note that calling
++         * setAction again after calling this method will not clear the image attachments already set, but the new
++         * action will have no reference to the existing attachments.</p>
++         *
++         * <p>In order for the images to be provided to the Facebook application as part of the app call, the
++         * NativeAppCallContentProvider must be specified correctly in the application's AndroidManifest.xml.</p>
++         *
++         * @param bitmapFiles a list of Files containing bitmaps to be uploaded and attached to the Open Graph action
++         * @param isUserGenerated if true, specifies that the user_generated flag should be set for these images
++         * @return this instance of the builder
++         */
++        public OpenGraphActionDialogBuilder setImageAttachmentFilesForAction(List<File> bitmapFiles,
++                boolean isUserGenerated) {
++            Validate.containsNoNulls(bitmapFiles, "bitmapFiles");
++            if (action == null) {
++                throw new FacebookException("Can not set attachments prior to setting action.");
++            }
++
++            List<String> attachmentUrls = addImageAttachmentFiles(bitmapFiles);
++            updateActionAttachmentUrls(attachmentUrls, isUserGenerated);
++
++            return this;
++        }
++
++        private void updateActionAttachmentUrls(List<String> attachmentUrls, boolean isUserGenerated) {
++            List<JSONObject> attachments = action.getImage();
++            if (attachments == null) {
++                attachments = new ArrayList<JSONObject>(attachmentUrls.size());
++            }
++
++            for (String url : attachmentUrls) {
++                JSONObject jsonObject = new JSONObject();
++                try {
++                    jsonObject.put(NativeProtocol.IMAGE_URL_KEY, url);
++                    if (isUserGenerated) {
+                         jsonObject.put(NativeProtocol.IMAGE_USER_GENERATED_KEY, true);
+-                    } catch (JSONException e) {
+-                        throw new FacebookException("Unable to attach images", e);
+                     }
+-                    attachments.add(jsonObject);
++                } catch (JSONException e) {
++                    throw new FacebookException("Unable to attach images", e);
+                 }
+-                action.setImage(attachments);
+-            } else {
+-                action.setImageUrls(attachmentUrls);
++                attachments.add(jsonObject);
+             }
+-            return this;
++            action.setImage(attachments);
+         }
+ 
++
+         /**
+-         * Specifies a list of images for an Open Graph object referenced by the action that should be uploaded
+-         * prior to publishing the action. The action must already have been set prior to calling this method, and
++         * <p>Specifies a list of images for an Open Graph object referenced by the action that should be uploaded
++         * prior to publishing the action. The images will not be marked as user-generated.
++         * The action must already have been set prior to calling this method, and
+          * the action must have a GraphObject-valued property with the specified property name. This method will
+          * generate unique names for the image attachments and update the graph object to refer to these
+          * attachments. Note that calling setObject again after calling this method, or modifying the value of the
+          * specified property, will not clear the image attachments already set, but the new action (or objects)
+-         * will have no reference to the existing attachments.
++         * will have no reference to the existing attachments.</p>
+          *
+-         * In order for the images to be provided to the Facebook application as part of the app call, the
+-         * NativeAppCallContentProvider must be specified correctly in the application's AndroidManifest.xml.
++         * <p>In order for the images to be provided to the Facebook application as part of the app call, the
++         * NativeAppCallContentProvider must be specified correctly in the application's AndroidManifest.xml.</p>
+          *
+-         * @param objectProperty the name of a property on the action that corresponds to an Open Graph object
+-         * @param bitmaps a list of Bitmaps to be uploaded and attached to the Open Graph object
++         * @param objectProperty the name of a property on the action that corresponds to an Open Graph object;
++         *                       the object must be marked as a new object to be created
++         *                       (i.e., {@link com.facebook.model.OpenGraphObject#getCreateObject()} must return
++         *                       true) or an exception will be thrown
++         * @param bitmapFiles a list of Files containing bitmaps to be uploaded and attached to the Open Graph object
+          * @return this instance of the builder
+          */
+         public OpenGraphActionDialogBuilder setImageAttachmentsForObject(String objectProperty, List<Bitmap> bitmaps) {
+             return setImageAttachmentsForObject(objectProperty, bitmaps, false);
+         }
+ 
++        /**
++         * <p>Specifies a list of images for an Open Graph object referenced by the action that should be uploaded
++         * prior to publishing the action. The images may be marked as being
++         * user-generated -- refer to
++         * <a href="https://developers.facebook.com/docs/opengraph/howtos/adding-photos-to-stories/">this article</a>
++         * for more information.
++         * The action must already have been set prior to calling this method, and
++         * the action must have a GraphObject-valued property with the specified property name. This method will
++         * generate unique names for the image attachments and update the graph object to refer to these
++         * attachments. Note that calling setObject again after calling this method, or modifying the value of the
++         * specified property, will not clear the image attachments already set, but the new action (or objects)
++         * will have no reference to the existing attachments.</p>
++         *
++         * <p>In order for the images to be provided to the Facebook application as part of the app call, the
++         * NativeAppCallContentProvider must be specified correctly in the application's AndroidManifest.xml.</p>
++         *
++         * @param objectProperty the name of a property on the action that corresponds to an Open Graph object;
++         *                       the object must be marked as a new object to be created
++         *                       (i.e., {@link com.facebook.model.OpenGraphObject#getCreateObject()} must return
++         *                       true) or an exception will be thrown
++         * @param objectProperty the name of a property on the action that corresponds to an Open Graph object
++         * @param bitmapFiles a list of Files containing bitmaps to be uploaded and attached to the Open Graph object
++         * @param isUserGenerated if true, specifies that the user_generated flag should be set for these images
++         * @return this instance of the builder
++         */
+         public OpenGraphActionDialogBuilder setImageAttachmentsForObject(String objectProperty, List<Bitmap> bitmaps,
+                 boolean isUserGenerated) {
+             Validate.notNull(objectProperty, "objectProperty");
+@@ -683,31 +823,103 @@ public OpenGraphActionDialogBuilder setImageAttachmentsForObject(String objectPr
+                 throw new FacebookException("Can not set attachments prior to setting action.");
+             }
+ 
++            List<String> attachmentUrls = addImageAttachments(bitmaps);
++            updateObjectAttachmentUrls(objectProperty, attachmentUrls, isUserGenerated);
++
++            return this;
++        }
++
++        /**
++         * <p>Specifies a list of images for an Open Graph object referenced by the action that should be uploaded
++         * prior to publishing the action. The images will not be marked as user-generated.
++         * The action must already have been set prior to calling this method, and
++         * the action must have a GraphObject-valued property with the specified property name. This method will
++         * generate unique names for the image attachments and update the graph object to refer to these
++         * attachments. Note that calling setObject again after calling this method, or modifying the value of the
++         * specified property, will not clear the image attachments already set, but the new action (or objects)
++         * will have no reference to the existing attachments.</p>
++         *
++         * <p>In order for the images to be provided to the Facebook application as part of the app call, the
++         * NativeAppCallContentProvider must be specified correctly in the application's AndroidManifest.xml.</p>
++         *
++         * @param objectProperty the name of a property on the action that corresponds to an Open Graph object;
++         *                       the object must be marked as a new object to be created
++         *                       (i.e., {@link com.facebook.model.OpenGraphObject#getCreateObject()} must return
++         *                       true) or an exception will be thrown
++         * @param bitmaps a list of Bitmaps to be uploaded and attached to the Open Graph object
++         * @return this instance of the builder
++         */
++        public OpenGraphActionDialogBuilder setImageAttachmentFilesForObject(String objectProperty,
++                List<File> bitmapFiles) {
++            return setImageAttachmentFilesForObject(objectProperty, bitmapFiles, false);
++        }
++
++        /**
++         * <p>Specifies a list of images for an Open Graph object referenced by the action that should be uploaded
++         * prior to publishing the action. The images may be marked as being
++         * user-generated -- refer to
++         * <a href="https://developers.facebook.com/docs/opengraph/howtos/adding-photos-to-stories/">this article</a>
++         * for more information.
++         * The action must already have been set prior to calling this method, and
++         * the action must have a GraphObject-valued property with the specified property name. This method will
++         * generate unique names for the image attachments and update the graph object to refer to these
++         * attachments. Note that calling setObject again after calling this method, or modifying the value of the
++         * specified property, will not clear the image attachments already set, but the new action (or objects)
++         * will have no reference to the existing attachments.</p>
++         *
++         * <p>In order for the images to be provided to the Facebook application as part of the app call, the
++         * NativeAppCallContentProvider must be specified correctly in the application's AndroidManifest.xml.</p>
++         *
++         * @param objectProperty the name of a property on the action that corresponds to an Open Graph object;
++         *                       the object must be marked as a new object to be created
++         *                       (i.e., {@link com.facebook.model.OpenGraphObject#getCreateObject()} must return
++         *                       true) or an exception will be thrown
++         * @param bitmaps a list of Bitmaps to be uploaded and attached to the Open Graph object
++         * @param isUserGenerated if true, specifies that the user_generated flag should be set for these images
++         * @return this instance of the builder
++         */
++        public OpenGraphActionDialogBuilder setImageAttachmentFilesForObject(String objectProperty,
++                List<File> bitmapFiles, boolean isUserGenerated) {
++            Validate.notNull(objectProperty, "objectProperty");
++            Validate.containsNoNulls(bitmapFiles, "bitmapFiles");
++            if (action == null) {
++                throw new FacebookException("Can not set attachments prior to setting action.");
++            }
++
++            List<String> attachmentUrls = addImageAttachmentFiles(bitmapFiles);
++            updateObjectAttachmentUrls(objectProperty, attachmentUrls, isUserGenerated);
++
++            return this;
++        }
++
++        void updateObjectAttachmentUrls(String objectProperty, List<String> attachmentUrls, boolean isUserGenerated) {
+             final OpenGraphObject object;
+             try {
+                 object = action.getPropertyAs(objectProperty, OpenGraphObject.class);
+                 if (object == null) {
+-                    throw new IllegalArgumentException("Action does not contain a property" + objectProperty);
++                    throw new IllegalArgumentException("Action does not contain a property '" + objectProperty + "'");
+                 }
+             } catch (FacebookGraphObjectException exception) {
+-                throw new IllegalArgumentException("Property " + objectProperty + " is not a graph object.");
++                throw new IllegalArgumentException("Property '" + objectProperty + "' is not a graph object");
++            }
++            if (!object.getCreateObject()) {
++                throw new IllegalArgumentException(
++                        "The Open Graph object in '" + objectProperty + "' is not marked for creation");
+             }
+ 
+-            List<String> attachmentUrls = addImageAttachments(bitmaps);
+-
+-            if (isUserGenerated) {
+-                GraphObjectList<GraphObject> attachments = GraphObject.Factory.createList(GraphObject.class);
+-                for (String url : attachmentUrls) {
+-                    GraphObject graphObject = GraphObject.Factory.create();
+-                    graphObject.setProperty(NativeProtocol.IMAGE_URL_KEY, url);
++            GraphObjectList<GraphObject> attachments = object.getImage();
++            if (attachments == null) {
++                attachments = GraphObject.Factory.createList(GraphObject.class);
++            }
++            for (String url : attachmentUrls) {
++                GraphObject graphObject = GraphObject.Factory.create();
++                graphObject.setProperty(NativeProtocol.IMAGE_URL_KEY, url);
++                if (isUserGenerated) {
+                     graphObject.setProperty(NativeProtocol.IMAGE_USER_GENERATED_KEY, true);
+-                    attachments.add(graphObject);
+                 }
+-                object.setImage(attachments);
+-            } else {
+-                object.setImageUrls(attachmentUrls);
++                attachments.add(graphObject);
+             }
+-            return this;
++            object.setImage(attachments);
+         }
+ 
+         private List<String> addImageAttachments(List<Bitmap> bitmaps) {
+@@ -725,6 +937,21 @@ public OpenGraphActionDialogBuilder setImageAttachmentsForObject(String objectPr
+             return attachmentUrls;
+         }
+ 
++        private List<String> addImageAttachmentFiles(List<File> bitmapFiles) {
++            ArrayList<String> attachmentUrls = new ArrayList<String>();
++            for (File bitmapFile : bitmapFiles) {
++                String attachmentName = UUID.randomUUID().toString();
++
++                addImageAttachment(attachmentName, bitmapFile);
++
++                String url = NativeAppCallContentProvider.getAttachmentUrl(applicationId, appCall.getCallId(),
++                        attachmentName);
++                attachmentUrls.add(url);
++            }
++
++            return attachmentUrls;
++        }
++
+         List<String> getImageAttachmentNames() {
+             return new ArrayList<String>(imageAttachments.keySet());
+         }
+@@ -763,6 +990,10 @@ public void onPresent(Context context) throws Exception {
+                     if (imageAttachments != null && imageAttachments.size() > 0) {
+                         getAttachmentStore().addAttachmentsForCall(context, appCall.getCallId(), imageAttachments);
+                     }
++                    if (imageAttachmentFiles != null && imageAttachmentFiles.size() > 0) {
++                        getAttachmentStore().addAttachmentFilesForCall(context, appCall.getCallId(),
++                                imageAttachmentFiles);
++                    }
+                 }
+             };
+         }
+@@ -775,6 +1006,14 @@ private OpenGraphActionDialogBuilder addImageAttachment(String imageName, Bitmap
+             return this;
+         }
+ 
++        private OpenGraphActionDialogBuilder addImageAttachment(String imageName, File attachment) {
++            if (imageAttachmentFiles == null) {
++                imageAttachmentFiles = new HashMap<String, File>();
++            }
++            imageAttachmentFiles.put(imageName, attachment);
++            return this;
++        }
++
+         private JSONObject flattenChildrenOfGraphObject(JSONObject graphObject) {
+             try {
+                 // Clone the existing object to avoid modifying it from under the caller.
+diff --git a/facebook/tests/src/com/facebook/BatchRequestTests.java b/facebook/tests/src/com/facebook/BatchRequestTests.java
+index 99bbebd19..833d024d8 100644
+--- a/facebook/tests/src/com/facebook/BatchRequestTests.java
++++ b/facebook/tests/src/com/facebook/BatchRequestTests.java
+@@ -81,6 +81,33 @@ public void testBatchWithoutAppIDIsError() {
+         Request.executeBatchAndWait(request1, request2);
+     }
+ 
++    @MediumTest
++    @LargeTest
++    public void testExecuteBatchRequestsPathEncoding() throws IOException {
++        // ensures that paths passed to batch requests are encoded properly before
++        // we send it up to the server
++
++        setBatchApplicationIdForTestApp();
++
++        Request request1 = new Request(null, "TourEiffel");
++        request1.setBatchEntryName("eiffel");
++        request1.setBatchEntryOmitResultOnSuccess(false);
++        Request request2 = new Request(null, "{result=eiffel:$.id}");
++
++        List<Response> responses = Request.executeBatchAndWait(request1, request2);
++        assertEquals(2, responses.size());
++        assertTrue(responses.get(0).getError() == null);
++        assertTrue(responses.get(1).getError() == null);
++
++        GraphPlace eiffelTower1 = responses.get(0).getGraphObjectAs(GraphPlace.class);
++        GraphPlace eiffelTower2 = responses.get(1).getGraphObjectAs(GraphPlace.class);
++        assertTrue(eiffelTower1 != null);
++        assertTrue(eiffelTower2 != null);
++
++        assertEquals("Paris", eiffelTower1.getLocation().getCity());
++        assertEquals("Paris", eiffelTower2.getLocation().getCity());
++    }
++
+     @MediumTest
+     @LargeTest
+     public void testExecuteBatchedGets() throws IOException {
+diff --git a/facebook/tests/src/com/facebook/RequestTests.java b/facebook/tests/src/com/facebook/RequestTests.java
+index 937e1e089..f162977d7 100644
+--- a/facebook/tests/src/com/facebook/RequestTests.java
++++ b/facebook/tests/src/com/facebook/RequestTests.java
+@@ -133,6 +133,129 @@ public void testCreatePlacesSearchRequestRequiresLocationOrSearchText() {
+         }
+     }
+ 
++    @SmallTest
++    @MediumTest
++    @LargeTest
++    public void testNewPostOpenGraphObjectRequestRequiresObject() {
++        try {
++            Request.newPostOpenGraphObjectRequest(null, null, null);
++            fail("expected exception");
++        } catch (FacebookException exception) {
++            // Success
++        }
++    }
++
++    @SmallTest
++    @MediumTest
++    @LargeTest
++    public void testNewPostOpenGraphObjectRequestRequiresObjectType() {
++        try {
++            OpenGraphObject object = OpenGraphObject.Factory.createForPost(null);
++            Request.newPostOpenGraphObjectRequest(null, object, null);
++            fail("expected exception");
++        } catch (FacebookException exception) {
++            // Success
++        }
++    }
++
++    @SmallTest
++    @MediumTest
++    @LargeTest
++    public void testNewPostOpenGraphObjectRequestRequiresNonEmptyObjectType() {
++        try {
++            OpenGraphObject object = OpenGraphObject.Factory.createForPost("");
++            object.setTitle("bar");
++            Request.newPostOpenGraphObjectRequest(null, object, null);
++            fail("expected exception");
++        } catch (FacebookException exception) {
++            // Success
++        }
++    }
++
++    @SmallTest
++    @MediumTest
++    @LargeTest
++    public void testNewPostOpenGraphObjectRequestRequiresTitle() {
++        try {
++            OpenGraphObject object = OpenGraphObject.Factory.createForPost("foo");
++            Request.newPostOpenGraphObjectRequest(null, object, null);
++            fail("expected exception");
++        } catch (FacebookException exception) {
++            // Success
++        }
++    }
++
++    @SmallTest
++    @MediumTest
++    @LargeTest
++    public void testNewPostOpenGraphObjectRequestRequiresNonEmptyTitle() {
++        try {
++            OpenGraphObject object = OpenGraphObject.Factory.createForPost("foo");
++            object.setTitle("");
++            Request.newPostOpenGraphObjectRequest(null, object, null);
++            fail("expected exception");
++        } catch (FacebookException exception) {
++            // Success
++        }
++    }
++
++    @SmallTest
++    @MediumTest
++    @LargeTest
++    public void testNewPostOpenGraphObjectRequest() {
++        OpenGraphObject object = OpenGraphObject.Factory.createForPost("foo");
++        object.setTitle("bar");
++        Request request = Request.newPostOpenGraphObjectRequest(null, object, null);
++        assertNotNull(request);
++    }
++
++    @SmallTest
++    @MediumTest
++    @LargeTest
++    public void testNewPostOpenGraphActionRequestRequiresAction() {
++        try {
++            Request.newPostOpenGraphActionRequest(null, null, null);
++            fail("expected exception");
++        } catch (FacebookException exception) {
++            // Success
++        }
++    }
++
++    @SmallTest
++    @MediumTest
++    @LargeTest
++    public void testNewPostOpenGraphActionRequestRequiresActionType() {
++        try {
++            OpenGraphAction action = OpenGraphAction.Factory.createForPost(null);
++            Request.newPostOpenGraphActionRequest(null, action, null);
++            fail("expected exception");
++        } catch (FacebookException exception) {
++            // Success
++        }
++    }
++
++    @SmallTest
++    @MediumTest
++    @LargeTest
++    public void testNewPostOpenGraphActionRequestRequiresNonEmptyActionType() {
++        try {
++            OpenGraphAction action = OpenGraphAction.Factory.createForPost("");
++            Request.newPostOpenGraphActionRequest(null, action, null);
++            fail("expected exception");
++        } catch (FacebookException exception) {
++            // Success
++        }
++    }
++
++    @SmallTest
++    @MediumTest
++    @LargeTest
++    public void testNewPostOpenGraphActionRequest() {
++        OpenGraphAction action = OpenGraphAction.Factory.createForPost("foo");
++        Request request = Request.newPostOpenGraphActionRequest(null, action, null);
++        assertNotNull(request);
++    }
++
+     @SmallTest
+     @MediumTest
+     @LargeTest
+diff --git a/facebook/tests/src/com/facebook/model/OpenGraphActionTests.java b/facebook/tests/src/com/facebook/model/OpenGraphActionTests.java
+index 611fa09e7..4ba0daee9 100644
+--- a/facebook/tests/src/com/facebook/model/OpenGraphActionTests.java
++++ b/facebook/tests/src/com/facebook/model/OpenGraphActionTests.java
+@@ -246,7 +246,7 @@ public void testParsedDataWithTypedAction() {
+     }
+ 
+     public void testSetGetTags() {
+-        OpenGraphAction action = OpenGraphAction.Factory.createForPost();
++        OpenGraphAction action = OpenGraphAction.Factory.createForPost("foo");
+ 
+         GraphObject tag = GraphObject.Factory.create();
+         tag.setProperty("id", "123");
+diff --git a/facebook/tests/src/com/facebook/widget/FacebookDialogTests.java b/facebook/tests/src/com/facebook/widget/FacebookDialogTests.java
+index 1f2667c60..9724ccc26 100644
+--- a/facebook/tests/src/com/facebook/widget/FacebookDialogTests.java
++++ b/facebook/tests/src/com/facebook/widget/FacebookDialogTests.java
+@@ -40,11 +40,11 @@ private String getAttachmentNameFromContentUri(String contentUri) {
+ 
+     public void testCantSetAttachmentsWithNullBitmaps() {
+         try {
+-            OpenGraphAction action = OpenGraphAction.Factory.createForPost();
++            OpenGraphAction action = OpenGraphAction.Factory.createForPost("foo");
+             action.setProperty("foo", "bar");
+ 
+             FacebookDialog.OpenGraphActionDialogBuilder builder =
+-                    new FacebookDialog.OpenGraphActionDialogBuilder(getActivity(), action, "foo", "foo");
++                    new FacebookDialog.OpenGraphActionDialogBuilder(getActivity(), action, "foo");
+ 
+             builder.setImageAttachmentsForAction(Arrays.asList((Bitmap)null));
+             fail("expected exception");
+@@ -53,11 +53,11 @@ public void testCantSetAttachmentsWithNullBitmaps() {
+     }
+ 
+     public void testOpenGraphActionImageAttachments() throws JSONException {
+-        OpenGraphAction action = OpenGraphAction.Factory.createForPost();
++        OpenGraphAction action = OpenGraphAction.Factory.createForPost("foo");
+         action.setProperty("foo", "bar");
+ 
+         FacebookDialog.OpenGraphActionDialogBuilder builder =
+-                new FacebookDialog.OpenGraphActionDialogBuilder(getActivity(), action, "foo", "foo");
++                new FacebookDialog.OpenGraphActionDialogBuilder(getActivity(), action, "foo");
+ 
+         Bitmap bitmap = Bitmap.createBitmap(20, 20, Bitmap.Config.ALPHA_8);
+ 
+@@ -78,7 +78,7 @@ public void testOpenGraphActionImageAttachments() throws JSONException {
+     public void testCantSetObjectAttachmentsWithoutAction() {
+         try {
+             FacebookDialog.OpenGraphActionDialogBuilder builder =
+-                    new FacebookDialog.OpenGraphActionDialogBuilder(getActivity(), null, "foo", "foo");
++                    new FacebookDialog.OpenGraphActionDialogBuilder(getActivity(), null, "foo");
+             builder.setImageAttachmentsForObject("foo", new ArrayList<Bitmap>());
+             fail("expected exception");
+         } catch (NullPointerException exception) {
+@@ -87,9 +87,9 @@ public void testCantSetObjectAttachmentsWithoutAction() {
+ 
+     public void testCantSetObjectAttachmentsWithoutObjectProperty() {
+         try {
+-            OpenGraphAction action = OpenGraphAction.Factory.createForPost();
++            OpenGraphAction action = OpenGraphAction.Factory.createForPost("foo");
+             FacebookDialog.OpenGraphActionDialogBuilder builder =
+-                    new FacebookDialog.OpenGraphActionDialogBuilder(getActivity(), action, "foo", "foo");
++                    new FacebookDialog.OpenGraphActionDialogBuilder(getActivity(), action, "foo");
+ 
+             builder.setImageAttachmentsForObject("foo", new ArrayList<Bitmap>());
+             fail("expected exception");
+@@ -99,9 +99,9 @@ public void testCantSetObjectAttachmentsWithoutObjectProperty() {
+ 
+     public void testCantSetObjectAttachmentsWithNonGraphObjectProperty() {
+         try {
+-            OpenGraphAction action = OpenGraphAction.Factory.createForPost();
++            OpenGraphAction action = OpenGraphAction.Factory.createForPost("foo");
+             FacebookDialog.OpenGraphActionDialogBuilder builder =
+-                    new FacebookDialog.OpenGraphActionDialogBuilder(getActivity(), action, "foo", "foo");
++                    new FacebookDialog.OpenGraphActionDialogBuilder(getActivity(), action, "foo");
+ 
+             action.setProperty("foo", "bar");
+ 
+@@ -113,11 +113,11 @@ public void testCantSetObjectAttachmentsWithNonGraphObjectProperty() {
+ 
+     public void testCantSetObjectAttachmentsWithNullBitmaps() {
+         try {
+-            OpenGraphAction action = OpenGraphAction.Factory.createForPost();
++            OpenGraphAction action = OpenGraphAction.Factory.createForPost("foo");
+             action.setProperty("foo", OpenGraphObject.Factory.createForPost("bar"));
+ 
+             FacebookDialog.OpenGraphActionDialogBuilder builder =
+-                    new FacebookDialog.OpenGraphActionDialogBuilder(getActivity(), action, "foo", "foo");
++                    new FacebookDialog.OpenGraphActionDialogBuilder(getActivity(), action, "foo");
+ 
+             builder.setImageAttachmentsForObject("foo", Arrays.asList((Bitmap)null));
+             fail("expected exception");
+@@ -126,12 +126,12 @@ public void testCantSetObjectAttachmentsWithNullBitmaps() {
+     }
+ 
+     public void testOpenGraphObjectImageAttachments() throws JSONException {
+-        OpenGraphAction action = OpenGraphAction.Factory.createForPost();
++        OpenGraphAction action = OpenGraphAction.Factory.createForPost("foo");
+         OpenGraphObject object = OpenGraphObject.Factory.createForPost("bar");
+         action.setProperty("foo", object);
+ 
+         FacebookDialog.OpenGraphActionDialogBuilder builder =
+-                new FacebookDialog.OpenGraphActionDialogBuilder(getActivity(), action, "foo", "foo");
++                new FacebookDialog.OpenGraphActionDialogBuilder(getActivity(), action, "foo");
+ 
+         Bitmap bitmap = Bitmap.createBitmap(20, 20, Bitmap.Config.ALPHA_8);
+ 
+@@ -150,12 +150,12 @@ public void testOpenGraphObjectImageAttachments() throws JSONException {
+     }
+ 
+     public void testOpenGraphActionAndObjectImageAttachments() throws JSONException {
+-        OpenGraphAction action = OpenGraphAction.Factory.createForPost();
++        OpenGraphAction action = OpenGraphAction.Factory.createForPost("foo");
+         OpenGraphObject object = OpenGraphObject.Factory.createForPost("bar");
+         action.setProperty("foo", object);
+ 
+         FacebookDialog.OpenGraphActionDialogBuilder builder =
+-                new FacebookDialog.OpenGraphActionDialogBuilder(getActivity(), action, "foo", "foo");
++                new FacebookDialog.OpenGraphActionDialogBuilder(getActivity(), action, "foo");
+ 
+         Bitmap bitmap = Bitmap.createBitmap(20, 20, Bitmap.Config.ALPHA_8);
+ 
+@@ -184,7 +184,7 @@ public void testOpenGraphActionAndObjectImageAttachments() throws JSONException
+     public void testOpenGraphDialogBuilderRequiresAction() {
+         try {
+             FacebookDialog.OpenGraphActionDialogBuilder builder =
+-                    new FacebookDialog.OpenGraphActionDialogBuilder(getActivity(), null, "foo", "foo");
++                    new FacebookDialog.OpenGraphActionDialogBuilder(getActivity(), null, "foo");
+ 
+             builder.build();
+             fail("expected exception");
+@@ -196,7 +196,7 @@ public void testOpenGraphDialogBuilderRequiresActionType() {
+         try {
+             FacebookDialog.OpenGraphActionDialogBuilder builder =
+                     new FacebookDialog.OpenGraphActionDialogBuilder(getActivity(),
+-                            OpenGraphAction.Factory.createForPost(), null, "foo");
++                            OpenGraphAction.Factory.createForPost(null), "foo");
+ 
+             builder.build();
+             fail("expected exception");
+@@ -208,7 +208,7 @@ public void testOpenGraphDialogBuilderRequiresPreviewPropertyName() {
+         try {
+             FacebookDialog.OpenGraphActionDialogBuilder builder =
+                     new FacebookDialog.OpenGraphActionDialogBuilder(getActivity(),
+-                            OpenGraphAction.Factory.createForPost(), "foo", null);
++                            OpenGraphAction.Factory.createForPost("foo"), null);
+ 
+             builder.build();
+             fail("expected exception");
+@@ -220,11 +220,41 @@ public void testOpenGraphDialogBuilderRequiresPreviewPropertyToExist() {
+         try {
+             FacebookDialog.OpenGraphActionDialogBuilder builder =
+                     new FacebookDialog.OpenGraphActionDialogBuilder(getActivity(),
+-                            OpenGraphAction.Factory.createForPost(), "foo", "nosuchproperty");
++                            OpenGraphAction.Factory.createForPost("foo"), "nosuchproperty");
+ 
+             builder.build();
+             fail("expected exception");
+         } catch (IllegalArgumentException exception) {
+         }
+     }
++
++    public void testOpenGraphDialogBuilderDeprecatedConstructorRequiresActionType() {
++        try {
++            OpenGraphAction action = OpenGraphAction.Factory.createForPost();
++            OpenGraphObject object = OpenGraphObject.Factory.createForPost("bar");
++            action.setProperty("object", object);
++            FacebookDialog.OpenGraphActionDialogBuilder builder =
++                    new FacebookDialog.OpenGraphActionDialogBuilder(getActivity(), action, "", "object");
++
++            builder.build();
++            fail("expected exception");
++        } catch (IllegalArgumentException exception) {
++        }
++
++    }
++
++    public void testOpenGraphDialogBuilderDeprecatedConstructorRequiresActionTypeMatches() {
++        try {
++            OpenGraphAction action = OpenGraphAction.Factory.createForPost("foo");
++            OpenGraphObject object = OpenGraphObject.Factory.createForPost("bar");
++            action.setProperty("object", object);
++            FacebookDialog.OpenGraphActionDialogBuilder builder =
++                    new FacebookDialog.OpenGraphActionDialogBuilder(getActivity(), action, "notfoo", "object");
++
++            builder.build();
++            fail("expected exception");
++        } catch (IllegalArgumentException exception) {
++        }
++
++    }
+ }
+diff --git a/samples/FriendPickerSample/src/com/facebook/samples/friendpicker/FriendPickerSampleActivity.java b/samples/FriendPickerSample/src/com/facebook/samples/friendpicker/FriendPickerSampleActivity.java
+index 18634f13c..f91d86b87 100644
+--- a/samples/FriendPickerSample/src/com/facebook/samples/friendpicker/FriendPickerSampleActivity.java
++++ b/samples/FriendPickerSample/src/com/facebook/samples/friendpicker/FriendPickerSampleActivity.java
+@@ -23,6 +23,7 @@
+ import android.view.View;
+ import android.widget.Button;
+ import android.widget.TextView;
++import com.facebook.AppEventsLogger;
+ import com.facebook.SessionState;
+ import com.facebook.UiLifecycleHelper;
+ import com.facebook.model.GraphUser;
+@@ -70,6 +71,15 @@ protected void onStart() {
+         displaySelectedFriends(RESULT_OK);
+     }
+ 
++    @Override
++    protected void onResume() {
++        super.onResume();
++
++        // Call the 'activateApp' method to log an app event for use in analytics and advertising reporting.  Do so in
++        // the onResume methods of the primary Activities that an app may be launched into.
++        AppEventsLogger.activateApp(this);
++    }
++
+     public void onActivityResult(int requestCode, int resultCode, Intent data) {
+         switch (requestCode) {
+             case PICK_FRIENDS_ACTIVITY:
+diff --git a/samples/GraphApiSample/src/com/facebook/samples/graphapi/GraphApiSampleActivity.java b/samples/GraphApiSample/src/com/facebook/samples/graphapi/GraphApiSampleActivity.java
+index bcd1e36eb..2a076f105 100644
+--- a/samples/GraphApiSample/src/com/facebook/samples/graphapi/GraphApiSampleActivity.java
++++ b/samples/GraphApiSample/src/com/facebook/samples/graphapi/GraphApiSampleActivity.java
+@@ -67,6 +67,15 @@ public void onActivityResult(int requestCode, int resultCode, Intent data) {
+         }
+     }
+ 
++    @Override
++    protected void onResume() {
++        super.onResume();
++
++        // Call the 'activateApp' method to log an app event for use in analytics and advertising reporting.  Do so in
++        // the onResume methods of the primary Activities that an app may be launched into.
++        AppEventsLogger.activateApp(this);
++    }
++
+     @Override
+     protected void onRestoreInstanceState(Bundle savedInstanceState) {
+         super.onRestoreInstanceState(savedInstanceState);
+diff --git a/samples/HelloFacebookSample/src/com/facebook/samples/hellofacebook/HelloFacebookSampleActivity.java b/samples/HelloFacebookSample/src/com/facebook/samples/hellofacebook/HelloFacebookSampleActivity.java
+index f012f7ef9..bf374a95c 100644
+--- a/samples/HelloFacebookSample/src/com/facebook/samples/hellofacebook/HelloFacebookSampleActivity.java
++++ b/samples/HelloFacebookSample/src/com/facebook/samples/hellofacebook/HelloFacebookSampleActivity.java
+@@ -184,6 +184,10 @@ protected void onResume() {
+         super.onResume();
+         uiHelper.onResume();
+ 
++        // Call the 'activateApp' method to log an app event for use in analytics and advertising reporting.  Do so in
++        // the onResume methods of the primary Activities that an app may be launched into.
++        AppEventsLogger.activateApp(this);
++
+         updateUI();
+     }
+ 
+diff --git a/samples/PlacePickerSample/src/com/facebook/samples/placepicker/PlacePickerSampleActivity.java b/samples/PlacePickerSample/src/com/facebook/samples/placepicker/PlacePickerSampleActivity.java
+index 185280771..ce8008f8b 100644
+--- a/samples/PlacePickerSample/src/com/facebook/samples/placepicker/PlacePickerSampleActivity.java
++++ b/samples/PlacePickerSample/src/com/facebook/samples/placepicker/PlacePickerSampleActivity.java
+@@ -28,6 +28,7 @@
+ import android.view.View;
+ import android.widget.Button;
+ import android.widget.TextView;
++import com.facebook.AppEventsLogger;
+ import com.facebook.SessionState;
+ import com.facebook.UiLifecycleHelper;
+ import com.facebook.model.GraphLocation;
+@@ -141,6 +142,10 @@ protected void onPause() {
+     protected void onResume() {
+         super.onResume();
+         lifecycleHelper.onResume();
++
++        // Call the 'activateApp' method to log an app event for use in analytics and advertising reporting.  Do so in
++        // the onResume methods of the primary Activities that an app may be launched into.
++        AppEventsLogger.activateApp(this);
+     }
+ 
+     private void onError(Exception exception) {
+diff --git a/samples/RPSSample/res/layout/rps_fragment.xml b/samples/RPSSample/res/layout/rps_fragment.xml
+index 491e9fe66..0142f6baa 100644
+--- a/samples/RPSSample/res/layout/rps_fragment.xml
++++ b/samples/RPSSample/res/layout/rps_fragment.xml
+@@ -22,35 +22,38 @@
+               android:layout_width="match_parent"
+               android:background="@drawable/app_background">
+ 
++    <LinearLayout android:layout_height="wrap_content"
++                  android:layout_width="wrap_content"
++                  android:layout_gravity="center"
++                  android:orientation="vertical">
++        <TextView android:layout_height="wrap_content"
++                  android:layout_width="wrap_content"
++                  android:id="@+id/text_rock"
++                  android:textColor="@color/text_color"
++                  android:textSize="@dimen/text_size"
++                  android:layout_gravity="left"
++                  android:layout_marginTop="20dp"
++                  android:text="@string/rock" />
+ 
+-    <TextView android:layout_height="wrap_content"
+-              android:layout_width="wrap_content"
+-              android:id="@+id/text_rock"
+-              android:textColor="@color/text_color"
+-              android:textSize="@dimen/text_size"
+-              android:layout_gravity="left"
+-              android:layout_marginLeft="@dimen/margin_left"
+-              android:layout_marginTop="20dp"
+-              android:text="@string/rock" />
+-
+-    <TextView android:layout_height="wrap_content"
+-              android:layout_width="wrap_content"
+-              android:id="@+id/text_paper"
+-              android:textColor="@color/text_color"
+-              android:textSize="@dimen/text_size"
+-              android:layout_gravity="center"
+-              android:text="@string/paper"/>
+-
+-    <TextView android:layout_height="wrap_content"
+-              android:layout_width="wrap_content"
+-              android:id="@+id/text_scissors"
+-              android:textColor="@color/text_color"
+-              android:textSize="@dimen/text_size"
+-              android:layout_gravity="right"
+-              android:layout_marginRight="@dimen/margin_right"
+-              android:layout_marginBottom="20dp"
+-              android:text="@string/scissors"/>
++        <TextView android:layout_height="wrap_content"
++                  android:layout_width="wrap_content"
++                  android:id="@+id/text_paper"
++                  android:textColor="@color/text_color"
++                  android:textSize="@dimen/text_size"
++                  android:layout_gravity="left"
++                  android:layout_marginLeft="30dp"
++                  android:text="@string/paper"/>
+ 
++        <TextView android:layout_height="wrap_content"
++                  android:layout_width="wrap_content"
++                  android:id="@+id/text_scissors"
++                  android:textColor="@color/text_color"
++                  android:textSize="@dimen/text_size"
++                  android:layout_gravity="left"
++                  android:layout_marginLeft="60dp"
++                  android:layout_marginBottom="20dp"
++                  android:text="@string/scissors"/>
++    </LinearLayout>
+     <FrameLayout
+             android:layout_width="match_parent"
+             android:layout_height="wrap_content"
+@@ -119,7 +122,7 @@
+                       android:layout_width="wrap_content"
+                       android:layout_gravity="left"
+                       android:textColor="@color/text_color"
+-                      android:textSize="@dimen/text_size"
++                      android:textSize="@dimen/text_size_small"
+                       android:text=""
+                       android:layout_centerHorizontal="true"
+                       android:layout_centerVertical="true" />
+diff --git a/samples/RPSSample/res/values/styles.xml b/samples/RPSSample/res/values/styles.xml
+index f019c244b..e43c8a696 100644
+--- a/samples/RPSSample/res/values/styles.xml
++++ b/samples/RPSSample/res/values/styles.xml
+@@ -20,8 +20,9 @@
+     
+     <color name="text_color">#303040</color>
+     <dimen name="text_size">50sp</dimen>
+-    <dimen name="margin_left">30dp</dimen>
+-    <dimen name="margin_right">30dp</dimen>
++    <dimen name="text_size_small">40sp</dimen>
++    <dimen name="margin_left">20dp</dimen>
++    <dimen name="margin_right">20dp</dimen>
+     
+     <dimen name="image_height">80dp</dimen>
+     <dimen name="image_width">80dp</dimen>
+diff --git a/samples/RPSSample/src/com/facebook/samples/rps/MainActivity.java b/samples/RPSSample/src/com/facebook/samples/rps/MainActivity.java
+index c1f05d74d..1740ecd2e 100644
+--- a/samples/RPSSample/src/com/facebook/samples/rps/MainActivity.java
++++ b/samples/RPSSample/src/com/facebook/samples/rps/MainActivity.java
+@@ -84,6 +84,10 @@ public void onResume() {
+         super.onResume();
+         uiHelper.onResume();
+         isResumed = true;
++
++        // Call the 'activateApp' method to log an app event for use in analytics and advertising reporting.  Do so in
++        // the onResume methods of the primary Activities that an app may be launched into.
++        AppEventsLogger.activateApp(this);
+     }
+ 
+     @Override
+diff --git a/samples/RPSSample/src/com/facebook/samples/rps/RpsFragment.java b/samples/RPSSample/src/com/facebook/samples/rps/RpsFragment.java
+index f2f6a0ee0..5627902e7 100644
+--- a/samples/RPSSample/src/com/facebook/samples/rps/RpsFragment.java
++++ b/samples/RPSSample/src/com/facebook/samples/rps/RpsFragment.java
+@@ -36,6 +36,7 @@
+ import static com.facebook.samples.rps.OpenGraphUtils.*;
+ import static com.facebook.samples.rps.RpsGameUtils.*;
+ 
++import com.facebook.model.OpenGraphAction;
+ import com.facebook.model.OpenGraphObject;
+ import com.facebook.widget.FacebookDialog;
+ 
+@@ -331,10 +332,8 @@ public void onCompleted(Response response) {
+             batch.add(gameRequest);
+ 
+             PlayAction playAction = createPlayActionWithGame(GAME_REQUEST_RESULT);
+-            Request playRequest = new Request(Session.getActiveSession(),
+-                    PlayAction.PATH,
+-                    null,
+-                    HttpMethod.POST,
++            Request playRequest = Request.newPostOpenGraphActionRequest(Session.getActiveSession(),
++                    playAction,
+                     new Request.Callback() {
+                         @Override
+                         public void onCompleted(Response response) {
+@@ -346,7 +345,6 @@ public void onCompleted(Response response) {
+                             }
+                         }
+                     });
+-            playRequest.setGraphObject(playAction);
+ 
+             batch.add(playRequest);
+             batch.executeAsync();
+@@ -366,7 +364,7 @@ private GameGraphObject createGameObject() {
+     }
+ 
+     private PlayAction createPlayActionWithGame(String game) {
+-        PlayAction playAction = GraphObject.Factory.create(PlayAction.class);
++        PlayAction playAction = OpenGraphAction.Factory.createForPost(PlayAction.class, PlayAction.TYPE);
+         playAction.setProperty("game", game);
+         return playAction;
+     }
+@@ -392,7 +390,7 @@ public void shareUsingNativeDialog() {
+                 builder.build().present();
+             }
+         } else {
+-            ThrowAction throwAction = GraphObject.Factory.create(ThrowAction.class);
++            ThrowAction throwAction = OpenGraphAction.Factory.createForPost(ThrowAction.class, ThrowAction.TYPE);
+             throwAction.setGesture(getBuiltInGesture(playerChoice));
+             throwAction.setOpposingGesture(getBuiltInGesture(computerChoice));
+ 
+@@ -405,7 +403,6 @@ public void shareUsingNativeDialog() {
+             FacebookDialog.OpenGraphActionDialogBuilder builder = new FacebookDialog.OpenGraphActionDialogBuilder(
+                     getActivity(),
+                     throwAction,
+-                    ThrowAction.TYPE,
+                     ThrowAction.PREVIEW_PROPERTY_NAME)
+                     .setFragment(this)
+                     .setImageAttachmentsForAction(Arrays.asList(bitmap));
+diff --git a/samples/Scrumptious/AndroidManifest.xml b/samples/Scrumptious/AndroidManifest.xml
+index 5bfc2b6a0..c4365dd21 100644
+--- a/samples/Scrumptious/AndroidManifest.xml
++++ b/samples/Scrumptious/AndroidManifest.xml
+@@ -27,5 +27,7 @@
+                   android:theme="@android:style/Theme.Translucent.NoTitleBar"
+                   android:label="@string/app_name" />
+         <meta-data android:name="com.facebook.sdk.ApplicationId" android:value="@string/app_id"/>
++        <provider android:authorities="com.facebook.app.NativeAppCallContentProvider233936543368280"
++                  android:name="com.facebook.NativeAppCallContentProvider" />
+     </application>
+ </manifest> 
+diff --git a/samples/Scrumptious/src/com/facebook/scrumptious/MainActivity.java b/samples/Scrumptious/src/com/facebook/scrumptious/MainActivity.java
+index 31927b442..b1fcc58da 100644
+--- a/samples/Scrumptious/src/com/facebook/scrumptious/MainActivity.java
++++ b/samples/Scrumptious/src/com/facebook/scrumptious/MainActivity.java
+@@ -24,6 +24,7 @@
+ import android.support.v4.app.FragmentTransaction;
+ import android.view.Menu;
+ import android.view.MenuItem;
++import com.facebook.AppEventsLogger;
+ import com.facebook.Session;
+ import com.facebook.SessionState;
+ import com.facebook.UiLifecycleHelper;
+@@ -87,6 +88,10 @@ public void onResume() {
+         super.onResume();
+         uiHelper.onResume();
+         isResumed = true;
++
++        // Call the 'activateApp' method to log an app event for use in analytics and advertising reporting.  Do so in
++        // the onResume methods of the primary Activities that an app may be launched into.
++        AppEventsLogger.activateApp(this);
+     }
+ 
+     @Override
+diff --git a/samples/Scrumptious/src/com/facebook/scrumptious/SelectionFragment.java b/samples/Scrumptious/src/com/facebook/scrumptious/SelectionFragment.java
+index 40bcf33e1..3c23f1144 100644
+--- a/samples/Scrumptious/src/com/facebook/scrumptious/SelectionFragment.java
++++ b/samples/Scrumptious/src/com/facebook/scrumptious/SelectionFragment.java
+@@ -27,6 +27,7 @@
+ import android.net.Uri;
+ import android.os.AsyncTask;
+ import android.os.Bundle;
++import android.os.Environment;
+ import android.provider.MediaStore;
+ import android.support.v4.app.Fragment;
+ import android.util.Log;
+@@ -58,7 +59,6 @@
+     private static final String MEAL_OBJECT_TYPE = "fb_sample_scrumps:meal";
+     private static final String EAT_ACTION_TYPE = "fb_sample_scrumps:eat";
+ 
+-    private static final String EAT_POST_ACTION_PATH = "me/" + EAT_ACTION_TYPE;
+     private static final String PENDING_ANNOUNCE_KEY = "pendingAnnounce";
+     private static final Uri M_FACEBOOK_URL = Uri.parse("http://m.facebook.com");
+     private static final int USER_GENERATED_MIN_SIZE = 480;
+@@ -320,9 +320,7 @@ private void handleGraphApiAnnounce() {
+                     eatAction.setProperty("meal", "{result=createObject:$.id}");
+                 }
+ 
+-                Request request = new Request(Session.getActiveSession(),
+-                        EAT_POST_ACTION_PATH, null, HttpMethod.POST);
+-                request.setGraphObject(eatAction);
++                Request request = Request.newPostOpenGraphActionRequest(Session.getActiveSession(), eatAction, null);
+                 requestBatch.add(request);
+ 
+                 return requestBatch.executeAndWait();
+@@ -339,7 +337,7 @@ protected void onPostExecute(List<Response> responses) {
+                     }
+                 }
+                 onPostActionResponse(finalResponse);
+-             }
++            }
+         };
+ 
+         task.execute();
+@@ -359,40 +357,58 @@ private void handleNativeShareAnnounce() {
+     private FacebookDialog.OpenGraphActionDialogBuilder createDialogBuilder() {
+         EatAction eatAction = createEatAction();
+ 
++        boolean userGenerated = false;
+         if (photoUri != null) {
+             String photoUriString = photoUri.toString();
+             Pair<File, Integer> fileAndMinDimemsion = getImageFileAndMinDimension();
+-            if (fileAndMinDimemsion != null) {
+-                eatAction.setImage(getImageListForAction(photoUriString,
+-                        fileAndMinDimemsion.second >= USER_GENERATED_MIN_SIZE));
++            userGenerated = fileAndMinDimemsion.second >= USER_GENERATED_MIN_SIZE;
++
++            // If we have a content: URI, we can just use that URI, otherwise we'll need to add it as an attachment.
++            if (fileAndMinDimemsion != null && photoUri.getScheme().startsWith("content")) {
++                eatAction.setImage(getImageListForAction(photoUriString, userGenerated));
+             }
+         }
+ 
+-        return new FacebookDialog.OpenGraphActionDialogBuilder(getActivity(),
+-                eatAction, EAT_ACTION_TYPE, "meal")
++        FacebookDialog.OpenGraphActionDialogBuilder builder = new FacebookDialog.OpenGraphActionDialogBuilder(
++                getActivity(), eatAction, "meal")
+                 .setFragment(SelectionFragment.this);
++
++        if (photoUri != null && !photoUri.getScheme().startsWith("content")) {
++            builder.setImageAttachmentFilesForAction(Arrays.asList(new File(photoUri.getPath())), userGenerated);
++        }
++
++        return builder;
+     }
+ 
+     private Pair<File, Integer> getImageFileAndMinDimension() {
+-        String [] filePath = { MediaStore.Images.Media.DATA };
+-        Cursor cursor = getActivity().getContentResolver().query(photoUri, filePath, null, null, null);
+-        if (cursor != null) {
+-            cursor.moveToFirst();
+-            int columnIndex = cursor.getColumnIndex(filePath[0]);
+-            String photoFile = cursor.getString(columnIndex);
+-            cursor.close();
+-
+-            File file = new File(photoFile);
++        File photoFile = null;
++        String photoUriString = photoUri.toString();
++        if (photoUriString.startsWith("file://")) {
++            photoFile = new File(photoUri.getPath());
++        } else if (photoUriString.startsWith("content://")) {
++            String [] filePath = { MediaStore.Images.Media.DATA };
++            Cursor cursor = getActivity().getContentResolver().query(photoUri, filePath, null, null, null);
++            if (cursor != null) {
++                cursor.moveToFirst();
++                int columnIndex = cursor.getColumnIndex(filePath[0]);
++                String filename = cursor.getString(columnIndex);
++                cursor.close();
++
++                photoFile = new File(filename);
++            }
++        }
+ 
++        if (photoFile != null) {
+             InputStream is = null;
+             try {
+-                is = new FileInputStream(file);
++                is = new FileInputStream(photoFile);
+ 
++                // We only want to get the bounds of the image, rather than load the whole thing.
+                 BitmapFactory.Options options = new BitmapFactory.Options();
+                 options.inJustDecodeBounds = true;
+                 BitmapFactory.decodeStream(is, null, options);
+ 
+-                return new Pair<File, Integer>(file, Math.min(options.outWidth, options.outHeight));
++                return new Pair<File, Integer>(photoFile, Math.min(options.outWidth, options.outHeight));
+             } catch (Exception e) {
+                 return null;
+             } finally {
+@@ -423,7 +439,7 @@ private GraphObject getImageObject(String uri, boolean userGenerated) {
+     }
+ 
+     private EatAction createEatAction() {
+-        EatAction eatAction = GraphObject.Factory.create(EatAction.class);
++        EatAction eatAction = OpenGraphAction.Factory.createForPost(EatAction.class, EAT_ACTION_TYPE);
+         for (BaseListElement element : listElements) {
+             element.populateOGAction(eatAction);
+         }
+@@ -611,9 +627,9 @@ private void startPickerActivity(Uri data, int requestCode) {
+ 
+         public EatListElement(int requestCode) {
+             super(getActivity().getResources().getDrawable(R.drawable.action_eating),
+-                  getActivity().getResources().getString(R.string.action_eating),
+-                  getActivity().getResources().getString(R.string.action_eating_default),
+-                  requestCode);
++                    getActivity().getResources().getString(R.string.action_eating),
++                    getActivity().getResources().getString(R.string.action_eating_default),
++                    requestCode);
+             foodChoices = getActivity().getResources().getStringArray(R.array.food_types);
+             foodUrls = getActivity().getResources().getStringArray(R.array.food_og_urls);
+         }
+@@ -735,9 +751,9 @@ private void setFoodText() {
+ 
+         public PeopleListElement(int requestCode) {
+             super(getActivity().getResources().getDrawable(R.drawable.action_people),
+-                  getActivity().getResources().getString(R.string.action_people),
+-                  getActivity().getResources().getString(R.string.action_people_default),
+-                  requestCode);
++                    getActivity().getResources().getString(R.string.action_people),
++                    getActivity().getResources().getString(R.string.action_people_default),
++                    requestCode);
+         }
+ 
+         @Override
+@@ -858,9 +874,9 @@ private void setUsersText() {
+ 
+         public LocationListElement(int requestCode) {
+             super(getActivity().getResources().getDrawable(R.drawable.action_location),
+-                  getActivity().getResources().getString(R.string.action_location),
+-                  getActivity().getResources().getString(R.string.action_location_default),
+-                  requestCode);
++                    getActivity().getResources().getString(R.string.action_location),
++                    getActivity().getResources().getString(R.string.action_location_default),
++                    requestCode);
+         }
+ 
+         @Override
+@@ -932,6 +948,11 @@ private void setPlaceText() {
+         private static final int CAMERA = 0;
+         private static final int GALLERY = 1;
+         private static final String PHOTO_URI_KEY = "photo_uri";
++        private static final String TEMP_URI_KEY = "temp_uri";
++        private static final String FILE_PREFIX = "scrumptious_img_";
++        private static final String FILE_SUFFIX = ".jpg";
++
++        private Uri tempUri = null;
+ 
+         public PhotoListElement(int requestCode) {
+             super(getActivity().getResources().getDrawable(R.drawable.action_photo),
+@@ -953,7 +974,11 @@ public void onClick(View view) {
+ 
+         @Override
+         protected void onActivityResult(Intent data) {
+-            photoUri = data.getData();
++            if (tempUri != null) {
++                photoUri = tempUri;
++            } else if (data != null) {
++                photoUri = data.getData();
++            }
+             setPhotoText();
+         }
+ 
+@@ -966,11 +991,15 @@ protected void onSaveInstanceState(Bundle bundle) {
+             if (photoUri != null) {
+                 bundle.putParcelable(PHOTO_URI_KEY, photoUri);
+             }
++            if (tempUri != null) {
++                bundle.putParcelable(TEMP_URI_KEY, tempUri);
++            }
+         }
+ 
+         @Override
+         protected boolean restoreState(Bundle savedState) {
+             photoUri = savedState.getParcelable(PHOTO_URI_KEY);
++            tempUri = savedState.getParcelable(TEMP_URI_KEY);
+             setPhotoText();
+             return true;
+         }
+@@ -1003,15 +1032,31 @@ private void setPhotoText() {
+ 
+         private void startCameraActivity() {
+             Intent intent = new Intent(MediaStore.ACTION_IMAGE_CAPTURE);
++            tempUri = getTempUri();
++            if (tempUri != null) {
++                intent.putExtra(MediaStore.EXTRA_OUTPUT, tempUri);
++            }
+             startActivityForResult(intent, getRequestCode());
+         }
+ 
+         private void startGalleryActivity() {
++            tempUri = null;
+             Intent intent = new Intent(Intent.ACTION_GET_CONTENT);
+             intent.setType("image/*");
+             String selectPicture = getResources().getString(R.string.select_picture);
+             startActivityForResult(Intent.createChooser(intent, selectPicture), getRequestCode());
+         }
++
++        private Uri getTempUri() {
++            String imgFileName = FILE_PREFIX + System.currentTimeMillis() + FILE_SUFFIX;
++
++            // Note: on an emulator, you might need to create the "Pictures" directory in /mnt/sdcard first
++            //       % adb shell
++            //       % mkdir /mnt/sdcard/Pictures
++            File image = new File(
++                    Environment.getExternalStoragePublicDirectory(Environment.DIRECTORY_PICTURES), imgFileName);
++            return Uri.fromFile(image);
++        }
+     }
+ 
+     private class ActionListAdapter extends ArrayAdapter<BaseListElement> {
+diff --git a/samples/SessionLoginSample/src/com/facebook/samples/sessionlogin/SessionLoginSampleActivity.java b/samples/SessionLoginSample/src/com/facebook/samples/sessionlogin/SessionLoginSampleActivity.java
+index 87dea2181..9c64116da 100644
+--- a/samples/SessionLoginSample/src/com/facebook/samples/sessionlogin/SessionLoginSampleActivity.java
++++ b/samples/SessionLoginSample/src/com/facebook/samples/sessionlogin/SessionLoginSampleActivity.java
+@@ -21,6 +21,7 @@
+ import android.os.Bundle;
+ import android.view.View;
+ import android.widget.Button;
++import com.facebook.AppEventsLogger;
+ 
+ public class SessionLoginSampleActivity extends Activity {
+ 
+@@ -69,4 +70,13 @@ public void onClick(View v) {
+             }
+         });
+     }
++
++    @Override
++    protected void onResume() {
++        super.onResume();
++
++        // Call the 'activateApp' method to log an app event for use in analytics and advertising reporting.  Do so in
++        // the onResume methods of the primary Activities that an app may be launched into.
++        AppEventsLogger.activateApp(this);
++    }
+ }
+diff --git a/samples/SwitchUserSample/src/com/facebook/samples/switchuser/MainActivity.java b/samples/SwitchUserSample/src/com/facebook/samples/switchuser/MainActivity.java
+index 94e6e150a..b7ddd6adb 100644
+--- a/samples/SwitchUserSample/src/com/facebook/samples/switchuser/MainActivity.java
++++ b/samples/SwitchUserSample/src/com/facebook/samples/switchuser/MainActivity.java
+@@ -119,6 +119,10 @@ public boolean onOptionsItemSelected(MenuItem item) {
+         if (currentSession != null) {
+             currentSession.addCallback(sessionStatusCallback);
+         }
++
++        // Call the 'activateApp' method to log an app event for use in analytics and advertising reporting.  Do so in
++        // the onResume methods of the primary Activities that an app may be launched into.
++        AppEventsLogger.activateApp(this);
+     }
+ 
+     @Override

@@ -1,0 +1,3157 @@
+diff --git a/java/dagger/internal/codegen/DaggerTypes.java b/java/dagger/internal/codegen/DaggerTypes.java
+index 0e8e95fea..dc7b386ae 100644
+--- a/java/dagger/internal/codegen/DaggerTypes.java
++++ b/java/dagger/internal/codegen/DaggerTypes.java
+@@ -22,9 +22,12 @@
+ 
+ import com.google.auto.common.MoreElements;
+ import com.google.auto.common.MoreTypes;
++import dagger.Lazy;
++import dagger.producers.Producer;
+ import java.util.List;
+ import java.util.Optional;
+ import javax.annotation.processing.ProcessingEnvironment;
++import javax.inject.Provider;
+ import javax.lang.model.element.Element;
+ import javax.lang.model.element.TypeElement;
+ import javax.lang.model.type.ArrayType;
+@@ -116,6 +119,28 @@ DeclaredType rewrapType(TypeMirror type, Class<?> wrappingClass) {
+     }
+   }
+ 
++  /** Returns a type mirror for {@code Lazy<T>} given a type mirror for {@code T}. */
++  TypeMirror lazyOf(TypeMirror typeMirror) {
++    return wrapType(typeMirror, Lazy.class);
++  }
++
++  /** Returns a type mirror for {@code Provider<T>} given a type mirror for {@code T}. */
++  TypeMirror providerOf(TypeMirror typeMirror) {
++    return wrapType(typeMirror, Provider.class);
++  }
++
++  /** Returns a type mirror for {@code Producer<T>} given a type mirror for {@code T}. */
++  TypeMirror producerOf(TypeMirror typeMirror) {
++    return wrapType(typeMirror, Producer.class);
++  }
++
++  /** Returns a type mirror for {@code Provider<Lazy<T>>} given a type mirror for {@code T}. */
++  TypeMirror providerOfLazyOf(TypeMirror typeMirror) {
++    return providerOf(lazyOf(typeMirror));
++  }
++
++  // Implementation of Types methods, delegating to types.
++
+   @Override
+   public Element asElement(TypeMirror t) {
+     return types.asElement(t);
+diff --git a/java/dagger/internal/codegen/PrivateMethodBindingExpression.java b/java/dagger/internal/codegen/PrivateMethodBindingExpression.java
+index c917b4efa..09a4e6bbf 100644
+--- a/java/dagger/internal/codegen/PrivateMethodBindingExpression.java
++++ b/java/dagger/internal/codegen/PrivateMethodBindingExpression.java
+@@ -21,19 +21,20 @@
+ import static com.google.common.base.CaseFormat.UPPER_CAMEL;
+ import static com.google.common.base.CaseFormat.UPPER_UNDERSCORE;
+ import static com.squareup.javapoet.MethodSpec.methodBuilder;
++import static com.squareup.javapoet.TypeSpec.anonymousClassBuilder;
+ import static javax.lang.model.element.Modifier.PRIVATE;
++import static javax.lang.model.element.Modifier.PUBLIC;
+ 
+ import com.google.auto.common.MoreTypes;
+ import com.squareup.javapoet.ClassName;
+ import com.squareup.javapoet.CodeBlock;
+-import com.squareup.javapoet.MethodSpec;
+ import com.squareup.javapoet.TypeName;
++import com.squareup.javapoet.TypeSpec;
+ import java.util.EnumMap;
+ import java.util.Map;
+ import javax.lang.model.type.TypeKind;
+ import javax.lang.model.type.TypeMirror;
+ import javax.lang.model.util.Elements;
+-import javax.lang.model.util.Types;
+ 
+ /**
+  * A binding expression that wraps the dependency expressions in a private, no-arg method.
+@@ -44,10 +45,10 @@
+   private final ClassName componentName;
+   private final GeneratedComponentModel generatedComponentModel;
+   private final BindingExpression delegate;
+-  private final Map<DependencyRequest.Kind, MethodSpec> methods =
++  private final Map<DependencyRequest.Kind, String> methodNames =
+       new EnumMap<>(DependencyRequest.Kind.class);
+   private final ContributionBinding binding;
+-  private final Types types;
++  private final DaggerTypes types;
+   private final Elements elements;
+ 
+   PrivateMethodBindingExpression(
+@@ -55,7 +56,7 @@
+       ClassName componentName,
+       GeneratedComponentModel generatedComponentModel,
+       BindingExpression delegate,
+-      Types types,
++      DaggerTypes types,
+       Elements elements) {
+     super(resolvedBindings);
+     this.componentName = componentName;
+@@ -70,43 +71,100 @@
+   Expression getDependencyExpression(
+       DependencyRequest.Kind requestKind, ClassName requestingClass) {
+     // TODO(user): we should just use the component method if one matches instead of creating one.
++    if (!methodNames.containsKey(requestKind)) {
++      String name = generatedComponentModel.getUniqueMethodName(methodName(requestKind));
++      methodNames.put(requestKind, name);
++      createMethod(name, requestKind);
++    }
++
++    CodeBlock invocation =
++        componentName.equals(requestingClass)
++            ? CodeBlock.of("$N()", methodNames.get(requestKind))
++            : CodeBlock.of("$T.this.$N()", componentName, methodNames.get(requestKind));
++    return Expression.create(returnType(requestKind), invocation);
++  }
++
++  /** Creates the no-arg method used for dependency expressions. */
++  private void createMethod(String name, DependencyRequest.Kind requestKind) {
++    // TODO(user): Consider when we can make this method static.
++    // TODO(user): Fix the order that these generated methods are written to the component.
++    generatedComponentModel.addMethod(
++        methodBuilder(name)
++            .addModifiers(PRIVATE)
++            .returns(TypeName.get(returnType(requestKind)))
++            .addStatement("return $L", methodBody(requestKind))
++            .build());
++  }
++
++  /** Returns the return type for the dependency request. */
++  private TypeMirror returnType(DependencyRequest.Kind requestKind) {
++    // TODO(user): use DR.Kind.type() when that CL is submitted.
+     switch (requestKind) {
+       case INSTANCE:
+-        MethodSpec method = methods.computeIfAbsent(requestKind, this::createMethod);
+-        CodeBlock invocation =
+-            componentName.equals(requestingClass)
+-                ? CodeBlock.of("$N()", method)
+-                : CodeBlock.of("$T.this.$N()", componentName, method);
+-        return Expression.create(returnType(), invocation);
++        return binding.contributesPrimitiveType()
++            ? asExecutable(binding.bindingElement().get()).getReturnType()
++            : instanceType();
++      case LAZY:
++        return accessibleType(types.lazyOf(instanceType()));
++      case PROVIDER_OF_LAZY:
++        return accessibleType(types.providerOfLazyOf(instanceType()));
++      case PROVIDER:
++        return accessibleType(types.providerOf(instanceType()));
++      case PRODUCER:
++        return accessibleType(types.producerOf(instanceType()));
+       default:
+-        return delegate.getDependencyExpression(requestKind, requestingClass);
++        throw new AssertionError("Unhandled DependencyRequest: " + requestKind);
+     }
+   }
+ 
+-  /** Creates the no-arg method used for dependency expressions and returns the method's name. */
+-  private MethodSpec createMethod(DependencyRequest.Kind requestKind) {
+-    MethodSpec method =
+-        methodBuilder(generatedComponentModel.getUniqueMethodName(methodName(requestKind)))
+-            .addModifiers(PRIVATE)
+-            .returns(TypeName.get(returnType()))
+-            .addStatement(
+-                "return $L",
+-                delegate.getDependencyExpression(requestKind, componentName).codeBlock())
+-            .build();
+-
+-    generatedComponentModel.addMethod(method);
+-    return method;
++  private TypeMirror instanceType() {
++    return accessibleType(binding.contributedType());
++  }
++
++  /** Returns the method body for the dependency request. */
++  private CodeBlock methodBody(DependencyRequest.Kind requestKind) {
++    switch (requestKind) {
++      case PROVIDER:
++        // TODO(user): Cache provider field instead of recreating each time.
++        return CodeBlock.of("$L", providerTypeSpec());
++      case LAZY:
++      case PROVIDER_OF_LAZY:
++        // TODO(user): Refactor the delegate BindingExpression to handle these cases?
++        // Don't use delegate.getDependencyExpression() because that will inline the provider
++        // dependency instead of delegating to the private method. To use the private method,
++        // recursively call this.getDependencyExpression().
++        return FrameworkType.PROVIDER.to(
++            requestKind,
++            getDependencyExpression(DependencyRequest.Kind.PROVIDER, componentName).codeBlock());
++      case INSTANCE:
++      case PRODUCER:
++        return delegate.getDependencyExpression(requestKind, componentName).codeBlock();
++      default:
++        throw new AssertionError("Unhandled DependencyRequest: " + requestKind);
++    }
+   }
+ 
+-  private TypeMirror returnType() {
+-    return binding.contributesPrimitiveType()
+-        ? asExecutable(binding.bindingElement().get()).getReturnType()
+-        : accessibleType(binding.contributedType(), componentName);
++  /** Returns a {@link TypeSpec} for an anonymous provider class. */
++  private TypeSpec providerTypeSpec() {
++    return anonymousClassBuilder("")
++        .addSuperinterface(TypeName.get(returnType(DependencyRequest.Kind.PROVIDER)))
++        .addMethod(
++            methodBuilder("get")
++                .addAnnotation(Override.class)
++                .addModifiers(PUBLIC)
++                .returns(TypeName.get(instanceType()))
++                .addStatement(
++                    "return $L",
++                    getDependencyExpression(DependencyRequest.Kind.INSTANCE, componentName)
++                        .codeBlock())
++                .build())
++        .build();
+   }
+ 
+   /** Returns the canonical name for a no-arg dependency expression method. */
+   private String methodName(DependencyRequest.Kind dependencyKind) {
+     // TODO(user): Use a better name for @MapKey binding instances.
++    // TODO(user): Include the binding method as part of the method name.
+     return String.format("get%s%s", bindingName(), dependencyKindName(dependencyKind));
+   }
+ 
+@@ -121,7 +179,7 @@ private static String dependencyKindName(DependencyRequest.Kind kind) {
+   }
+ 
+   /** Returns a {@link TypeName} for the binding that is accessible to the component. */
+-  private TypeMirror accessibleType(TypeMirror typeMirror, ClassName componentName) {
++  private TypeMirror accessibleType(TypeMirror typeMirror) {
+     if (Accessibility.isTypeAccessibleFrom(typeMirror, componentName.packageName())) {
+       return typeMirror;
+     } else if (Accessibility.isRawTypeAccessible(typeMirror, componentName.packageName())
+diff --git a/javatests/dagger/functional/cycle/LongCycleTest.java b/javatests/dagger/functional/cycle/LongCycleTest.java
+index fd5439556..75bfad460 100644
+--- a/javatests/dagger/functional/cycle/LongCycleTest.java
++++ b/javatests/dagger/functional/cycle/LongCycleTest.java
+@@ -17,6 +17,7 @@
+ package dagger.functional.cycle;
+ 
+ import static com.google.common.truth.Truth.assertThat;
++import static com.google.common.truth.TruthJUnit.assume;
+ 
+ import dagger.functional.cycle.LongCycle.LongCycleComponent;
+ import org.junit.Test;
+@@ -25,7 +26,7 @@
+ 
+ @RunWith(JUnit4.class)
+ public class LongCycleTest {
+-  
++
+   /**
+    * Tests a cycle long enough that the real factory is created in a separate initialize method from
+    * the delegate factory.
+@@ -42,6 +43,7 @@ public void longCycle() {
+    */
+   @Test
+   public void longCycleHasMoreThanOneInitializeMethod() throws NoSuchMethodException {
++    assume().that(System.getProperty("dagger.mode")).isNotEqualTo("ExperimentalAndroidMode");
+     DaggerLongCycle_LongCycleComponent.class
+         .getDeclaredMethod("initialize2", DaggerLongCycle_LongCycleComponent.Builder.class);
+   }
+diff --git a/javatests/dagger/functional/subcomponent/SubcomponentTest.java b/javatests/dagger/functional/subcomponent/SubcomponentTest.java
+index 68d19d3a7..84c11f896 100644
+--- a/javatests/dagger/functional/subcomponent/SubcomponentTest.java
++++ b/javatests/dagger/functional/subcomponent/SubcomponentTest.java
+@@ -18,6 +18,7 @@
+ 
+ import static com.google.common.collect.Sets.intersection;
+ import static com.google.common.truth.Truth.assertThat;
++import static com.google.common.truth.TruthJUnit.assume;
+ 
+ import java.util.Arrays;
+ import java.util.Collection;
+@@ -32,23 +33,22 @@
+   private static final ParentComponent parentComponent = DaggerParentComponent.create();
+   private static final ParentOfGenericComponent parentOfGenericComponent =
+       DaggerParentOfGenericComponent.create();
+-  
++
+   @Parameters
+   public static Collection<Object[]> parameters() {
+     return Arrays.asList(new Object[][] {
+         { parentComponent, parentComponent.newChildComponent() },
+         { parentComponent, parentComponent.newChildAbstractClassComponent() },
+         { parentOfGenericComponent, parentOfGenericComponent.subcomponent() }});
+-  }        
+-  
++  }
++
+   private final ParentGetters parentGetters;
+   private final ChildComponent childComponent;
+-  
++
+   public SubcomponentTest(ParentGetters parentGetters, ChildComponent childComponent) {
+     this.parentGetters = parentGetters;
+     this.childComponent = childComponent;
+   }
+-  
+ 
+   @Test
+   public void scopePropagatesUpward_class() {
+@@ -86,6 +86,7 @@ public void multibindingContributions() {
+ 
+   @Test
+   public void unscopedProviders() {
++    assume().that(System.getProperty("dagger.mode")).isNotEqualTo("ExperimentalAndroidMode");
+     assertThat(parentGetters.getUnscopedTypeProvider())
+         .isSameAs(childComponent.getUnscopedTypeProvider());
+     assertThat(parentGetters.getUnscopedTypeProvider())
+diff --git a/javatests/dagger/internal/codegen/ComponentProcessorTest.java b/javatests/dagger/internal/codegen/ComponentProcessorTest.java
+index 72d5ce4b4..d92a7b115 100644
+--- a/javatests/dagger/internal/codegen/ComponentProcessorTest.java
++++ b/javatests/dagger/internal/codegen/ComponentProcessorTest.java
+@@ -302,6 +302,19 @@ public void componentWithInvalidModule() {
+                 "    return new SomeInjectableType();",
+                 "  }",
+                 "",
++                "  private Provider<SomeInjectableType> getSomeInjectableTypeProvider() {",
++                "    return new Provider<SomeInjectableType>() {",
++                "      @Override",
++                "      public SomeInjectableType get() {",
++                "        return getSomeInjectableTypeInstance();",
++                "      }",
++                "    };",
++                "  }",
++                "",
++                "  private Lazy<SomeInjectableType> getSomeInjectableTypeLazy() {",
++                "    return DoubleCheck.lazy(getSomeInjectableTypeProvider());",
++                "  }",
++                "",
+                 "  @Override",
+                 "  public SomeInjectableType someInjectableType() {",
+                 "    return getSomeInjectableTypeInstance();",
+@@ -309,12 +322,12 @@ public void componentWithInvalidModule() {
+                 "",
+                 "  @Override",
+                 "  public Lazy<SomeInjectableType> lazySomeInjectableType() {",
+-                "    return DoubleCheck.lazy(SomeInjectableType_Factory.create());",
++                "    return getSomeInjectableTypeLazy();",
+                 "  }",
+                 "",
+                 "  @Override",
+                 "  public Provider<SomeInjectableType> someInjectableTypeProvider() {",
+-                "    return SomeInjectableType_Factory.create();",
++                "    return getSomeInjectableTypeProvider();",
+                 "  }",
+                 "",
+                 "  public static final class Builder {",
+diff --git a/javatests/dagger/internal/codegen/ComponentRequirementFieldTest.java b/javatests/dagger/internal/codegen/ComponentRequirementFieldTest.java
+index 79cf4aa9f..9613e4104 100644
+--- a/javatests/dagger/internal/codegen/ComponentRequirementFieldTest.java
++++ b/javatests/dagger/internal/codegen/ComponentRequirementFieldTest.java
+@@ -20,6 +20,7 @@
+ import static dagger.internal.codegen.Compilers.daggerCompiler;
+ import static dagger.internal.codegen.GeneratedLines.GENERATED_ANNOTATION;
+ import static dagger.internal.codegen.GeneratedLines.NPE_FROM_COMPONENT_METHOD;
++import static dagger.internal.codegen.GeneratedLines.NPE_FROM_PROVIDES_METHOD;
+ 
+ import com.google.testing.compile.Compilation;
+ import com.google.testing.compile.JavaFileObjects;
+@@ -541,15 +542,128 @@ public void componentRequirementNeededInFactoryCreationOfSubcomponent() {
+             "interface TestSubcomponent {",
+             "  Provider<Object> dependsOnMultibinding();",
+             "}");
+-
+-    Compilation compilation =
+-        daggerCompiler()
+-            .withOptions(compilerMode.javacopts())
+-            .compile(parentModule, childModule, component, subcomponent);
+-    assertThat(compilation).succeeded();
+-    assertThat(compilation)
+-        .generatedSourceFile("test.DaggerTestComponent")
+-        .hasSourceEquivalentTo(
++    JavaFileObject generatedComponent;
++    switch (compilerMode) {
++      case EXPERIMENTAL_ANDROID:
++        generatedComponent =
++            JavaFileObjects.forSourceLines(
++                "test.DaggerTestComponent",
++                "package test;",
++                "",
++                "import com.google.common.collect.ImmutableSet;",
++                "import dagger.internal.Preconditions;",
++                "import javax.annotation.Generated;",
++                "import javax.inject.Provider;",
++                "",
++                GENERATED_ANNOTATION,
++                "public final class DaggerTestComponent implements TestComponent {",
++                "  private ParentModule parentModule;",
++                "",
++                "  private DaggerTestComponent(Builder builder) {",
++                "    initialize(builder);",
++                "  }",
++                "",
++                "  public static Builder builder() {",
++                "    return new Builder();",
++                "  }",
++                "",
++                "  public static TestComponent create() {",
++                "    return new Builder().build();",
++                "  }",
++                "",
++                "  private Object getObjectInstance2() {",
++                "    return Preconditions.checkNotNull(",
++                "        ParentModule.contribution(), " + NPE_FROM_PROVIDES_METHOD + ");",
++                "  }",
++                "",
++                "  private Object getObjectInstance() {",
++                "    return Preconditions.checkNotNull(",
++                "        parentModule.reliesOnMultibinding(",
++                "            ImmutableSet.<Object>of(getObjectInstance2())),",
++                "        " + NPE_FROM_PROVIDES_METHOD + ");",
++                "  }",
++                "",
++                "  private Provider<Object> getObjectProvider() {",
++                "    return new Provider<Object>() {",
++                "      @Override",
++                "      public Object get() {",
++                "        return getObjectInstance();",
++                "      }",
++                "    };",
++                "  }",
++                "",
++                "  @SuppressWarnings(\"unchecked\")",
++                "  private void initialize(final Builder builder) {",
++                "    this.parentModule = builder.parentModule;",
++                "  }",
++                "",
++                "  @Override",
++                "  public Provider<Object> dependsOnMultibinding() {",
++                "    return getObjectProvider();",
++                "  }",
++                "",
++                "  @Override",
++                "  public TestSubcomponent subcomponent() {",
++                "    return new TestSubcomponentImpl();",
++                "  }",
++                "",
++                "  public static final class Builder {",
++                "    private ParentModule parentModule;",
++                "",
++                "    private Builder() {}",
++                "",
++                "    public TestComponent build() {",
++                "      if (parentModule == null) {",
++                "        this.parentModule = new ParentModule();",
++                "      }",
++                "      return new DaggerTestComponent(this);",
++                "    }",
++                "",
++                "    public Builder parentModule(ParentModule parentModule) {",
++                "      this.parentModule = Preconditions.checkNotNull(parentModule);",
++                "      return this;",
++                "    }",
++                "  }",
++                "",
++                "  private final class TestSubcomponentImpl implements TestSubcomponent {",
++                "    private TestSubcomponentImpl() {}",
++                "",
++                "    private Object getObjectInstance2() {",
++                "      return Preconditions.checkNotNull(",
++                "          ParentModule.contribution(), " + NPE_FROM_PROVIDES_METHOD + ");",
++                "    }",
++                "",
++                "    private Object getObjectInstance3() {",
++                "      return Preconditions.checkNotNull(",
++                "          ChildModule.contribution(), " + NPE_FROM_PROVIDES_METHOD + ");",
++                "    }",
++                "",
++                "    private Object getObjectInstance() {",
++                "      return Preconditions.checkNotNull(",
++                "          DaggerTestComponent.this.parentModule.reliesOnMultibinding(",
++                "              ImmutableSet.<Object>of(",
++                "                  getObjectInstance2(), getObjectInstance3())),",
++                "          " + NPE_FROM_PROVIDES_METHOD + ");",
++                "    }",
++                "",
++                "    private Provider<Object> getObjectProvider() {",
++                "      return new Provider<Object>() {",
++                "        @Override",
++                "        public Object get() {",
++                "          return getObjectInstance();",
++                "        }",
++                "      };",
++                "    }",
++                "",
++                "    @Override",
++                "    public Provider<Object> dependsOnMultibinding() {",
++                "      return getObjectProvider();",
++                "    }",
++                "  }",
++                "}");
++        break;
++      default:
++        generatedComponent =
+             JavaFileObjects.forSourceLines(
+                 "test.DaggerTestComponent",
+                 "package test;",
+@@ -644,6 +758,15 @@ public void componentRequirementNeededInFactoryCreationOfSubcomponent() {
+                 "      return reliesOnMultibindingProvider;",
+                 "    }",
+                 "  }",
+-                "}"));
++                "}");
++    }
++    Compilation compilation =
++        daggerCompiler()
++            .withOptions(compilerMode.javacopts())
++            .compile(parentModule, childModule, component, subcomponent);
++    assertThat(compilation).succeeded();
++    assertThat(compilation)
++        .generatedSourceFile("test.DaggerTestComponent")
++        .hasSourceEquivalentTo(generatedComponent);
+   }
+ }
+diff --git a/javatests/dagger/internal/codegen/ElidedFactoriesTest.java b/javatests/dagger/internal/codegen/ElidedFactoriesTest.java
+index ad83170bf..9278d0378 100644
+--- a/javatests/dagger/internal/codegen/ElidedFactoriesTest.java
++++ b/javatests/dagger/internal/codegen/ElidedFactoriesTest.java
+@@ -232,8 +232,6 @@ public void simpleComponent_injectsProviderOf_dependsOnScoped() {
+                 "public final class DaggerSimpleComponent implements SimpleComponent {",
+                 "  private Provider<ScopedType> scopedTypeProvider;",
+                 "",
+-                "  private Provider<DependsOnScoped> dependsOnScopedProvider;",
+-                "",
+                 "  private DaggerSimpleComponent(Builder builder) {",
+                 "    initialize(builder);",
+                 "  }",
+@@ -246,15 +244,26 @@ public void simpleComponent_injectsProviderOf_dependsOnScoped() {
+                 "    return new Builder().build();",
+                 "  }",
+                 "",
++                "  private DependsOnScoped getDependsOnScopedInstance() {",
++                "    return new DependsOnScoped(scopedTypeProvider.get());",
++                "  }",
++                "",
++                "  private Provider<DependsOnScoped> getDependsOnScopedProvider() {",
++                "    return new Provider<DependsOnScoped>() {",
++                "      @Override",
++                "      public DependsOnScoped get() {",
++                "        return getDependsOnScopedInstance();",
++                "      }",
++                "    };",
++                "  }",
++                "",
+                 "  private NeedsProvider getNeedsProviderInstance() {",
+-                "    return new NeedsProvider(dependsOnScopedProvider);",
++                "    return new NeedsProvider(getDependsOnScopedProvider());",
+                 "  }",
+                 "",
+                 "  @SuppressWarnings(\"unchecked\")",
+                 "  private void initialize(final Builder builder) {",
+                 "    this.scopedTypeProvider = DoubleCheck.provider(ScopedType_Factory.create());",
+-                "    this.dependsOnScopedProvider = ",
+-                "        DependsOnScoped_Factory.create(scopedTypeProvider);",
+                 "  }",
+                 "",
+                 "  @Override",
+diff --git a/javatests/dagger/internal/codegen/MapBindingComponentProcessorTest.java b/javatests/dagger/internal/codegen/MapBindingComponentProcessorTest.java
+index 9023979aa..15d3a3b2c 100644
+--- a/javatests/dagger/internal/codegen/MapBindingComponentProcessorTest.java
++++ b/javatests/dagger/internal/codegen/MapBindingComponentProcessorTest.java
+@@ -125,82 +125,194 @@ public void mapBindingsWithEnumKey() {
+         "interface TestComponent {",
+         "  Provider<Map<PathEnum, Provider<Handler>>> dispatcher();",
+         "}");
+-    JavaFileObject generatedComponent =
+-        JavaFileObjects.forSourceLines(
+-            "test.DaggerTestComponent",
+-            "package test;",
+-            "",
+-            "import dagger.internal.MapProviderFactory;",
+-            "import dagger.internal.Preconditions;",
+-            "import java.util.Map;",
+-            "import javax.annotation.Generated;",
+-            "import javax.inject.Provider;",
+-            "",
+-            GENERATED_ANNOTATION,
+-            "public final class DaggerTestComponent implements TestComponent {",
+-            "  private Provider<Handler> provideAdminHandlerProvider;",
+-            "  private Provider<Handler> provideLoginHandlerProvider;",
+-            "  private Provider<Map<PathEnum, Provider<Handler>>>",
+-            "      mapOfPathEnumAndProviderOfHandlerProvider;",
+-            "",
+-            "  private DaggerTestComponent(Builder builder) {",
+-            "    initialize(builder);",
+-            "  }",
+-            "",
+-            "  public static Builder builder() {",
+-            "    return new Builder();",
+-            "  }",
+-            "",
+-            "  public static TestComponent create() {",
+-            "    return new Builder().build();",
+-            "  }",
+-            "",
+-            "  @SuppressWarnings(\"unchecked\")",
+-            "  private void initialize(final Builder builder) {",
+-            "    this.provideAdminHandlerProvider =",
+-            "        MapModuleOne_ProvideAdminHandlerFactory.create(builder.mapModuleOne);",
+-            "    this.provideLoginHandlerProvider =",
+-            "        MapModuleTwo_ProvideLoginHandlerFactory.create(builder.mapModuleTwo);",
+-            "    this.mapOfPathEnumAndProviderOfHandlerProvider =",
+-            "        MapProviderFactory.<PathEnum, Handler>builder(2)",
+-            "            .put(PathEnum.ADMIN, provideAdminHandlerProvider)",
+-            "            .put(PathEnum.LOGIN, provideLoginHandlerProvider)",
+-            "            .build();",
+-            "  }",
+-            "",
+-            "  @Override",
+-            "  public Provider<Map<PathEnum, Provider<Handler>>> dispatcher() {",
+-            "    return mapOfPathEnumAndProviderOfHandlerProvider;",
+-            "  }",
+-            "",
+-            "  public static final class Builder {",
+-            "    private MapModuleOne mapModuleOne;",
+-            "    private MapModuleTwo mapModuleTwo;",
+-            "",
+-            "    private Builder() {",
+-            "    }",
+-            "",
+-            "    public TestComponent build() {",
+-            "      if (mapModuleOne == null) {",
+-            "        this.mapModuleOne = new MapModuleOne();",
+-            "      }",
+-            "      if (mapModuleTwo == null) {",
+-            "        this.mapModuleTwo = new MapModuleTwo();",
+-            "      }",
+-            "      return new DaggerTestComponent(this);",
+-            "    }",
+-            "",
+-            "    public Builder mapModuleOne(MapModuleOne mapModuleOne) {",
+-            "      this.mapModuleOne = Preconditions.checkNotNull(mapModuleOne);",
+-            "      return this;",
+-            "    }",
+-            "",
+-            "    public Builder mapModuleTwo(MapModuleTwo mapModuleTwo) {",
+-            "      this.mapModuleTwo = Preconditions.checkNotNull(mapModuleTwo);",
+-            "      return this;",
+-            "    }",
+-            "  }",
+-            "}");
++    JavaFileObject generatedComponent;
++    switch (compilerMode) {
++      case EXPERIMENTAL_ANDROID:
++        generatedComponent =
++            JavaFileObjects.forSourceLines(
++                "test.DaggerTestComponent",
++                "package test;",
++                "",
++                "import dagger.internal.MapProviderFactory;",
++                "import dagger.internal.Preconditions;",
++                "import java.util.Map;",
++                "import javax.annotation.Generated;",
++                "import javax.inject.Provider;",
++                "",
++                GENERATED_ANNOTATION,
++                "public final class DaggerTestComponent implements TestComponent {",
++                "  private MapModuleOne mapModuleOne;",
++                "",
++                "  private MapModuleTwo mapModuleTwo;",
++                "",
++                "  private Provider<Map<PathEnum, Provider<Handler>>>",
++                "      mapOfPathEnumAndProviderOfHandlerProvider;",
++                "",
++                "  private DaggerTestComponent(Builder builder) {",
++                "    initialize(builder);",
++                "  }",
++                "",
++                "  public static Builder builder() {",
++                "    return new Builder();",
++                "  }",
++                "",
++                "  public static TestComponent create() {",
++                "    return new Builder().build();",
++                "  }",
++                "",
++                "  private Handler getMapOfPathEnumAndProviderOfHandlerInstance() {",
++                "    return Preconditions.checkNotNull(",
++                "        mapModuleOne.provideAdminHandler(),",
++                "        " + NPE_FROM_PROVIDES_METHOD + ");",
++                "  }",
++                "",
++                "  private Provider<Handler> getMapOfPathEnumAndProviderOfHandlerProvider() {",
++                "    return new Provider<Handler>() {",
++                "      @Override",
++                "      public Handler get() {",
++                "        return getMapOfPathEnumAndProviderOfHandlerInstance();",
++                "      }",
++                "    };",
++                "  }",
++                "",
++                "  private Handler getMapOfPathEnumAndProviderOfHandlerInstance2() {",
++                "    return Preconditions.checkNotNull(",
++                "        mapModuleTwo.provideLoginHandler(),",
++                "        " + NPE_FROM_PROVIDES_METHOD + ");",
++                "  }",
++                "",
++                "  private Provider<Handler> getMapOfPathEnumAndProviderOfHandlerProvider2() {",
++                "    return new Provider<Handler>() {",
++                "      @Override",
++                "      public Handler get() {",
++                "        return getMapOfPathEnumAndProviderOfHandlerInstance2();",
++                "      }",
++                "    };",
++                "  }",
++                "",
++                "  @SuppressWarnings(\"unchecked\")",
++                "  private void initialize(final Builder builder) {",
++                "    this.mapModuleOne = builder.mapModuleOne;",
++                "    this.mapModuleTwo = builder.mapModuleTwo;",
++                "    this.mapOfPathEnumAndProviderOfHandlerProvider =",
++                "        MapProviderFactory.<PathEnum, Handler>builder(2)",
++                "            .put(PathEnum.ADMIN, getMapOfPathEnumAndProviderOfHandlerProvider())",
++                "            .put(PathEnum.LOGIN, getMapOfPathEnumAndProviderOfHandlerProvider2())",
++                "            .build();",
++                "  }",
++                "",
++                "  @Override",
++                "  public Provider<Map<PathEnum, Provider<Handler>>> dispatcher() {",
++                "    return mapOfPathEnumAndProviderOfHandlerProvider;",
++                "  }",
++                "",
++                "  public static final class Builder {",
++                "    private MapModuleOne mapModuleOne;",
++                "",
++                "    private MapModuleTwo mapModuleTwo;",
++                "",
++                "    private Builder() {}",
++                "",
++                "    public TestComponent build() {",
++                "      if (mapModuleOne == null) {",
++                "        this.mapModuleOne = new MapModuleOne();",
++                "      }",
++                "      if (mapModuleTwo == null) {",
++                "        this.mapModuleTwo = new MapModuleTwo();",
++                "      }",
++                "      return new DaggerTestComponent(this);",
++                "    }",
++                "",
++                "    public Builder mapModuleOne(MapModuleOne mapModuleOne) {",
++                "      this.mapModuleOne = Preconditions.checkNotNull(mapModuleOne);",
++                "      return this;",
++                "    }",
++                "",
++                "    public Builder mapModuleTwo(MapModuleTwo mapModuleTwo) {",
++                "      this.mapModuleTwo = Preconditions.checkNotNull(mapModuleTwo);",
++                "      return this;",
++                "    }",
++                "  }",
++                "}");
++        break;
++      default:
++        generatedComponent =
++            JavaFileObjects.forSourceLines(
++                "test.DaggerTestComponent",
++                "package test;",
++                "",
++                "import dagger.internal.MapProviderFactory;",
++                "import dagger.internal.Preconditions;",
++                "import java.util.Map;",
++                "import javax.annotation.Generated;",
++                "import javax.inject.Provider;",
++                "",
++                GENERATED_ANNOTATION,
++                "public final class DaggerTestComponent implements TestComponent {",
++                "  private Provider<Handler> provideAdminHandlerProvider;",
++                "  private Provider<Handler> provideLoginHandlerProvider;",
++                "  private Provider<Map<PathEnum, Provider<Handler>>>",
++                "      mapOfPathEnumAndProviderOfHandlerProvider;",
++                "",
++                "  private DaggerTestComponent(Builder builder) {",
++                "    initialize(builder);",
++                "  }",
++                "",
++                "  public static Builder builder() {",
++                "    return new Builder();",
++                "  }",
++                "",
++                "  public static TestComponent create() {",
++                "    return new Builder().build();",
++                "  }",
++                "",
++                "  @SuppressWarnings(\"unchecked\")",
++                "  private void initialize(final Builder builder) {",
++                "    this.provideAdminHandlerProvider =",
++                "        MapModuleOne_ProvideAdminHandlerFactory.create(builder.mapModuleOne);",
++                "    this.provideLoginHandlerProvider =",
++                "        MapModuleTwo_ProvideLoginHandlerFactory.create(builder.mapModuleTwo);",
++                "    this.mapOfPathEnumAndProviderOfHandlerProvider =",
++                "        MapProviderFactory.<PathEnum, Handler>builder(2)",
++                "            .put(PathEnum.ADMIN, provideAdminHandlerProvider)",
++                "            .put(PathEnum.LOGIN, provideLoginHandlerProvider)",
++                "            .build();",
++                "  }",
++                "",
++                "  @Override",
++                "  public Provider<Map<PathEnum, Provider<Handler>>> dispatcher() {",
++                "    return mapOfPathEnumAndProviderOfHandlerProvider;",
++                "  }",
++                "",
++                "  public static final class Builder {",
++                "    private MapModuleOne mapModuleOne;",
++                "    private MapModuleTwo mapModuleTwo;",
++                "",
++                "    private Builder() {",
++                "    }",
++                "",
++                "    public TestComponent build() {",
++                "      if (mapModuleOne == null) {",
++                "        this.mapModuleOne = new MapModuleOne();",
++                "      }",
++                "      if (mapModuleTwo == null) {",
++                "        this.mapModuleTwo = new MapModuleTwo();",
++                "      }",
++                "      return new DaggerTestComponent(this);",
++                "    }",
++                "",
++                "    public Builder mapModuleOne(MapModuleOne mapModuleOne) {",
++                "      this.mapModuleOne = Preconditions.checkNotNull(mapModuleOne);",
++                "      return this;",
++                "    }",
++                "",
++                "    public Builder mapModuleTwo(MapModuleTwo mapModuleTwo) {",
++                "      this.mapModuleTwo = Preconditions.checkNotNull(mapModuleTwo);",
++                "      return this;",
++                "    }",
++                "  }",
++                "}");
++    }
+     assertAbout(javaSources())
+         .that(
+             ImmutableList.of(
+@@ -562,155 +674,267 @@ public void mapBindingsWithStringKey() {
+         "interface TestComponent {",
+         "  Provider<Map<String, Provider<Handler>>> dispatcher();",
+         "}");
+-    JavaFileObject generatedComponent =
+-        JavaFileObjects.forSourceLines(
+-            "test.DaggerTestComponent",
+-            "package test;",
+-            "",
+-            "import dagger.internal.MapProviderFactory;",
+-            "import dagger.internal.Preconditions;",
+-            "import java.util.Map;",
+-            "import javax.annotation.Generated;",
+-            "import javax.inject.Provider;",
+-            "",
+-            GENERATED_ANNOTATION,
+-            "public final class DaggerTestComponent implements TestComponent {",
+-            "  private Provider<Handler> provideAdminHandlerProvider;",
+-            "  private Provider<Handler> provideLoginHandlerProvider;",
+-            "  private Provider<Map<String, Provider<Handler>>>",
+-            "      mapOfStringAndProviderOfHandlerProvider;",
+-            "",
+-            "  private DaggerTestComponent(Builder builder) {",
+-            "    initialize(builder);",
+-            "  }",
+-            "",
+-            "  public static Builder builder() {",
+-            "    return new Builder();",
+-            "  }",
+-            "",
+-            "  public static TestComponent create() {",
+-            "    return new Builder().build();",
+-            "  }",
+-            "",
+-            "  @SuppressWarnings(\"unchecked\")",
+-            "  private void initialize(final Builder builder) {",
+-            "    this.provideAdminHandlerProvider =",
+-            "        MapModuleOne_ProvideAdminHandlerFactory.create(builder.mapModuleOne);",
+-            "    this.provideLoginHandlerProvider =",
+-            "        MapModuleTwo_ProvideLoginHandlerFactory.create(builder.mapModuleTwo);",
+-            "    this.mapOfStringAndProviderOfHandlerProvider =",
+-            "        MapProviderFactory.<String, Handler>builder(2)",
+-            "            .put(\"Admin\", provideAdminHandlerProvider)",
+-            "            .put(\"Login\", provideLoginHandlerProvider)",
+-            "            .build();",
+-            "  }",
+-            "",
+-            "  @Override",
+-            "  public Provider<Map<String, Provider<Handler>>> dispatcher() {",
+-            "    return mapOfStringAndProviderOfHandlerProvider;",
+-            "  }",
+-            "",
+-            "  public static final class Builder {",
+-            "    private MapModuleOne mapModuleOne;",
+-            "    private MapModuleTwo mapModuleTwo;",
+-            "",
+-            "    private Builder() {",
+-            "    }",
+-            "",
+-            "    public TestComponent build() {",
+-            "      if (mapModuleOne == null) {",
+-            "        this.mapModuleOne = new MapModuleOne();",
+-            "      }",
+-            "      if (mapModuleTwo == null) {",
+-            "        this.mapModuleTwo = new MapModuleTwo();",
+-            "      }",
+-            "      return new DaggerTestComponent(this);",
+-            "    }",
+-            "",
+-            "    public Builder mapModuleOne(MapModuleOne mapModuleOne) {",
+-            "      this.mapModuleOne = Preconditions.checkNotNull(mapModuleOne);",
+-            "      return this;",
+-            "    }",
+-            "",
+-            "    public Builder mapModuleTwo(MapModuleTwo mapModuleTwo) {",
+-            "      this.mapModuleTwo = Preconditions.checkNotNull(mapModuleTwo);",
+-            "      return this;",
+-            "    }",
+-            "  }",
+-            "}");
+-    assertAbout(javaSources())
+-        .that(
+-            ImmutableList.of(
+-                mapModuleOneFile,
+-                mapModuleTwoFile,
+-                HandlerFile,
+-                LoginHandlerFile,
+-                AdminHandlerFile,
+-                componentFile))
+-        .withCompilerOptions(compilerMode.javacopts())
+-        .processedWith(new ComponentProcessor())
+-        .compilesWithoutError()
+-        .and()
+-        .generatesSources(generatedComponent);
+-  }
+-
+-  @Test
+-  public void mapBindingsWithWrappedKey() {
+-    JavaFileObject mapModuleOneFile =
+-        JavaFileObjects
+-            .forSourceLines("test.MapModuleOne",
++    JavaFileObject generatedComponent;
++    switch (compilerMode) {
++      case EXPERIMENTAL_ANDROID:
++        generatedComponent =
++            JavaFileObjects.forSourceLines(
++                "test.DaggerTestComponent",
+                 "package test;",
+                 "",
+-                "import dagger.Module;",
+-                "import dagger.Provides;",
+-                "import dagger.multibindings.IntoMap;",
++                "import dagger.internal.MapProviderFactory;",
++                "import dagger.internal.Preconditions;",
++                "import java.util.Map;",
++                "import javax.annotation.Generated;",
++                "import javax.inject.Provider;",
+                 "",
+-                "@Module",
+-                "final class MapModuleOne {",
+-                "  @Provides @IntoMap",
+-                "  @WrappedClassKey(Integer.class) Handler provideAdminHandler() {",
+-                "    return new AdminHandler();",
++                GENERATED_ANNOTATION,
++                "public final class DaggerTestComponent implements TestComponent {",
++                "  private MapModuleOne mapModuleOne;",
++                "",
++                "  private MapModuleTwo mapModuleTwo;",
++                "",
++                "  private Provider<Map<String, Provider<Handler>>>",
++                "      mapOfStringAndProviderOfHandlerProvider;",
++                "",
++                "  private DaggerTestComponent(Builder builder) {",
++                "    initialize(builder);",
+                 "  }",
+-                "}");
+-    JavaFileObject mapModuleTwoFile =
+-        JavaFileObjects
+-            .forSourceLines("test.MapModuleTwo",
+-                "package test;",
+                 "",
+-                "import dagger.Module;",
+-                "import dagger.Provides;",
+-                "import dagger.multibindings.IntoMap;",
++                "  public static Builder builder() {",
++                "    return new Builder();",
++                "  }",
+                 "",
+-                "@Module",
+-                "final class MapModuleTwo {",
+-                "  @Provides @IntoMap",
+-                "  @WrappedClassKey(Long.class) Handler provideLoginHandler() {",
+-                "    return new LoginHandler();",
++                "  public static TestComponent create() {",
++                "    return new Builder().build();",
+                 "  }",
+-                "}");
+-    JavaFileObject wrappedClassKeyFile = JavaFileObjects.forSourceLines("test.WrappedClassKey",
+-        "package test;",
+-        "import dagger.MapKey;",
+-        "import java.lang.annotation.Retention;",
+-        "import static java.lang.annotation.RetentionPolicy.RUNTIME;",
+-        "",
+-        "@MapKey(unwrapValue = false)",
+-        "@Retention(RUNTIME)",
+-        "public @interface WrappedClassKey {",
+-        "  Class<?> value();",
+-        "}");
+-    JavaFileObject HandlerFile = JavaFileObjects.forSourceLines("test.Handler",
+-        "package test;",
+-        "",
+-        "interface Handler {}");
+-    JavaFileObject LoginHandlerFile = JavaFileObjects.forSourceLines("test.LoginHandler",
+-        "package test;",
+-        "",
+-        "class LoginHandler implements Handler {",
+-        "  public LoginHandler() {}",
+-        "}");
+-    JavaFileObject AdminHandlerFile = JavaFileObjects.forSourceLines("test.AdminHandler",
+-        "package test;",
++                "",
++                "  private Handler getMapOfStringAndProviderOfHandlerInstance() {",
++                "    return Preconditions.checkNotNull(",
++                "        mapModuleOne.provideAdminHandler(),",
++                "        " + NPE_FROM_PROVIDES_METHOD + ");",
++                "  }",
++                "",
++                "  private Provider<Handler> getMapOfStringAndProviderOfHandlerProvider() {",
++                "    return new Provider<Handler>() {",
++                "      @Override",
++                "      public Handler get() {",
++                "        return getMapOfStringAndProviderOfHandlerInstance();",
++                "      }",
++                "    };",
++                "  }",
++                "",
++                "  private Handler getMapOfStringAndProviderOfHandlerInstance2() {",
++                "    return Preconditions.checkNotNull(",
++                "        mapModuleTwo.provideLoginHandler(),",
++                "        " + NPE_FROM_PROVIDES_METHOD + ");",
++                "  }",
++                "",
++                "  private Provider<Handler> getMapOfStringAndProviderOfHandlerProvider2() {",
++                "    return new Provider<Handler>() {",
++                "      @Override",
++                "      public Handler get() {",
++                "        return getMapOfStringAndProviderOfHandlerInstance2();",
++                "      }",
++                "    };",
++                "  }",
++                "",
++                "  @SuppressWarnings(\"unchecked\")",
++                "  private void initialize(final Builder builder) {",
++                "    this.mapModuleOne = builder.mapModuleOne;",
++                "    this.mapModuleTwo = builder.mapModuleTwo;",
++                "    this.mapOfStringAndProviderOfHandlerProvider =",
++                "        MapProviderFactory.<String, Handler>builder(2)",
++                "            .put(\"Admin\", getMapOfStringAndProviderOfHandlerProvider())",
++                "            .put(\"Login\", getMapOfStringAndProviderOfHandlerProvider2())",
++                "            .build();",
++                "  }",
++                "",
++                "  @Override",
++                "  public Provider<Map<String, Provider<Handler>>> dispatcher() {",
++                "    return mapOfStringAndProviderOfHandlerProvider;",
++                "  }",
++                "",
++                "  public static final class Builder {",
++                "    private MapModuleOne mapModuleOne;",
++                "",
++                "    private MapModuleTwo mapModuleTwo;",
++                "",
++                "    private Builder() {}",
++                "",
++                "    public TestComponent build() {",
++                "      if (mapModuleOne == null) {",
++                "        this.mapModuleOne = new MapModuleOne();",
++                "      }",
++                "      if (mapModuleTwo == null) {",
++                "        this.mapModuleTwo = new MapModuleTwo();",
++                "      }",
++                "      return new DaggerTestComponent(this);",
++                "    }",
++                "",
++                "    public Builder mapModuleOne(MapModuleOne mapModuleOne) {",
++                "      this.mapModuleOne = Preconditions.checkNotNull(mapModuleOne);",
++                "      return this;",
++                "    }",
++                "",
++                "    public Builder mapModuleTwo(MapModuleTwo mapModuleTwo) {",
++                "      this.mapModuleTwo = Preconditions.checkNotNull(mapModuleTwo);",
++                "      return this;",
++                "    }",
++                "  }",
++                "}");
++        break;
++      default:
++        generatedComponent =
++            JavaFileObjects.forSourceLines(
++                "test.DaggerTestComponent",
++                "package test;",
++                "",
++                "import dagger.internal.MapProviderFactory;",
++                "import dagger.internal.Preconditions;",
++                "import java.util.Map;",
++                "import javax.annotation.Generated;",
++                "import javax.inject.Provider;",
++                "",
++                GENERATED_ANNOTATION,
++                "public final class DaggerTestComponent implements TestComponent {",
++                "  private Provider<Handler> provideAdminHandlerProvider;",
++                "  private Provider<Handler> provideLoginHandlerProvider;",
++                "  private Provider<Map<String, Provider<Handler>>>",
++                "      mapOfStringAndProviderOfHandlerProvider;",
++                "",
++                "  private DaggerTestComponent(Builder builder) {",
++                "    initialize(builder);",
++                "  }",
++                "",
++                "  public static Builder builder() {",
++                "    return new Builder();",
++                "  }",
++                "",
++                "  public static TestComponent create() {",
++                "    return new Builder().build();",
++                "  }",
++                "",
++                "  @SuppressWarnings(\"unchecked\")",
++                "  private void initialize(final Builder builder) {",
++                "    this.provideAdminHandlerProvider =",
++                "        MapModuleOne_ProvideAdminHandlerFactory.create(builder.mapModuleOne);",
++                "    this.provideLoginHandlerProvider =",
++                "        MapModuleTwo_ProvideLoginHandlerFactory.create(builder.mapModuleTwo);",
++                "    this.mapOfStringAndProviderOfHandlerProvider =",
++                "        MapProviderFactory.<String, Handler>builder(2)",
++                "            .put(\"Admin\", provideAdminHandlerProvider)",
++                "            .put(\"Login\", provideLoginHandlerProvider)",
++                "            .build();",
++                "  }",
++                "",
++                "  @Override",
++                "  public Provider<Map<String, Provider<Handler>>> dispatcher() {",
++                "    return mapOfStringAndProviderOfHandlerProvider;",
++                "  }",
++                "",
++                "  public static final class Builder {",
++                "    private MapModuleOne mapModuleOne;",
++                "    private MapModuleTwo mapModuleTwo;",
++                "",
++                "    private Builder() {",
++                "    }",
++                "",
++                "    public TestComponent build() {",
++                "      if (mapModuleOne == null) {",
++                "        this.mapModuleOne = new MapModuleOne();",
++                "      }",
++                "      if (mapModuleTwo == null) {",
++                "        this.mapModuleTwo = new MapModuleTwo();",
++                "      }",
++                "      return new DaggerTestComponent(this);",
++                "    }",
++                "",
++                "    public Builder mapModuleOne(MapModuleOne mapModuleOne) {",
++                "      this.mapModuleOne = Preconditions.checkNotNull(mapModuleOne);",
++                "      return this;",
++                "    }",
++                "",
++                "    public Builder mapModuleTwo(MapModuleTwo mapModuleTwo) {",
++                "      this.mapModuleTwo = Preconditions.checkNotNull(mapModuleTwo);",
++                "      return this;",
++                "    }",
++                "  }",
++                "}");
++    }
++    assertAbout(javaSources())
++        .that(
++            ImmutableList.of(
++                mapModuleOneFile,
++                mapModuleTwoFile,
++                HandlerFile,
++                LoginHandlerFile,
++                AdminHandlerFile,
++                componentFile))
++        .withCompilerOptions(compilerMode.javacopts())
++        .processedWith(new ComponentProcessor())
++        .compilesWithoutError()
++        .and()
++        .generatesSources(generatedComponent);
++  }
++
++  @Test
++  public void mapBindingsWithWrappedKey() {
++    JavaFileObject mapModuleOneFile =
++        JavaFileObjects
++            .forSourceLines("test.MapModuleOne",
++                "package test;",
++                "",
++                "import dagger.Module;",
++                "import dagger.Provides;",
++                "import dagger.multibindings.IntoMap;",
++                "",
++                "@Module",
++                "final class MapModuleOne {",
++                "  @Provides @IntoMap",
++                "  @WrappedClassKey(Integer.class) Handler provideAdminHandler() {",
++                "    return new AdminHandler();",
++                "  }",
++                "}");
++    JavaFileObject mapModuleTwoFile =
++        JavaFileObjects
++            .forSourceLines("test.MapModuleTwo",
++                "package test;",
++                "",
++                "import dagger.Module;",
++                "import dagger.Provides;",
++                "import dagger.multibindings.IntoMap;",
++                "",
++                "@Module",
++                "final class MapModuleTwo {",
++                "  @Provides @IntoMap",
++                "  @WrappedClassKey(Long.class) Handler provideLoginHandler() {",
++                "    return new LoginHandler();",
++                "  }",
++                "}");
++    JavaFileObject wrappedClassKeyFile = JavaFileObjects.forSourceLines("test.WrappedClassKey",
++        "package test;",
++        "import dagger.MapKey;",
++        "import java.lang.annotation.Retention;",
++        "import static java.lang.annotation.RetentionPolicy.RUNTIME;",
++        "",
++        "@MapKey(unwrapValue = false)",
++        "@Retention(RUNTIME)",
++        "public @interface WrappedClassKey {",
++        "  Class<?> value();",
++        "}");
++    JavaFileObject HandlerFile = JavaFileObjects.forSourceLines("test.Handler",
++        "package test;",
++        "",
++        "interface Handler {}");
++    JavaFileObject LoginHandlerFile = JavaFileObjects.forSourceLines("test.LoginHandler",
++        "package test;",
++        "",
++        "class LoginHandler implements Handler {",
++        "  public LoginHandler() {}",
++        "}");
++    JavaFileObject AdminHandlerFile = JavaFileObjects.forSourceLines("test.AdminHandler",
++        "package test;",
+         "",
+         "class AdminHandler implements Handler {",
+         "  public AdminHandler() {}",
+@@ -726,84 +950,202 @@ public void mapBindingsWithWrappedKey() {
+         "interface TestComponent {",
+         "  Provider<Map<WrappedClassKey, Provider<Handler>>> dispatcher();",
+         "}");
+-    JavaFileObject generatedComponent =
+-        JavaFileObjects.forSourceLines(
+-            "test.DaggerTestComponent",
+-            "package test;",
+-            "",
+-            "import dagger.internal.MapProviderFactory;",
+-            "import dagger.internal.Preconditions;",
+-            "import java.util.Map;",
+-            "import javax.annotation.Generated;",
+-            "import javax.inject.Provider;",
+-            "",
+-            GENERATED_ANNOTATION,
+-            "public final class DaggerTestComponent implements TestComponent {",
+-            "  private Provider<Handler> provideAdminHandlerProvider;",
+-            "  private Provider<Handler> provideLoginHandlerProvider;",
+-            "  private Provider<Map<WrappedClassKey, Provider<Handler>>>",
+-            "      mapOfWrappedClassKeyAndProviderOfHandlerProvider;",
+-            "",
+-            "  private DaggerTestComponent(Builder builder) {",
+-            "    initialize(builder);",
+-            "  }",
+-            "",
+-            "  public static Builder builder() {",
+-            "    return new Builder();",
+-            "  }",
+-            "",
+-            "  public static TestComponent create() {",
+-            "    return new Builder().build();",
+-            "  }",
+-            "",
+-            "  @SuppressWarnings(\"unchecked\")",
+-            "  private void initialize(final Builder builder) {",
+-            "    this.provideAdminHandlerProvider =",
+-            "        MapModuleOne_ProvideAdminHandlerFactory.create(builder.mapModuleOne);",
+-            "    this.provideLoginHandlerProvider =",
+-            "        MapModuleTwo_ProvideLoginHandlerFactory.create(builder.mapModuleTwo);",
+-            "    this.mapOfWrappedClassKeyAndProviderOfHandlerProvider =",
+-            "        MapProviderFactory.<WrappedClassKey, Handler>builder(2)",
+-            "            .put(WrappedClassKeyCreator.createWrappedClassKey(Integer.class),",
+-            "                provideAdminHandlerProvider)",
+-            "            .put(WrappedClassKeyCreator.createWrappedClassKey(Long.class),",
+-            "                provideLoginHandlerProvider)",
+-            "            .build();",
+-            "  }",
+-            "",
+-            "  @Override",
+-            "  public Provider<Map<WrappedClassKey, Provider<Handler>>> dispatcher() {",
+-            "    return mapOfWrappedClassKeyAndProviderOfHandlerProvider;",
+-            "  }",
+-            "",
+-            "  public static final class Builder {",
+-            "    private MapModuleOne mapModuleOne;",
+-            "    private MapModuleTwo mapModuleTwo;",
+-            "",
+-            "    private Builder() {",
+-            "    }",
+-            "",
+-            "    public TestComponent build() {",
+-            "      if (mapModuleOne == null) {",
+-            "        this.mapModuleOne = new MapModuleOne();",
+-            "      }",
+-            "      if (mapModuleTwo == null) {",
+-            "        this.mapModuleTwo = new MapModuleTwo();",
+-            "      }",
+-            "      return new DaggerTestComponent(this);",
+-            "    }",
+-            "",
+-            "    public Builder mapModuleOne(MapModuleOne mapModuleOne) {",
+-            "      this.mapModuleOne = Preconditions.checkNotNull(mapModuleOne);",
+-            "      return this;",
+-            "    }",
+-            "",
+-            "    public Builder mapModuleTwo(MapModuleTwo mapModuleTwo) {",
+-            "      this.mapModuleTwo = Preconditions.checkNotNull(mapModuleTwo);",
+-            "      return this;",
+-            "    }",
+-            "  }",
+-            "}");
++    JavaFileObject generatedComponent;
++    switch (compilerMode) {
++      case EXPERIMENTAL_ANDROID:
++        generatedComponent =
++            JavaFileObjects.forSourceLines(
++                "test.DaggerTestComponent",
++                "package test;",
++                "",
++                "import dagger.internal.MapProviderFactory;",
++                "import dagger.internal.Preconditions;",
++                "import java.util.Map;",
++                "import javax.annotation.Generated;",
++                "import javax.inject.Provider;",
++                "",
++                GENERATED_ANNOTATION,
++                "public final class DaggerTestComponent implements TestComponent {",
++                "  private MapModuleOne mapModuleOne;",
++                "",
++                "  private MapModuleTwo mapModuleTwo;",
++                "",
++                "  private Provider<Map<WrappedClassKey, Provider<Handler>>>",
++                "      mapOfWrappedClassKeyAndProviderOfHandlerProvider;",
++                "",
++                "  private DaggerTestComponent(Builder builder) {",
++                "    initialize(builder);",
++                "  }",
++                "",
++                "  public static Builder builder() {",
++                "    return new Builder();",
++                "  }",
++                "",
++                "  public static TestComponent create() {",
++                "    return new Builder().build();",
++                "  }",
++                "",
++                "  private Handler getMapOfWrappedClassKeyAndProviderOfHandlerInstance() {",
++                "    return Preconditions.checkNotNull(",
++                "        mapModuleOne.provideAdminHandler(),",
++                "        " + NPE_FROM_PROVIDES_METHOD + ");",
++                "  }",
++                "",
++                "  private Provider<Handler>",
++                "        getMapOfWrappedClassKeyAndProviderOfHandlerProvider() {",
++                "    return new Provider<Handler>() {",
++                "      @Override",
++                "      public Handler get() {",
++                "        return getMapOfWrappedClassKeyAndProviderOfHandlerInstance();",
++                "      }",
++                "    };",
++                "  }",
++                "",
++                "  private Handler getMapOfWrappedClassKeyAndProviderOfHandlerInstance2() {",
++                "    return Preconditions.checkNotNull(",
++                "        mapModuleTwo.provideLoginHandler(),",
++                "        " + NPE_FROM_PROVIDES_METHOD + ");",
++                "  }",
++                "",
++                "  private Provider<Handler>",
++                "        getMapOfWrappedClassKeyAndProviderOfHandlerProvider2() {",
++                "    return new Provider<Handler>() {",
++                "      @Override",
++                "      public Handler get() {",
++                "        return getMapOfWrappedClassKeyAndProviderOfHandlerInstance2();",
++                "      }",
++                "    };",
++                "  }",
++                "",
++                "  @SuppressWarnings(\"unchecked\")",
++                "  private void initialize(final Builder builder) {",
++                "    this.mapModuleOne = builder.mapModuleOne;",
++                "    this.mapModuleTwo = builder.mapModuleTwo;",
++                "    this.mapOfWrappedClassKeyAndProviderOfHandlerProvider =",
++                "        MapProviderFactory.<WrappedClassKey, Handler>builder(2)",
++                "            .put(",
++                "                WrappedClassKeyCreator.createWrappedClassKey(Integer.class),",
++                "                getMapOfWrappedClassKeyAndProviderOfHandlerProvider())",
++                "            .put(",
++                "                WrappedClassKeyCreator.createWrappedClassKey(Long.class),",
++                "                getMapOfWrappedClassKeyAndProviderOfHandlerProvider2())",
++                "            .build();",
++                "  }",
++                "",
++                "  @Override",
++                "  public Provider<Map<WrappedClassKey, Provider<Handler>>> dispatcher() {",
++                "    return mapOfWrappedClassKeyAndProviderOfHandlerProvider;",
++                "  }",
++                "",
++                "  public static final class Builder {",
++                "    private MapModuleOne mapModuleOne;",
++                "",
++                "    private MapModuleTwo mapModuleTwo;",
++                "",
++                "    private Builder() {}",
++                "",
++                "    public TestComponent build() {",
++                "      if (mapModuleOne == null) {",
++                "        this.mapModuleOne = new MapModuleOne();",
++                "      }",
++                "      if (mapModuleTwo == null) {",
++                "        this.mapModuleTwo = new MapModuleTwo();",
++                "      }",
++                "      return new DaggerTestComponent(this);",
++                "    }",
++                "",
++                "    public Builder mapModuleOne(MapModuleOne mapModuleOne) {",
++                "      this.mapModuleOne = Preconditions.checkNotNull(mapModuleOne);",
++                "      return this;",
++                "    }",
++                "",
++                "    public Builder mapModuleTwo(MapModuleTwo mapModuleTwo) {",
++                "      this.mapModuleTwo = Preconditions.checkNotNull(mapModuleTwo);",
++                "      return this;",
++                "    }",
++                "  }",
++                "}");
++        break;
++      default:
++        generatedComponent =
++            JavaFileObjects.forSourceLines(
++                "test.DaggerTestComponent",
++                "package test;",
++                "",
++                "import dagger.internal.MapProviderFactory;",
++                "import dagger.internal.Preconditions;",
++                "import java.util.Map;",
++                "import javax.annotation.Generated;",
++                "import javax.inject.Provider;",
++                "",
++                GENERATED_ANNOTATION,
++                "public final class DaggerTestComponent implements TestComponent {",
++                "  private Provider<Handler> provideAdminHandlerProvider;",
++                "  private Provider<Handler> provideLoginHandlerProvider;",
++                "  private Provider<Map<WrappedClassKey, Provider<Handler>>>",
++                "      mapOfWrappedClassKeyAndProviderOfHandlerProvider;",
++                "",
++                "  private DaggerTestComponent(Builder builder) {",
++                "    initialize(builder);",
++                "  }",
++                "",
++                "  public static Builder builder() {",
++                "    return new Builder();",
++                "  }",
++                "",
++                "  public static TestComponent create() {",
++                "    return new Builder().build();",
++                "  }",
++                "",
++                "  @SuppressWarnings(\"unchecked\")",
++                "  private void initialize(final Builder builder) {",
++                "    this.provideAdminHandlerProvider =",
++                "        MapModuleOne_ProvideAdminHandlerFactory.create(builder.mapModuleOne);",
++                "    this.provideLoginHandlerProvider =",
++                "        MapModuleTwo_ProvideLoginHandlerFactory.create(builder.mapModuleTwo);",
++                "    this.mapOfWrappedClassKeyAndProviderOfHandlerProvider =",
++                "        MapProviderFactory.<WrappedClassKey, Handler>builder(2)",
++                "            .put(WrappedClassKeyCreator.createWrappedClassKey(Integer.class),",
++                "                provideAdminHandlerProvider)",
++                "            .put(WrappedClassKeyCreator.createWrappedClassKey(Long.class),",
++                "                provideLoginHandlerProvider)",
++                "            .build();",
++                "  }",
++                "",
++                "  @Override",
++                "  public Provider<Map<WrappedClassKey, Provider<Handler>>> dispatcher() {",
++                "    return mapOfWrappedClassKeyAndProviderOfHandlerProvider;",
++                "  }",
++                "",
++                "  public static final class Builder {",
++                "    private MapModuleOne mapModuleOne;",
++                "    private MapModuleTwo mapModuleTwo;",
++                "",
++                "    private Builder() {",
++                "    }",
++                "",
++                "    public TestComponent build() {",
++                "      if (mapModuleOne == null) {",
++                "        this.mapModuleOne = new MapModuleOne();",
++                "      }",
++                "      if (mapModuleTwo == null) {",
++                "        this.mapModuleTwo = new MapModuleTwo();",
++                "      }",
++                "      return new DaggerTestComponent(this);",
++                "    }",
++                "",
++                "    public Builder mapModuleOne(MapModuleOne mapModuleOne) {",
++                "      this.mapModuleOne = Preconditions.checkNotNull(mapModuleOne);",
++                "      return this;",
++                "    }",
++                "",
++                "    public Builder mapModuleTwo(MapModuleTwo mapModuleTwo) {",
++                "      this.mapModuleTwo = Preconditions.checkNotNull(mapModuleTwo);",
++                "      return this;",
++                "    }",
++                "  }",
++                "}");
++    }
+     assertAbout(javaSources())
+         .that(
+             ImmutableList.of(
+@@ -894,81 +1236,192 @@ public void mapBindingsWithNonProviderValue() {
+         "interface TestComponent {",
+         "  Provider<Map<PathEnum, Handler>> dispatcher();",
+         "}");
+-    JavaFileObject generatedComponent =
+-        JavaFileObjects.forSourceLines(
+-            "test.DaggerTestComponent",
+-            "package test;",
+-            "",
+-            "import dagger.internal.MapFactory;",
+-            "import dagger.internal.Preconditions;",
+-            "import java.util.Map;",
+-            "import javax.annotation.Generated;",
+-            "import javax.inject.Provider;",
+-            "",
+-            GENERATED_ANNOTATION,
+-            "public final class DaggerTestComponent implements TestComponent {",
+-            "  private Provider<Handler> provideAdminHandlerProvider;",
+-            "  private Provider<Handler> provideLoginHandlerProvider;",
+-            "  private Provider<Map<PathEnum, Handler>> mapOfPathEnumAndHandlerProvider;",
+-            "",
+-            "  private DaggerTestComponent(Builder builder) {",
+-            "    initialize(builder);",
+-            "  }",
+-            "",
+-            "  public static Builder builder() {",
+-            "    return new Builder();",
+-            "  }",
+-            "",
+-            "  public static TestComponent create() {",
+-            "    return new Builder().build();",
+-            "  }",
+-            "",
+-            "  @SuppressWarnings(\"unchecked\")",
+-            "  private void initialize(final Builder builder) {",
+-            "    this.provideAdminHandlerProvider =",
+-            "        MapModuleOne_ProvideAdminHandlerFactory.create(builder.mapModuleOne);",
+-            "    this.provideLoginHandlerProvider =",
+-            "        MapModuleTwo_ProvideLoginHandlerFactory.create(builder.mapModuleTwo);",
+-            "    this.mapOfPathEnumAndHandlerProvider =",
+-            "        MapFactory.<PathEnum, Handler>builder(2)",
+-            "            .put(PathEnum.ADMIN, provideAdminHandlerProvider)",
+-            "            .put(PathEnum.LOGIN, provideLoginHandlerProvider)",
+-            "            .build();",
+-            "  }",
+-            "",
+-            "  @Override",
+-            "  public Provider<Map<PathEnum, Handler>> dispatcher() {",
+-            "    return mapOfPathEnumAndHandlerProvider;",
+-            "  }",
+-            "",
+-            "  public static final class Builder {",
+-            "    private MapModuleOne mapModuleOne;",
+-            "    private MapModuleTwo mapModuleTwo;",
+-            "",
+-            "    private Builder() {",
+-            "    }",
+-            "",
+-            "    public TestComponent build() {",
+-            "      if (mapModuleOne == null) {",
+-            "        this.mapModuleOne = new MapModuleOne();",
+-            "      }",
+-            "      if (mapModuleTwo == null) {",
+-            "        this.mapModuleTwo = new MapModuleTwo();",
+-            "      }",
+-            "      return new DaggerTestComponent(this);",
+-            "    }",
+-            "",
+-            "    public Builder mapModuleOne(MapModuleOne mapModuleOne) {",
+-            "      this.mapModuleOne = Preconditions.checkNotNull(mapModuleOne);",
+-            "      return this;",
+-            "    }",
+-            "",
+-            "    public Builder mapModuleTwo(MapModuleTwo mapModuleTwo) {",
+-            "      this.mapModuleTwo = Preconditions.checkNotNull(mapModuleTwo);",
+-            "      return this;",
+-            "    }",
+-            "  }",
+-            "}");
++    JavaFileObject generatedComponent;
++    switch (compilerMode) {
++      case EXPERIMENTAL_ANDROID:
++        generatedComponent =
++            JavaFileObjects.forSourceLines(
++                "test.DaggerTestComponent",
++                "package test;",
++                "",
++                "import dagger.internal.MapFactory;",
++                "import dagger.internal.Preconditions;",
++                "import java.util.Map;",
++                "import javax.annotation.Generated;",
++                "import javax.inject.Provider;",
++                "",
++                GENERATED_ANNOTATION,
++                "public final class DaggerTestComponent implements TestComponent {",
++                "  private MapModuleOne mapModuleOne;",
++                "",
++                "  private MapModuleTwo mapModuleTwo;",
++                "",
++                "  private Provider<Map<PathEnum, Handler>> mapOfPathEnumAndHandlerProvider;",
++                "",
++                "  private DaggerTestComponent(Builder builder) {",
++                "    initialize(builder);",
++                "  }",
++                "",
++                "  public static Builder builder() {",
++                "    return new Builder();",
++                "  }",
++                "",
++                "  public static TestComponent create() {",
++                "    return new Builder().build();",
++                "  }",
++                "",
++                "  private Handler getMapOfPathEnumAndProviderOfHandlerInstance() {",
++                "    return Preconditions.checkNotNull(",
++                "        mapModuleOne.provideAdminHandler(),",
++                "        " + NPE_FROM_PROVIDES_METHOD + ");",
++                "  }",
++                "",
++                "  private Provider<Handler> getMapOfPathEnumAndProviderOfHandlerProvider() {",
++                "    return new Provider<Handler>() {",
++                "      @Override",
++                "      public Handler get() {",
++                "        return getMapOfPathEnumAndProviderOfHandlerInstance();",
++                "      }",
++                "    };",
++                "  }",
++                "",
++                "  private Handler getMapOfPathEnumAndProviderOfHandlerInstance2() {",
++                "    return Preconditions.checkNotNull(",
++                "        mapModuleTwo.provideLoginHandler(),",
++                "        " + NPE_FROM_PROVIDES_METHOD + ");",
++                "  }",
++                "",
++                "  private Provider<Handler> getMapOfPathEnumAndProviderOfHandlerProvider2() {",
++                "    return new Provider<Handler>() {",
++                "      @Override",
++                "      public Handler get() {",
++                "        return getMapOfPathEnumAndProviderOfHandlerInstance2();",
++                "      }",
++                "    };",
++                "  }",
++                "",
++                "  @SuppressWarnings(\"unchecked\")",
++                "  private void initialize(final Builder builder) {",
++                "    this.mapModuleOne = builder.mapModuleOne;",
++                "    this.mapModuleTwo = builder.mapModuleTwo;",
++                "    this.mapOfPathEnumAndHandlerProvider =",
++                "        MapFactory.<PathEnum, Handler>builder(2)",
++                "            .put(PathEnum.ADMIN, getMapOfPathEnumAndProviderOfHandlerProvider())",
++                "            .put(PathEnum.LOGIN, getMapOfPathEnumAndProviderOfHandlerProvider2())",
++                "            .build();",
++                "  }",
++                "",
++                "  @Override",
++                "  public Provider<Map<PathEnum, Handler>> dispatcher() {",
++                "    return mapOfPathEnumAndHandlerProvider;",
++                "  }",
++                "",
++                "  public static final class Builder {",
++                "    private MapModuleOne mapModuleOne;",
++                "",
++                "    private MapModuleTwo mapModuleTwo;",
++                "",
++                "    private Builder() {}",
++                "",
++                "    public TestComponent build() {",
++                "      if (mapModuleOne == null) {",
++                "        this.mapModuleOne = new MapModuleOne();",
++                "      }",
++                "      if (mapModuleTwo == null) {",
++                "        this.mapModuleTwo = new MapModuleTwo();",
++                "      }",
++                "      return new DaggerTestComponent(this);",
++                "    }",
++                "",
++                "    public Builder mapModuleOne(MapModuleOne mapModuleOne) {",
++                "      this.mapModuleOne = Preconditions.checkNotNull(mapModuleOne);",
++                "      return this;",
++                "    }",
++                "",
++                "    public Builder mapModuleTwo(MapModuleTwo mapModuleTwo) {",
++                "      this.mapModuleTwo = Preconditions.checkNotNull(mapModuleTwo);",
++                "      return this;",
++                "    }",
++                "  }",
++                "}");
++        break;
++      default:
++        generatedComponent =
++            JavaFileObjects.forSourceLines(
++                "test.DaggerTestComponent",
++                "package test;",
++                "",
++                "import dagger.internal.MapFactory;",
++                "import dagger.internal.Preconditions;",
++                "import java.util.Map;",
++                "import javax.annotation.Generated;",
++                "import javax.inject.Provider;",
++                "",
++                GENERATED_ANNOTATION,
++                "public final class DaggerTestComponent implements TestComponent {",
++                "  private Provider<Handler> provideAdminHandlerProvider;",
++                "  private Provider<Handler> provideLoginHandlerProvider;",
++                "  private Provider<Map<PathEnum, Handler>> mapOfPathEnumAndHandlerProvider;",
++                "",
++                "  private DaggerTestComponent(Builder builder) {",
++                "    initialize(builder);",
++                "  }",
++                "",
++                "  public static Builder builder() {",
++                "    return new Builder();",
++                "  }",
++                "",
++                "  public static TestComponent create() {",
++                "    return new Builder().build();",
++                "  }",
++                "",
++                "  @SuppressWarnings(\"unchecked\")",
++                "  private void initialize(final Builder builder) {",
++                "    this.provideAdminHandlerProvider =",
++                "        MapModuleOne_ProvideAdminHandlerFactory.create(builder.mapModuleOne);",
++                "    this.provideLoginHandlerProvider =",
++                "        MapModuleTwo_ProvideLoginHandlerFactory.create(builder.mapModuleTwo);",
++                "    this.mapOfPathEnumAndHandlerProvider =",
++                "        MapFactory.<PathEnum, Handler>builder(2)",
++                "            .put(PathEnum.ADMIN, provideAdminHandlerProvider)",
++                "            .put(PathEnum.LOGIN, provideLoginHandlerProvider)",
++                "            .build();",
++                "  }",
++                "",
++                "  @Override",
++                "  public Provider<Map<PathEnum, Handler>> dispatcher() {",
++                "    return mapOfPathEnumAndHandlerProvider;",
++                "  }",
++                "",
++                "  public static final class Builder {",
++                "    private MapModuleOne mapModuleOne;",
++                "    private MapModuleTwo mapModuleTwo;",
++                "",
++                "    private Builder() {",
++                "    }",
++                "",
++                "    public TestComponent build() {",
++                "      if (mapModuleOne == null) {",
++                "        this.mapModuleOne = new MapModuleOne();",
++                "      }",
++                "      if (mapModuleTwo == null) {",
++                "        this.mapModuleTwo = new MapModuleTwo();",
++                "      }",
++                "      return new DaggerTestComponent(this);",
++                "    }",
++                "",
++                "    public Builder mapModuleOne(MapModuleOne mapModuleOne) {",
++                "      this.mapModuleOne = Preconditions.checkNotNull(mapModuleOne);",
++                "      return this;",
++                "    }",
++                "",
++                "    public Builder mapModuleTwo(MapModuleTwo mapModuleTwo) {",
++                "      this.mapModuleTwo = Preconditions.checkNotNull(mapModuleTwo);",
++                "      return this;",
++                "    }",
++                "  }",
++                "}");
++    }
+     assertAbout(javaSources())
+         .that(
+             ImmutableList.of(
+diff --git a/javatests/dagger/internal/codegen/MapBindingExpressionTest.java b/javatests/dagger/internal/codegen/MapBindingExpressionTest.java
+index 36c9621bc..061b39b13 100644
+--- a/javatests/dagger/internal/codegen/MapBindingExpressionTest.java
++++ b/javatests/dagger/internal/codegen/MapBindingExpressionTest.java
+@@ -117,6 +117,15 @@ public void mapBindings() {
+                 "    return MapModule.provideInt();",
+                 "  }",
+                 "",
++                "  private Provider<Integer> getMapOfIntegerAndProviderOfIntegerProvider() {",
++                "    return new Provider<Integer>() {",
++                "      @Override",
++                "      public Integer get() {",
++                "        return getMapOfIntegerAndProviderOfIntegerInstance();",
++                "      }",
++                "    };",
++                "  }",
++                "",
+                 "  private long getMapOfLongAndProviderOfLongInstance() {",
+                 "    return MapModule.provideLong0();",
+                 "  }",
+@@ -129,6 +138,33 @@ public void mapBindings() {
+                 "    return MapModule.provideLong2();",
+                 "  }",
+                 "",
++                "  private Provider<Long> getMapOfLongAndProviderOfLongProvider() {",
++                "    return new Provider<Long>() {",
++                "      @Override",
++                "      public Long get() {",
++                "        return getMapOfLongAndProviderOfLongInstance();",
++                "      }",
++                "    };",
++                "  }",
++                "",
++                "  private Provider<Long> getMapOfLongAndProviderOfLongProvider2() {",
++                "    return new Provider<Long>() {",
++                "      @Override",
++                "      public Long get() {",
++                "        return getMapOfLongAndProviderOfLongInstance2();",
++                "      }",
++                "    };",
++                "  }",
++                "",
++                "  private Provider<Long> getMapOfLongAndProviderOfLongProvider3() {",
++                "    return new Provider<Long>() {",
++                "      @Override",
++                "      public Long get() {",
++                "        return getMapOfLongAndProviderOfLongInstance3();",
++                "      }",
++                "    };",
++                "  }",
++                "",
+                 "  @Override",
+                 "  public Map<String, String> strings() {",
+                 "    return Collections.<String, String>emptyMap();",
+@@ -148,7 +184,7 @@ public void mapBindings() {
+                 "  @Override",
+                 "  public Map<Integer, Provider<Integer>> providerInts() {",
+                 "    return Collections.<Integer, Provider<Integer>>singletonMap(",
+-                "        0, MapModule_ProvideIntFactory.create());",
++                "        0, getMapOfIntegerAndProviderOfIntegerProvider());",
+                 "  }",
+                 "",
+                 "  @Override",
+@@ -163,9 +199,9 @@ public void mapBindings() {
+                 "  @Override",
+                 "  public Map<Long, Provider<Long>> providerLongs() {",
+                 "    return MapBuilder.<Long, Provider<Long>>newMapBuilder(3)",
+-                "        .put(0L, MapModule_ProvideLong0Factory.create())",
+-                "        .put(1L, MapModule_ProvideLong1Factory.create())",
+-                "        .put(2L, MapModule_ProvideLong2Factory.create())",
++                "        .put(0L, getMapOfLongAndProviderOfLongProvider())",
++                "        .put(1L, getMapOfLongAndProviderOfLongProvider2())",
++                "        .put(2L, getMapOfLongAndProviderOfLongProvider3())",
+                 "        .build();",
+                 "  }",
+                 "",
+diff --git a/javatests/dagger/internal/codegen/MapBindingExpressionWithGuavaTest.java b/javatests/dagger/internal/codegen/MapBindingExpressionWithGuavaTest.java
+index 33f2345f8..6eadd389f 100644
+--- a/javatests/dagger/internal/codegen/MapBindingExpressionWithGuavaTest.java
++++ b/javatests/dagger/internal/codegen/MapBindingExpressionWithGuavaTest.java
+@@ -149,6 +149,15 @@ public void mapBindings() {
+                 "    return MapModule.provideInt();",
+                 "  }",
+                 "",
++                "  private Provider<Integer> getMapOfIntegerAndProviderOfIntegerProvider() {",
++                "    return new Provider<Integer>() {",
++                "      @Override",
++                "      public Integer get() {",
++                "        return getMapOfIntegerAndProviderOfIntegerInstance();",
++                "      }",
++                "    };",
++                "  }",
++                "",
+                 "  private long getMapOfLongAndProviderOfLongInstance() {",
+                 "    return MapModule.provideLong0();",
+                 "  }",
+@@ -161,6 +170,33 @@ public void mapBindings() {
+                 "    return MapModule.provideLong2();",
+                 "  }",
+                 "",
++                "  private Provider<Long> getMapOfLongAndProviderOfLongProvider() {",
++                "    return new Provider<Long>() {",
++                "      @Override",
++                "      public Long get() {",
++                "        return getMapOfLongAndProviderOfLongInstance();",
++                "      }",
++                "    };",
++                "  }",
++                "",
++                "  private Provider<Long> getMapOfLongAndProviderOfLongProvider2() {",
++                "    return new Provider<Long>() {",
++                "      @Override",
++                "      public Long get() {",
++                "        return getMapOfLongAndProviderOfLongInstance2();",
++                "      }",
++                "    };",
++                "  }",
++                "",
++                "  private Provider<Long> getMapOfLongAndProviderOfLongProvider3() {",
++                "    return new Provider<Long>() {",
++                "      @Override",
++                "      public Long get() {",
++                "        return getMapOfLongAndProviderOfLongInstance3();",
++                "      }",
++                "    };",
++                "  }",
++                "",
+                 "  @Override",
+                 "  public Map<String, String> strings() {",
+                 "    return ImmutableMap.<String, String>of();",
+@@ -180,7 +216,7 @@ public void mapBindings() {
+                 "  @Override",
+                 "  public Map<Integer, Provider<Integer>> providerInts() {",
+                 "    return ImmutableMap.<Integer, Provider<Integer>>of(",
+-                "        0, MapModule_ProvideIntFactory.create());",
++                "        0, getMapOfIntegerAndProviderOfIntegerProvider());",
+                 "  }",
+                 "",
+                 "  @Override",
+@@ -194,9 +230,9 @@ public void mapBindings() {
+                 "  @Override",
+                 "  public Map<Long, Provider<Long>> providerLongs() {",
+                 "    return ImmutableMap.<Long, Provider<Long>>of(",
+-                "        0L, MapModule_ProvideLong0Factory.create(),",
+-                "        1L, MapModule_ProvideLong1Factory.create(),",
+-                "        2L, MapModule_ProvideLong2Factory.create());",
++                "        0L, getMapOfLongAndProviderOfLongProvider(),",
++                "        1L, getMapOfLongAndProviderOfLongProvider2(),",
++                "        2L, getMapOfLongAndProviderOfLongProvider3());",
+                 "  }",
+                 "",
+                 "  @Override",
+@@ -239,6 +275,60 @@ public void mapBindings() {
+                 "      return SubcomponentMapModule.provideLong5();",
+                 "    }",
+                 "",
++                "    private Provider<Long> getMapOfLongAndProviderOfLongProvider() {",
++                "      return new Provider<Long>() {",
++                "        @Override",
++                "        public Long get() {",
++                "          return getMapOfLongAndProviderOfLongInstance();",
++                "        }",
++                "      };",
++                "    }",
++                "",
++                "    private Provider<Long> getMapOfLongAndProviderOfLongProvider2() {",
++                "      return new Provider<Long>() {",
++                "        @Override",
++                "        public Long get() {",
++                "          return getMapOfLongAndProviderOfLongInstance2();",
++                "        }",
++                "      };",
++                "    }",
++                "",
++                "    private Provider<Long> getMapOfLongAndProviderOfLongProvider3() {",
++                "      return new Provider<Long>() {",
++                "        @Override",
++                "        public Long get() {",
++                "          return getMapOfLongAndProviderOfLongInstance3();",
++                "        }",
++                "      };",
++                "    }",
++                "",
++                "    private Provider<Long> getMapOfLongAndProviderOfLongProvider4() {",
++                "      return new Provider<Long>() {",
++                "        @Override",
++                "        public Long get() {",
++                "          return getMapOfLongAndProviderOfLongInstance4();",
++                "        }",
++                "      };",
++                "    }",
++                "",
++                "    private Provider<Long> getMapOfLongAndProviderOfLongProvider5() {",
++                "      return new Provider<Long>() {",
++                "        @Override",
++                "        public Long get() {",
++                "          return getMapOfLongAndProviderOfLongInstance5();",
++                "        }",
++                "      };",
++                "    }",
++                "",
++                "    private Provider<Long> getMapOfLongAndProviderOfLongProvider6() {",
++                "      return new Provider<Long>() {",
++                "        @Override",
++                "        public Long get() {",
++                "          return getMapOfLongAndProviderOfLongInstance6();",
++                "        }",
++                "      };",
++                "    }",
++                "",
+                 "    @Override",
+                 "    public Map<Long, Long> longs() {",
+                 "      return ImmutableMap.<Long, Long>builder()",
+@@ -254,12 +344,12 @@ public void mapBindings() {
+                 "    @Override",
+                 "    public Map<Long, Provider<Long>> providerLongs() {",
+                 "      return ImmutableMap.<Long, Provider<Long>>builder()",
+-                "          .put(0L, MapModule_ProvideLong0Factory.create())",
+-                "          .put(1L, MapModule_ProvideLong1Factory.create())",
+-                "          .put(2L, MapModule_ProvideLong2Factory.create())",
+-                "          .put(3L, SubcomponentMapModule_ProvideLong3Factory.create())",
+-                "          .put(4L, SubcomponentMapModule_ProvideLong4Factory.create())",
+-                "          .put(5L, SubcomponentMapModule_ProvideLong5Factory.create())",
++                "          .put(0L, getMapOfLongAndProviderOfLongProvider())",
++                "          .put(1L, getMapOfLongAndProviderOfLongProvider2())",
++                "          .put(2L, getMapOfLongAndProviderOfLongProvider3())",
++                "          .put(3L, getMapOfLongAndProviderOfLongProvider4())",
++                "          .put(4L, getMapOfLongAndProviderOfLongProvider5())",
++                "          .put(5L, getMapOfLongAndProviderOfLongProvider6())",
+                 "          .build();",
+                 "    }",
+                 "  }",
+diff --git a/javatests/dagger/internal/codegen/MapKeyProcessorTest.java b/javatests/dagger/internal/codegen/MapKeyProcessorTest.java
+index 11d9db41c..fc1da0395 100644
+--- a/javatests/dagger/internal/codegen/MapKeyProcessorTest.java
++++ b/javatests/dagger/internal/codegen/MapKeyProcessorTest.java
+@@ -20,17 +20,31 @@
+ import static com.google.testing.compile.JavaSourcesSubject.assertThat;
+ import static com.google.testing.compile.JavaSourcesSubjectFactory.javaSources;
+ import static dagger.internal.codegen.GeneratedLines.GENERATED_ANNOTATION;
++import static dagger.internal.codegen.GeneratedLines.NPE_FROM_PROVIDES_METHOD;
+ 
+ import com.google.auto.value.processor.AutoAnnotationProcessor;
+ import com.google.common.collect.ImmutableList;
+ import com.google.testing.compile.JavaFileObjects;
++import java.util.Collection;
+ import javax.tools.JavaFileObject;
+ import org.junit.Test;
+ import org.junit.runner.RunWith;
+-import org.junit.runners.JUnit4;
++import org.junit.runners.Parameterized;
++import org.junit.runners.Parameterized.Parameters;
+ 
+-@RunWith(JUnit4.class)
++@RunWith(Parameterized.class)
+ public class MapKeyProcessorTest {
++  @Parameters(name = "{0}")
++  public static Collection<Object[]> parameters() {
++    return CompilerMode.TEST_PARAMETERS;
++  }
++
++  private final CompilerMode compilerMode;
++
++  public MapKeyProcessorTest(CompilerMode compilerMode) {
++    this.compilerMode = compilerMode;
++  }
++
+   @Test
+   public void mapKeyCreatorFile() {
+     JavaFileObject enumKeyFile = JavaFileObjects.forSourceLines("test.PathKey",
+@@ -71,6 +85,7 @@ public void mapKeyCreatorFile() {
+             "}");
+     assertAbout(javaSources())
+         .that(ImmutableList.of(enumKeyFile, pathEnumFile))
++        .withCompilerOptions(compilerMode.javacopts())
+         .processedWith(new ComponentProcessor(), new AutoAnnotationProcessor())
+         .compilesWithoutError()
+         .and()
+@@ -121,6 +136,7 @@ public void nestedMapKeyCreatorFile() {
+             "}");
+     assertAbout(javaSources())
+         .that(ImmutableList.of(enumKeyFile, pathEnumFile))
++        .withCompilerOptions(compilerMode.javacopts())
+         .processedWith(new ComponentProcessor(), new AutoAnnotationProcessor())
+         .compilesWithoutError()
+         .and()
+@@ -207,79 +223,187 @@ public void mapKeyComponentFileWithDisorderedKeyField() {
+         "interface TestComponent {",
+         "  Map<PathKey, Provider<Handler>> dispatcher();",
+         "}");
+-    JavaFileObject generatedComponent =
+-        JavaFileObjects.forSourceLines(
+-            "test.DaggerTestComponent",
+-            "package test;",
+-            "",
+-            "import com.google.common.collect.ImmutableMap;",
+-            "import dagger.internal.Preconditions;",
+-            "import java.util.Map;",
+-            "import javax.annotation.Generated;",
+-            "import javax.inject.Provider;",
+-            "",
+-            GENERATED_ANNOTATION,
+-            "public final class DaggerTestComponent implements TestComponent {",
+-            "  private Provider<Handler> provideAdminHandlerProvider;",
+-            "  private Provider<Handler> provideLoginHandlerProvider;",
+-            "",
+-            "  private DaggerTestComponent(Builder builder) {",
+-            "    initialize(builder);",
+-            "  }",
+-            "",
+-            "  public static Builder builder() {",
+-            "    return new Builder();",
+-            "  }",
+-            "",
+-            "  public static TestComponent create() {",
+-            "    return new Builder().build();",
+-            "  }",
+-            "",
+-            "  @SuppressWarnings(\"unchecked\")",
+-            "  private void initialize(final Builder builder) {",
+-            "    this.provideAdminHandlerProvider =",
+-            "        MapModuleOne_ProvideAdminHandlerFactory.create(builder.mapModuleOne);",
+-            "    this.provideLoginHandlerProvider =",
+-            "        MapModuleTwo_ProvideLoginHandlerFactory.create(builder.mapModuleTwo);",
+-            "  }",
+-            "",
+-            "  @Override",
+-            "  public Map<PathKey, Provider<Handler>> dispatcher() {",
+-            "    return ImmutableMap.<PathKey, Provider<Handler>>of(",
+-            "        PathKeyCreator.createPathKey(PathEnum.ADMIN, \"AdminPath\"),",
+-            "        provideAdminHandlerProvider,",
+-            "        PathKeyCreator.createPathKey(PathEnum.LOGIN, \"LoginPath\"),",
+-            "        provideLoginHandlerProvider);",
+-            "  }",
+-            "",
+-            "  public static final class Builder {",
+-            "    private MapModuleOne mapModuleOne;",
+-            "    private MapModuleTwo mapModuleTwo;",
+-            "",
+-            "    private Builder() {",
+-            "    }",
+-            "",
+-            "    public TestComponent build() {",
+-            "      if (mapModuleOne == null) {",
+-            "        this.mapModuleOne = new MapModuleOne();",
+-            "      }",
+-            "      if (mapModuleTwo == null) {",
+-            "        this.mapModuleTwo = new MapModuleTwo();",
+-            "      }",
+-            "      return new DaggerTestComponent(this);",
+-            "    }",
+-            "",
+-            "    public Builder mapModuleOne(MapModuleOne mapModuleOne) {",
+-            "      this.mapModuleOne = Preconditions.checkNotNull(mapModuleOne);",
+-            "      return this;",
+-            "    }",
+-            "",
+-            "    public Builder mapModuleTwo(MapModuleTwo mapModuleTwo) {",
+-            "      this.mapModuleTwo = Preconditions.checkNotNull(mapModuleTwo);",
+-            "      return this;",
+-            "    }",
+-            "  }",
+-            "}");
++    JavaFileObject generatedComponent;
++    switch (compilerMode) {
++      case EXPERIMENTAL_ANDROID:
++        generatedComponent =
++            JavaFileObjects.forSourceLines(
++                "test.DaggerTestComponent",
++                "package test;",
++                "",
++                "import com.google.common.collect.ImmutableMap;",
++                "import dagger.internal.Preconditions;",
++                "import java.util.Map;",
++                "import javax.annotation.Generated;",
++                "import javax.inject.Provider;",
++                "",
++                GENERATED_ANNOTATION,
++                "public final class DaggerTestComponent implements TestComponent {",
++                "  private MapModuleOne mapModuleOne;",
++                "",
++                "  private MapModuleTwo mapModuleTwo;",
++                "",
++                "  private DaggerTestComponent(Builder builder) {",
++                "    initialize(builder);",
++                "  }",
++                "",
++                "  public static Builder builder() {",
++                "    return new Builder();",
++                "  }",
++                "",
++                "  public static TestComponent create() {",
++                "    return new Builder().build();",
++                "  }",
++                "",
++                "  private Handler getMapOfPathKeyAndProviderOfHandlerInstance() {",
++                "    return Preconditions.checkNotNull(",
++                "        mapModuleOne.provideAdminHandler(),",
++                "        " + NPE_FROM_PROVIDES_METHOD + ");",
++                "  }",
++                "",
++                "  private Provider<Handler> getMapOfPathKeyAndProviderOfHandlerProvider() {",
++                "    return new Provider<Handler>() {",
++                "      @Override",
++                "      public Handler get() {",
++                "        return getMapOfPathKeyAndProviderOfHandlerInstance();",
++                "      }",
++                "    };",
++                "  }",
++                "",
++                "  private Handler getMapOfPathKeyAndProviderOfHandlerInstance2() {",
++                "    return Preconditions.checkNotNull(",
++                "        mapModuleTwo.provideLoginHandler(),",
++                "        " + NPE_FROM_PROVIDES_METHOD + ");",
++                "  }",
++                "",
++                "  private Provider<Handler> getMapOfPathKeyAndProviderOfHandlerProvider2() {",
++                "    return new Provider<Handler>() {",
++                "      @Override",
++                "      public Handler get() {",
++                "        return getMapOfPathKeyAndProviderOfHandlerInstance2();",
++                "      }",
++                "    };",
++                "  }",
++                "",
++                "  @SuppressWarnings(\"unchecked\")",
++                "  private void initialize(final Builder builder) {",
++                "    this.mapModuleOne = builder.mapModuleOne;",
++                "    this.mapModuleTwo = builder.mapModuleTwo;",
++                "  }",
++                "",
++                "  @Override",
++                "  public Map<PathKey, Provider<Handler>> dispatcher() {",
++                "    return ImmutableMap.<PathKey, Provider<Handler>>of(",
++                "        PathKeyCreator.createPathKey(PathEnum.ADMIN, \"AdminPath\"),",
++                "        getMapOfPathKeyAndProviderOfHandlerProvider(),",
++                "        PathKeyCreator.createPathKey(PathEnum.LOGIN, \"LoginPath\"),",
++                "        getMapOfPathKeyAndProviderOfHandlerProvider2());",
++                "  }",
++                "",
++                "  public static final class Builder {",
++                "    private MapModuleOne mapModuleOne;",
++                "",
++                "    private MapModuleTwo mapModuleTwo;",
++                "",
++                "    private Builder() {}",
++                "",
++                "    public TestComponent build() {",
++                "      if (mapModuleOne == null) {",
++                "        this.mapModuleOne = new MapModuleOne();",
++                "      }",
++                "      if (mapModuleTwo == null) {",
++                "        this.mapModuleTwo = new MapModuleTwo();",
++                "      }",
++                "      return new DaggerTestComponent(this);",
++                "    }",
++                "",
++                "    public Builder mapModuleOne(MapModuleOne mapModuleOne) {",
++                "      this.mapModuleOne = Preconditions.checkNotNull(mapModuleOne);",
++                "      return this;",
++                "    }",
++                "",
++                "    public Builder mapModuleTwo(MapModuleTwo mapModuleTwo) {",
++                "      this.mapModuleTwo = Preconditions.checkNotNull(mapModuleTwo);",
++                "      return this;",
++                "    }",
++                "  }",
++                "}");
++        break;
++      default:
++        generatedComponent =
++            JavaFileObjects.forSourceLines(
++                "test.DaggerTestComponent",
++                "package test;",
++                "",
++                "import com.google.common.collect.ImmutableMap;",
++                "import dagger.internal.Preconditions;",
++                "import java.util.Map;",
++                "import javax.annotation.Generated;",
++                "import javax.inject.Provider;",
++                "",
++                GENERATED_ANNOTATION,
++                "public final class DaggerTestComponent implements TestComponent {",
++                "  private Provider<Handler> provideAdminHandlerProvider;",
++                "  private Provider<Handler> provideLoginHandlerProvider;",
++                "",
++                "  private DaggerTestComponent(Builder builder) {",
++                "    initialize(builder);",
++                "  }",
++                "",
++                "  public static Builder builder() {",
++                "    return new Builder();",
++                "  }",
++                "",
++                "  public static TestComponent create() {",
++                "    return new Builder().build();",
++                "  }",
++                "",
++                "  @SuppressWarnings(\"unchecked\")",
++                "  private void initialize(final Builder builder) {",
++                "    this.provideAdminHandlerProvider =",
++                "        MapModuleOne_ProvideAdminHandlerFactory.create(builder.mapModuleOne);",
++                "    this.provideLoginHandlerProvider =",
++                "        MapModuleTwo_ProvideLoginHandlerFactory.create(builder.mapModuleTwo);",
++                "  }",
++                "",
++                "  @Override",
++                "  public Map<PathKey, Provider<Handler>> dispatcher() {",
++                "    return ImmutableMap.<PathKey, Provider<Handler>>of(",
++                "        PathKeyCreator.createPathKey(PathEnum.ADMIN, \"AdminPath\"),",
++                "        provideAdminHandlerProvider,",
++                "        PathKeyCreator.createPathKey(PathEnum.LOGIN, \"LoginPath\"),",
++                "        provideLoginHandlerProvider);",
++                "  }",
++                "",
++                "  public static final class Builder {",
++                "    private MapModuleOne mapModuleOne;",
++                "    private MapModuleTwo mapModuleTwo;",
++                "",
++                "    private Builder() {",
++                "    }",
++                "",
++                "    public TestComponent build() {",
++                "      if (mapModuleOne == null) {",
++                "        this.mapModuleOne = new MapModuleOne();",
++                "      }",
++                "      if (mapModuleTwo == null) {",
++                "        this.mapModuleTwo = new MapModuleTwo();",
++                "      }",
++                "      return new DaggerTestComponent(this);",
++                "    }",
++                "",
++                "    public Builder mapModuleOne(MapModuleOne mapModuleOne) {",
++                "      this.mapModuleOne = Preconditions.checkNotNull(mapModuleOne);",
++                "      return this;",
++                "    }",
++                "",
++                "    public Builder mapModuleTwo(MapModuleTwo mapModuleTwo) {",
++                "      this.mapModuleTwo = Preconditions.checkNotNull(mapModuleTwo);",
++                "      return this;",
++                "    }",
++                "  }",
++                "}");
++    }
+     assertAbout(javaSources())
+         .that(
+             ImmutableList.of(
+@@ -291,6 +415,7 @@ public void mapKeyComponentFileWithDisorderedKeyField() {
+                 loginHandlerFile,
+                 adminHandlerFile,
+                 componentFile))
++        .withCompilerOptions(compilerMode.javacopts())
+         .processedWith(new ComponentProcessor(), new AutoAnnotationProcessor())
+         .compilesWithoutError()
+         .and()
+@@ -376,79 +501,187 @@ public void mapKeyComponentFileWithDefaultField() {
+         "interface TestComponent {",
+         "  Map<PathKey, Provider<Handler>> dispatcher();",
+         "}");
+-    JavaFileObject generatedComponent =
+-        JavaFileObjects.forSourceLines(
+-            "test.DaggerTestComponent",
+-            "package test;",
+-            "",
+-            "import com.google.common.collect.ImmutableMap;",
+-            "import dagger.internal.Preconditions;",
+-            "import java.util.Map;",
+-            "import javax.annotation.Generated;",
+-            "import javax.inject.Provider;",
+-            "",
+-            GENERATED_ANNOTATION,
+-            "public final class DaggerTestComponent implements TestComponent {",
+-            "  private Provider<Handler> provideAdminHandlerProvider;",
+-            "  private Provider<Handler> provideLoginHandlerProvider;",
+-            "",
+-            "  private DaggerTestComponent(Builder builder) {",
+-            "    initialize(builder);",
+-            "  }",
+-            "",
+-            "  public static Builder builder() {",
+-            "    return new Builder();",
+-            "  }",
+-            "",
+-            "  public static TestComponent create() {",
+-            "    return new Builder().build();",
+-            "  }",
+-            "",
+-            "  @SuppressWarnings(\"unchecked\")",
+-            "  private void initialize(final Builder builder) {",
+-            "    this.provideAdminHandlerProvider =",
+-            "        MapModuleOne_ProvideAdminHandlerFactory.create(builder.mapModuleOne);",
+-            "    this.provideLoginHandlerProvider =",
+-            "        MapModuleTwo_ProvideLoginHandlerFactory.create(builder.mapModuleTwo);",
+-            "  }",
+-            "",
+-            "  @Override",
+-            "  public Map<PathKey, Provider<Handler>> dispatcher() {",
+-            "    return ImmutableMap.<PathKey, Provider<Handler>>of(",
+-            "        PathKeyCreator.createPathKey(PathEnum.ADMIN, \"DefaultPath\"),",
+-            "        provideAdminHandlerProvider,",
+-            "        PathKeyCreator.createPathKey(PathEnum.LOGIN, \"LoginPath\"),",
+-            "        provideLoginHandlerProvider);",
+-            "  }",
+-            "",
+-            "  public static final class Builder {",
+-            "    private MapModuleOne mapModuleOne;",
+-            "    private MapModuleTwo mapModuleTwo;",
+-            "",
+-            "    private Builder() {",
+-            "    }",
+-            "",
+-            "    public TestComponent build() {",
+-            "      if (mapModuleOne == null) {",
+-            "        this.mapModuleOne = new MapModuleOne();",
+-            "      }",
+-            "      if (mapModuleTwo == null) {",
+-            "        this.mapModuleTwo = new MapModuleTwo();",
+-            "      }",
+-            "      return new DaggerTestComponent(this);",
+-            "    }",
+-            "",
+-            "    public Builder mapModuleOne(MapModuleOne mapModuleOne) {",
+-            "      this.mapModuleOne = Preconditions.checkNotNull(mapModuleOne);",
+-            "      return this;",
+-            "    }",
+-            "",
+-            "    public Builder mapModuleTwo(MapModuleTwo mapModuleTwo) {",
+-            "      this.mapModuleTwo = Preconditions.checkNotNull(mapModuleTwo);",
+-            "      return this;",
+-            "    }",
+-            "  }",
+-            "}");
++    JavaFileObject generatedComponent;
++    switch (compilerMode) {
++      case EXPERIMENTAL_ANDROID:
++        generatedComponent =
++            JavaFileObjects.forSourceLines(
++                "test.DaggerTestComponent",
++                "package test;",
++                "",
++                "import com.google.common.collect.ImmutableMap;",
++                "import dagger.internal.Preconditions;",
++                "import java.util.Map;",
++                "import javax.annotation.Generated;",
++                "import javax.inject.Provider;",
++                "",
++                GENERATED_ANNOTATION,
++                "public final class DaggerTestComponent implements TestComponent {",
++                "  private MapModuleOne mapModuleOne;",
++                "",
++                "  private MapModuleTwo mapModuleTwo;",
++                "",
++                "  private DaggerTestComponent(Builder builder) {",
++                "    initialize(builder);",
++                "  }",
++                "",
++                "  public static Builder builder() {",
++                "    return new Builder();",
++                "  }",
++                "",
++                "  public static TestComponent create() {",
++                "    return new Builder().build();",
++                "  }",
++                "",
++                "  private Handler getMapOfPathKeyAndProviderOfHandlerInstance() {",
++                "    return Preconditions.checkNotNull(",
++                "        mapModuleOne.provideAdminHandler(),",
++                "        " + NPE_FROM_PROVIDES_METHOD + ");",
++                "  }",
++                "",
++                "  private Provider<Handler> getMapOfPathKeyAndProviderOfHandlerProvider() {",
++                "    return new Provider<Handler>() {",
++                "      @Override",
++                "      public Handler get() {",
++                "        return getMapOfPathKeyAndProviderOfHandlerInstance();",
++                "      }",
++                "    };",
++                "  }",
++                "",
++                "  private Handler getMapOfPathKeyAndProviderOfHandlerInstance2() {",
++                "    return Preconditions.checkNotNull(",
++                "        mapModuleTwo.provideLoginHandler(),",
++                "        " + NPE_FROM_PROVIDES_METHOD + ");",
++                "  }",
++                "",
++                "  private Provider<Handler> getMapOfPathKeyAndProviderOfHandlerProvider2() {",
++                "    return new Provider<Handler>() {",
++                "      @Override",
++                "      public Handler get() {",
++                "        return getMapOfPathKeyAndProviderOfHandlerInstance2();",
++                "      }",
++                "    };",
++                "  }",
++                "",
++                "  @SuppressWarnings(\"unchecked\")",
++                "  private void initialize(final Builder builder) {",
++                "    this.mapModuleOne = builder.mapModuleOne;",
++                "    this.mapModuleTwo = builder.mapModuleTwo;",
++                "  }",
++                "",
++                "  @Override",
++                "  public Map<PathKey, Provider<Handler>> dispatcher() {",
++                "    return ImmutableMap.<PathKey, Provider<Handler>>of(",
++                "        PathKeyCreator.createPathKey(PathEnum.ADMIN, \"DefaultPath\"),",
++                "        getMapOfPathKeyAndProviderOfHandlerProvider(),",
++                "        PathKeyCreator.createPathKey(PathEnum.LOGIN, \"LoginPath\"),",
++                "        getMapOfPathKeyAndProviderOfHandlerProvider2());",
++                "  }",
++                "",
++                "  public static final class Builder {",
++                "    private MapModuleOne mapModuleOne;",
++                "",
++                "    private MapModuleTwo mapModuleTwo;",
++                "",
++                "    private Builder() {}",
++                "",
++                "    public TestComponent build() {",
++                "      if (mapModuleOne == null) {",
++                "        this.mapModuleOne = new MapModuleOne();",
++                "      }",
++                "      if (mapModuleTwo == null) {",
++                "        this.mapModuleTwo = new MapModuleTwo();",
++                "      }",
++                "      return new DaggerTestComponent(this);",
++                "    }",
++                "",
++                "    public Builder mapModuleOne(MapModuleOne mapModuleOne) {",
++                "      this.mapModuleOne = Preconditions.checkNotNull(mapModuleOne);",
++                "      return this;",
++                "    }",
++                "",
++                "    public Builder mapModuleTwo(MapModuleTwo mapModuleTwo) {",
++                "      this.mapModuleTwo = Preconditions.checkNotNull(mapModuleTwo);",
++                "      return this;",
++                "    }",
++                "  }",
++                "}");
++        break;
++      default:
++        generatedComponent =
++            JavaFileObjects.forSourceLines(
++                "test.DaggerTestComponent",
++                "package test;",
++                "",
++                "import com.google.common.collect.ImmutableMap;",
++                "import dagger.internal.Preconditions;",
++                "import java.util.Map;",
++                "import javax.annotation.Generated;",
++                "import javax.inject.Provider;",
++                "",
++                GENERATED_ANNOTATION,
++                "public final class DaggerTestComponent implements TestComponent {",
++                "  private Provider<Handler> provideAdminHandlerProvider;",
++                "  private Provider<Handler> provideLoginHandlerProvider;",
++                "",
++                "  private DaggerTestComponent(Builder builder) {",
++                "    initialize(builder);",
++                "  }",
++                "",
++                "  public static Builder builder() {",
++                "    return new Builder();",
++                "  }",
++                "",
++                "  public static TestComponent create() {",
++                "    return new Builder().build();",
++                "  }",
++                "",
++                "  @SuppressWarnings(\"unchecked\")",
++                "  private void initialize(final Builder builder) {",
++                "    this.provideAdminHandlerProvider =",
++                "        MapModuleOne_ProvideAdminHandlerFactory.create(builder.mapModuleOne);",
++                "    this.provideLoginHandlerProvider =",
++                "        MapModuleTwo_ProvideLoginHandlerFactory.create(builder.mapModuleTwo);",
++                "  }",
++                "",
++                "  @Override",
++                "  public Map<PathKey, Provider<Handler>> dispatcher() {",
++                "    return ImmutableMap.<PathKey, Provider<Handler>>of(",
++                "        PathKeyCreator.createPathKey(PathEnum.ADMIN, \"DefaultPath\"),",
++                "        provideAdminHandlerProvider,",
++                "        PathKeyCreator.createPathKey(PathEnum.LOGIN, \"LoginPath\"),",
++                "        provideLoginHandlerProvider);",
++                "  }",
++                "",
++                "  public static final class Builder {",
++                "    private MapModuleOne mapModuleOne;",
++                "    private MapModuleTwo mapModuleTwo;",
++                "",
++                "    private Builder() {",
++                "    }",
++                "",
++                "    public TestComponent build() {",
++                "      if (mapModuleOne == null) {",
++                "        this.mapModuleOne = new MapModuleOne();",
++                "      }",
++                "      if (mapModuleTwo == null) {",
++                "        this.mapModuleTwo = new MapModuleTwo();",
++                "      }",
++                "      return new DaggerTestComponent(this);",
++                "    }",
++                "",
++                "    public Builder mapModuleOne(MapModuleOne mapModuleOne) {",
++                "      this.mapModuleOne = Preconditions.checkNotNull(mapModuleOne);",
++                "      return this;",
++                "    }",
++                "",
++                "    public Builder mapModuleTwo(MapModuleTwo mapModuleTwo) {",
++                "      this.mapModuleTwo = Preconditions.checkNotNull(mapModuleTwo);",
++                "      return this;",
++                "    }",
++                "  }",
++                "}");
++    }
+     assertAbout(javaSources())
+         .that(
+             ImmutableList.of(
+@@ -460,6 +693,7 @@ public void mapKeyComponentFileWithDefaultField() {
+                 loginHandlerFile,
+                 adminHandlerFile,
+                 componentFile))
++        .withCompilerOptions(compilerMode.javacopts())
+         .processedWith(new ComponentProcessor(), new AutoAnnotationProcessor())
+         .compilesWithoutError()
+         .and()
+@@ -503,6 +737,7 @@ public void mapKeyWithDefaultValue() {
+             "  boolean value() default false;",
+             "}");
+     assertThat(module, mapKey)
++        .withCompilerOptions(compilerMode.javacopts())
+         .processedWith(new ComponentProcessor(), new AutoAnnotationProcessor())
+         .compilesWithoutError();
+   }
+diff --git a/javatests/dagger/internal/codegen/OptionalBindingRequestFulfillmentTest.java b/javatests/dagger/internal/codegen/OptionalBindingRequestFulfillmentTest.java
+index dfc2ecae5..35480e2ab 100644
+--- a/javatests/dagger/internal/codegen/OptionalBindingRequestFulfillmentTest.java
++++ b/javatests/dagger/internal/codegen/OptionalBindingRequestFulfillmentTest.java
+@@ -119,7 +119,6 @@ public void inlinedOptionalBindings() {
+                 "import javax.inject.Provider;",
+                 "import other.DefinitelyNot;",
+                 "import other.Maybe;",
+-                "import other.Maybe_MaybeModule_ProvideMaybeFactory;",
+                 "",
+                 GENERATED_ANNOTATION,
+                 "public final class DaggerTestComponent implements TestComponent {",
+@@ -139,6 +138,19 @@ public void inlinedOptionalBindings() {
+                 "        " + NPE_FROM_PROVIDES + ");",
+                 "  }",
+                 "",
++                "  private Provider<Maybe> getMaybeProvider() {",
++                "    return new Provider<Maybe>() {",
++                "      @Override",
++                "      public Maybe get() {",
++                "        return getMaybeInstance();",
++                "      }",
++                "    };",
++                "  }",
++                "",
++                "  private Provider<Lazy<Maybe>> getMaybeProviderOfLazy() {",
++                "    return ProviderOfLazy.create(getMaybeProvider());",
++                "  }",
++                "",
+                 "  @Override",
+                 "  public Optional<Maybe> maybe() {",
+                 "    return Optional.of(getMaybeInstance());",
+@@ -146,8 +158,7 @@ public void inlinedOptionalBindings() {
+                 "",
+                 "  @Override",
+                 "  public Optional<Provider<Lazy<Maybe>>> providerOfLazyOfMaybe() {",
+-                "    return Optional.of(ProviderOfLazy.create(",
+-                "        Maybe_MaybeModule_ProvideMaybeFactory.create()));",
++                "    return Optional.of(getMaybeProviderOfLazy());",
+                 "  }",
+                 "",
+                 "  @Override",
+@@ -157,7 +168,7 @@ public void inlinedOptionalBindings() {
+                 "",
+                 "  @Override",
+                 "  public Optional<Provider<Lazy<DefinitelyNot>>>",
+-                "      providerOfLazyOfDefinitelyNot() {",
++                "        providerOfLazyOfDefinitelyNot() {",
+                 "    return Optional.absent();",
+                 "  }",
+                 "",
+diff --git a/javatests/dagger/internal/codegen/ProductionComponentProcessorTest.java b/javatests/dagger/internal/codegen/ProductionComponentProcessorTest.java
+index 0ff883892..16b2b56c0 100644
+--- a/javatests/dagger/internal/codegen/ProductionComponentProcessorTest.java
++++ b/javatests/dagger/internal/codegen/ProductionComponentProcessorTest.java
+@@ -20,16 +20,30 @@
+ import static com.google.testing.compile.JavaSourceSubjectFactory.javaSource;
+ import static com.google.testing.compile.JavaSourcesSubjectFactory.javaSources;
+ import static dagger.internal.codegen.GeneratedLines.GENERATED_ANNOTATION;
++import static dagger.internal.codegen.GeneratedLines.NPE_FROM_PROVIDES_METHOD;
+ 
+ import com.google.common.collect.ImmutableList;
+ import com.google.testing.compile.JavaFileObjects;
++import java.util.Collection;
+ import javax.tools.JavaFileObject;
+ import org.junit.Test;
+ import org.junit.runner.RunWith;
+-import org.junit.runners.JUnit4;
++import org.junit.runners.Parameterized;
++import org.junit.runners.Parameterized.Parameters;
+ 
+-@RunWith(JUnit4.class)
++@RunWith(Parameterized.class)
+ public class ProductionComponentProcessorTest {
++  @Parameters(name = "{0}")
++  public static Collection<Object[]> parameters() {
++    return CompilerMode.TEST_PARAMETERS;
++  }
++
++  private final CompilerMode compilerMode;
++
++  public ProductionComponentProcessorTest(CompilerMode compilerMode) {
++    this.compilerMode = compilerMode;
++  }
++
+   @Test public void componentOnConcreteClass() {
+     JavaFileObject componentFile = JavaFileObjects.forSourceLines("test.NotAComponent",
+         "package test;",
+@@ -54,7 +68,9 @@
+         "enum NotAComponent {",
+         "  INSTANCE",
+         "}");
+-    assertAbout(javaSource()).that(componentFile)
++    assertAbout(javaSource())
++        .that(componentFile)
++        .withCompilerOptions(compilerMode.javacopts())
+         .processedWith(new ComponentProcessor())
+         .failsToCompile()
+         .withErrorContaining("interface");
+@@ -68,7 +84,9 @@
+         "",
+         "@ProductionComponent",
+         "@interface NotAComponent {}");
+-    assertAbout(javaSource()).that(componentFile)
++    assertAbout(javaSource())
++        .that(componentFile)
++        .withCompilerOptions(compilerMode.javacopts())
+         .processedWith(new ComponentProcessor())
+         .failsToCompile()
+         .withErrorContaining("interface");
+@@ -84,6 +102,7 @@
+         "interface NotAComponent {}");
+     assertAbout(javaSource())
+         .that(componentFile)
++        .withCompilerOptions(compilerMode.javacopts())
+         .processedWith(new ComponentProcessor())
+         .failsToCompile()
+         .withErrorContaining("is not annotated with one of @Module, @ProducerModule");
+@@ -144,6 +163,7 @@ public void dependsOnProductionExecutor() {
+             "}");
+     assertAbout(javaSources())
+         .that(ImmutableList.of(moduleFile, producerModuleFile, componentFile))
++        .withCompilerOptions(compilerMode.javacopts())
+         .processedWith(new ComponentProcessor())
+         .failsToCompile()
+         .withErrorContaining("may not depend on the production executor");
+@@ -198,115 +218,266 @@ public void simpleComponent() {
+             "    ListenableFuture<A> a();",
+             "  }",
+             "}");
+-    JavaFileObject generatedComponent =
+-        JavaFileObjects.forSourceLines(
+-            "test.DaggerTestClass_SimpleComponent",
+-            "package test;",
+-            "",
+-            "import com.google.common.util.concurrent.ListenableFuture;",
+-            "import dagger.internal.DoubleCheck;",
+-            "import dagger.internal.InstanceFactory;",
+-            "import dagger.internal.Preconditions;",
+-            "import dagger.internal.SetFactory;",
+-            "import dagger.producers.Producer;",
+-            "import dagger.producers.internal.Producers;",
+-            "import dagger.producers.monitoring.ProductionComponentMonitor;",
+-            "import java.util.concurrent.Executor;",
+-            "import javax.annotation.Generated;",
+-            "import javax.inject.Provider;",
+-            "",
+-            GENERATED_ANNOTATION,
+-            "public final class DaggerTestClass_SimpleComponent",
+-            "    implements TestClass.SimpleComponent {",
+-            "  private Provider<Executor> executorProvider;",
+-            "  private Provider<Executor> executorProvider2;",
+-            "  private Provider<TestClass.SimpleComponent> simpleComponentProvider;",
+-            "  private Provider<ProductionComponentMonitor> monitorProvider;",
+-            "  private Provider<TestClass.B> bProvider;",
+-            "  private Producer<TestClass.B> bProducer;",
+-            "  private Producer<TestClass.A> aProducer;",
+-            "",
+-            "  private DaggerTestClass_SimpleComponent(Builder builder) {",
+-            "    initialize(builder);",
+-            "  }",
+-            "",
+-            "  public static Builder builder() {",
+-            "    return new Builder();",
+-            "  }",
+-            "",
+-            "  public static TestClass.SimpleComponent create() {",
+-            "    return new Builder().build()",
+-            "  }",
+-            "",
+-            "  @SuppressWarnings(\"unchecked\")",
+-            "  private void initialize(final Builder builder) {",
+-            "    this.executorProvider =",
+-            "        TestClass_BModule_ExecutorFactory.create(builder.bModule);",
+-            "     this.executorProvider2 =",
+-            "         DoubleCheck.provider(",
+-            "             TestClass_SimpleComponent_ProductionExecutorModule_ExecutorFactory",
+-            "                 .create(executorProvider));",
+-            "    this.simpleComponentProvider = ",
+-            "        InstanceFactory.<TestClass.SimpleComponent>create(this);",
+-            "    this.monitorProvider =",
+-            "        DoubleCheck.provider(",
+-            "            TestClass_SimpleComponent_MonitoringModule_MonitorFactory.create(",
+-            "                simpleComponentProvider,",
+-            "                SetFactory.<ProductionComponentMonitor.Factory>empty());",
+-            "    this.bProvider = TestClass_BModule_BFactory.create(",
+-            "        builder.bModule, TestClass_C_Factory.create());",
+-            "    this.bProducer = Producers.producerFromProvider(bProvider);",
+-            "    this.aProducer = new TestClass_AModule_AFactory(",
+-            "        builder.aModule,",
+-            "        executorProvider2,",
+-            "        monitorProvider,",
+-            "        bProducer);",
+-            "  }",
+-            "",
+-            "  @Override",
+-            "  public ListenableFuture<TestClass.A> a() {",
+-            "    return aProducer.get();",
+-            "  }",
+-            "",
+-            "  public static final class Builder {",
+-            "    private TestClass.BModule bModule;",
+-            "    private TestClass.AModule aModule;",
+-            "",
+-            "    private Builder() {",
+-            "    }",
+-            "",
+-            "    public TestClass.SimpleComponent build() {",
+-            "      if (bModule == null) {",
+-            "        this.bModule = new TestClass.BModule();",
+-            "      }",
+-            "      if (aModule == null) {",
+-            "        this.aModule = new TestClass.AModule();",
+-            "      }",
+-            "      return new DaggerTestClass_SimpleComponent(this);",
+-            "    }",
+-            "",
+-            "    public Builder aModule(TestClass.AModule aModule) {",
+-            "      this.aModule = Preconditions.checkNotNull(aModule);",
+-            "      return this;",
+-            "    }",
+-            "",
+-            "    public Builder bModule(TestClass.BModule bModule) {",
+-            "      this.bModule = Preconditions.checkNotNull(bModule);",
+-            "      return this;",
+-            "    }",
+-            "",
+-            "    @Deprecated",
+-            "    public Builder testClass_SimpleComponent_ProductionExecutorModule(",
+-            "        TestClass_SimpleComponent_ProductionExecutorModule",
+-            "        testClass_SimpleComponent_ProductionExecutorModule) {",
+-            "      Preconditions.checkNotNull(testClass_SimpleComponent_ProductionExecutorModule);",
+-            "      return this;",
+-            "    }",
+-            "}");
+-    assertAbout(javaSource()).that(component)
++    JavaFileObject generatedComponent;
++    switch (compilerMode) {
++      case EXPERIMENTAL_ANDROID:
++        generatedComponent =
++            JavaFileObjects.forSourceLines(
++                "test.DaggerTestClass_SimpleComponent",
++                "package test;",
++                "",
++                "import com.google.common.util.concurrent.ListenableFuture;",
++                "import dagger.internal.DoubleCheck;",
++                "import dagger.internal.InstanceFactory;",
++                "import dagger.internal.Preconditions;",
++                "import dagger.internal.SetFactory;",
++                "import dagger.producers.Producer;",
++                "import dagger.producers.internal.Producers;",
++                "import dagger.producers.monitoring.ProductionComponentMonitor;",
++                "import java.util.concurrent.Executor;",
++                "import javax.annotation.Generated;",
++                "import javax.inject.Provider;",
++                "",
++                GENERATED_ANNOTATION,
++                "public final class DaggerTestClass_SimpleComponent",
++                "    implements TestClass.SimpleComponent {",
++                "  private TestClass.BModule bModule;",
++                "",
++                "  private Provider<Executor> executorProvider2;",
++                "",
++                "  private Provider<TestClass.SimpleComponent> simpleComponentProvider;",
++                "",
++                "  private Provider<ProductionComponentMonitor> monitorProvider;",
++                "",
++                "  private Producer<TestClass.B> bProducer;",
++                "",
++                "  private Producer<TestClass.A> aProducer;",
++                "",
++                "  private DaggerTestClass_SimpleComponent(Builder builder) {",
++                "    initialize(builder);",
++                "  }",
++                "",
++                "  public static Builder builder() {",
++                "    return new Builder();",
++                "  }",
++                "",
++                "  public static TestClass.SimpleComponent create() {",
++                "    return new Builder().build();",
++                "  }",
++                "",
++                "  private Executor getProductionExecutorInstance() {",
++                "    return Preconditions.checkNotNull(",
++                "        bModule.executor(), " + NPE_FROM_PROVIDES_METHOD + ");",
++                "  }",
++                "",
++                "  private Provider<Executor> getProductionExecutorProvider() {",
++                "    return new Provider<Executor>() {",
++                "      @Override",
++                "      public Executor get() {",
++                "        return getProductionExecutorInstance();",
++                "      }",
++                "    };",
++                "  }",
++                "",
++                "  private TestClass.C getCInstance() {",
++                "    return new TestClass.C();",
++                "  }",
++                "",
++                "  private TestClass.B getBInstance() {",
++                "    return Preconditions.checkNotNull(",
++                "        bModule.b(getCInstance()), " + NPE_FROM_PROVIDES_METHOD + ");",
++                "  }",
++                "",
++                "  private Provider<TestClass.B> getBProvider() {",
++                "    return new Provider<TestClass.B>() {",
++                "      @Override",
++                "      public TestClass.B get() {",
++                "        return getBInstance();",
++                "      }",
++                "    };",
++                "  }",
++                "",
++                "  private Producer<TestClass.B> getBProducer() {",
++                "    return bProducer;",
++                "  }",
++                "",
++                "  @SuppressWarnings(\"unchecked\")",
++                "  private void initialize(final Builder builder) {",
++                "    this.bModule = builder.bModule;",
++                "    this.executorProvider2 =",
++                "        DoubleCheck.provider(",
++                "            TestClass_SimpleComponent_ProductionExecutorModule_ExecutorFactory",
++                "                .create(getProductionExecutorProvider()));",
++                "    this.simpleComponentProvider =",
++                "        InstanceFactory.<TestClass.SimpleComponent>create(this);",
++                "    this.monitorProvider =",
++                "        DoubleCheck.provider(",
++                "            TestClass_SimpleComponent_MonitoringModule_MonitorFactory.create(",
++                "                simpleComponentProvider,",
++                "                SetFactory.<ProductionComponentMonitor.Factory>empty()));",
++                "    this.bProducer = Producers.producerFromProvider(getBProvider());",
++                "    this.aProducer =",
++                "        new TestClass_AModule_AFactory(",
++                "            builder.aModule, executorProvider2, monitorProvider, getBProducer());",
++                "  }",
++                "",
++                "  @Override",
++                "  public ListenableFuture<TestClass.A> a() {",
++                "    return aProducer.get();",
++                "  }",
++                "",
++                "  public static final class Builder {",
++                "    private TestClass.BModule bModule;",
++                "",
++                "    private TestClass.AModule aModule;",
++                "",
++                "    private Builder() {}",
++                "",
++                "    public TestClass.SimpleComponent build() {",
++                "      if (bModule == null) {",
++                "        this.bModule = new TestClass.BModule();",
++                "      }",
++                "      if (aModule == null) {",
++                "        this.aModule = new TestClass.AModule();",
++                "      }",
++                "      return new DaggerTestClass_SimpleComponent(this);",
++                "    }",
++                "",
++                "    public Builder aModule(TestClass.AModule aModule) {",
++                "      this.aModule = Preconditions.checkNotNull(aModule);",
++                "      return this;",
++                "    }",
++                "",
++                "    public Builder bModule(TestClass.BModule bModule) {",
++                "      this.bModule = Preconditions.checkNotNull(bModule);",
++                "      return this;",
++                "    }",
++                "",
++                "    @Deprecated",
++                "    public Builder testClass_SimpleComponent_ProductionExecutorModule(",
++                "        TestClass_SimpleComponent_ProductionExecutorModule",
++                "            testClass_SimpleComponent_ProductionExecutorModule) {",
++                "      Preconditions.checkNotNull(",
++                "          testClass_SimpleComponent_ProductionExecutorModule);",
++                "      return this;",
++                "    }",
++                "  }",
++                "}");
++        break;
++      default:
++        generatedComponent =
++            JavaFileObjects.forSourceLines(
++                "test.DaggerTestClass_SimpleComponent",
++                "package test;",
++                "",
++                "import com.google.common.util.concurrent.ListenableFuture;",
++                "import dagger.internal.DoubleCheck;",
++                "import dagger.internal.InstanceFactory;",
++                "import dagger.internal.Preconditions;",
++                "import dagger.internal.SetFactory;",
++                "import dagger.producers.Producer;",
++                "import dagger.producers.internal.Producers;",
++                "import dagger.producers.monitoring.ProductionComponentMonitor;",
++                "import java.util.concurrent.Executor;",
++                "import javax.annotation.Generated;",
++                "import javax.inject.Provider;",
++                "",
++                GENERATED_ANNOTATION,
++                "public final class DaggerTestClass_SimpleComponent",
++                "    implements TestClass.SimpleComponent {",
++                "  private Provider<Executor> executorProvider;",
++                "  private Provider<Executor> executorProvider2;",
++                "  private Provider<TestClass.SimpleComponent> simpleComponentProvider;",
++                "  private Provider<ProductionComponentMonitor> monitorProvider;",
++                "  private Provider<TestClass.B> bProvider;",
++                "  private Producer<TestClass.B> bProducer;",
++                "  private Producer<TestClass.A> aProducer;",
++                "",
++                "  private DaggerTestClass_SimpleComponent(Builder builder) {",
++                "    initialize(builder);",
++                "  }",
++                "",
++                "  public static Builder builder() {",
++                "    return new Builder();",
++                "  }",
++                "",
++                "  public static TestClass.SimpleComponent create() {",
++                "    return new Builder().build()",
++                "  }",
++                "",
++                "  @SuppressWarnings(\"unchecked\")",
++                "  private void initialize(final Builder builder) {",
++                "    this.executorProvider =",
++                "        TestClass_BModule_ExecutorFactory.create(builder.bModule);",
++                "     this.executorProvider2 =",
++                "         DoubleCheck.provider(",
++                "             TestClass_SimpleComponent_ProductionExecutorModule_ExecutorFactory",
++                "                 .create(executorProvider));",
++                "    this.simpleComponentProvider = ",
++                "        InstanceFactory.<TestClass.SimpleComponent>create(this);",
++                "    this.monitorProvider =",
++                "        DoubleCheck.provider(",
++                "            TestClass_SimpleComponent_MonitoringModule_MonitorFactory.create(",
++                "                simpleComponentProvider,",
++                "                SetFactory.<ProductionComponentMonitor.Factory>empty());",
++                "    this.bProvider = TestClass_BModule_BFactory.create(",
++                "        builder.bModule, TestClass_C_Factory.create());",
++                "    this.bProducer = Producers.producerFromProvider(bProvider);",
++                "    this.aProducer = new TestClass_AModule_AFactory(",
++                "        builder.aModule,",
++                "        executorProvider2,",
++                "        monitorProvider,",
++                "        bProducer);",
++                "  }",
++                "",
++                "  @Override",
++                "  public ListenableFuture<TestClass.A> a() {",
++                "    return aProducer.get();",
++                "  }",
++                "",
++                "  public static final class Builder {",
++                "    private TestClass.BModule bModule;",
++                "    private TestClass.AModule aModule;",
++                "",
++                "    private Builder() {",
++                "    }",
++                "",
++                "    public TestClass.SimpleComponent build() {",
++                "      if (bModule == null) {",
++                "        this.bModule = new TestClass.BModule();",
++                "      }",
++                "      if (aModule == null) {",
++                "        this.aModule = new TestClass.AModule();",
++                "      }",
++                "      return new DaggerTestClass_SimpleComponent(this);",
++                "    }",
++                "",
++                "    public Builder aModule(TestClass.AModule aModule) {",
++                "      this.aModule = Preconditions.checkNotNull(aModule);",
++                "      return this;",
++                "    }",
++                "",
++                "    public Builder bModule(TestClass.BModule bModule) {",
++                "      this.bModule = Preconditions.checkNotNull(bModule);",
++                "      return this;",
++                "    }",
++                "",
++                "    @Deprecated",
++                "    public Builder testClass_SimpleComponent_ProductionExecutorModule(",
++                "        TestClass_SimpleComponent_ProductionExecutorModule",
++                "        testClass_SimpleComponent_ProductionExecutorModule) {",
++                "      Preconditions.checkNotNull(testClass_SimpleComponent_ProductionExecutorModule);",
++                "      return this;",
++                "    }",
++                "}");
++    }
++    assertAbout(javaSource())
++        .that(component)
++        .withCompilerOptions(compilerMode.javacopts())
+         .processedWith(new ComponentProcessor())
+         .compilesWithoutError()
+-        .and().generatesSources(generatedComponent);
++        .and()
++        .generatesSources(generatedComponent);
+   }
+ 
+   @Test public void nullableProducersAreNotErrors() {
+@@ -357,7 +528,9 @@ public void simpleComponent() {
+         "    ListenableFuture<A> a();",
+         "  }",
+         "}");
+-    assertAbout(javaSource()).that(component)
++    assertAbout(javaSource())
++        .that(component)
++        .withCompilerOptions(compilerMode.javacopts())
+         .processedWith(new ComponentProcessor())
+         .compilesWithoutError()
+         .withWarningContaining("@Nullable on @Produces methods does not do anything")
+diff --git a/test_defs.bzl b/test_defs.bzl
+index 9daba18ab..9e076e2d4 100644
+--- a/test_defs.bzl
++++ b/test_defs.bzl
+@@ -47,9 +47,12 @@ def _gen_tests(library_rule_type, test_rule_type, name, srcs, deps, test_only_de
+   if variant_name:
+     suffix = "_" + variant_name
+     tags = [variant_name]
++    # Add jvm_flags so that the mode can be accessed from within tests.
++    jvm_flags = ["-Ddagger.mode=" + variant_name]
+   else:
+     suffix = ""
+     tags = []
++    jvm_flags = []
+ 
+   test_files = []
+   supporting_files = []
+@@ -92,6 +95,7 @@ def _gen_tests(library_rule_type, test_rule_type, name, srcs, deps, test_only_de
+         srcs = [test_file],
+         plugins = plugins,
+         javacopts = extra_javacopts + (javacopts or []) + (test_javacopts or []),
++        jvm_flags = jvm_flags,
+         tags = tags,
+         test_class = test_class,
+     )

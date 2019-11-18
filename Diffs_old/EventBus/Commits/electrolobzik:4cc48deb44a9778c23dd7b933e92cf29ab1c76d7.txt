@@ -1,0 +1,313 @@
+diff --git a/EventBus/src/de/greenrobot/event/EventBus.java b/EventBus/src/de/greenrobot/event/EventBus.java
+index 52892e57..25fa6dc4 100644
+--- a/EventBus/src/de/greenrobot/event/EventBus.java
++++ b/EventBus/src/de/greenrobot/event/EventBus.java
+@@ -43,6 +43,8 @@
+     /** Log tag, apps may override it. */
+     public static String TAG = "Event";
+ 
++	private static final int MAX_MILLIS_INSIDE_HANDLE_MESSAGE = 10;
++
+     private static volatile EventBus defaultInstance;
+ 
+     private static final Map<Class<?>, List<Class<?>>> eventTypesCache = new HashMap<Class<?>, List<Class<?>>>();
+@@ -50,6 +52,7 @@
+     private final Map<Class<?>, CopyOnWriteArrayList<Subscription>> subscriptionsByEventType;
+     private final Map<Object, List<Class<?>>> typesBySubscriber;
+     private final Map<Class<?>, Object> stickyEvents;
++	private final Map<Looper, HandlerPoster> handlerPosters;
+ 
+     private final ThreadLocal<PostingThreadState> currentPostingThreadState = new ThreadLocal<PostingThreadState>() {
+         @Override
+@@ -108,7 +111,8 @@ public EventBus() {
+         subscriptionsByEventType = new HashMap<Class<?>, CopyOnWriteArrayList<Subscription>>();
+         typesBySubscriber = new HashMap<Object, List<Class<?>>>();
+         stickyEvents = new ConcurrentHashMap<Class<?>, Object>();
+-        mainThreadPoster = new HandlerPoster(this, Looper.getMainLooper(), 10);
++		handlerPosters = new HashMap<Looper, HandlerPoster>();
++        mainThreadPoster = getThreadPoster(Looper.getMainLooper());
+         backgroundPoster = new BackgroundPoster(this);
+         asyncPoster = new AsyncPoster(this);
+         subscriberMethodFinder = new SubscriberMethodFinder();
+@@ -140,7 +144,7 @@ public void register(Object subscriber) {
+         register(subscriber, defaultMethodName, false, 0);
+     }
+ 
+-    /**
++	/**
+      * Like {@link #register(Object)} with an additional subscriber priority to influence the order of event delivery.
+      * Within the same delivery thread ({@link ThreadMode}), higher priority subscribers will receive events before
+      * others with a lower priority. The default priority is 0. Note: the priority does *NOT* affect the order of
+@@ -150,6 +154,60 @@ public void register(Object subscriber, int priority) {
+         register(subscriber, defaultMethodName, false, priority);
+     }
+ 
++   	/**
++	 * Registers the given subscriber to receive events in separate already running thread. Subscribers must call
++	 * {@link #unregisterForThread(Object)} or {@link #unregister(Object)} once they are no longer interested in
++	 * receiving events or thread is to finish it's work.
++	 *
++	 * Only event handling methods that are identified by special name, "onEventAnyThread" are registered by this
++	 * method.
++	 */
++	public void registerForThread(Object subscriber) {
++		registerForThread(subscriber, false, 0);
++	}
++
++	/**
++	 * Like {@link #registerForThread(Object)} with an additional subscriber priority to influence the order of event
++	 * delivery. Within the same delivery thread ({@link ThreadMode}), higher priority subscribers will receive events
++	 * before others with a lower priority. The default priority is 0. Note: the priority does *NOT* affect the order of
++	 * delivery among subscribers with different {@link ThreadMode}s!
++	 */
++	public void registerForThread(Object subscriber, int priority) {
++		registerForThread(subscriber, false, priority);
++	}
++
++	/**
++	 * Like {@link #registerForThread(Object)}, but also triggers delivery of the most recent sticky event (posted with
++	 * {@link #postSticky(Object)}) to the given subscriber.
++	 */
++	public void registerForThreadSticky(Object subscriber) {
++		registerForThread(subscriber, true, 0);
++	}
++
++	/**
++	 * Like {@link #registerForThreadSticky(Object, int)}, but also triggers delivery of the most recent sticky event
++	 * (posted with {@link #postSticky(Object)}) to the given subscriber.
++	 */
++	public void registerForThreadSticky(Object subscriber, int priority) {
++		registerForThread(subscriber, true, priority);
++	}
++
++	private void registerForThread(Object subscriber, boolean sticky, int priority) {
++
++		if (!isRegistered(subscriber)) {
++			Log.w(TAG, "Subscriber to register for additional thread was not registered before: " + subscriber.getClass());
++		} else {
++			List<SubscriberMethod> subscriberMethods = subscriberMethodFinder.findSubscriberMethods(subscriber.getClass(),
++					defaultMethodName);
++			for (SubscriberMethod subscriberMethod : subscriberMethods) {
++				if (subscriberMethod.threadMode == ThreadMode.RunningThread) {
++					subscribe(subscriber, subscriberMethod, sticky, priority);
++				}
++			}
++		}
++
++	}
++
+     /**
+      * @deprecated For simplification of the API, this method will be removed in the future.
+      */
+@@ -242,7 +300,7 @@ private synchronized void register(Object subscriber, String methodName, boolean
+     }
+ 
+     // Must be called in synchronized block
+-    private void subscribe(Object subscriber, SubscriberMethod subscriberMethod, boolean sticky, int priority) {
++	private void subscribe(Object subscriber, SubscriberMethod subscriberMethod, boolean sticky, int priority) {
+         subscribed = true;
+         Class<?> eventType = subscriberMethod.eventType;
+         CopyOnWriteArrayList<Subscription> subscriptions = subscriptionsByEventType.get(eventType);
+@@ -253,8 +311,8 @@ private void subscribe(Object subscriber, SubscriberMethod subscriberMethod, boo
+         } else {
+             for (Subscription subscription : subscriptions) {
+                 if (subscription.equals(newSubscription)) {
+-                    throw new EventBusException("Subscriber " + subscriber.getClass() + " already registered to event "
+-                            + eventType);
++					throw new EventBusException("Subscriber " + subscriber.getClass() + " already registered to event "
++								+ eventType);
+                 }
+             }
+         }
+@@ -305,7 +363,7 @@ public synchronized void unregister(Object subscriber, Class<?>... eventTypes) {
+         List<Class<?>> subscribedClasses = typesBySubscriber.get(subscriber);
+         if (subscribedClasses != null) {
+             for (Class<?> eventType : eventTypes) {
+-                unubscribeByEventType(subscriber, eventType);
++                unubscribeByEventType(subscriber, eventType, false);
+                 subscribedClasses.remove(eventType);
+             }
+             if (subscribedClasses.isEmpty()) {
+@@ -317,28 +375,47 @@ public synchronized void unregister(Object subscriber, Class<?>... eventTypes) {
+     }
+ 
+     /** Only updates subscriptionsByEventType, not typesBySubscriber! Caller must update typesBySubscriber. */
+-    private void unubscribeByEventType(Object subscriber, Class<?> eventType) {
++    private void unubscribeByEventType(Object subscriber, Class<?> eventType, boolean onlyCurrentThread) {
+         List<Subscription> subscriptions = subscriptionsByEventType.get(eventType);
+         if (subscriptions != null) {
+             int size = subscriptions.size();
+             for (int i = 0; i < size; i++) {
+                 Subscription subscription = subscriptions.get(i);
+                 if (subscription.subscriber == subscriber) {
+-                    subscription.active = false;
+-                    subscriptions.remove(i);
+-                    i--;
+-                    size--;
++					if (!onlyCurrentThread || (subscription.looper == Looper.myLooper())) {
++						subscription.active = false;
++						subscriptions.remove(i);
++						i--;
++						size--;
++					}
+                 }
+             }
+         }
+     }
+ 
++	private boolean hasSubscriptions(Object subscriber, Class<?> eventType) {
++		boolean result = false;
++		List<Subscription> subscriptions = subscriptionsByEventType.get(eventType);
++		if (subscriptions != null) {
++			int size = subscriptions.size();
++			for (int i = 0; i < size; i++) {
++				Subscription subscription = subscriptions.get(i);
++				if (subscription.subscriber == subscriber) {
++					result = true;
++					break;
++				}
++			}
++		}
++
++		return result;
++	}
++
+     /** Unregisters the given subscriber from all event classes. */
+     public synchronized void unregister(Object subscriber) {
+         List<Class<?>> subscribedTypes = typesBySubscriber.get(subscriber);
+         if (subscribedTypes != null) {
+             for (Class<?> eventType : subscribedTypes) {
+-                unubscribeByEventType(subscriber, eventType);
++                unubscribeByEventType(subscriber, eventType, false);
+             }
+             typesBySubscriber.remove(subscriber);
+         } else {
+@@ -346,6 +423,28 @@ public synchronized void unregister(Object subscriber) {
+         }
+     }
+ 
++	/**
++	 * Unregisters the given subscriber from all event classes, but only in current thread.
++	 * Used with {@link #registerForThread} to stop handling events on exact background thread
++	 */
++	public synchronized void unregisterForThread(Object subscriber) {
++		List<Class<?>> subscribedTypes = typesBySubscriber.get(subscriber);
++		if (subscribedTypes != null) {
++			boolean hasSubscriptions = false;
++			for (Class<?> eventType : subscribedTypes) {
++				unubscribeByEventType(subscriber, eventType, true);
++				if (hasSubscriptions(subscriber, eventType)) {
++					hasSubscriptions = true;
++				}
++			}
++			if (!hasSubscriptions) {
++				typesBySubscriber.remove(subscriber);
++			}
++		} else {
++			Log.w(TAG, "Subscriber to unregister was not registered before: " + subscriber.getClass());
++		}
++	}
++
+     /** Posts the given event to the event bus. */
+     public void post(Object event) {
+         PostingThreadState postingState = currentPostingThreadState.get();
+@@ -506,7 +605,15 @@ private void postToSubscription(Subscription subscription, Object event, boolean
+                 mainThreadPoster.enqueue(subscription, event);
+             }
+             break;
+-        case BackgroundThread:
++		case RunningThread:
++			if (subscription.looper == Looper.myLooper()) {
++				invokeSubscriber(subscription, event);
++			} else {
++				HandlerPoster handlerPoster = getThreadPoster(subscription.looper);
++				handlerPoster.enqueue(subscription, event);
++			}
++			break;
++ 		case BackgroundThread:
+             if (isMainThread) {
+                 backgroundPoster.enqueue(subscription, event);
+             } else {
+@@ -605,4 +712,15 @@ void invokeSubscriber(Subscription subscription, Object event) throws Error {
+         void onPostCompleted(List<SubscriberExceptionEvent> exceptionEvents);
+     }
+ 
++	private HandlerPoster getThreadPoster(Looper looper) {
++	 	HandlerPoster handlerPoster;
++		if (handlerPosters.containsKey(looper)) {
++			handlerPoster =  handlerPosters.get(looper);
++		}                                        else {
++			handlerPoster = new HandlerPoster(this, looper, MAX_MILLIS_INSIDE_HANDLE_MESSAGE);
++			handlerPosters.put(looper, handlerPoster);
++		}
++
++		return handlerPoster;
++	}
+ }
+diff --git a/EventBus/src/de/greenrobot/event/SubscriberMethodFinder.java b/EventBus/src/de/greenrobot/event/SubscriberMethodFinder.java
+index f3ec4628..40788bb3 100644
+--- a/EventBus/src/de/greenrobot/event/SubscriberMethodFinder.java
++++ b/EventBus/src/de/greenrobot/event/SubscriberMethodFinder.java
+@@ -70,6 +70,8 @@
+                                 threadMode = ThreadMode.BackgroundThread;
+                             } else if (modifierString.equals("Async")) {
+                                 threadMode = ThreadMode.Async;
++							} else if (modifierString.equals("AnyThread")) {
++								threadMode = ThreadMode.RunningThread;
+                             } else {
+                                 if (skipMethodVerificationForClasses.containsKey(clazz)) {
+                                     continue;
+diff --git a/EventBus/src/de/greenrobot/event/Subscription.java b/EventBus/src/de/greenrobot/event/Subscription.java
+index 6c84c440..43d26535 100644
+--- a/EventBus/src/de/greenrobot/event/Subscription.java
++++ b/EventBus/src/de/greenrobot/event/Subscription.java
+@@ -15,10 +15,14 @@
+  */
+ package de.greenrobot.event;
+ 
++import android.os.Looper;
++
+ final class Subscription {
+     final Object subscriber;
+     final SubscriberMethod subscriberMethod;
+     final int priority;
++	final Looper looper;
++
+     /**
+      * Becomes false as soon as {@link EventBus#unregister(Object)} is called, which is checked by queued event delivery
+      * {@link EventBus#invokeSubscriber(PendingPost)} to prevent race conditions.
+@@ -29,6 +33,12 @@
+         this.subscriber = subscriber;
+         this.subscriberMethod = subscriberMethod;
+         this.priority = priority;
++		Looper myLooper = Looper.myLooper();
++		if (myLooper == null) {
++			Looper.prepare();
++			myLooper = Looper.myLooper();
++		}
++		this.looper = myLooper;
+         active = true;
+     }
+ 
+diff --git a/EventBus/src/de/greenrobot/event/ThreadMode.java b/EventBus/src/de/greenrobot/event/ThreadMode.java
+index 4022ace5..abe43dc3 100644
+--- a/EventBus/src/de/greenrobot/event/ThreadMode.java
++++ b/EventBus/src/de/greenrobot/event/ThreadMode.java
+@@ -53,5 +53,15 @@
+      * of long running asynchronous handler methods at the same time to limit the number of concurrent threads. EventBus
+      * uses a thread pool to efficiently reuse threads from completed asynchronous event handler notifications.
+      */
+-    Async
++    Async,
++
++	/**
++	 * Event handler methods are called in all existing threads, that made registration for handling events with this
++	 * ThreadMode. If the posting thread is registered with this mode, event handler methods also will be called
++	 * directly in the posting thread. Posting events never wait for event handler methods using this mode. Thread is
++	 * obtained and saved in the moment of object registration. It is not allowed general registering of one object to
++	 * the bus several times in different threads. If you need to subscribe single object to handle events in several
++	 * threads, you should use {@link EventBus#registerForThread} for background threads instead.
++	 */
++	RunningThread
+ }
+\ No newline at end of file

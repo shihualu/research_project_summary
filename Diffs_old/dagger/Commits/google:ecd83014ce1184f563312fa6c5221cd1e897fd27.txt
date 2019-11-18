@@ -1,0 +1,358 @@
+diff --git a/java/dagger/internal/codegen/BindingGraphConverter.java b/java/dagger/internal/codegen/BindingGraphConverter.java
+index ee82f2a26..b57955b62 100644
+--- a/java/dagger/internal/codegen/BindingGraphConverter.java
++++ b/java/dagger/internal/codegen/BindingGraphConverter.java
+@@ -66,9 +66,11 @@
+     // multibindings or optional bindings, the parent-owned binding is still there. If that
+     // parent-owned binding is not reachable from its component, it doesn't need to be in the graph
+     // because it will never be used. So remove all nodes that are not reachable from the root
+-    // component.
+-    unreachableNodes(traverser.network.asGraph(), rootComponentNode(traverser.network))
+-        .forEach(traverser.network::removeNode);
++    // component—unless the component is a module-binding validation component.
++    if (!bindingGraph.componentDescriptor().kind().isForModuleValidation()) {
++      unreachableNodes(traverser.network.asGraph(), rootComponentNode(traverser.network))
++          .forEach(traverser.network::removeNode);
++    }
+ 
+     ComponentKind componentKind = bindingGraph.componentDescriptor().kind();
+     return BindingGraphProxies.bindingGraph(
+diff --git a/java/dagger/internal/codegen/BindingGraphFactory.java b/java/dagger/internal/codegen/BindingGraphFactory.java
+index 9a3560c86..365cb8157 100644
+--- a/java/dagger/internal/codegen/BindingGraphFactory.java
++++ b/java/dagger/internal/codegen/BindingGraphFactory.java
+@@ -31,6 +31,7 @@
+ import static dagger.model.BindingKind.INJECTION;
+ import static dagger.model.BindingKind.OPTIONAL;
+ import static dagger.model.BindingKind.SUBCOMPONENT_BUILDER;
++import static dagger.model.RequestKind.MEMBERS_INJECTION;
+ import static java.util.function.Predicate.isEqual;
+ import static javax.lang.model.util.ElementFilter.methodsIn;
+ 
+@@ -47,7 +48,6 @@
+ import dagger.Reusable;
+ import dagger.model.DependencyRequest;
+ import dagger.model.Key;
+-import dagger.model.RequestKind;
+ import dagger.model.Scope;
+ import dagger.producers.Produced;
+ import dagger.producers.Producer;
+@@ -174,12 +174,25 @@ private BindingGraph create(
+             indexBindingDeclarationsByKey(subcomponentDeclarations.build()),
+             indexBindingDeclarationsByKey(delegatesBuilder.build()),
+             indexBindingDeclarationsByKey(optionalsBuilder.build()));
+-    for (DependencyRequest entryPoint : componentDescriptor.entryPoints()) {
+-      if (entryPoint.kind().equals(RequestKind.MEMBERS_INJECTION)) {
+-        requestResolver.resolveMembersInjection(entryPoint.key());
+-      } else {
+-        requestResolver.resolve(entryPoint.key());
+-      }
++
++    componentDescriptor.entryPointMethods().stream()
++        .map(method -> method.dependencyRequest().get())
++        .forEach(
++            entryPoint -> {
++              if (entryPoint.kind().equals(MEMBERS_INJECTION)) {
++                requestResolver.resolveMembersInjection(entryPoint.key());
++              } else {
++                requestResolver.resolve(entryPoint.key());
++              }
++            });
++
++    if (componentDescriptor.kind().isForModuleValidation()) {
++      // For module-binding validation, resolve the keys for all bindings in all modules, stripping
++      // any multibinding contribution identifier so that the multibinding itself is resolved.
++      componentDescriptor.modules().stream()
++          .flatMap(module -> module.allBindingKeys().stream())
++          .map(key -> key.toBuilder().multibindingContributionIdentifier(Optional.empty()).build())
++          .forEach(requestResolver::resolve);
+     }
+ 
+     // Resolve all bindings for subcomponents, creating subgraphs for all subcomponents that have
+diff --git a/java/dagger/internal/codegen/ComponentDescriptor.java b/java/dagger/internal/codegen/ComponentDescriptor.java
+index 2ae713151..806134aab 100644
+--- a/java/dagger/internal/codegen/ComponentDescriptor.java
++++ b/java/dagger/internal/codegen/ComponentDescriptor.java
+@@ -52,7 +52,6 @@
+ import dagger.Module;
+ import dagger.Subcomponent;
+ import dagger.model.DependencyRequest;
+-import dagger.model.RequestKind;
+ import dagger.model.Scope;
+ import dagger.producers.CancellationPolicy;
+ import dagger.producers.ProductionComponent;
+@@ -220,7 +219,7 @@ private static boolean doesComponentMethodMatch(
+         .isPresent();
+   }
+ 
+-  /** The entry point methods on the component type. */
++  /** The entry point methods on the component type. Each has a {@link DependencyRequest}. */
+   final ImmutableSet<ComponentMethodDescriptor> entryPointMethods() {
+     return componentMethods()
+         .stream()
+@@ -228,41 +227,6 @@ private static boolean doesComponentMethodMatch(
+         .collect(toImmutableSet());
+   }
+ 
+-  /**
+-   * The entry points.
+-   *
+-   * <p>For descriptors that are generated from a module in order to validate the module's bindings,
+-   * these will be requests for every key for every binding declared in the module (erasing
+-   * multibinding contribution identifiers so that we get the multibinding key).
+-   *
+-   * <p>In order not to trigger a validation error if the requested binding is nullable, each
+-   * request will be nullable.
+-   *
+-   * <p>In order not to trigger a validation error if the requested binding is a production binding,
+-   * each request will be for a {@link com.google.common.util.concurrent.ListenableFuture} of the
+-   * key type.
+-   */
+-  final ImmutableSet<DependencyRequest> entryPoints() {
+-    if (kind().isForModuleValidation()) {
+-      return modules().stream()
+-          .flatMap(module -> module.allBindingKeys().stream())
+-          .map(key -> key.toBuilder().multibindingContributionIdentifier(Optional.empty()).build())
+-          .map(
+-              key ->
+-                  DependencyRequest.builder()
+-                      .key(key)
+-                      // TODO(dpb): Futures only in ProducerModules, instances elsewhere?
+-                      .kind(RequestKind.FUTURE)
+-                      .isNullable(true)
+-                      .build())
+-          .collect(toImmutableSet());
+-    } else {
+-      return entryPointMethods().stream()
+-          .map(method -> method.dependencyRequest().get())
+-          .collect(toImmutableSet());
+-    }
+-  }
+-
+   // TODO(gak): Consider making this non-optional and revising the
+   // interaction between the spec & generation
+   /** Returns a descriptor for the creator type for this component type, if the user defined one. */
+diff --git a/java/dagger/internal/codegen/ComponentNodeImpl.java b/java/dagger/internal/codegen/ComponentNodeImpl.java
+index 7b624aa17..0c24352e8 100644
+--- a/java/dagger/internal/codegen/ComponentNodeImpl.java
++++ b/java/dagger/internal/codegen/ComponentNodeImpl.java
+@@ -16,6 +16,8 @@
+ 
+ package dagger.internal.codegen;
+ 
++import static dagger.internal.codegen.DaggerStreams.toImmutableSet;
++
+ import com.google.auto.value.AutoValue;
+ import com.google.common.collect.ImmutableSet;
+ import dagger.model.BindingGraph.ComponentNode;
+@@ -33,7 +35,9 @@ static ComponentNode create(
+ 
+   @Override
+   public ImmutableSet<DependencyRequest> entryPoints() {
+-    return componentDescriptor().entryPoints();
++    return componentDescriptor().entryPointMethods().stream()
++        .map(method -> method.dependencyRequest().get())
++        .collect(toImmutableSet());
+   }
+ 
+   @Override
+diff --git a/java/dagger/internal/codegen/ComponentTreeTraverser.java b/java/dagger/internal/codegen/ComponentTreeTraverser.java
+index 5086062e8..2291f9c80 100644
+--- a/java/dagger/internal/codegen/ComponentTreeTraverser.java
++++ b/java/dagger/internal/codegen/ComponentTreeTraverser.java
+@@ -38,6 +38,7 @@
+ import com.google.common.collect.Iterables;
+ import com.google.common.collect.Iterators;
+ import com.google.common.collect.LinkedHashMultiset;
++import dagger.internal.codegen.ComponentDescriptor.ComponentMethodDescriptor;
+ import dagger.model.ComponentPath;
+ import dagger.model.DependencyRequest;
+ import dagger.model.Key;
+@@ -125,8 +126,9 @@ protected void visitComponent(BindingGraph graph) {
+                       graph, parent, childFactoryMethod.methodElement()));
+     }
+ 
+-    for (DependencyRequest entryPoint : graph.componentDescriptor().entryPoints()) {
+-      visitEntryPoint(entryPoint, graph);
++    for (ComponentMethodDescriptor entryPointMethod :
++        graph.componentDescriptor().entryPointMethods()) {
++      visitEntryPoint(entryPointMethod.dependencyRequest().get(), graph);
+     }
+ 
+     for (BindingGraph child : graph.subgraphs()) {
+diff --git a/java/dagger/internal/codegen/DependencyCycleValidator.java b/java/dagger/internal/codegen/DependencyCycleValidator.java
+index 2007ce8cd..dd947ca4a 100644
+--- a/java/dagger/internal/codegen/DependencyCycleValidator.java
++++ b/java/dagger/internal/codegen/DependencyCycleValidator.java
+@@ -106,10 +106,14 @@ public void visitGraph(BindingGraph bindingGraph, DiagnosticReporter diagnosticR
+   /**
+    * Reports a dependency cycle at the dependency into the cycle that is closest to an entry point.
+    *
+-   * <p>Looks for the shortest path from the component that contains the cycle (all bindings in a
+-   * cycle must be in the same component; see below) to some binding in the cycle. Then looks for
+-   * the last dependency in that path that is not in the cycle; that is the dependency that will be
+-   * reported, so that the dependency trace will end just before the cycle.
++   * <p>For cycles found in standard components, looks for the shortest path from the component that
++   * contains the cycle (all bindings in a cycle must be in the same component; see below) to some
++   * binding in the cycle. Then looks for the last dependency in that path that is not in the cycle;
++   * that is the dependency that will be reported, so that the dependency trace will end just before
++   * the cycle.
++   *
++   * <p>For cycles found during module binding validation, just reports the component that contains
++   * the cycle.
+    *
+    * <p>Proof (by counterexample) that all bindings in a cycle must be in the same component: Assume
+    * one binding in the cycle is in a parent component. Bindings cannot depend on bindings in child
+@@ -117,6 +121,14 @@ public void visitGraph(BindingGraph bindingGraph, DiagnosticReporter diagnosticR
+    */
+   private void reportCycle(
+       Cycle<Node> cycle, BindingGraph bindingGraph, DiagnosticReporter diagnosticReporter) {
++    if (bindingGraph.isModuleBindingGraph()) {
++      diagnosticReporter.reportComponent(
++          ERROR,
++          bindingGraph.componentNode(cycle.nodes().asList().get(0).componentPath()).get(),
++          errorMessage(cycle, bindingGraph));
++      return;
++    }
++
+     ImmutableList<Node> path = shortestPathToCycleFromAnEntryPoint(cycle, bindingGraph);
+     Node cycleStartNode = path.get(path.size() - 1);
+     Node previousNode = path.get(path.size() - 2);
+@@ -224,6 +236,7 @@ private DependencyEdge chooseDependencyEdgeConnecting(
+   }
+ 
+   /** Returns the subgraph containing only {@link DependencyEdge}s that would not break a cycle. */
++  // TODO(dpb): Return a network containing only Binding nodes.
+   private ImmutableNetwork<Node, DependencyEdge> nonCycleBreakingDependencyGraph(
+       BindingGraph bindingGraph) {
+     MutableNetwork<Node, DependencyEdge> dependencyNetwork =
+diff --git a/java/dagger/internal/codegen/DiagnosticReporterFactory.java b/java/dagger/internal/codegen/DiagnosticReporterFactory.java
+index 4625a9f83..ba4404222 100644
+--- a/java/dagger/internal/codegen/DiagnosticReporterFactory.java
++++ b/java/dagger/internal/codegen/DiagnosticReporterFactory.java
+@@ -30,6 +30,7 @@
+ import static dagger.internal.codegen.DaggerElements.elementToString;
+ import static dagger.internal.codegen.DaggerGraphs.shortestPath;
+ import static dagger.internal.codegen.DaggerStreams.instancesOf;
++import static dagger.internal.codegen.DaggerStreams.presentValues;
+ import static dagger.internal.codegen.DaggerStreams.toImmutableSet;
+ import static java.util.Collections.min;
+ import static java.util.Comparator.comparing;
+@@ -320,21 +321,21 @@ public String toString() {
+           dependencyTrace.forEach(
+               edge ->
+                   dependencyRequestFormatter.appendFormatLine(message, edge.dependencyRequest()));
+-          appendComponentPathUnlessAtRoot(message, source(getLast(dependencyTrace)));
++          if (!dependencyTrace.isEmpty()) {
++            appendComponentPathUnlessAtRoot(message, source(getLast(dependencyTrace)));
++          }
+         }
+ 
+         // Print any dependency requests that aren't shown as part of the dependency trace.
+         ImmutableSet<Element> requestsToPrint =
+             requests.stream()
++                // if printing entry points, skip entry points and the traced request
+                 .filter(
+-                    // if printing entry points, skip them and the request at the head of the
+-                    // dependency trace here.
+-                    printingEntryPoints
+-                        ? request ->
+-                            !request.isEntryPoint() && !request.equals(dependencyTrace.get(0))
+-                        : request -> true)
+-                .filter(request -> request.dependencyRequest().requestElement().isPresent())
+-                .map(request -> request.dependencyRequest().requestElement().get())
++                    request ->
++                        !printingEntryPoints
++                            || (!request.isEntryPoint() && !isTracedRequest(request)))
++                .map(request -> request.dependencyRequest().requestElement())
++                .flatMap(presentValues())
+                 .collect(toImmutableSet());
+         if (!requestsToPrint.isEmpty()) {
+           message
+@@ -379,6 +380,10 @@ public String toString() {
+         return message.toString();
+       }
+ 
++      private boolean isTracedRequest(DependencyEdge request) {
++        return !dependencyTrace.isEmpty() && request.equals(dependencyTrace.get(0));
++      }
++
+       /**
+        * Returns the dependency trace from one of the {@code entryPoints} to {@code binding} to
+        * {@code message} as a list <i>ending with</i> the entry point.
+@@ -387,6 +392,11 @@ public String toString() {
+       // bindingGraph.shortestPathFromEntryPoint(DependencyEdge, MaybeBindingNode)
+       ImmutableList<DependencyEdge> dependencyTrace(
+           MaybeBinding binding, ImmutableSet<DependencyEdge> entryPoints) {
++        // Module binding graphs may have bindings unreachable from any entry points. If there are
++        // no entry points for this DiagnosticInfo, don't try to print a dependency trace.
++        if (entryPoints.isEmpty()) {
++          return ImmutableList.of();
++        }
+         // Show the full dependency trace for one entry point.
+         DependencyEdge entryPointForTrace =
+             min(
+diff --git a/java/dagger/model/BindingGraph.java b/java/dagger/model/BindingGraph.java
+index 65e0bac1d..e02ad0dac 100644
+--- a/java/dagger/model/BindingGraph.java
++++ b/java/dagger/model/BindingGraph.java
+@@ -16,7 +16,6 @@
+ 
+ package dagger.model;
+ 
+-import static com.google.common.base.Verify.verify;
+ import static com.google.common.collect.Sets.intersection;
+ import static com.google.common.graph.Graphs.inducedSubgraph;
+ import static com.google.common.graph.Graphs.reachableNodes;
+@@ -220,7 +219,7 @@ public final ComponentNode rootComponentNode() {
+ 
+   /**
+    * Returns the edges for entry points that transitively depend on a binding or missing binding for
+-   * a key. Never returns an empty set.
++   * a key.
+    */
+   public final ImmutableSet<DependencyEdge> entryPointEdgesDependingOnBinding(
+       MaybeBinding binding) {
+@@ -228,10 +227,7 @@ public final ComponentNode rootComponentNode() {
+     Network<Node, DependencyEdge> subgraphDependingOnBinding =
+         inducedSubgraph(
+             dependencyGraph, reachableNodes(transpose(dependencyGraph).asGraph(), binding));
+-    ImmutableSet<DependencyEdge> entryPointEdges =
+-        intersection(entryPointEdges(), subgraphDependingOnBinding.edges()).immutableCopy();
+-    verify(!entryPointEdges.isEmpty(), "No entry points depend on binding %s", binding);
+-    return entryPointEdges;
++    return intersection(entryPointEdges(), subgraphDependingOnBinding.edges()).immutableCopy();
+   }
+ 
+   /** Returns the bindings that directly request a given binding as a dependency. */
+@@ -265,6 +261,7 @@ public final ComponentNode rootComponentNode() {
+         .collect(toImmutableSet());
+   }
+ 
++  /** Returns a subnetwork that contains all nodes but only {@link DependencyEdge}s. */
+   // TODO(dpb): Make public. Cache.
+   private ImmutableNetwork<Node, DependencyEdge> dependencyGraph() {
+     MutableNetwork<Node, DependencyEdge> dependencyGraph =
+@@ -272,6 +269,7 @@ public final ComponentNode rootComponentNode() {
+             .expectedNodeCount(network().nodes().size())
+             .expectedEdgeCount((int) dependencyEdgeStream().count())
+             .build();
++    network().nodes().forEach(dependencyGraph::addNode); // include disconnected nodes
+     dependencyEdgeStream()
+         .forEach(
+             edge -> {
+diff --git a/javatests/dagger/internal/codegen/DependencyCycleValidationTest.java b/javatests/dagger/internal/codegen/DependencyCycleValidationTest.java
+index 4a57da3c7..edb2232b1 100644
+--- a/javatests/dagger/internal/codegen/DependencyCycleValidationTest.java
++++ b/javatests/dagger/internal/codegen/DependencyCycleValidationTest.java
+@@ -92,9 +92,7 @@
+                 "    test.Outer.A is injected at",
+                 "        test.Outer.B(aParam)",
+                 "    test.Outer.B is injected at",
+-                "        test.Outer.C(bParam)",
+-                "It is requested at:",
+-                "    test.Outer.MModule.object(c)"))
++                "        test.Outer.C(bParam)"))
+         .inFile(component)
+         .onLineContaining("interface MModule");
+   }

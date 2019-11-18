@@ -1,0 +1,1478 @@
+diff --git a/providers/channelmgr/src/main/java/com/ning/http/client/providers/chanmgr/ChanMgrAsyncHttpProvider.java b/providers/channelmgr/src/main/java/com/ning/http/client/providers/chanmgr/ChanMgrAsyncHttpProvider.java
+index 19ff2e2c2..7b65bd68f 100644
+--- a/providers/channelmgr/src/main/java/com/ning/http/client/providers/chanmgr/ChanMgrAsyncHttpProvider.java
++++ b/providers/channelmgr/src/main/java/com/ning/http/client/providers/chanmgr/ChanMgrAsyncHttpProvider.java
+@@ -38,8 +38,10 @@
+ import java.util.Map.Entry;
+ import java.util.concurrent.Callable;
+ import java.util.concurrent.ExecutionException;
++import java.util.concurrent.Executors;
+ import java.util.concurrent.Future;
+ import java.util.concurrent.RejectedExecutionException;
++import java.util.concurrent.ScheduledExecutorService;
+ import java.util.concurrent.Semaphore;
+ import java.util.concurrent.TimeUnit;
+ import java.util.concurrent.TimeoutException;
+@@ -120,19 +122,27 @@
+ import com.ning.http.client.ntlm.NTLMEngine;
+ import com.ning.http.client.ntlm.NTLMEngineException;
+ import com.ning.http.client.providers.chanmgr.FeedableBodyGenerator.FeedListener;
+-import com.ning.http.client.providers.chanmgr.chain.AConnectListener;
++import com.ning.http.client.providers.chanmgr.chain.AChannelFromPoolListener;
++import com.ning.http.client.providers.chanmgr.chain.BConnectCallback;
+ import com.ning.http.client.providers.chanmgr.spnego.SpnegoEngine;
+ import com.ning.http.client.providers.chanmgr.util.CleanupChannelGroup;
+ import com.ning.http.client.websocket.WebSocketUpgradeHandler;
+ import com.ning.http.multipart.MultipartBody;
+ import com.ning.http.multipart.MultipartRequestEntity;
++import com.ning.http.pool.AsyncConnectionPool;
++import com.ning.http.pool.AsyncConnectionPoolImpl;
++import com.ning.http.pool.Connection;
++import com.ning.http.pool.ConnectionCloseListener;
++import com.ning.http.pool.ConnectionCreator;
++import com.ning.http.pool.FakeConnectionPool;
++import com.ning.http.pool.PoolConfig;
+ import com.ning.http.util.AsyncHttpProviderUtils;
+ import com.ning.http.util.AuthenticatorUtils;
+ import com.ning.http.util.ProxyUtils;
+ import com.ning.http.util.SslUtils;
+ import com.ning.http.util.UTF8UrlEncoder;
+ 
+-public class ChanMgrAsyncHttpProvider extends SimpleChannelUpstreamHandler implements AsyncHttpProvider {
++public class ChanMgrAsyncHttpProvider extends SimpleChannelUpstreamHandler implements AsyncHttpProvider, ConnectionCreator<TCPChannel> {
+     private final static String WEBSOCKET_KEY = "Sec-WebSocket-Key";
+     private final static String HTTP_HANDLER = "httpHandler";
+     protected final static String SSL_HANDLER = "sslHandler";
+@@ -148,7 +158,7 @@
+     private final AsyncHttpClientConfig config;
+     private final AtomicBoolean isClose = new AtomicBoolean(false);
+ 
+-    private final ConnectionsPool<String, TCPChannel> connectionsPool;
++    private final AsyncConnectionPool<TCPChannel> connectionsPool;
+     private Semaphore freeConnections = null;
+     private final ChanMgrAsyncHttpProviderConfig asyncHttpProviderConfig;
+     private final boolean trackConnections;
+@@ -175,14 +185,20 @@ public ChanMgrAsyncHttpProvider(AsyncHttpClientConfig config) {
+         this.config = config;
+ 
+         // This is dangerous as we can't catch a wrong typed ConnectionsPool
+-        ConnectionsPool<String, TCPChannel> cp = (ConnectionsPool<String, TCPChannel>) config.getConnectionsPool();
+-        if (cp == null && config.getAllowPoolingConnection()) {
+-            cp = new ChanMgrConnectionsPool(this);
+-        } else if (cp == null) {
+-            cp = new NonConnectionsPool();
++        if (config.getAllowPoolingConnection()) {
++    		PoolConfig poolConfig = new PoolConfig();
++    		poolConfig.setMaxConnectionPerHost(config.getMaxConnectionPerHost());
++    		poolConfig.setMaxTotalConnections(config.getMaxTotalConnections());
++    		poolConfig.setRequestTimeoutInMs(config.getRequestTimeoutInMs());
++    		poolConfig.setIdleConnectionInPoolTimeoutInMs(config.getIdleConnectionInPoolTimeoutInMs());
++            ScheduledExecutorService svc = Executors.newScheduledThreadPool(1);
++            connectionsPool = new AsyncConnectionPoolImpl<TCPChannel>(poolConfig, svc);
++        } else {
++        	connectionsPool = new FakeConnectionPool();
+         }
+-        this.connectionsPool = cp;
+ 
++        connectionsPool.setCreator(this);
++        
+         if (config.getMaxTotalConnections() != -1) {
+             trackConnections = true;
+             freeConnections = new Semaphore(config.getMaxTotalConnections());
+@@ -200,24 +216,6 @@ public String toString() {
+                 connectionsPool.toString());
+     }
+ 
+-    private TCPChannel lookupInCache(URI uri) {
+-        final TCPChannel channel = connectionsPool.poll(AsyncHttpProviderUtils.getBaseUrl(uri));
+-
+-//        if (channel != null) {
+-//            log.debug("Using cached Channel {}\n for uri {}\n", channel, uri);
+-//
+-//            try {
+-//                // Always make sure the channel who got cached support the proper protocol. It could
+-//                // only occurs when a HttpMethod.CONNECT is used agains a proxy that require upgrading from http to
+-//                // https.
+-//                return verifyChannelPipeline(channel, uri.getScheme());
+-//            } catch (Exception ex) {
+-//                log.debug(ex.getMessage(), ex);
+-//            }
+-//        }
+-        return null;
+-    }
+-
+     private SSLEngine createSSLEngine() throws IOException, GeneralSecurityException {
+         SSLEngine sslEngine = config.getSSLEngineFactory().newSSLEngine();
+         if (sslEngine == null) {
+@@ -533,19 +531,17 @@ private static HttpRequest construct(AsyncHttpClientConfig config,
+     }
+ 
+     private static boolean isWebSocket(URI uri) {
+-		// TODO Auto-generated method stub
+-		return false;
++		throw new UnsupportedOperationException();
+ 	}
+ 
+ 	private static boolean isSecure(URI uri) {
+-		// TODO Auto-generated method stub
+-		return false;
++		throw new UnsupportedOperationException();
+ 	}
+ 
+ 	public void close() {
+         isClose.set(true);
+         try {
+-            connectionsPool.destroy();
++            connectionsPool.clear();
+             config.executorService().shutdown();
+             config.reaper().shutdown();
+             chanMgr.stop();
+@@ -565,41 +561,19 @@ public Response prepareResponse(final HttpResponseStatus status,
+     /* @Override */
+ 
+     public <T> ListenableFuture<T> execute(Request request, final AsyncHandler<T> asyncHandler) throws IOException {
+-    	TCPChannel channel = chanMgr.createTCPChannel("channel"+getNextNum());
+     	
+         String requestUrl = request.getUrl();
+         URI uri = AsyncHttpProviderUtils.createUri(requestUrl);
+ 
+-        InetSocketAddress remoteAddress = null;
+-        if (request.getInetAddress() != null) {
+-            remoteAddress = new InetSocketAddress(request.getInetAddress(), AsyncHttpProviderUtils.getPort(uri));
+-        }
+-
+-       // connectionsPool.
+-        
+         HttpRequest nettyRequest = null;
+-
+-        ChanMgrResponseFuture<T> future = new ChanMgrResponseFuture<T>(uri, request, asyncHandler, nettyRequest, config.getRequestTimeoutInMs(), config.getIdleConnectionTimeoutInMs(), this);
+-        
+-        AConnectListener<T> listener = new AConnectListener<T>(future);
+-        boolean fromPool = false;
++        ChanMgrResponseFuture<T> future = new ChanMgrResponseFuture<T>();
+         
+-        if(!fromPool) {
+-        	FutureOperation futureOp = channel.connect(remoteAddress);
+-        	futureOp.setListener(listener);
+-        } else {
+-        	//we are re-using the channel, so just perform the write only then...
+-        	
+-        	//no need to wait for connection so just write the request out
+-        	listener.performWrite(channel);
+-        }
++    	String baseUrl = AsyncHttpProviderUtils.getBaseUrl(uri);
++    	connectionsPool.obtainConnection(baseUrl, new AChannelFromPoolListener(request, future, uri));
+     	
+     	return future;
+     }
+ 
+-    private synchronized int getNextNum() {
+-    	return chanCount++;
+-    }
+     protected static int requestTimeout(AsyncHttpClientConfig config, PerRequestConfig perRequestConfig) {
+         int result;
+         if (perRequestConfig != null) {
+@@ -758,26 +732,14 @@ public AsyncHttpClientConfig getConfig() {
+         return config;
+     }
+ 
+-    private static class NonConnectionsPool implements ConnectionsPool<String, TCPChannel> {
+-
+-        public boolean offer(String uri, TCPChannel connection) {
+-            return false;
+-        }
+-
+-        public TCPChannel poll(String uri) {
+-            return null;
+-        }
+-
+-        public boolean removeAll(TCPChannel connection) {
+-            return false;
+-        }
+-
+-        public boolean canCacheConnection() {
+-            return true;
+-        }
+-
+-        public void destroy() {
+-        }
+-    }
++	@Override
++	public Connection<TCPChannel> createConnection(ConnectionCloseListener<TCPChannel> l) {
++		TCPChannel channel = chanMgr.createTCPChannel("chan"+getNextNum3());
++		ChanMgrConnection conn = new ChanMgrConnection(channel);
++		return conn;
++	}
+    
++    private synchronized int getNextNum3() {
++    	return chanCount++;
++    }
+ }
+diff --git a/providers/channelmgr/src/main/java/com/ning/http/client/providers/chanmgr/ChanMgrConnection.java b/providers/channelmgr/src/main/java/com/ning/http/client/providers/chanmgr/ChanMgrConnection.java
+new file mode 100644
+index 000000000..8c1ccab1c
+--- /dev/null
++++ b/providers/channelmgr/src/main/java/com/ning/http/client/providers/chanmgr/ChanMgrConnection.java
+@@ -0,0 +1,18 @@
++package com.ning.http.client.providers.chanmgr;
++
++import org.playorm.nio.api.channels.TCPChannel;
++
++import com.ning.http.pool.Connection;
++
++public class ChanMgrConnection extends Connection<TCPChannel> {
++
++	public ChanMgrConnection(TCPChannel channel) {
++		super(channel);
++	}
++
++	@Override
++	protected void close() {
++		getChannel().close();
++	}
++
++}
+diff --git a/providers/channelmgr/src/main/java/com/ning/http/client/providers/chanmgr/ChanMgrConnectionsPool.java b/providers/channelmgr/src/main/java/com/ning/http/client/providers/chanmgr/ChanMgrConnectionsPool.java
+deleted file mode 100644
+index b580f2acc..000000000
+--- a/providers/channelmgr/src/main/java/com/ning/http/client/providers/chanmgr/ChanMgrConnectionsPool.java
++++ /dev/null
+@@ -1,241 +0,0 @@
+-/*
+- * Copyright (c) 2010-2012 Sonatype, Inc. All rights reserved.
+- *
+- * This program is licensed to you under the Apache License Version 2.0,
+- * and you may not use this file except in compliance with the Apache License Version 2.0.
+- * You may obtain a copy of the Apache License Version 2.0 at http://www.apache.org/licenses/LICENSE-2.0.
+- *
+- * Unless required by applicable law or agreed to in writing,
+- * software distributed under the Apache License Version 2.0 is distributed on an
+- * "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+- * See the Apache License Version 2.0 for the specific language governing permissions and limitations there under.
+- */
+-package com.ning.http.client.providers.chanmgr;
+-
+-import java.util.ArrayList;
+-import java.util.HashSet;
+-import java.util.List;
+-import java.util.Set;
+-import java.util.Timer;
+-import java.util.TimerTask;
+-import java.util.concurrent.ConcurrentHashMap;
+-import java.util.concurrent.ConcurrentLinkedQueue;
+-import java.util.concurrent.atomic.AtomicBoolean;
+-
+-import org.playorm.nio.api.channels.TCPChannel;
+-import org.slf4j.Logger;
+-import org.slf4j.LoggerFactory;
+-
+-import com.ning.http.client.ConnectionsPool;
+-
+-/**
+- * A simple implementation of {@link com.ning.http.client.ConnectionsPool} based on a {@link java.util.concurrent.ConcurrentHashMap}
+- */
+-public class ChanMgrConnectionsPool implements ConnectionsPool<String, TCPChannel> {
+-
+-    private final static Logger log = LoggerFactory.getLogger(ChanMgrConnectionsPool.class);
+-    private final ConcurrentHashMap<String, ConcurrentLinkedQueue<TCPChannel>> connectionsPool = new ConcurrentHashMap<String, ConcurrentLinkedQueue<TCPChannel>>();
+-    private final Set<TCPChannel> openChannels = new HashSet<TCPChannel>();
+-    
+-    private final AtomicBoolean isClosed = new AtomicBoolean(false);
+-    private final Timer idleConnectionDetector = new Timer(true);
+-    private final boolean sslConnectionPoolEnabled;
+-    private final int maxTotalConnections;
+-    private final int maxConnectionPerHost;
+-    private final int maxConnectionLifeTimeInMs;
+-    private final long maxIdleTime;
+-
+-    public ChanMgrConnectionsPool(ChanMgrAsyncHttpProvider provider) {
+-        this.maxTotalConnections = provider.getConfig().getMaxTotalConnections();
+-        this.maxConnectionPerHost = provider.getConfig().getMaxConnectionPerHost();
+-        this.sslConnectionPoolEnabled = provider.getConfig().isSslConnectionPoolEnabled();
+-        this.maxIdleTime = provider.getConfig().getIdleConnectionInPoolTimeoutInMs();
+-        this.maxConnectionLifeTimeInMs = provider.getConfig().getMaxConnectionLifeTimeInMs();
+-        this.idleConnectionDetector.schedule(new IdleChannelDetector(), maxIdleTime, maxIdleTime);
+-    }
+-
+-    /**
+-     * {@inheritDoc}
+-     */
+-    public boolean offer(String uri, TCPChannel channel) {
+-        if (isClosed.get()) return false;
+-
+-        if (!sslConnectionPoolEnabled && uri.startsWith("https")) {
+-            return false;
+-        }
+-
+-        Long createTime = (Long) channel.getSession().get("createTime");
+-        if (createTime == null){
+-        	channel.getSession().put("createTime", System.currentTimeMillis());
+-        }
+-        else if (maxConnectionLifeTimeInMs != -1 && (createTime + maxConnectionLifeTimeInMs) < System.currentTimeMillis() ) {
+-           log.debug("Channel {} expired", channel);
+-           return false;
+-        }
+-
+-        log.debug("Adding uri: {} for channel {}", uri, channel);
+-        //channel.getPipeline().getContext(ChanMgrAsyncHttpProvider.class).setAttachment(new ChanMgrAsyncHttpProvider.DiscardEvent());
+-
+-        ConcurrentLinkedQueue<TCPChannel> idleConnectionForHost = connectionsPool.get(uri);
+-        if (idleConnectionForHost == null) {
+-            ConcurrentLinkedQueue<TCPChannel> newPool = new ConcurrentLinkedQueue<TCPChannel>();
+-            idleConnectionForHost = connectionsPool.putIfAbsent(uri, newPool);
+-            if (idleConnectionForHost == null) 
+-            	idleConnectionForHost = newPool;
+-        }
+-
+-        boolean added;
+-        int size = idleConnectionForHost.size();
+-        if (maxConnectionPerHost == -1 || size < maxConnectionPerHost) {
+-            TCPChannel idleChannel = channel;
+-            channel.getSession().put("uri", uri);
+-            synchronized (idleConnectionForHost) {
+-                added = idleConnectionForHost.add(idleChannel);
+-                openChannels.add(idleChannel);
+-            }
+-        } else {
+-            log.debug("Maximum number of requests per host reached {} for {}", maxConnectionPerHost, uri);
+-            added = false;
+-        }
+-        return added;
+-    }
+-
+-    /**
+-     * {@inheritDoc}
+-     */
+-    public TCPChannel poll(String uri) {
+-        if (!sslConnectionPoolEnabled && uri.startsWith("https")) {
+-            return null;
+-        }
+-
+-        TCPChannel idleChannel = null;
+-        ConcurrentLinkedQueue<TCPChannel> idleConnectionForHost = connectionsPool.get(uri);
+-        if (idleConnectionForHost != null) {
+-            boolean poolEmpty = false;
+-            while (!poolEmpty && idleChannel == null) {
+-                if (idleConnectionForHost.size() > 0) {
+-                    synchronized (idleConnectionForHost) {
+-                        idleChannel = idleConnectionForHost.poll();
+-                    }
+-                }
+-
+-                if (idleChannel == null) {
+-                    poolEmpty = true;
+-                } else if (!idleChannel.isConnected() || idleChannel.isClosed()) {
+-                    idleChannel = null;
+-                    log.trace("Channel not connected or not opened!");
+-                }
+-            }
+-        }
+-        return idleChannel;
+-    }
+-
+-    private boolean remove(TCPChannel pooledChannel) {
+-        if (pooledChannel == null || isClosed.get()) return false;
+-
+-        String uri = (String) pooledChannel.getSession().get("uri");
+-        
+-        boolean isRemoved = false;
+-        ConcurrentLinkedQueue<TCPChannel> pooledConnectionForHost = connectionsPool.get(uri);
+-        if (pooledConnectionForHost != null) {
+-            isRemoved = pooledConnectionForHost.remove(pooledChannel);
+-        }
+-        openChannels.remove(pooledChannel);
+-        return isRemoved;
+-    }
+-
+-    /**
+-     * {@inheritDoc}
+-     */
+-    public boolean removeAll(TCPChannel channel) {
+-        return !isClosed.get() && remove(channel);
+-    }
+-
+-    /**
+-     * {@inheritDoc}
+-     */
+-    public boolean canCacheConnection() {
+-        if (!isClosed.get() && maxTotalConnections != -1 && openChannels.size() >= maxTotalConnections) {
+-            return false;
+-        } else {
+-            return true;
+-        }
+-    }
+-
+-	/**
+-     * {@inheritDoc}
+-     */
+-    public void destroy() {
+-        if (isClosed.getAndSet(true)) return;
+-
+-        // stop timer
+-        idleConnectionDetector.cancel();
+-        idleConnectionDetector.purge();
+-
+-        for (TCPChannel channel : openChannels) {
+-            close(channel);
+-        }
+-        connectionsPool.clear();
+-        openChannels.clear();
+-    }
+-
+-    private void close(TCPChannel channel) {
+-        try {
+-        	openChannels.remove(channel);
+-        	channel.close();
+-        } catch (Throwable t) {
+-            // noop
+-        }
+-    }
+-
+-    public final String toString() {
+-        return String.format("NettyConnectionPool: {pool-size: %d}", openChannels.size());
+-    }
+-    
+-    private class IdleChannelDetector extends TimerTask {
+-        @Override
+-        public void run() {
+-            try {
+-                if (isClosed.get()) return;
+-
+-                if (log.isDebugEnabled()) {
+-                    Set<String> keys = connectionsPool.keySet();
+-
+-                    for (String s : keys) {
+-                        log.debug("Entry count for : {} : {}", s, connectionsPool.get(s).size());
+-                    }
+-                }
+-
+-                List<TCPChannel> channelsInTimeout = new ArrayList<TCPChannel>();
+-                long currentTime = System.currentTimeMillis();
+-
+-                for (TCPChannel idleChannel : openChannels) {
+-                	long start = (Long) idleChannel.getSession().get("createTime");
+-                    long age = currentTime - start;
+-                    if (age > maxIdleTime) {
+-
+-                        log.debug("Adding Candidate Idle Channel {}", idleChannel);
+-
+-                        // store in an unsynchronized list to minimize the impact on the ConcurrentHashMap.
+-                        channelsInTimeout.add(idleChannel);
+-                    }
+-                }
+-                long endConcurrentLoop = System.currentTimeMillis();
+-
+-                for (TCPChannel idleChannel : channelsInTimeout) {
+-                    if (remove(idleChannel)) {
+-                        log.debug("Closing Idle Channel {}", idleChannel);
+-                        close(idleChannel);
+-                    }
+-                }
+-
+-                if (log.isTraceEnabled())
+-                    log.trace(String.format("%d channel open, %d idle channels closed (times: 1st-loop=%d, 2nd-loop=%d).\n",
+-                        connectionsPool.size(), channelsInTimeout.size(), endConcurrentLoop - currentTime, System.currentTimeMillis() - endConcurrentLoop));
+-            } catch (Throwable t) {
+-                log.error("uncaught exception!", t);
+-            }
+-        }
+-    }
+-
+-}
+diff --git a/providers/channelmgr/src/main/java/com/ning/http/client/providers/chanmgr/ChanMgrResponseFuture.java b/providers/channelmgr/src/main/java/com/ning/http/client/providers/chanmgr/ChanMgrResponseFuture.java
+old mode 100755
+new mode 100644
+index 5cec14660..e5abda125
+--- a/providers/channelmgr/src/main/java/com/ning/http/client/providers/chanmgr/ChanMgrResponseFuture.java
++++ b/providers/channelmgr/src/main/java/com/ning/http/client/providers/chanmgr/ChanMgrResponseFuture.java
+@@ -1,490 +1,91 @@
+-/*
+- * Copyright 2010 Ning, Inc.
+- *
+- * Ning licenses this file to you under the Apache License, version 2.0
+- * (the "License"); you may not use this file except in compliance with the
+- * License.  You may obtain a copy of the License at:
+- *
+- *    http://www.apache.org/licenses/LICENSE-2.0
+- *
+- * Unless required by applicable law or agreed to in writing, software
+- * distributed under the License is distributed on an "AS IS" BASIS, WITHOUT
+- * WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.  See the
+- * License for the specific language governing permissions and limitations
+- * under the License.
+- */
+ package com.ning.http.client.providers.chanmgr;
+ 
+-import com.ning.http.client.AsyncHandler;
+-import com.ning.http.client.Request;
+-import com.ning.http.client.listenable.AbstractListenableFuture;
+-import org.jboss.netty.channel.Channel;
+-import org.jboss.netty.handler.codec.http.HttpRequest;
+-import org.jboss.netty.handler.codec.http.HttpResponse;
+-import org.slf4j.Logger;
+-import org.slf4j.LoggerFactory;
+-
+-import java.net.MalformedURLException;
+-import java.net.URI;
+ import java.util.concurrent.Callable;
+-import java.util.concurrent.CancellationException;
+-import java.util.concurrent.CountDownLatch;
+ import java.util.concurrent.ExecutionException;
+-import java.util.concurrent.Future;
++import java.util.concurrent.Executor;
+ import java.util.concurrent.TimeUnit;
+ import java.util.concurrent.TimeoutException;
+-import java.util.concurrent.atomic.AtomicBoolean;
+-import java.util.concurrent.atomic.AtomicInteger;
+-import java.util.concurrent.atomic.AtomicLong;
+-import java.util.concurrent.atomic.AtomicReference;
+-
+-/**
+- * A {@link Future} that can be used to track when an asynchronous HTTP request has been fully processed.
+- *
+- * @param <V>
+- */
+-public final class ChanMgrResponseFuture<V> extends AbstractListenableFuture<V> {
+-
+-    private final static Logger logger = LoggerFactory.getLogger(ChanMgrResponseFuture.class);
+-    public final static String MAX_RETRY = "com.ning.http.client.providers.netty.maxRetry";
+-
+-    enum STATE {
+-        NEW,
+-        POOLED,
+-        RECONNECTED,
+-        CLOSED,
+-    }
+-
+-    private final CountDownLatch latch = new CountDownLatch(1);
+-    private final AtomicBoolean isDone = new AtomicBoolean(false);
+-    private final AtomicBoolean isCancelled = new AtomicBoolean(false);
+-    private AsyncHandler<V> asyncHandler;
+-    private final int responseTimeoutInMs;
+-    private final int idleConnectionTimeoutInMs;
+-    private Request request;
+-    private HttpRequest nettyRequest;
+-    private final AtomicReference<V> content = new AtomicReference<V>();
+-    private URI uri;
+-    private boolean keepAlive = true;
+-    private HttpResponse httpResponse;
+-    private final AtomicReference<ExecutionException> exEx = new AtomicReference<ExecutionException>();
+-    private final AtomicInteger redirectCount = new AtomicInteger();
+-    private volatile Future<?> reaperFuture;
+-    private final AtomicBoolean inAuth = new AtomicBoolean(false);
+-    private final AtomicBoolean statusReceived = new AtomicBoolean(false);
+-    private final AtomicLong touch = new AtomicLong(System.currentTimeMillis());
+-    private final long start = System.currentTimeMillis();
+-    private final ChanMgrAsyncHttpProvider asyncHttpProvider;
+-    private final AtomicReference<STATE> state = new AtomicReference<STATE>(STATE.NEW);
+-    private final AtomicBoolean contentProcessed = new AtomicBoolean(false);
+-    private Channel channel;
+-    private boolean reuseChannel = false;
+-    private final AtomicInteger currentRetry = new AtomicInteger(0);
+-    private final int maxRetry;
+-    private boolean writeHeaders;
+-    private boolean writeBody;
+-    private final AtomicBoolean throwableCalled = new AtomicBoolean(false);
+-    private boolean allowConnect = false;
+-
+-    public ChanMgrResponseFuture(URI uri,
+-                               Request request,
+-                               AsyncHandler<V> asyncHandler,
+-                               HttpRequest nettyRequest,
+-                               int responseTimeoutInMs,
+-                               int idleConnectionTimeoutInMs,
+-                               ChanMgrAsyncHttpProvider asyncHttpProvider) {
+-
+-        this.asyncHandler = asyncHandler;
+-        this.responseTimeoutInMs = responseTimeoutInMs;
+-        this.idleConnectionTimeoutInMs = idleConnectionTimeoutInMs;
+-        this.request = request;
+-        this.nettyRequest = nettyRequest;
+-        this.uri = uri;
+-        this.asyncHttpProvider = asyncHttpProvider;
+-
+-        if (System.getProperty(MAX_RETRY) != null) {
+-            maxRetry = Integer.valueOf(System.getProperty(MAX_RETRY));
+-        } else {
+-            maxRetry = asyncHttpProvider.getConfig().getMaxRequestRetry();
+-        }
+-        writeHeaders = true;
+-        writeBody = true;
+-    }
+-
+-    protected URI getURI() throws MalformedURLException {
+-        return uri;
+-    }
+-
+-    protected void setURI(URI uri) {
+-        this.uri = uri;
+-    }
+-
+-    /**
+-     * {@inheritDoc}
+-     */
+-    /* @Override */
+-    public boolean isDone() {
+-        return isDone.get();
+-    }
+-
+-    /**
+-     * {@inheritDoc}
+-     */
+-    /* @Override */
+-    public boolean isCancelled() {
+-        return isCancelled.get();
+-    }
+-
+-    void setAsyncHandler(AsyncHandler<V> asyncHandler) {
+-        this.asyncHandler = asyncHandler;
+-    }
+-
+-    /**
+-     * {@inheritDoc}
+-     */
+-    /* @Override */
+-    public boolean cancel(boolean force) {
+-        cancelReaper();
+-
+-        if (isCancelled.get()) return false;
+-
+-        try {
+-            channel.getPipeline().getContext(ChanMgrAsyncHttpProvider.class).setAttachment(new ChanMgrAsyncHttpProvider.DiscardEvent());
+-            channel.close();
+-        } catch (Throwable t) {
+-            // Ignore
+-        }
+-        if (!throwableCalled.getAndSet(true)) {
+-            try {
+-                asyncHandler.onThrowable(new CancellationException());
+-            } catch (Throwable t) {
+-                logger.warn("cancel", t);
+-            }
+-        }
+-        latch.countDown();
+-        isCancelled.set(true);
+-        super.done();
+-        return true;
+-    }
+-
+-    /**
+-     * Is the Future still valid
+-     *
+-     * @return <code>true</code> if response has expired and should be terminated.
+-     */
+-    public boolean hasExpired() {
+-        long now = System.currentTimeMillis();
+-        return idleConnectionTimeoutInMs != -1 && ((now - touch.get()) >= idleConnectionTimeoutInMs)
+-                || responseTimeoutInMs != -1 && ((now - start) >= responseTimeoutInMs);
+-    }
+-
+-    /**
+-     * {@inheritDoc}
+-     */
+-    /* @Override */
+-    public V get() throws InterruptedException, ExecutionException {
+-        try {
+-            return get(responseTimeoutInMs, TimeUnit.MILLISECONDS);
+-        } catch (TimeoutException e) {
+-            cancelReaper();
+-            throw new ExecutionException(e);
+-        }
+-    }
+-
+-    void cancelReaper() {
+-        if (reaperFuture != null) {
+-            reaperFuture.cancel(true);
+-        }
+-    }
+-
+-    /**
+-     * {@inheritDoc}
+-     */
+-    /* @Override */
+-    public V get(long l, TimeUnit tu) throws InterruptedException, TimeoutException, ExecutionException {
+-        if (!isDone() && !isCancelled()) {
+-            boolean expired = false;
+-            if (l == -1) {
+-                latch.await();
+-            } else {
+-                expired = !latch.await(l, tu);
+-            }
+-
+-            if (expired) {
+-                isCancelled.set(true);
+-                try {
+-                    channel.getPipeline().getContext(ChanMgrAsyncHttpProvider.class).setAttachment(new ChanMgrAsyncHttpProvider.DiscardEvent());
+-                    channel.close();
+-                } catch (Throwable t) {
+-                    // Ignore
+-                }
+-                TimeoutException te = new TimeoutException(String.format("No response received after %s %s", l, tu.name().toLowerCase()));
+-                if (!throwableCalled.getAndSet(true)) {
+-                    try {
+-                        asyncHandler.onThrowable(te);
+-                    } catch (Throwable t) {
+-                        logger.debug("asyncHandler.onThrowable", t);
+-                    } finally {
+-                        cancelReaper();
+-                        throw new ExecutionException(te);
+-                    }
+-                }
+-            }
+-            isDone.set(true);
+-
+-            ExecutionException e = exEx.getAndSet(null);
+-            if (e != null) {
+-                throw e;
+-            }
+-        }
+-        return getContent();
+-    }
+-
+-    V getContent() throws ExecutionException {
+-        ExecutionException e = exEx.getAndSet(null);
+-        if (e != null) {
+-            throw e;
+-        }
+-
+-        V update = content.get();
+-        // No more retry
+-        currentRetry.set(maxRetry);
+-        if (exEx.get() == null && !contentProcessed.getAndSet(true)) {
+-            try {
+-                update = asyncHandler.onCompleted();
+-            } catch (Throwable ex) {
+-                if (!throwableCalled.getAndSet(true)) {
+-                    try {
+-                        asyncHandler.onThrowable(ex);
+-                    } catch (Throwable t) {
+-                        logger.debug("asyncHandler.onThrowable", t);
+-                    } finally {
+-                        cancelReaper();
+-                        throw new RuntimeException(ex);
+-                    }
+-                }
+-            }
+-            content.compareAndSet(null, update);
+-        }
+-        return update;
+-    }
+-
+-    public final void done(Callable callable) {
+-        try {
+-            cancelReaper();
+-
+-            if (exEx.get() != null) {
+-                return;
+-            }
+-            getContent();
+-            isDone.set(true);
+-            if (callable != null) {
+-                try {
+-                    callable.call();
+-                } catch (Exception ex) {
+-                    throw new RuntimeException(ex);
+-                }
+-            }
+-        } catch (ExecutionException t) {
+-            return;
+-        } catch (RuntimeException t) {
+-            exEx.compareAndSet(null, new ExecutionException(t));
+-        } finally {
+-            latch.countDown();
+-        }
+-        super.done();
+-    }
+-
+-    public final void abort(final Throwable t) {
+-        cancelReaper();
+-
+-        if (isDone.get() || isCancelled.get()) return;
+-
+-        exEx.compareAndSet(null, new ExecutionException(t));
+-        if (!throwableCalled.getAndSet(true)) {
+-            try {
+-                asyncHandler.onThrowable(t);
+-            } catch (Throwable te) {
+-                logger.debug("asyncHandler.onThrowable", te);
+-            } finally {
+-                isCancelled.set(true);
+-            }
+-        }
+-        latch.countDown();
+-        super.done();
+-    }
+-
+-    public void content(V v) {
+-        content.set(v);
+-    }
+-
+-    protected final Request getRequest() {
+-        return request;
+-    }
+-
+-    public final HttpRequest getNettyRequest() {
+-        return nettyRequest;
+-    }
+-
+-    protected final void setNettyRequest(HttpRequest nettyRequest) {
+-        this.nettyRequest = nettyRequest;
+-    }
+-
+-    protected final AsyncHandler<V> getAsyncHandler() {
+-        return asyncHandler;
+-    }
+-
+-    protected final boolean getKeepAlive() {
+-        return keepAlive;
+-    }
+-
+-    protected final void setKeepAlive(final boolean keepAlive) {
+-        this.keepAlive = keepAlive;
+-    }
+-
+-    protected final HttpResponse getHttpResponse() {
+-        return httpResponse;
+-    }
+-
+-    protected final void setHttpResponse(final HttpResponse httpResponse) {
+-        this.httpResponse = httpResponse;
+-    }
+-
+-    protected int incrementAndGetCurrentRedirectCount() {
+-        return redirectCount.incrementAndGet();
+-    }
+-
+-    protected void setReaperFuture(Future<?> reaperFuture) {
+-        cancelReaper();
+-        this.reaperFuture = reaperFuture;
+-    }
+-
+-    protected boolean isInAuth() {
+-        return inAuth.get();
+-    }
+-
+-    protected boolean getAndSetAuth(boolean inDigestAuth) {
+-        return inAuth.getAndSet(inDigestAuth);
+-    }
+-
+-    protected STATE getState() {
+-        return state.get();
+-    }
+-
+-    protected void setState(STATE state) {
+-        this.state.set(state);
+-    }
+-
+-    public boolean getAndSetStatusReceived(boolean sr) {
+-        return statusReceived.getAndSet(sr);
+-    }
+-
+-    /**
+-     * {@inheritDoc}
+-     */
+-    /* @Override */
+-    public void touch() {
+-        touch.set(System.currentTimeMillis());
+-    }
+-
+-    /**
+-     * {@inheritDoc}
+-     */
+-    /* @Override */
+-    public boolean getAndSetWriteHeaders(boolean writeHeaders) {
+-        boolean b = this.writeHeaders;
+-        this.writeHeaders = writeHeaders;
+-        return b;
+-    }
+-
+-    /**
+-     * {@inheritDoc}
+-     */
+-    /* @Override */
+-    public boolean getAndSetWriteBody(boolean writeBody) {
+-        boolean b = this.writeBody;
+-        this.writeBody = writeBody;
+-        return b;
+-    }
+-
+-    protected ChanMgrAsyncHttpProvider provider() {
+-        return asyncHttpProvider;
+-    }
+-
+-    protected void attachChannel(Channel channel) {
+-        this.channel = channel;
+-    }
+-
+-    public void setReuseChannel(boolean reuseChannel) {
+-        this.reuseChannel = reuseChannel;
+-    }
+-
+-    public boolean isConnectAllowed() {
+-        return allowConnect;
+-    }
+-
+-    public void setConnectAllowed(boolean allowConnect) {
+-        this.allowConnect = allowConnect;
+-    }
+-
+-    protected void attachChannel(Channel channel, boolean reuseChannel) {
+-        this.channel = channel;
+-        this.reuseChannel = reuseChannel;
+-    }
+-
+-    protected Channel channel() {
+-        return channel;
+-    }
+-
+-    protected boolean reuseChannel() {
+-        return reuseChannel;
+-    }
+-
+-    protected boolean canRetry() {
+-        if (currentRetry.incrementAndGet() > maxRetry) {
+-            return false;
+-        }
+-        return true;
+-    }
+-
+-    public void setRequest(Request request) {
+-        this.request = request;
+-    }
+-
+-    /**
+-     * Return true if the {@link Future} cannot be recovered. There is some scenario where a connection can be
+-     * closed by an unexpected IOException, and in some situation we can recover from that exception.
+-     *
+-     * @return true if that {@link Future} cannot be recovered.
+-     */
+-    public boolean cannotBeReplay() {
+-        return isDone()
+-                || !canRetry()
+-                || isCancelled()
+-                || (channel() != null && channel().isOpen() && uri.getScheme().compareToIgnoreCase("https") != 0)
+-                || isInAuth();
+-    }
+ 
+-    @Override
+-    public String toString() {
+-        return "NettyResponseFuture{" +
+-                "currentRetry=" + currentRetry +
+-                ",\n\tisDone=" + isDone +
+-                ",\n\tisCancelled=" + isCancelled +
+-                ",\n\tasyncHandler=" + asyncHandler +
+-                ",\n\tresponseTimeoutInMs=" + responseTimeoutInMs +
+-                ",\n\tnettyRequest=" + nettyRequest +
+-                ",\n\tcontent=" + content +
+-                ",\n\turi=" + uri +
+-                ",\n\tkeepAlive=" + keepAlive +
+-                ",\n\thttpResponse=" + httpResponse +
+-                ",\n\texEx=" + exEx +
+-                ",\n\tredirectCount=" + redirectCount +
+-                ",\n\treaperFuture=" + reaperFuture +
+-                ",\n\tinAuth=" + inAuth +
+-                ",\n\tstatusReceived=" + statusReceived +
+-                ",\n\ttouch=" + touch +
+-                '}';
+-    }
++import org.playorm.nio.api.channels.TCPChannel;
++
++import com.ning.http.client.ListenableFuture;
++import com.ning.http.pool.Connection;
++
++public class ChanMgrResponseFuture<T> implements ListenableFuture<T> {
++
++	private Connection<TCPChannel> connection;
++
++	@Override
++	public boolean cancel(boolean mayInterruptIfRunning) {
++		throw new UnsupportedOperationException();
++	}
++
++	@Override
++	public boolean isCancelled() {
++		throw new UnsupportedOperationException();
++	}
++
++	@Override
++	public boolean isDone() {
++		throw new UnsupportedOperationException();
++	}
++
++	@Override
++	public T get() throws InterruptedException, ExecutionException {
++		throw new UnsupportedOperationException();
++	}
++
++	@Override
++	public T get(long timeout, TimeUnit unit) throws InterruptedException,
++			ExecutionException, TimeoutException {
++		throw new UnsupportedOperationException();
++	}
++
++	@Override
++	public void done(Callable<?> callable) {
++		throw new UnsupportedOperationException();
++	}
++
++	@Override
++	public void abort(Throwable t) {
++		throw new UnsupportedOperationException();
++	}
++
++	@Override
++	public void content(T v) {
++		throw new UnsupportedOperationException();
++	}
++
++	@Override
++	public void touch() {
++		throw new UnsupportedOperationException();
++	}
++
++	@Override
++	public boolean getAndSetWriteHeaders(boolean writeHeader) {
++		throw new UnsupportedOperationException();
++	}
++
++	@Override
++	public boolean getAndSetWriteBody(boolean writeBody) {
++		throw new UnsupportedOperationException();
++	}
++	
++	@Override
++	public ListenableFuture<T> addListener(Runnable listener, Executor exec) {
++		throw new UnsupportedOperationException();
++	}
++
++	public void setConnection(Connection<TCPChannel> connection) {
++		this.connection = connection;
++	}
++
++	public Connection<TCPChannel> getConnection() {
++		return connection;
++	}
++
++	public void getAndSetAuth(boolean b) {
++		throw new UnsupportedOperationException();
++	}
+ 
+ }
+diff --git a/providers/channelmgr/src/main/java/com/ning/http/client/providers/chanmgr/chain/AChannelFromPoolListener.java b/providers/channelmgr/src/main/java/com/ning/http/client/providers/chanmgr/chain/AChannelFromPoolListener.java
+new file mode 100644
+index 000000000..8107b4448
+--- /dev/null
++++ b/providers/channelmgr/src/main/java/com/ning/http/client/providers/chanmgr/chain/AChannelFromPoolListener.java
+@@ -0,0 +1,70 @@
++package com.ning.http.client.providers.chanmgr.chain;
++
++import java.net.InetSocketAddress;
++import java.net.URI;
++
++import org.playorm.nio.api.channels.TCPChannel;
++import org.playorm.nio.api.handlers.FutureOperation;
++
++import com.ning.http.client.Request;
++import com.ning.http.client.providers.chanmgr.ChanMgrResponseFuture;
++import com.ning.http.pool.AsyncConnectionPool;
++import com.ning.http.pool.AsyncConnectionPoolImpl;
++import com.ning.http.pool.Connection;
++import com.ning.http.pool.ConnectionAvailableListener;
++import com.ning.http.util.AsyncHttpProviderUtils;
++
++public class AChannelFromPoolListener<T> implements ConnectionAvailableListener<TCPChannel> {
++
++	private ChanMgrResponseFuture<T> future;
++	private Request request;
++	private URI uri;
++	private BConnectCallback<T> connectListener = new BConnectCallback<T>();
++	private DReadListener<T> readListener = new DReadListener<T>();
++
++	public AChannelFromPoolListener(Request request, ChanMgrResponseFuture<T> future, URI uri) {
++		this.request = request;
++		this.future = future;
++		this.uri = uri;
++	}
++
++	@Override
++	public void connectionAvailable(Connection<TCPChannel> connection) {
++		TCPChannel channel = connection.getChannel();
++		channel.getSession().put("future", future);
++
++		//if not connected, call channel.connect and set connect listener to hear the connection finish
++        //OR if connected already, call the connectListener directly to start writing request
++        if(!channel.isConnected()) {
++        	//If channel is NOT connected, this is a brand new channel we need to setup so we need to
++        	// 1. register a permanent read listener
++        	// 2. connect up the socket asynchronously(it calls connectListener.finished when connect is done so this thread can return and do more)
++        	channel.registerForReads(readListener);
++        	
++            InetSocketAddress remoteAddress = null;
++            if (request.getInetAddress() != null) {
++                remoteAddress = new InetSocketAddress(request.getInetAddress(), AsyncHttpProviderUtils.getPort(uri));
++            }
++            
++        	attachStateToChannel(connection, channel);
++        	FutureOperation futureOp = channel.connect(remoteAddress);
++        	futureOp.setListener(connectListener);
++        } else {
++        	//We are connected already so this was a previous connection so just
++        	//set the future object on the old readListener to receive new responses
++        	attachStateToChannel(connection, channel);
++        	connectListener.performWrite(channel);
++        }	
++	}
++
++	private void attachStateToChannel(Connection<TCPChannel> connection, TCPChannel channel) {
++		channel.getSession().put("future", future);
++		future.setConnection(connection);
++	}
++
++	@Override
++	public void timeoutNotAvailble(String uri) {
++		future.abort(new PoolTimeoutException("Could not retrieve connection from pool in alloted time.  increate number of connections in pool or timeout period possible?"));
++	}
++
++}
+diff --git a/providers/channelmgr/src/main/java/com/ning/http/client/providers/chanmgr/chain/AConnectListener.java b/providers/channelmgr/src/main/java/com/ning/http/client/providers/chanmgr/chain/BConnectCallback.java
+similarity index 51%
+rename from providers/channelmgr/src/main/java/com/ning/http/client/providers/chanmgr/chain/AConnectListener.java
+rename to providers/channelmgr/src/main/java/com/ning/http/client/providers/chanmgr/chain/BConnectCallback.java
+index 8f9a80527..3a2c52f95 100644
+--- a/providers/channelmgr/src/main/java/com/ning/http/client/providers/chanmgr/chain/AConnectListener.java
++++ b/providers/channelmgr/src/main/java/com/ning/http/client/providers/chanmgr/chain/BConnectCallback.java
+@@ -1,6 +1,5 @@
+ package com.ning.http.client.providers.chanmgr.chain;
+ 
+-import java.io.IOException;
+ import java.nio.ByteBuffer;
+ 
+ import org.playorm.nio.api.channels.Channel;
+@@ -10,30 +9,26 @@
+ 
+ import com.ning.http.client.providers.chanmgr.ChanMgrResponseFuture;
+ 
+-public class AConnectListener<T> implements OperationCallback {
+-
+-	private ChanMgrResponseFuture<T> future;
+-
+-	public AConnectListener(ChanMgrResponseFuture<T> future) {
+-		this.future = future;
+-	}
++public class BConnectCallback<T> implements OperationCallback {
+ 
+ 	@Override
+-	public void finished(Channel c) throws IOException {
++	public void finished(Channel c) {
+ 		performWrite(c);
+ 	}
+ 
+ 	@Override
+ 	public void failed(RegisterableChannel c, Throwable e) {
+-		// TODO Auto-generated method stub
+-		
++		Channel channel = (Channel) c;
++		ChanMgrResponseFuture<T> future = (ChanMgrResponseFuture<T>) channel.getSession().get("future");
++		future.abort(e);
+ 	}
+ 
+-	public void performWrite(Channel c) {
+-		BWriteListener<T> writeListener = new BWriteListener<T>(future);
+-		
++	public void performWrite(Channel channel) {
++		ChanMgrResponseFuture<T> future = (ChanMgrResponseFuture<T>) channel.getSession().get("future");
++		CWriteListener<T> writeListener = new CWriteListener<T>(future);
++
+ 		ByteBuffer b = null;
+-		FutureOperation futureOp = c.write(b);
++		FutureOperation futureOp = channel.write(b);
+ 		futureOp.setListener(writeListener);
+ 	}
+ 
+diff --git a/providers/channelmgr/src/main/java/com/ning/http/client/providers/chanmgr/chain/BWriteListener.java b/providers/channelmgr/src/main/java/com/ning/http/client/providers/chanmgr/chain/CWriteListener.java
+similarity index 62%
+rename from providers/channelmgr/src/main/java/com/ning/http/client/providers/chanmgr/chain/BWriteListener.java
+rename to providers/channelmgr/src/main/java/com/ning/http/client/providers/chanmgr/chain/CWriteListener.java
+index 9e7d2fe84..e8e92602b 100644
+--- a/providers/channelmgr/src/main/java/com/ning/http/client/providers/chanmgr/chain/BWriteListener.java
++++ b/providers/channelmgr/src/main/java/com/ning/http/client/providers/chanmgr/chain/CWriteListener.java
+@@ -8,21 +8,23 @@
+ 
+ import com.ning.http.client.providers.chanmgr.ChanMgrResponseFuture;
+ 
+-public class BWriteListener<T> implements OperationCallback {
++public class CWriteListener<T> implements OperationCallback {
+ 
+ 	private ChanMgrResponseFuture<T> future;
+ 
+-	public BWriteListener(ChanMgrResponseFuture<T> future) {
++	public CWriteListener(ChanMgrResponseFuture<T> future) {
+ 		this.future = future;
+ 	}
+ 
+ 	@Override
+ 	public void finished(Channel c) throws IOException {
+-		//is there anyway to notify the client in async-http-client that the write request went through?
++		//1. is there anyway to notify the client in async-http-client that the write request went through?
++		//2. Do we even want to notify the client..what would be the point?
+ 	}
+ 
+ 	@Override
+ 	public void failed(RegisterableChannel c, Throwable e) {
++		future.abort(e);
+ 	}
+ 
+ }
+diff --git a/providers/channelmgr/src/main/java/com/ning/http/client/providers/chanmgr/chain/DReadListener.java b/providers/channelmgr/src/main/java/com/ning/http/client/providers/chanmgr/chain/DReadListener.java
+new file mode 100644
+index 000000000..bee1efb7a
+--- /dev/null
++++ b/providers/channelmgr/src/main/java/com/ning/http/client/providers/chanmgr/chain/DReadListener.java
+@@ -0,0 +1,45 @@
++package com.ning.http.client.providers.chanmgr.chain;
++
++import java.io.IOException;
++import java.nio.ByteBuffer;
++
++import org.playorm.nio.api.channels.Channel;
++import org.playorm.nio.api.channels.TCPChannel;
++import org.playorm.nio.api.handlers.DataChunk;
++import org.playorm.nio.api.handlers.DataListener;
++
++import com.ning.http.client.providers.chanmgr.ChanMgrResponseFuture;
++import com.ning.http.pool.AsyncConnectionPool;
++import com.ning.http.pool.AsyncConnectionPoolImpl;
++import com.ning.http.pool.Connection;
++
++public class DReadListener<T> implements DataListener {
++
++	@Override
++	public void incomingData(Channel channel, DataChunk b) throws IOException {
++		ChanMgrResponseFuture<T> future = fetchFuture(channel);
++		
++		//This method is called many times in the case of chunking so we can't release the connection until
++		//finished = true
++		
++		//if(finished)
++			future.getConnection().releaseConnection();
++	}
++
++	@Override
++	public void farEndClosed(Channel channel) {
++		ChanMgrResponseFuture<T> future = fetchFuture(channel);
++	}
++
++	@Override
++	public void failure(Channel channel, ByteBuffer data, Exception e) {
++		ChanMgrResponseFuture<T> future = fetchFuture(channel);
++		future.abort(e);
++	}
++
++	private ChanMgrResponseFuture<T> fetchFuture(Channel channel) {
++		ChanMgrResponseFuture<T> future = (ChanMgrResponseFuture<T>) channel.getSession().get("future");
++		return future;
++	}
++
++}
+diff --git a/providers/channelmgr/src/main/java/com/ning/http/client/providers/chanmgr/chain/PoolTimeoutException.java b/providers/channelmgr/src/main/java/com/ning/http/client/providers/chanmgr/chain/PoolTimeoutException.java
+new file mode 100644
+index 000000000..acf7b8159
+--- /dev/null
++++ b/providers/channelmgr/src/main/java/com/ning/http/client/providers/chanmgr/chain/PoolTimeoutException.java
+@@ -0,0 +1,20 @@
++package com.ning.http.client.providers.chanmgr.chain;
++
++public class PoolTimeoutException extends RuntimeException {
++
++	public PoolTimeoutException() {
++	}
++
++	public PoolTimeoutException(String message) {
++		super(message);
++	}
++
++	public PoolTimeoutException(Throwable cause) {
++		super(cause);
++	}
++
++	public PoolTimeoutException(String message, Throwable cause) {
++		super(message, cause);
++	}
++
++}
+diff --git a/providers/channelmgr/src/main/java/com/ning/http/pool/AsyncConnectionPool.java b/providers/channelmgr/src/main/java/com/ning/http/pool/AsyncConnectionPool.java
+index 2a57eaf39..2726b6f17 100644
+--- a/providers/channelmgr/src/main/java/com/ning/http/pool/AsyncConnectionPool.java
++++ b/providers/channelmgr/src/main/java/com/ning/http/pool/AsyncConnectionPool.java
+@@ -12,7 +12,9 @@
+ 	 * @param l
+ 	 */
+ 	void obtainConnection(String baseUrl, ConnectionAvailableListener<T> l);
++
++	public void clear();
+ 	
+-	void releaseConnection(Connection<T> state);	
++	//void releaseConnection(Connection<T> state);	
+ 	
+ }
+diff --git a/providers/channelmgr/src/main/java/com/ning/http/pool/AsyncConnectionPoolImpl.java b/providers/channelmgr/src/main/java/com/ning/http/pool/AsyncConnectionPoolImpl.java
+index cfd6ccd54..6b0ea180c 100644
+--- a/providers/channelmgr/src/main/java/com/ning/http/pool/AsyncConnectionPoolImpl.java
++++ b/providers/channelmgr/src/main/java/com/ning/http/pool/AsyncConnectionPoolImpl.java
+@@ -10,11 +10,9 @@
+ import org.slf4j.Logger;
+ import org.slf4j.LoggerFactory;
+ 
+-import com.ning.http.client.providers.chanmgr.ChanMgrConnectionsPool;
+-
+ public class AsyncConnectionPoolImpl<T> implements AsyncConnectionPool<T>, ConnectionCloseListener<T> {
+ 
+-    private final static Logger log = LoggerFactory.getLogger(ChanMgrConnectionsPool.class);
++    private final static Logger log = LoggerFactory.getLogger(AsyncConnectionPoolImpl.class);
+     private final ConcurrentHashMap<String, HostPool<T>> connectionsPool = new ConcurrentHashMap<String, HostPool<T>>();
+     private List<PendingRequest<T>> pendingRequests = new ArrayList<PendingRequest<T>>();
+     
+@@ -25,6 +23,7 @@
+ 	private ConnectionCreator<T> creator;
+ 	private int requestTimeout;
+ 	private ScheduledExecutorService timer;
++	private ScheduledFuture<?> idleChannelFuture;
+ 
+     public AsyncConnectionPoolImpl(PoolConfig config, ScheduledExecutorService svc) {
+         this.maxTotalConnections = config.getMaxTotalConnections();
+@@ -33,7 +32,7 @@ public AsyncConnectionPoolImpl(PoolConfig config, ScheduledExecutorService svc)
+         this.maxIdleTime = config.getIdleConnectionInPoolTimeoutInMs();
+         this.requestTimeout = config.getRequestTimeoutInMs();
+         this.timer = svc;
+-        timer.scheduleAtFixedRate(new IdleChannelDetector(), maxIdleTime, maxIdleTime, TimeUnit.MILLISECONDS);
++        idleChannelFuture = timer.scheduleAtFixedRate(new IdleChannelDetector(), maxIdleTime, maxIdleTime, TimeUnit.MILLISECONDS);
+     }
+ 
+ 	@Override
+@@ -100,7 +99,6 @@ private void schedulePendingRequest(String baseUrl, ConnectionAvailableListener<
+ 		return queue;
+ 	}
+ 
+-	@Override
+ 	public void releaseConnection(Connection<T> state) {
+ 		String baseUrl = state.getBaseUrl();
+ 		state.setLastTimeUsed(System.currentTimeMillis());
+@@ -228,4 +226,17 @@ public int getNumPools() {
+ 		return connectionsPool.size();
+ 	}
+ 
++	@Override
++	public void clear() {
++		pendingRequests.clear();
++		
++		synchronized(this) {
++			for(HostPool<T> host : connectionsPool.values()) {
++				host.closeAllConnections();
++			}
++			connectionsPool.clear();
++		}
++		idleChannelFuture.cancel(false);
++	}
++
+ }
+diff --git a/providers/channelmgr/src/main/java/com/ning/http/pool/Connection.java b/providers/channelmgr/src/main/java/com/ning/http/pool/Connection.java
+index 23f531a8c..1aa621535 100644
+--- a/providers/channelmgr/src/main/java/com/ning/http/pool/Connection.java
++++ b/providers/channelmgr/src/main/java/com/ning/http/pool/Connection.java
+@@ -5,6 +5,7 @@
+ 	private String baseUrl;
+ 	private T channel;
+ 	private long lastTimeUsed;
++	private AsyncConnectionPoolImpl<T> pool;
+ 	
+ 	public Connection(T channel2) {
+ 		this.channel = channel2;
+@@ -17,6 +18,10 @@ public Connection(T channel2) {
+ 	 */
+ 	protected abstract void close();
+ 	
++	public void releaseConnection() {
++		pool.releaseConnection(this);
++	}
++	
+ 	public String getBaseUrl() {
+ 		return baseUrl;
+ 	}
+@@ -25,6 +30,10 @@ void setBaseUrl(String uri) {
+ 		this.baseUrl = uri;
+ 	}
+ 
++	void setPool(AsyncConnectionPoolImpl<T> pool) {
++		this.pool = pool;
++	}
++	
+ 	void setLastTimeUsed(long currentTimeMillis) {
+ 		this.lastTimeUsed = currentTimeMillis;
+ 	}
+diff --git a/providers/channelmgr/src/main/java/com/ning/http/pool/FakeConnectionPool.java b/providers/channelmgr/src/main/java/com/ning/http/pool/FakeConnectionPool.java
+new file mode 100644
+index 000000000..1efc62075
+--- /dev/null
++++ b/providers/channelmgr/src/main/java/com/ning/http/pool/FakeConnectionPool.java
+@@ -0,0 +1,26 @@
++package com.ning.http.pool;
++
++import org.playorm.nio.api.channels.TCPChannel;
++
++public class FakeConnectionPool implements AsyncConnectionPool<TCPChannel>, ConnectionCloseListener<TCPChannel> {
++
++	private ConnectionCreator<TCPChannel> creator;
++
++	@Override
++	public void setCreator(ConnectionCreator<TCPChannel> creator) {
++		this.creator = creator;
++	}
++
++	@Override
++	public void obtainConnection(String baseUrl,
++			ConnectionAvailableListener<TCPChannel> l) {
++		Connection<TCPChannel> conn = creator.createConnection(this);
++		l.connectionAvailable(conn);
++	}
++
++	@Override
++	public void connectionClosed(Connection<TCPChannel> conn) {
++		//no-op since connection is used only once anyways
++	}
++
++}
+diff --git a/providers/channelmgr/src/main/java/com/ning/http/pool/HostPool.java b/providers/channelmgr/src/main/java/com/ning/http/pool/HostPool.java
+index 9da40ecfe..6b4dfdc29 100644
+--- a/providers/channelmgr/src/main/java/com/ning/http/pool/HostPool.java
++++ b/providers/channelmgr/src/main/java/com/ning/http/pool/HostPool.java
+@@ -67,4 +67,17 @@ public void releaseIdleConnections(long maxIdleTime) {
+ 			}
+ 		}
+ 	}
++
++	public void closeAllConnections() {
++		for(Connection<T> conn : idleConnections) {
++			conn.close();
++		}
++		
++		for(Connection<T> conn : inUseConnections) {
++			conn.close();
++		}
++		
++		idleConnections.clear();
++		inUseConnections.clear();
++	}
+ }
+diff --git a/providers/channelmgr/src/test/java/com/ning/http/pool/MockCreator.java b/providers/channelmgr/src/test/java/com/ning/http/pool/MockCreator.java
+index ad60db8eb..cb7b8090c 100644
+--- a/providers/channelmgr/src/test/java/com/ning/http/pool/MockCreator.java
++++ b/providers/channelmgr/src/test/java/com/ning/http/pool/MockCreator.java
+@@ -5,7 +5,7 @@
+ 	private int counter;
+ 	
+ 	@Override
+-	public Connection<Integer> createConnection() {
++	public Connection<Integer> createConnection(ConnectionCloseListener<Integer> listener) {
+ 		return new MyConnection(counter++);
+ 	}
+ 	

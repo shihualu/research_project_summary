@@ -1,0 +1,187 @@
+diff --git a/library/src/androidTest/java/com/google/android/exoplayer/util/NalUnitUtilTest.java b/library/src/androidTest/java/com/google/android/exoplayer/util/NalUnitUtilTest.java
+index 3755a9f250..9bd1d07d3d 100644
+--- a/library/src/androidTest/java/com/google/android/exoplayer/util/NalUnitUtilTest.java
++++ b/library/src/androidTest/java/com/google/android/exoplayer/util/NalUnitUtilTest.java
+@@ -17,6 +17,7 @@
+ 
+ import junit.framework.TestCase;
+ 
++import java.nio.ByteBuffer;
+ import java.util.Arrays;
+ 
+ /**
+@@ -122,6 +123,22 @@ public void testUnescapeModifiesBuffersWithStartCodes() {
+     assertUnescapeMatchesExpected("0000030200000300", "000002000000");
+   }
+ 
++  public void testDiscardToSps() {
++    assertDiscardToSpsMatchesExpected("", "");
++    assertDiscardToSpsMatchesExpected("00", "");
++    assertDiscardToSpsMatchesExpected("FFFF000001", "");
++    assertDiscardToSpsMatchesExpected("00000001", "");
++    assertDiscardToSpsMatchesExpected("00000001FF67", "");
++    assertDiscardToSpsMatchesExpected("00000001000167", "");
++    assertDiscardToSpsMatchesExpected("0000000167", "0000000167");
++    assertDiscardToSpsMatchesExpected("0000000167FF", "0000000167FF");
++    assertDiscardToSpsMatchesExpected("0000000167FF", "0000000167FF");
++    assertDiscardToSpsMatchesExpected("0000000167FF000000016700", "0000000167FF000000016700");
++    assertDiscardToSpsMatchesExpected("000000000167FF", "0000000167FF");
++    assertDiscardToSpsMatchesExpected("0001670000000167FF", "0000000167FF");
++    assertDiscardToSpsMatchesExpected("FF00000001660000000167FF", "0000000167FF");
++  }
++
+   private static byte[] buildTestData() {
+     byte[] data = new byte[20];
+     for (int i = 0; i < data.length; i++) {
+@@ -156,4 +173,14 @@ private static void assertUnescapeMatchesExpected(String input, String expectedO
+     assertTrue(Arrays.equals(expectedOutputBitstream, outputBitstream));
+   }
+ 
++  private static void assertDiscardToSpsMatchesExpected(String input, String expectedOutput) {
++    byte[] bitstream = Util.getBytesFromHexString(input);
++    byte[] expectedOutputBitstream = Util.getBytesFromHexString(expectedOutput);
++    ByteBuffer buffer = ByteBuffer.wrap(bitstream);
++    buffer.position(buffer.limit());
++    NalUnitUtil.discardToSps(buffer);
++    assertTrue(Arrays.equals(expectedOutputBitstream,
++        Arrays.copyOf(buffer.array(), buffer.position())));
++  }
++
+ }
+diff --git a/library/src/main/java/com/google/android/exoplayer/MediaCodecTrackRenderer.java b/library/src/main/java/com/google/android/exoplayer/MediaCodecTrackRenderer.java
+index 3f6c70e683..b857689849 100644
+--- a/library/src/main/java/com/google/android/exoplayer/MediaCodecTrackRenderer.java
++++ b/library/src/main/java/com/google/android/exoplayer/MediaCodecTrackRenderer.java
+@@ -19,6 +19,7 @@
+ import com.google.android.exoplayer.drm.DrmInitData;
+ import com.google.android.exoplayer.drm.DrmSessionManager;
+ import com.google.android.exoplayer.util.Assertions;
++import com.google.android.exoplayer.util.NalUnitUtil;
+ import com.google.android.exoplayer.util.TraceUtil;
+ import com.google.android.exoplayer.util.Util;
+ 
+@@ -209,6 +210,7 @@ private static String buildCustomDiagnosticInfo(int errorCode) {
+   private DrmInitData drmInitData;
+   private MediaCodec codec;
+   private boolean codecIsAdaptive;
++  private boolean codecNeedsDiscardToSpsWorkaround;
+   private boolean codecNeedsFlushWorkaround;
+   private boolean codecNeedsEosPropagationWorkaround;
+   private boolean codecNeedsEosFlushWorkaround;
+@@ -351,6 +353,7 @@ protected final void maybeInitCodec() throws ExoPlaybackException {
+ 
+     String codecName = decoderInfo.name;
+     codecIsAdaptive = decoderInfo.adaptive;
++    codecNeedsDiscardToSpsWorkaround = codecNeedsDiscardToSpsWorkaround(codecName, format);
+     codecNeedsFlushWorkaround = codecNeedsFlushWorkaround(codecName);
+     codecNeedsEosPropagationWorkaround = codecNeedsEosPropagationWorkaround(codecName);
+     codecNeedsEosFlushWorkaround = codecNeedsEosFlushWorkaround(codecName);
+@@ -430,6 +433,7 @@ protected void releaseCodec() {
+       codecReconfigured = false;
+       codecHasQueuedBuffers = false;
+       codecIsAdaptive = false;
++      codecNeedsDiscardToSpsWorkaround = false;
+       codecNeedsFlushWorkaround = false;
+       codecNeedsEosPropagationWorkaround = false;
+       codecNeedsEosFlushWorkaround = false;
+@@ -643,6 +647,13 @@ private boolean feedInputBuffer(long positionUs, boolean firstFeed) throws ExoPl
+     if (waitingForKeys) {
+       return false;
+     }
++    if (codecNeedsDiscardToSpsWorkaround && !sampleEncrypted) {
++      NalUnitUtil.discardToSps(sampleHolder.data);
++      if (sampleHolder.data.position() == 0) {
++        return true;
++      }
++      codecNeedsDiscardToSpsWorkaround = false;
++    }
+     try {
+       int bufferSize = sampleHolder.data.position();
+       int adaptiveReconfigurationBytes = bufferSize - sampleHolder.size;
+@@ -972,6 +983,21 @@ private static boolean codecNeedsFlushWorkaround(String name) {
+             && ("OMX.Exynos.avc.dec".equals(name) || "OMX.Exynos.avc.dec.secure".equals(name)));
+   }
+ 
++  /**
++   * Returns whether the decoder is an H.264/AVC decoder known to fail if NAL units are queued
++   * before the codec specific data.
++   * <p>
++   * If true is returned, the renderer will work around the issue by discarding data up to the SPS.
++   *
++   * @param name The name of the decoder.
++   * @param format The format used to configure the decoder.
++   * @return True if the decoder is known to fail if NAL units are queued before CSD.
++   */
++  private static boolean codecNeedsDiscardToSpsWorkaround(String name, MediaFormat format) {
++    return Util.SDK_INT < 21 && format.initializationData.isEmpty()
++        && "OMX.MTK.VIDEO.DECODER.AVC".equals(name);
++  }
++
+   /**
+    * Returns whether the decoder is known to handle the propagation of the
+    * {@link MediaCodec#BUFFER_FLAG_END_OF_STREAM} flag incorrectly on the host device.
+diff --git a/library/src/main/java/com/google/android/exoplayer/util/NalUnitUtil.java b/library/src/main/java/com/google/android/exoplayer/util/NalUnitUtil.java
+index 75830c9cc9..7b4caae880 100644
+--- a/library/src/main/java/com/google/android/exoplayer/util/NalUnitUtil.java
++++ b/library/src/main/java/com/google/android/exoplayer/util/NalUnitUtil.java
+@@ -15,6 +15,7 @@
+  */
+ package com.google.android.exoplayer.util;
+ 
++import java.nio.ByteBuffer;
+ import java.util.Arrays;
+ 
+ /**
+@@ -48,6 +49,8 @@
+     2f
+   };
+ 
++  private static final int NAL_UNIT_TYPE_SPS = 7;
++
+   private static final Object scratchEscapePositionsLock = new Object();
+ 
+   /**
+@@ -103,6 +106,43 @@ public static int unescapeStream(byte[] data, int limit) {
+     }
+   }
+ 
++  /**
++   * Discards data from the buffer up to the first SPS, where {@code data.position()} is interpreted
++   * as the length of the buffer.
++   * <p>
++   * When the method returns, {@code data.position()} will contain the new length of the buffer. If
++   * the buffer is not empty it is guaranteed to start with an SPS.
++   *
++   * @param data Buffer containing start code delimited NAL units.
++   */
++  public static void discardToSps(ByteBuffer data) {
++    int length = data.position();
++    int consecutiveZeros = 0;
++    int offset = 0;
++    while (offset + 1 < length) {
++      int value = data.get(offset) & 0xFF;
++      if (consecutiveZeros == 3) {
++        if (value == 1 && (data.get(offset + 1) & 0x1F) == NAL_UNIT_TYPE_SPS) {
++          // Copy from this NAL unit onwards to the start of the buffer.
++          ByteBuffer offsetData = data.duplicate();
++          offsetData.position(offset - 3);
++          offsetData.limit(length);
++          data.position(0);
++          data.put(offsetData);
++          return;
++        }
++      } else if (value == 0) {
++        consecutiveZeros++;
++      }
++      if (value != 0) {
++        consecutiveZeros = 0;
++      }
++      offset++;
++    }
++    // Empty the buffer if the SPS NAL unit was not found.
++    data.clear();
++  }
++
+   /**
+    * Constructs and returns a NAL unit with a start code followed by the data in {@code atom}.
+    */

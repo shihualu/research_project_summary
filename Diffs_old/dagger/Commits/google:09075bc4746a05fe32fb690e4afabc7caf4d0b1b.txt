@@ -1,0 +1,1214 @@
+diff --git a/compiler/src/main/java/dagger/internal/codegen/Binding.java b/compiler/src/main/java/dagger/internal/codegen/Binding.java
+index 7d34dc270..435d8f3ca 100644
+--- a/compiler/src/main/java/dagger/internal/codegen/Binding.java
++++ b/compiler/src/main/java/dagger/internal/codegen/Binding.java
+@@ -16,8 +16,8 @@
+ package dagger.internal.codegen;
+ 
+ import com.google.auto.common.MoreElements;
++import com.google.common.base.Optional;
+ import com.google.common.collect.ImmutableSet;
+-import com.google.common.collect.ImmutableSetMultimap;
+ import javax.lang.model.element.Element;
+ import javax.lang.model.element.TypeElement;
+ import javax.lang.model.util.SimpleElementVisitor6;
+@@ -52,16 +52,20 @@ public TypeElement visitType(TypeElement e, Void p) {
+     }, null);
+   }
+ 
+-  /** The set of {@link DependencyRequest dependencies} required to satisfy this binding. */
++  /**
++   * The explicit set of {@link DependencyRequest dependencies} required to satisfy this binding.
++   */
+   abstract ImmutableSet<DependencyRequest> dependencies();
+ 
+-  /** Returns the {@link #dependencies()} indexed by {@link Key}. */
+-  ImmutableSetMultimap<FrameworkKey, DependencyRequest> dependenciesByKey() {
+-    ImmutableSetMultimap.Builder<FrameworkKey, DependencyRequest> builder =
+-        ImmutableSetMultimap.builder();
+-    for (DependencyRequest dependency : dependencies()) {
+-      builder.put(FrameworkKey.forDependencyRequest(dependency), dependency);
+-    }
+-    return builder.build();
+-  }
++  /**
++   * The set of {@link DependencyRequest dependencies} required to satisfy this binding. This is a
++   * superset of {@link #dependencies()}.
++   */
++  abstract ImmutableSet<DependencyRequest> implicitDependencies();
++
++  /**
++   * Returns the name of the package in which this binding must be managed. E.g.: a binding
++   * may reference non-public types.
++   */
++  abstract Optional<String> bindingPackage();
+ }
+diff --git a/compiler/src/main/java/dagger/internal/codegen/ComponentDescriptor.java b/compiler/src/main/java/dagger/internal/codegen/ComponentDescriptor.java
+index 24d27ec92..ea56b661e 100644
+--- a/compiler/src/main/java/dagger/internal/codegen/ComponentDescriptor.java
++++ b/compiler/src/main/java/dagger/internal/codegen/ComponentDescriptor.java
+@@ -15,6 +15,7 @@
+  */
+ package dagger.internal.codegen;
+ 
++import com.google.auto.common.MoreElements;
+ import com.google.auto.common.MoreTypes;
+ import com.google.auto.value.AutoValue;
+ import com.google.common.base.Optional;
+@@ -34,6 +35,7 @@
+ import java.util.Deque;
+ import java.util.LinkedHashSet;
+ import java.util.List;
++import java.util.Map.Entry;
+ import java.util.Queue;
+ import javax.lang.model.element.AnnotationMirror;
+ import javax.lang.model.element.ExecutableElement;
+@@ -95,6 +97,8 @@
+    */
+   abstract ImmutableMap<Key, MembersInjectionBinding> resolvedMembersInjectionBindings();
+ 
++  abstract ImmutableSetMultimap<String, FrameworkKey> initializationByPackage();
++
+   /**
+    * The ordering of {@link Key keys} that will allow all of the {@link Factory} and
+    * {@link MembersInjector} implementations to initialize properly.
+@@ -228,6 +232,15 @@ ComponentDescriptor create(TypeElement componentDefinitionType) {
+             resolvedProvisionBindings, resolvedMembersInjectionBindings);
+       }
+ 
++      ImmutableSetMultimap.Builder<String, FrameworkKey> initializationByPackageBuilder =
++          ImmutableSetMultimap.builder();
++      for (Entry<FrameworkKey, Binding> resolvedBindingEntry : resolvedBindings.entries()) {
++        initializationByPackageBuilder.put(
++            resolvedBindingEntry.getValue().bindingPackage().or(
++                  MoreElements.getPackage(componentDefinitionType).getQualifiedName().toString()),
++            resolvedBindingEntry.getKey());
++      }
++
+       return new AutoValue_ComponentDescriptor(
+           componentDefinitionType,
+           componentDependencyTypes,
+@@ -235,6 +248,7 @@ ComponentDescriptor create(TypeElement componentDefinitionType) {
+           transitiveModules,
+           resolvedProvisionBindings.build(),
+           resolvedMembersInjectionBindings.build(),
++          initializationByPackageBuilder.build(),
+           ImmutableList.copyOf(resolvedBindings.keySet()));
+     }
+ 
+diff --git a/compiler/src/main/java/dagger/internal/codegen/ComponentGenerator.java b/compiler/src/main/java/dagger/internal/codegen/ComponentGenerator.java
+index 9e53eb70b..40791d463 100644
+--- a/compiler/src/main/java/dagger/internal/codegen/ComponentGenerator.java
++++ b/compiler/src/main/java/dagger/internal/codegen/ComponentGenerator.java
+@@ -27,6 +27,7 @@
+ import com.google.common.collect.Iterables;
+ import com.google.common.collect.Lists;
+ import com.google.common.collect.Maps;
++import com.google.common.collect.Multimaps;
+ import com.google.common.collect.Sets;
+ import dagger.Component;
+ import dagger.Factory;
+@@ -48,6 +49,7 @@
+ import dagger.internal.codegen.writer.TypeName;
+ import dagger.internal.codegen.writer.TypeNames;
+ import dagger.internal.codegen.writer.VoidName;
++import java.util.EnumSet;
+ import java.util.List;
+ import java.util.Map;
+ import java.util.Map.Entry;
+@@ -59,6 +61,7 @@
+ import javax.lang.model.element.AnnotationValue;
+ import javax.lang.model.element.Element;
+ import javax.lang.model.element.ExecutableElement;
++import javax.lang.model.element.Modifier;
+ import javax.lang.model.element.Name;
+ import javax.lang.model.element.TypeElement;
+ import javax.lang.model.element.VariableElement;
+@@ -88,11 +91,8 @@
+  * @since 2.0
+  */
+ final class ComponentGenerator extends SourceFileGenerator<ComponentDescriptor> {
+-  private final Key.Factory keyFactory;
+-
+-  ComponentGenerator(Filer filer, Key.Factory keyFactory) {
++  ComponentGenerator(Filer filer) {
+     super(filer);
+-    this.keyFactory = keyFactory;
+   }
+ 
+   @Override
+@@ -114,7 +114,7 @@ ClassName nameGeneratedType(ComponentDescriptor input) {
+   }
+ 
+   @Override
+-  JavaWriter write(ClassName componentName, ComponentDescriptor input) {
++  ImmutableSet<JavaWriter> write(ClassName componentName, ComponentDescriptor input) {
+     ClassName componentDefinitionTypeName =
+         ClassName.fromTypeElement(input.componentDefinitionType());
+ 
+@@ -140,10 +140,8 @@ JavaWriter write(ClassName componentName, ComponentDescriptor input) {
+ 
+     ImmutableMap<Key, String> providerNames =
+         generateProviderNamesForBindings(resolvedProvisionBindings);
+-    Map<Key, FieldWriter> providerFields = Maps.newHashMap();
+     ImmutableMap<Key, String> membersInjectorNames =
+         generateMembersInjectorNamesForBindings(resolvedMembersInjectionBindings);
+-    Map<Key, FieldWriter> membersInjectorFields = Maps.newHashMap();
+ 
+     // the full set of types that calling code uses to construct a component instance
+     ImmutableMap<TypeElement, String> componentContributionNames =
+@@ -157,6 +155,10 @@ JavaWriter write(ClassName componentName, ComponentDescriptor input) {
+                   }
+                 })));
+ 
++    ImmutableMap.Builder<FrameworkKey, Snippet> memberSelectSnippetsBuilder =
++        ImmutableMap.builder();
++    ImmutableSet.Builder<JavaWriter> packageProxies = ImmutableSet.builder();
++
+     ConstructorWriter constructorWriter = componentWriter.addConstructor();
+     constructorWriter.addModifiers(PRIVATE);
+     constructorWriter.addParameter(builderWriter, "builder");
+@@ -206,6 +208,68 @@ JavaWriter write(ClassName componentName, ComponentDescriptor input) {
+       }
+     }
+ 
++    for (Entry<String, Set<FrameworkKey>> packageEntry :
++        Multimaps.asMap(input.initializationByPackage()).entrySet()) {
++      String packageName = packageEntry.getKey();
++
++      final Optional<String> proxySelector;
++      final ClassWriter classWithFields;
++      final Set<Modifier> fieldModifiers;
++
++      if (packageName.equals(componentName.packageName())) {
++        // no proxy
++        proxySelector = Optional.absent();
++        // component gets the fields
++        classWithFields = componentWriter;
++        // private fields
++        fieldModifiers = EnumSet.of(PRIVATE, FINAL);
++      } else {
++        // create the proxy
++        JavaWriter proxyWriter = JavaWriter.inPackage(packageName);
++        packageProxies.add(proxyWriter);
++        ClassWriter proxyClassWriter =
++            proxyWriter.addClass(componentName.simpleName() + "__PackageProxy");
++        proxyClassWriter.addModifiers(PUBLIC, FINAL);
++        // create the field for the proxy in the component
++        FieldWriter proxyField =
++            componentWriter.addField(proxyClassWriter.name(), packageName.replace('.', '_')
++                + "_Proxy");
++        proxyField.addModifiers(PRIVATE, FINAL);
++        proxyField.setInitializer("new %s()", proxyClassWriter.name());
++        // add the field for the member select
++        proxySelector = Optional.of(proxyField.name());
++        // proxy gets the fields
++        classWithFields = proxyClassWriter;
++        // public fields in the proxy
++        fieldModifiers = EnumSet.of(PUBLIC);
++      }
++
++      for (FrameworkKey frameworkKey : packageEntry.getValue()) {
++        Key key = frameworkKey.key();
++        TypeName frameworkTypeName = ParameterizedTypeName.create(
++            ClassName.fromClass(frameworkKey.frameworkClass()),
++            TypeNames.forTypeMirror(key.type()));
++
++        final String fieldName;
++        if (frameworkKey.frameworkClass().equals(Provider.class)) {
++          fieldName = providerNames.get(key);
++        } else if (frameworkKey.frameworkClass().equals(MembersInjector.class)) {
++          fieldName = membersInjectorNames.get(key);
++        } else {
++          throw new IllegalStateException();
++        }
++
++        FieldWriter frameworkField = classWithFields.addField(frameworkTypeName, fieldName);
++        frameworkField.addModifiers(fieldModifiers);
++
++        memberSelectSnippetsBuilder.put(frameworkKey, Snippet.memberSelectSnippet(
++            new ImmutableList.Builder<String>()
++                .addAll(proxySelector.asSet())
++                .add(frameworkField.name())
++                .build()));
++      }
++    }
++
+     buildMethod.body().addSnippet("return new %s(this);", componentWriter.name());
+ 
+     if (!requiresBuilder) {
+@@ -215,29 +279,7 @@ JavaWriter write(ClassName componentName, ComponentDescriptor input) {
+       factoryMethod.body().addSnippet("return builder().build();");
+     }
+ 
+-    for (Entry<Key, String> providerEntry : providerNames.entrySet()) {
+-      Key key = providerEntry.getKey();
+-      // TODO(gak): provide more elaborate information about which requests relate
+-      TypeName providerTypeReferece = ParameterizedTypeName.create(
+-          ClassName.fromClass(Provider.class),
+-          TypeNames.forTypeMirror(key.type()));
+-      FieldWriter providerField =
+-          componentWriter.addField(providerTypeReferece, providerEntry.getValue());
+-      providerField.addModifiers(PRIVATE, FINAL);
+-      providerFields.put(key, providerField);
+-    }
+-
+-    for (Entry<Key, String> membersInjectorEntry : membersInjectorNames.entrySet()) {
+-      Key key = membersInjectorEntry.getKey();
+-      // TODO(gak): provide more elaborate information about which requests relate
+-      TypeName membersInjectorTypeReferece = ParameterizedTypeName.create(
+-          ClassName.fromClass(MembersInjector.class),
+-          TypeNames.forTypeMirror(key.type()));
+-      FieldWriter membersInjectorField =
+-          componentWriter.addField(membersInjectorTypeReferece, membersInjectorEntry.getValue());
+-      membersInjectorField.addModifiers(PRIVATE, FINAL);
+-      membersInjectorFields.put(key, membersInjectorField);
+-    }
++    ImmutableMap<FrameworkKey, Snippet> memberSelectSnippets = memberSelectSnippetsBuilder.build();
+ 
+     for (FrameworkKey frameworkKey : input.initializationOrdering()) {
+       Key key = frameworkKey.key();
+@@ -249,10 +291,10 @@ JavaWriter write(ClassName componentName, ComponentDescriptor input) {
+             ImmutableList.Builder<Snippet> setFactoryParameters = ImmutableList.builder();
+             for (ProvisionBinding binding : bindings) {
+               setFactoryParameters.add(initializeFactoryForBinding(
+-                  binding, componentContributionFields, providerFields, membersInjectorFields));
++                  binding, componentContributionFields, memberSelectSnippets));
+             }
+             constructorWriter.body().addSnippet("this.%s = %s.create(%n%s);",
+-                providerFields.get(key).name(), ClassName.fromClass(SetFactory.class),
++                memberSelectSnippets.get(frameworkKey), ClassName.fromClass(SetFactory.class),
+                 Snippet.makeParametersSnippet(setFactoryParameters.build()));
+             break;
+           case MAPBINDING:
+@@ -276,27 +318,27 @@ JavaWriter write(ClassName componentName, ComponentDescriptor input) {
+               Map<? extends ExecutableElement, ? extends AnnotationValue> map =
+                   mapKeyAnnotationMirror.getElementValues();
+               constructorWriter.body().addSnippet("    .put(%s, %s)",
+-                  Iterables.getOnlyElement(map.entrySet()).getValue(), 
++                  Iterables.getOnlyElement(map.entrySet()).getValue(),
+                   initializeFactoryForBinding(
+-                      binding, componentContributionFields, providerFields, membersInjectorFields));
++                      binding, componentContributionFields, memberSelectSnippets));
+             }
+             constructorWriter.body().addSnippet("    .build();");
+             break;
+           case SINGULARBINDING:
+             ProvisionBinding binding = Iterables.getOnlyElement(bindings);
+             constructorWriter.body().addSnippet("this.%s = %s;",
+-                providerFields.get(key).name(), 
++                memberSelectSnippets.get(frameworkKey),
+                 initializeFactoryForBinding(
+-                    binding, componentContributionFields, providerFields, membersInjectorFields));
++                    binding, componentContributionFields, memberSelectSnippets));
+             break;
+           default:
+             throw new IllegalStateException();
+         }
+       } else if (frameworkKey.frameworkClass().equals(MembersInjector.class)) {
+         constructorWriter.body().addSnippet("this.%s = %s;",
+-            membersInjectorFields.get(key).name(),
++            memberSelectSnippets.get(frameworkKey),
+             initializeMembersInjectorForBinding(resolvedMembersInjectionBindings.get(key),
+-                providerFields, membersInjectorFields));
++                memberSelectSnippets));
+       } else {
+         throw new IllegalStateException(
+             "unknown framework class: " + frameworkKey.frameworkClass());
+@@ -311,8 +353,9 @@ JavaWriter write(ClassName componentName, ComponentDescriptor input) {
+               requestElement.getSimpleName().toString());
+       interfaceMethod.annotate(Override.class);
+       interfaceMethod.addModifiers(PUBLIC);
++      FrameworkKey frameworkKey = FrameworkKey.forDependencyRequest(interfaceRequest);
+       if (interfaceRequest.kind().equals(MEMBERS_INJECTOR)) {
+-        String membersInjectorName = membersInjectorFields.get(interfaceRequest.key()).name();
++        Snippet membersInjectorName = memberSelectSnippets.get(frameworkKey);
+         VariableElement parameter = Iterables.getOnlyElement(requestElement.getParameters());
+         Name parameterName = parameter.getSimpleName();
+         interfaceMethod.addParameter(
+@@ -324,18 +367,20 @@ JavaWriter write(ClassName componentName, ComponentDescriptor input) {
+         }
+       } else {
+         interfaceMethod.body().addSnippet("return %s;",
+-            frameworkTypeUsageStatement(providerFields.get(interfaceRequest.key()).name(),
++            frameworkTypeUsageStatement(memberSelectSnippets.get(frameworkKey),
+                 interfaceRequest.kind()));
+       }
+     }
+ 
+-    return writer;
++    return new ImmutableSet.Builder<JavaWriter>()
++        .addAll(packageProxies.build())
++        .add(writer)
++        .build();
+   }
+ 
+   private Snippet initializeFactoryForBinding(ProvisionBinding binding,
+       Map<TypeElement, FieldWriter> contributionFields,
+-      Map<Key, FieldWriter> providerFields,
+-      Map<Key, FieldWriter> membersInjectorFields) {
++      ImmutableMap<FrameworkKey, Snippet> memberSelectSnippets) {
+     if (binding.bindingKind().equals(COMPONENT)) {
+       return Snippet.format("%s.<%s>create(this)",
+           ClassName.fromClass(InstanceFactory.class),
+@@ -352,21 +397,20 @@ private Snippet initializeFactoryForBinding(ProvisionBinding binding,
+           contributionFields.get(binding.bindingTypeElement()).name(),
+           binding.bindingElement().getSimpleName().toString());
+     } else {
+-      List<String> parameters = Lists.newArrayListWithCapacity(binding.dependencies().size() + 1);
++      List<Snippet> parameters = Lists.newArrayListWithCapacity(binding.dependencies().size() + 1);
+       if (binding.bindingKind().equals(PROVISION)) {
+-        parameters.add(contributionFields.get(binding.bindingTypeElement()).name());
++        parameters.add(Snippet.format(contributionFields.get(binding.bindingTypeElement()).name()));
+       }
+       if (binding.memberInjectionRequest().isPresent()) {
+-        FieldWriter membersInjectorField =
+-            membersInjectorFields.get(keyFactory.forType(binding.providedKey().type()));
+-        if (membersInjectorField != null) {
+-          parameters.add(membersInjectorField.name());
++        Snippet snippet = memberSelectSnippets.get(
++            FrameworkKey.forDependencyRequest(binding.memberInjectionRequest().get()));
++        if (snippet != null) {
++          parameters.add(snippet);
+         } else {
+           throw new UnsupportedOperationException("Non-generated MembersInjector");
+         }
+       }
+-      parameters.addAll(
+-          getDependencyParameters(binding.dependencies(), providerFields, membersInjectorFields));
++      parameters.addAll(getDependencyParameters(binding.dependencies(), memberSelectSnippets));
+       return binding.scope().isPresent()
+           ? Snippet.format("%s.create(new %s(%s))",
+               ClassName.fromClass(ScopedProvider.class),
+@@ -380,23 +424,19 @@ private Snippet initializeFactoryForBinding(ProvisionBinding binding,
+ 
+   private static Snippet initializeMembersInjectorForBinding(
+       MembersInjectionBinding binding,
+-      Map<Key, FieldWriter> providerFields,
+-      Map<Key, FieldWriter> membersInjectorFields) {
+-    List<String> parameters = getDependencyParameters(binding.dependencySet(),
+-        providerFields, membersInjectorFields);
++      ImmutableMap<FrameworkKey, Snippet> memberSelectSnippets) {
++    List<Snippet> parameters = getDependencyParameters(ImmutableSet.copyOf(binding.dependencies()),
++        memberSelectSnippets);
+     return Snippet.format("new %s(%s)",
+        membersInjectorNameForMembersInjectionBinding(binding).toString(),
+         Joiner.on(", ").join(parameters));
+   }
+ 
+-  private static List<String> getDependencyParameters(Iterable<DependencyRequest> dependencies,
+-      Map<Key, FieldWriter> providerFields,
+-      Map<Key, FieldWriter> membersInjectorFields) {
+-    ImmutableList.Builder<String> parameters = ImmutableList.builder();
++  private static List<Snippet> getDependencyParameters(Iterable<DependencyRequest> dependencies,
++      ImmutableMap<FrameworkKey, Snippet> memberSelectSnippets) {
++    ImmutableList.Builder<Snippet> parameters = ImmutableList.builder();
+     for (DependencyRequest dependency : dependencies) {
+-        parameters.add(dependency.kind().equals(MEMBERS_INJECTOR)
+-            ? membersInjectorFields.get(dependency.key()).name()
+-            : providerFields.get(dependency.key()).name());
++      parameters.add(memberSelectSnippets.get(FrameworkKey.forDependencyRequest(dependency)));
+     }
+     return parameters.build();
+   }
+diff --git a/compiler/src/main/java/dagger/internal/codegen/ComponentProcessor.java b/compiler/src/main/java/dagger/internal/codegen/ComponentProcessor.java
+index 1342cc859..9f0ec9c1a 100644
+--- a/compiler/src/main/java/dagger/internal/codegen/ComponentProcessor.java
++++ b/compiler/src/main/java/dagger/internal/codegen/ComponentProcessor.java
+@@ -93,8 +93,7 @@ public synchronized void init(ProcessingEnvironment processingEnv) {
+     FactoryGenerator factoryGenerator = new FactoryGenerator(filer);
+     MembersInjectorGenerator membersInjectorGenerator =
+         new MembersInjectorGenerator(filer, elements, types);
+-    ComponentGenerator componentGenerator =
+-        new ComponentGenerator(filer, keyFactory);
++    ComponentGenerator componentGenerator = new ComponentGenerator(filer);
+ 
+     this.processingSteps = ImmutableList.<ProcessingStep>of(
+         new MapKeyProcessingStep(
+diff --git a/compiler/src/main/java/dagger/internal/codegen/FactoryGenerator.java b/compiler/src/main/java/dagger/internal/codegen/FactoryGenerator.java
+index 8e5c70d9e..79da42d4a 100644
+--- a/compiler/src/main/java/dagger/internal/codegen/FactoryGenerator.java
++++ b/compiler/src/main/java/dagger/internal/codegen/FactoryGenerator.java
+@@ -78,7 +78,7 @@ ClassName nameGeneratedType(ProvisionBinding binding) {
+   }
+ 
+   @Override
+-  JavaWriter write(ClassName generatedTypeName, ProvisionBinding binding) {
++  ImmutableSet<JavaWriter> write(ClassName generatedTypeName, ProvisionBinding binding) {
+     TypeMirror keyType = binding.provisionType().equals(Type.MAP) ? Util.getValueTypeOfMap(
+         Util.getDeclaredTypeOfMap(binding.providedKey().type()))
+         : binding.providedKey().type();
+@@ -144,7 +144,8 @@ JavaWriter write(ClassName generatedTypeName, ProvisionBinding binding) {
+     List<Snippet> parameters = Lists.newArrayList();
+     for (DependencyRequest dependency : binding.dependencies()) {
+       parameters.add(frameworkTypeUsageStatement(
+-          names.get(FrameworkKey.forDependencyRequest(dependency)), dependency.kind()));
++          Snippet.format(names.get(FrameworkKey.forDependencyRequest(dependency))),
++          dependency.kind()));
+     }
+     Snippet parametersSnippet = makeParametersSnippet(parameters);
+ 
+@@ -175,6 +176,6 @@ JavaWriter write(ClassName generatedTypeName, ProvisionBinding binding) {
+     }
+ 
+     // TODO(gak): write a sensible toString
+-    return writer;
++    return ImmutableSet.of(writer);
+   }
+ }
+diff --git a/compiler/src/main/java/dagger/internal/codegen/MembersInjectionBinding.java b/compiler/src/main/java/dagger/internal/codegen/MembersInjectionBinding.java
+index d55980e7c..918731f75 100644
+--- a/compiler/src/main/java/dagger/internal/codegen/MembersInjectionBinding.java
++++ b/compiler/src/main/java/dagger/internal/codegen/MembersInjectionBinding.java
+@@ -18,6 +18,7 @@
+ import com.google.auto.common.MoreElements;
+ import com.google.auto.value.AutoValue;
+ import com.google.common.base.Function;
++import com.google.common.base.Optional;
+ import com.google.common.collect.ComparisonChain;
+ import com.google.common.collect.FluentIterable;
+ import com.google.common.collect.ImmutableSet;
+@@ -35,6 +36,7 @@
+ import static com.google.auto.common.MoreElements.isAnnotationPresent;
+ import static com.google.common.base.Preconditions.checkArgument;
+ import static com.google.common.base.Preconditions.checkNotNull;
++import static javax.lang.model.element.Modifier.PUBLIC;
+ 
+ /**
+  * Represents the full members injection of a particular type. This does not pay attention to
+@@ -47,6 +49,10 @@
+ abstract class MembersInjectionBinding extends Binding {
+   @Override abstract TypeElement bindingElement();
+ 
++  @Override ImmutableSet<DependencyRequest> implicitDependencies() {
++    return dependencies();
++  }
++
+   /**
+    * Creates a {@link MembersInjectionBinding} for the given bindings.
+    *
+@@ -69,18 +75,16 @@ static MembersInjectionBinding create(Iterable<InjectionSite> injectionSites) {
+           }
+         })
+         .toSet();
++    Optional<String> bindingPackage = injectedTypeElement.getModifiers().contains(PUBLIC)
++        ? Optional.<String>absent()
++        : Optional.of(MoreElements.getPackage(injectedTypeElement).getQualifiedName().toString());
+     return new AutoValue_MembersInjectionBinding(
+-        dependencies, injectedTypeElement, injectionSiteSet);
++        dependencies, bindingPackage, injectedTypeElement, injectionSiteSet);
+   }
+ 
+   /** The set of individual sites where {@link Inject} is applied. */
+   abstract ImmutableSortedSet<InjectionSite> injectionSites();
+ 
+-  /** The total set of dependencies required by all injection sites. */
+-  final ImmutableSet<DependencyRequest> dependencySet() {
+-    return ImmutableSet.copyOf(dependencies());
+-  }
+-
+   private static final Ordering<InjectionSite> INJECTION_ORDERING =
+       new Ordering<InjectionSite>() {
+         @Override
+diff --git a/compiler/src/main/java/dagger/internal/codegen/MembersInjectorGenerator.java b/compiler/src/main/java/dagger/internal/codegen/MembersInjectorGenerator.java
+index 70c3363c2..3c6743486 100644
+--- a/compiler/src/main/java/dagger/internal/codegen/MembersInjectorGenerator.java
++++ b/compiler/src/main/java/dagger/internal/codegen/MembersInjectorGenerator.java
+@@ -22,6 +22,7 @@
+ import com.google.common.collect.FluentIterable;
+ import com.google.common.collect.ImmutableList;
+ import com.google.common.collect.ImmutableMap;
++import com.google.common.collect.ImmutableSet;
+ import com.google.common.collect.Iterables;
+ import dagger.MembersInjector;
+ import dagger.internal.codegen.MembersInjectionBinding.InjectionSite;
+@@ -90,7 +91,7 @@ ClassName nameGeneratedType(MembersInjectionBinding binding) {
+   }
+ 
+   @Override
+-  JavaWriter write(ClassName injectorClassName, MembersInjectionBinding binding) {
++  ImmutableSet<JavaWriter> write(ClassName injectorClassName, MembersInjectionBinding binding) {
+     ClassName injectedClassName = ClassName.fromTypeElement(binding.bindingElement());
+ 
+     JavaWriter writer = JavaWriter.inPackage(injectedClassName.packageName());
+@@ -128,7 +129,7 @@ JavaWriter write(ClassName injectorClassName, MembersInjectionBinding binding) {
+     }
+ 
+     ImmutableMap<FrameworkKey, String> names =
+-        SourceFiles.generateFrameworkReferenceNamesForDependencies(binding.dependencySet());
++        SourceFiles.generateFrameworkReferenceNamesForDependencies(ImmutableSet.copyOf(binding.dependencies()));
+ 
+     ImmutableMap.Builder<FrameworkKey, FieldWriter> dependencyFieldsBuilder =
+         ImmutableMap.builder();
+@@ -164,14 +165,16 @@ JavaWriter write(ClassName injectorClassName, MembersInjectionBinding binding) {
+               fieldDependency));
+           injectMembersWriter.body().addSnippet("instance.%s = %s;",
+               injectionSite.element().getSimpleName(),
+-              frameworkTypeUsageStatement(singleField.name(), fieldDependency.kind()));
++              frameworkTypeUsageStatement(Snippet.format(singleField.name()),
++                  fieldDependency.kind()));
+           break;
+         case METHOD:
+           ImmutableList.Builder<Snippet> parameters = ImmutableList.builder();
+           for (DependencyRequest methodDependnecy : injectionSite.dependencies()) {
+             FieldWriter field =
+             depedencyFields.get(FrameworkKey.forDependencyRequest(methodDependnecy));
+-            parameters.add(frameworkTypeUsageStatement(field.name(), methodDependnecy.kind()));
++            parameters.add(frameworkTypeUsageStatement(Snippet.format(field.name()),
++                methodDependnecy.kind()));
+           }
+           injectMembersWriter.body().addSnippet("instance.%s(%s);",
+               injectionSite.element().getSimpleName(),
+@@ -181,7 +184,7 @@ JavaWriter write(ClassName injectorClassName, MembersInjectionBinding binding) {
+           throw new AssertionError();
+       }
+     }
+-    return writer;
++    return ImmutableSet.of(writer);
+   }
+ 
+   private Optional<TypeElement> supertype(TypeElement type) {
+diff --git a/compiler/src/main/java/dagger/internal/codegen/ProvisionBinding.java b/compiler/src/main/java/dagger/internal/codegen/ProvisionBinding.java
+index e887055d0..0afd875b3 100644
+--- a/compiler/src/main/java/dagger/internal/codegen/ProvisionBinding.java
++++ b/compiler/src/main/java/dagger/internal/codegen/ProvisionBinding.java
+@@ -24,13 +24,22 @@
+ import dagger.Component;
+ import dagger.Provides;
+ import java.util.Iterator;
++import java.util.Set;
+ import javax.inject.Inject;
+ import javax.lang.model.element.AnnotationMirror;
+ import javax.lang.model.element.Element;
+ import javax.lang.model.element.ElementKind;
+ import javax.lang.model.element.ExecutableElement;
++import javax.lang.model.element.Name;
++import javax.lang.model.element.PackageElement;
+ import javax.lang.model.element.TypeElement;
++import javax.lang.model.type.ArrayType;
++import javax.lang.model.type.DeclaredType;
++import javax.lang.model.type.TypeMirror;
++import javax.lang.model.type.TypeVariable;
++import javax.lang.model.type.WildcardType;
+ import javax.lang.model.util.Elements;
++import javax.lang.model.util.SimpleTypeVisitor6;
+ import javax.lang.model.util.Types;
+ 
+ import static com.google.auto.common.MoreElements.isAnnotationPresent;
+@@ -44,6 +53,7 @@
+ import static javax.lang.model.element.ElementKind.CONSTRUCTOR;
+ import static javax.lang.model.element.ElementKind.FIELD;
+ import static javax.lang.model.element.ElementKind.METHOD;
++import static javax.lang.model.element.Modifier.PUBLIC;
+ import static dagger.internal.codegen.ErrorMessages.NON_SETBINDING;
+ import static dagger.internal.codegen.ErrorMessages.NON_MAPBINDING;
+ import static dagger.internal.codegen.ErrorMessages.INVALID_COLLECTIONBINDING;
+@@ -57,6 +67,14 @@
+  */
+ @AutoValue
+ abstract class ProvisionBinding extends Binding {
++  @Override
++  ImmutableSet<DependencyRequest> implicitDependencies() {
++    return new ImmutableSet.Builder<DependencyRequest>()
++        .addAll(dependencies())
++        .addAll(memberInjectionRequest().asSet())
++        .build();
++  }
++
+   enum Kind {
+     /** Represents an {@link Inject} binding. */
+     INJECTION,
+@@ -162,21 +180,81 @@ static BindingsType getBindingsType(Iterable<ProvisionBinding> bindings) {
+       this.dependencyRequestFactory = dependencyRequestFactory;
+     }
+ 
++    private static Optional<String> findBindingPackage(Key providedKey) {
++      Set<String> packages = nonPublicPackageUse(providedKey.type());
++      switch (packages.size()) {
++        case 0:
++          return Optional.absent();
++        case 1:
++          return Optional.of(packages.iterator().next());
++        default:
++          throw new IllegalStateException();
++      }
++    }
++
++    private static Set<String> nonPublicPackageUse(TypeMirror typeMirror) {
++      ImmutableSet.Builder<String> packages = ImmutableSet.builder();
++      typeMirror.accept(new SimpleTypeVisitor6<Void, ImmutableSet.Builder<String>>() {
++        @Override
++        public Void visitArray(ArrayType t, ImmutableSet.Builder<String> p) {
++          return t.getComponentType().accept(this, p);
++        }
++
++        @Override
++        public Void visitDeclared(DeclaredType t, ImmutableSet.Builder<String> p) {
++          for (TypeMirror typeArgument : t.getTypeArguments()) {
++            typeArgument.accept(this, p);
++          }
++          // TODO(gak): address public nested types in non-public types
++          TypeElement typeElement = MoreElements.asType(t.asElement());
++          if (!typeElement.getModifiers().contains(PUBLIC)) {
++            PackageElement elementPackage = MoreElements.getPackage(typeElement);
++            Name qualifiedName = elementPackage.getQualifiedName();
++            p.add(qualifiedName.toString());
++          }
++          return null;
++        }
++
++        @Override
++        public Void visitTypeVariable(TypeVariable t, ImmutableSet.Builder<String> p) {
++          t.getLowerBound().accept(this, p);
++          t.getUpperBound().accept(this, p);
++          return null;
++        }
++
++        @Override
++        public Void visitWildcard(WildcardType t, ImmutableSet.Builder<String> p) {
++          if (t.getExtendsBound() != null) {
++            t.getExtendsBound().accept(this, p);
++          }
++          if (t.getSuperBound() != null) {
++            t.getSuperBound().accept(this, p);
++          }
++          return null;
++        }
++      }, packages);
++      return packages.build();
++    }
++
+     ProvisionBinding forInjectConstructor(ExecutableElement constructorElement) {
+       checkNotNull(constructorElement);
+       checkArgument(constructorElement.getKind().equals(CONSTRUCTOR));
+       checkArgument(isAnnotationPresent(constructorElement, Inject.class));
+       Key key = keyFactory.forInjectConstructor(constructorElement);
+       checkArgument(!key.qualifier().isPresent());
++      ImmutableSet<DependencyRequest> dependencies =
++          dependencyRequestFactory.forRequiredVariables(constructorElement.getParameters());
++      Optional<DependencyRequest> membersInjectionRequest = membersInjectionRequest(
++          MoreElements.asType(constructorElement.getEnclosingElement()));
+       return new AutoValue_ProvisionBinding(
+           constructorElement,
+-          dependencyRequestFactory.forRequiredVariables(constructorElement.getParameters()),
++          dependencies,
++          findBindingPackage(key),
+           Kind.INJECTION,
+           Provides.Type.UNIQUE,
+           key,
+           getScopeAnnotation(constructorElement.getEnclosingElement()),
+-          membersInjectionRequest(
+-              MoreElements.asType(constructorElement.getEnclosingElement())));
++          membersInjectionRequest);
+     }
+ 
+     private static final ImmutableSet<ElementKind> MEMBER_KINDS =
+@@ -201,12 +279,16 @@ ProvisionBinding forProvidesMethod(ExecutableElement providesMethod) {
+       checkArgument(providesMethod.getKind().equals(METHOD));
+       Provides providesAnnotation = providesMethod.getAnnotation(Provides.class);
+       checkArgument(providesAnnotation != null);
++      Key key = keyFactory.forProvidesMethod(providesMethod);
++      ImmutableSet<DependencyRequest> dependencies =
++          dependencyRequestFactory.forRequiredVariables(providesMethod.getParameters());
+       return new AutoValue_ProvisionBinding(
+           providesMethod,
+-          dependencyRequestFactory.forRequiredVariables(providesMethod.getParameters()),
++          dependencies,
++          findBindingPackage(key),
+           Kind.PROVISION,
+           providesAnnotation.type(),
+-          keyFactory.forProvidesMethod(providesMethod),
++          key,
+           getScopeAnnotation(providesMethod),
+           Optional.<DependencyRequest>absent());
+     }
+@@ -218,6 +300,7 @@ ProvisionBinding forComponent(TypeElement componentDefinitionType) {
+       return new AutoValue_ProvisionBinding(
+           componentDefinitionType,
+           ImmutableSet.<DependencyRequest>of(),
++          Optional.<String>absent(),
+           Kind.COMPONENT,
+           Provides.Type.UNIQUE,
+           keyFactory.forType(componentDefinitionType.asType()),
+@@ -232,6 +315,7 @@ ProvisionBinding forComponentMethod(ExecutableElement componentMethod) {
+       return new AutoValue_ProvisionBinding(
+           componentMethod,
+           ImmutableSet.<DependencyRequest>of(),
++          Optional.<String>absent(),
+           Kind.COMPONENT_PROVISION,
+           Provides.Type.UNIQUE,
+           keyFactory.forComponentMethod(componentMethod),
+diff --git a/compiler/src/main/java/dagger/internal/codegen/SourceFileGenerationException.java b/compiler/src/main/java/dagger/internal/codegen/SourceFileGenerationException.java
+index 725c24e37..6ea9729d1 100644
+--- a/compiler/src/main/java/dagger/internal/codegen/SourceFileGenerationException.java
++++ b/compiler/src/main/java/dagger/internal/codegen/SourceFileGenerationException.java
+@@ -16,6 +16,8 @@
+ package dagger.internal.codegen;
+ 
+ import com.google.common.base.Optional;
++import com.google.common.collect.ImmutableSet;
++import com.google.common.collect.Iterables;
+ import dagger.internal.codegen.writer.ClassName;
+ import javax.annotation.processing.Messager;
+ import javax.lang.model.element.Element;
+@@ -34,35 +36,39 @@
+  * @since 2.0
+  */
+ final class SourceFileGenerationException extends Exception implements PrintableErrorMessage {
+-  private final ClassName generatedClassName;
++  private final ImmutableSet<ClassName> generatedClassNames;
+   private final Optional<? extends Element> associatedElement;
+ 
+-  SourceFileGenerationException(ClassName generatedClassName, Throwable cause,
++  SourceFileGenerationException(Iterable<ClassName> generatedClassNames, Throwable cause,
+       Optional<? extends Element> associatedElement) {
+-    super(createMessage(generatedClassName, cause.getMessage()), cause);
+-    this.generatedClassName = checkNotNull(generatedClassName);
++    super(createMessage(generatedClassNames, cause.getMessage()), cause);
++    this.generatedClassNames = ImmutableSet.copyOf(generatedClassNames);
+     this.associatedElement = checkNotNull(associatedElement);
+   }
+ 
+-  SourceFileGenerationException(ClassName generatedClassName, Throwable cause) {
+-    this(generatedClassName, cause, Optional.<Element>absent());
++  SourceFileGenerationException(Iterable<ClassName> generatedClassNames, Throwable cause) {
++    this(generatedClassNames, cause, Optional.<Element>absent());
+   }
+ 
+-  SourceFileGenerationException(ClassName generatedClassName, Throwable cause,
++  SourceFileGenerationException(Iterable<ClassName> generatedClassNames, Throwable cause,
+       Element associatedElement) {
+-    this(generatedClassName, cause, Optional.of(associatedElement));
++    this(generatedClassNames, cause, Optional.of(associatedElement));
+   }
+ 
+-  public ClassName generatedClassName() {
+-    return generatedClassName;
++  public ImmutableSet<ClassName> generatedClassNames() {
++    return generatedClassNames;
+   }
+ 
+   public Optional<? extends Element> associatedElement() {
+     return associatedElement;
+   }
+ 
+-  private static String createMessage(ClassName generatedClassName, String message) {
+-    return String.format("Could not generate %s: %s.", generatedClassName, message);
++  private static String createMessage(Iterable<ClassName> generatedClassNames, String message) {
++    return String.format("Could not generate %s: %s.",
++        Iterables.isEmpty(generatedClassNames)
++            ? "unknown files"
++            : Iterables.toString(generatedClassNames),
++        message);
+   }
+ 
+   @Override
+diff --git a/compiler/src/main/java/dagger/internal/codegen/SourceFileGenerator.java b/compiler/src/main/java/dagger/internal/codegen/SourceFileGenerator.java
+index 9cfd003ec..13430c670 100644
+--- a/compiler/src/main/java/dagger/internal/codegen/SourceFileGenerator.java
++++ b/compiler/src/main/java/dagger/internal/codegen/SourceFileGenerator.java
+@@ -15,11 +15,15 @@
+  */
+ package dagger.internal.codegen;
+ 
++import com.google.common.base.Function;
+ import com.google.common.base.Optional;
+ import com.google.common.base.Throwables;
++import com.google.common.collect.ImmutableList;
+ import com.google.common.collect.ImmutableSet;
++import com.google.common.collect.Iterables;
+ import dagger.internal.codegen.writer.ClassName;
+ import dagger.internal.codegen.writer.JavaWriter;
++import dagger.internal.codegen.writer.TypeWriter;
+ import java.io.IOException;
+ import javax.annotation.processing.Filer;
+ import javax.lang.model.element.Element;
+@@ -42,27 +46,36 @@
+     this.filer = checkNotNull(filer);
+   }
+ 
+-  final ClassName generate(T input) throws SourceFileGenerationException {
++  final void generate(T input) throws SourceFileGenerationException {
+     ClassName generatedTypeName = nameGeneratedType(input);
+     ImmutableSet<Element> originatingElements = ImmutableSet.copyOf(getOriginatingElements(input));
+     try {
+-      JavaWriter javaWriter = write(generatedTypeName, input);
+-      try {
+-        javaWriter.file(filer, originatingElements);
+-      } catch (IOException e) {
+-        throw new SourceFileGenerationException(generatedTypeName, e,
+-            getElementForErrorReporting(input));
++      ImmutableSet<JavaWriter> writers = write(generatedTypeName, input);
++      for (JavaWriter javaWriter : writers) {
++        try {
++          javaWriter.file(filer, originatingElements);
++        } catch (IOException e) {
++          throw new SourceFileGenerationException(getNamesForWriters(javaWriter.getTypeWriters()),
++              e, getElementForErrorReporting(input));
++        }
+       }
+-      return generatedTypeName;
+     } catch (Exception e) {
+       // if the code above threw a SFGE, use that
+       Throwables.propagateIfPossible(e, SourceFileGenerationException.class);
+       // otherwise, throw a new one
+-      throw new SourceFileGenerationException(generatedTypeName, e,
++      throw new SourceFileGenerationException(ImmutableList.<ClassName>of(), e,
+           getElementForErrorReporting(input));
+     }
+   }
+ 
++  private static Iterable<ClassName> getNamesForWriters(Iterable<TypeWriter> typeWriters) {
++    return Iterables.transform(typeWriters, new Function<TypeWriter, ClassName>() {
++      @Override public ClassName apply(TypeWriter input) {
++        return input.name();
++      }
++    });
++  }
++
+   /**
+    * Implementations should return the {@link ClassName} for the top-level type to be generated.
+    */
+@@ -82,5 +95,5 @@ final ClassName generate(T input) throws SourceFileGenerationException {
+ 
+   /**
+    */
+-  abstract JavaWriter write(ClassName generatedTypeName, T input);
++  abstract ImmutableSet<JavaWriter> write(ClassName generatedTypeName, T input);
+ }
+diff --git a/compiler/src/main/java/dagger/internal/codegen/SourceFiles.java b/compiler/src/main/java/dagger/internal/codegen/SourceFiles.java
+index 773f2b3bd..bff40ab06 100644
+--- a/compiler/src/main/java/dagger/internal/codegen/SourceFiles.java
++++ b/compiler/src/main/java/dagger/internal/codegen/SourceFiles.java
+@@ -247,17 +247,17 @@ public String apply(Entry<?, String> input) {
+         }));
+   }
+ 
+-  static Snippet frameworkTypeUsageStatement(String frameworkTypeName,
++  static Snippet frameworkTypeUsageStatement(Snippet frameworkTypeMemberSelect,
+       DependencyRequest.Kind dependencyKind) {
+     switch (dependencyKind) {
+       case LAZY:
+         return Snippet.format("%s.create(%s)",
+-            ClassName.fromClass(DoubleCheckLazy.class), frameworkTypeName);
++            ClassName.fromClass(DoubleCheckLazy.class), frameworkTypeMemberSelect);
+       case INSTANCE:
+-        return Snippet.format("%s.get()", frameworkTypeName);
++        return Snippet.format("%s.get()", frameworkTypeMemberSelect);
+       case PROVIDER:
+       case MEMBERS_INJECTOR:
+-        return Snippet.format("%s", frameworkTypeName);
++        return Snippet.format("%s", frameworkTypeMemberSelect);
+       default:
+         throw new AssertionError();
+     }
+diff --git a/compiler/src/main/java/dagger/internal/codegen/writer/JavaWriter.java b/compiler/src/main/java/dagger/internal/codegen/writer/JavaWriter.java
+index 5f087dbca..5a3d6eed1 100644
+--- a/compiler/src/main/java/dagger/internal/codegen/writer/JavaWriter.java
++++ b/compiler/src/main/java/dagger/internal/codegen/writer/JavaWriter.java
+@@ -21,15 +21,11 @@
+ import java.util.regex.Pattern;
+ import javax.annotation.processing.Filer;
+ import javax.lang.model.element.Element;
+-import javax.lang.model.element.Modifier;
+ import javax.lang.model.element.PackageElement;
+ import javax.tools.JavaFileObject;
+ 
+-import static com.google.common.base.Preconditions.checkArgument;
+ import static com.google.common.base.Preconditions.checkNotNull;
+-import static javax.lang.model.element.Modifier.PRIVATE;
+-import static javax.lang.model.element.Modifier.PROTECTED;
+-import static javax.lang.model.element.Modifier.STATIC;
++import static java.util.Collections.unmodifiableList;
+ 
+ /**
+  * Writes a single compilation unit.
+@@ -48,7 +44,7 @@ public static JavaWriter inPackage(PackageElement packageElement) {
+   }
+ 
+   private final String packageName;
+-  // TODO(gak): disallow multiple types in a file
++  // TODO(gak): disallow multiple types in a file?
+   private final List<TypeWriter> typeWriters;
+   private final List<ClassName> explicitImports;
+ 
+@@ -58,20 +54,17 @@ private JavaWriter(String packageName) {
+     this.explicitImports = Lists.newArrayList();
+   }
+ 
++  public List<TypeWriter> getTypeWriters() {
++    return unmodifiableList(typeWriters);
++  }
++
+   public JavaWriter addImport(Class<?> importedClass) {
+     explicitImports.add(ClassName.fromClass(importedClass));
+     return this;
+   }
+ 
+   public ClassWriter addClass(String simpleName) {
+-    Set<Modifier> modifiers = ImmutableSet.<Modifier>of();
+-    checkNotNull(modifiers);
+     checkNotNull(simpleName);
+-    checkArgument(!modifiers.contains(PROTECTED));
+-    checkArgument(!modifiers.contains(PRIVATE));
+-    checkArgument(!modifiers.contains(STATIC));
+-    checkNotNull(Optional.<Class<?>>absent());
+-    checkNotNull(ImmutableSet.<Class<?>>of());
+     ClassWriter classWriter = new ClassWriter(ClassName.create(packageName, simpleName));
+     typeWriters.add(classWriter);
+     return classWriter;
+@@ -152,8 +145,12 @@ public Appendable write(Appendable appendable) throws IOException {
+ 
+   public void file(Filer filer, Iterable<? extends Element> originatingElements)
+       throws IOException {
+-    JavaFileObject sourceFile = filer.createSourceFile(
+-        Iterables.getOnlyElement(typeWriters).name.canonicalName(),
++    file(filer, Iterables.getOnlyElement(typeWriters).name.canonicalName(), originatingElements);
++  }
++
++  public void file(Filer filer, CharSequence name,  Iterable<? extends Element> originatingElements)
++      throws IOException {
++    JavaFileObject sourceFile = filer.createSourceFile(name,
+         Iterables.toArray(originatingElements, Element.class));
+     Closer closer = Closer.create();
+     try {
+diff --git a/compiler/src/main/java/dagger/internal/codegen/writer/Modifiable.java b/compiler/src/main/java/dagger/internal/codegen/writer/Modifiable.java
+index f0e7ab804..0e9bab058 100644
+--- a/compiler/src/main/java/dagger/internal/codegen/writer/Modifiable.java
++++ b/compiler/src/main/java/dagger/internal/codegen/writer/Modifiable.java
+@@ -1,5 +1,6 @@
+ package dagger.internal.codegen.writer;
+ 
++import com.google.common.collect.Iterables;
+ import com.google.common.collect.Lists;
+ import dagger.internal.codegen.writer.Writable.Context;
+ import java.io.IOException;
+@@ -19,7 +20,11 @@
+   }
+ 
+   public void addModifiers(Modifier first, Modifier... rest) {
+-    this.modifiers.addAll(Lists.asList(first, rest));
++    addModifiers(Lists.asList(first, rest));
++  }
++
++  public void addModifiers(Iterable<Modifier> modifiers) {
++    Iterables.addAll(this.modifiers, modifiers);
+   }
+ 
+   public AnnotationWriter annotate(Class<? extends Annotation> annotation) {
+diff --git a/compiler/src/main/java/dagger/internal/codegen/writer/Snippet.java b/compiler/src/main/java/dagger/internal/codegen/writer/Snippet.java
+index cbd0af712..c7fc64470 100644
+--- a/compiler/src/main/java/dagger/internal/codegen/writer/Snippet.java
++++ b/compiler/src/main/java/dagger/internal/codegen/writer/Snippet.java
+@@ -1,9 +1,12 @@
+ package dagger.internal.codegen.writer;
+ 
+ import com.google.common.base.Function;
++import com.google.common.base.Joiner;
+ import com.google.common.collect.FluentIterable;
+ import com.google.common.collect.ImmutableSet;
++import com.google.common.collect.Iterables;
+ import java.io.IOException;
++import java.util.Collections;
+ import java.util.Iterator;
+ import java.util.List;
+ import java.util.Set;
+@@ -12,7 +15,7 @@
+   private final String value;
+   private final ImmutableSet<TypeName> types;
+ 
+-  Snippet(String value, ImmutableSet<TypeName> types) {
++  private Snippet(String value, ImmutableSet<TypeName> types) {
+     this.value = value;
+     this.types = types;
+   }
+@@ -64,8 +67,13 @@ public static Snippet format(String format, Object... args) {
+     return new Snippet(value, types.build());
+   }
+ 
+-  public static Snippet create(String value, Iterable<TypeName> types) {
+-    return new Snippet(value, ImmutableSet.copyOf(types));
++  public static Snippet format(String format, Iterable<? extends Object> args) {
++    return format(format, Iterables.toArray(args, Object.class));
++  }
++
++  public static Snippet memberSelectSnippet(Iterable<? extends Object> selectors) {
++    return format(Joiner.on('.').join(Collections.nCopies(Iterables.size(selectors), "%s")),
++        selectors);
+   }
+ 
+   public static Snippet makeParametersSnippet(List<Snippet> parameterSnippets) {
+@@ -82,6 +90,6 @@ public static Snippet makeParametersSnippet(List<Snippet> parameterSnippets) {
+       stringBuilder.append(", ").append(nextSnippet.value());
+       typesBuilder.addAll(nextSnippet.types());
+     }
+-    return Snippet.create(stringBuilder.toString(), typesBuilder.build());
++    return new Snippet(stringBuilder.toString(), ImmutableSet.copyOf(typesBuilder.build()));
+   }
+ }
+diff --git a/compiler/src/main/java/dagger/internal/codegen/writer/TypeWriter.java b/compiler/src/main/java/dagger/internal/codegen/writer/TypeWriter.java
+index 788c1b3b5..611a2aee3 100644
+--- a/compiler/src/main/java/dagger/internal/codegen/writer/TypeWriter.java
++++ b/compiler/src/main/java/dagger/internal/codegen/writer/TypeWriter.java
+@@ -23,7 +23,7 @@
+   }
+ 
+   @Override
+-  public TypeName name() {
++  public ClassName name() {
+     return name;
+   }
+ 
+diff --git a/compiler/src/test/java/dagger/internal/codegen/ComponentProcessorTest.java b/compiler/src/test/java/dagger/internal/codegen/ComponentProcessorTest.java
+index de78e852e..c3b0e963f 100644
+--- a/compiler/src/test/java/dagger/internal/codegen/ComponentProcessorTest.java
++++ b/compiler/src/test/java/dagger/internal/codegen/ComponentProcessorTest.java
+@@ -419,9 +419,9 @@
+         "@Generated(\"dagger.internal.codegen.ComponentProcessor\")",
+         "public final class Dagger_TestComponent implements TestComponent {",
+         "  private final TestModule testModule;",
+-        "  private final Provider<A> aProvider;",
+-        "  private final Provider<B> bProvider;",
+         "  private final Provider<C> cProvider;",
++        "  private final Provider<B> bProvider;",
++        "  private final Provider<A> aProvider;",
+         "",
+         "  private Dagger_TestComponent(Builder builder) {",
+         "    assert builder != null;",
+@@ -870,8 +870,8 @@
+         "@Generated(\"dagger.internal.codegen.ComponentProcessor\")",
+         "public final class Dagger_SimpleComponent implements SimpleComponent {",
+         "  private final Provider<SomeInjectableType> someInjectableTypeProvider;",
+-        "  private final Provider<SomeInjectedType> someInjectedTypeProvider;",
+         "  private final MembersInjector<SomeInjectedType> someInjectedTypeMembersInjector;",
++        "  private final Provider<SomeInjectedType> someInjectedTypeProvider;",
+         "",
+         "  private Dagger_SimpleComponent(Builder builder) {",
+         "    assert builder != null;",
+@@ -1195,9 +1195,9 @@
+         "",
+         "@Generated(\"dagger.internal.codegen.ComponentProcessor\")",
+         "public final class Dagger_TestComponent implements TestComponent {",
+-        "  private final Provider<A> aProvider;",
+-        "  private final Provider<B> bProvider;",
+         "  private final Provider<C> cProvider;",
++        "  private final Provider<B> bProvider;",
++        "  private final Provider<A> aProvider;",
+         "  private final Provider<X> xProvider;",
+         "",
+         "  private Dagger_TestComponent(Builder builder) {",
+diff --git a/compiler/src/test/java/dagger/internal/codegen/PackageProxyTest.java b/compiler/src/test/java/dagger/internal/codegen/PackageProxyTest.java
+new file mode 100644
+index 000000000..65915a093
+--- /dev/null
++++ b/compiler/src/test/java/dagger/internal/codegen/PackageProxyTest.java
+@@ -0,0 +1,95 @@
++package dagger.internal.codegen;
++
++import com.google.common.collect.ImmutableList;
++import com.google.testing.compile.JavaFileObjects;
++import javax.tools.JavaFileObject;
++import org.junit.Test;
++import org.junit.runner.RunWith;
++import org.junit.runners.JUnit4;
++
++import static com.google.common.truth.Truth.assert_;
++import static com.google.testing.compile.JavaSourcesSubjectFactory.javaSources;
++
++@RunWith(JUnit4.class)
++public class PackageProxyTest {
++  @Test public void testPackageProxy() {
++    JavaFileObject publicClassFile = JavaFileObjects.forSourceLines("foreign.PublicClass",
++        "package foreign;",
++        "",
++        "import javax.inject.Inject;",
++        "",
++        "public final class PublicClass {",
++        "  @Inject PublicClass(NonPublicClass dep) {}",
++        "}");
++    JavaFileObject nonPublicClassFile = JavaFileObjects.forSourceLines("foreign.NonPublicClass",
++        "package foreign;",
++        "",
++        "import javax.inject.Inject;",
++        "",
++        "final class NonPublicClass {",
++        "  @Inject NonPublicClass() {}",
++        "}");
++
++    JavaFileObject componentFile = JavaFileObjects.forSourceLines("test.TestComponent",
++        "package test;",
++        "",
++        "import dagger.Component;",
++        "",
++        "import foreign.PublicClass;",
++        "import javax.inject.Provider;",
++        "",
++        "@Component",
++        "interface TestComponent {",
++        "  PublicClass publicClass();",
++        "}");
++    JavaFileObject generatedComponent = JavaFileObjects.forSourceLines(
++        "test.Dagger_TestComponent",
++        "package test;",
++        "",
++        "import foreign.Dagger_TestComponent__PackageProxy;",
++        "import foreign.NonPublicClass$$Factory;",
++        "import foreign.PublicClass;",
++        "import foreign.PublicClass$$Factory;",
++        "import javax.annotation.Generated;",
++        "import javax.inject.Provider;",
++        "",
++        "@Generated(\"dagger.internal.codegen.ComponentProcessor\")",
++        "public final class Dagger_TestComponent implements TestComponent {",
++        "  private final Dagger_TestComponent__PackageProxy foreign_Proxy =",
++        "      new Dagger_TestComponent__PackageProxy();",
++        "  private final Provider<PublicClass> publicClassProvider;",
++        "",
++        "  private Dagger_TestComponent(Builder builder) {",
++        "    assert builder != null;",
++        "    this.foreign_Proxy.nonPublicClassProvider = new NonPublicClass$$Factory();",
++        "    this.publicClassProvider =",
++        "        new PublicClass$$Factory(foreign_Proxy.nonPublicClassProvider);",
++        "  }",
++        "",
++        "  public static Builder builder() {",
++        "    return new Builder();",
++        "  }",
++        "",
++        "  public static TestComponent create() {",
++        "    return builder().build();",
++        "  }",
++        "",
++        "  @Override public PublicClass publicClass() {",
++        "    return publicClassProvider.get();",
++        "  }",
++        "",
++        "  public static final class Builder {",
++        "    private Builder() {}",
++        "",
++        "    public TestComponent build() {",
++        "      return new Dagger_TestComponent(this);",
++        "    }",
++        "  }",
++        "}");
++    assert_().about(javaSources())
++        .that(ImmutableList.of(publicClassFile, nonPublicClassFile, componentFile))
++        .processedWith(new ComponentProcessor())
++        .compilesWithoutError()
++        .and().generatesSources(generatedComponent);
++  }
++}
+diff --git a/compiler/src/test/java/dagger/tests/integration/operation/PrimitiveInjectionTest.java b/compiler/src/test/java/dagger/tests/integration/operation/PrimitiveInjectionTest.java
+index 01207fd5b..a9af97fa1 100644
+--- a/compiler/src/test/java/dagger/tests/integration/operation/PrimitiveInjectionTest.java
++++ b/compiler/src/test/java/dagger/tests/integration/operation/PrimitiveInjectionTest.java
+@@ -77,8 +77,8 @@
+       "@Generated(\"dagger.internal.codegen.ComponentProcessor\")",
+       "public final class Dagger_PrimitiveComponent implements PrimitiveComponent {",
+       "  private final PrimitiveModule primitiveModule;",
+-      "  private final Provider<PrimitiveInjectable> primitiveInjectableProvider;",
+       "  private final Provider<Integer> primitiveIntProvider;",
++      "  private final Provider<PrimitiveInjectable> primitiveInjectableProvider;",
+       "",
+       "  private Dagger_PrimitiveComponent(Builder builder) {",
+       "    assert builder != null;",

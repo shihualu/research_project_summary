@@ -1,0 +1,1791 @@
+diff --git a/java/dagger/internal/codegen/BUILD b/java/dagger/internal/codegen/BUILD
+index 3aaf13d72..8a9f72cb9 100644
+--- a/java/dagger/internal/codegen/BUILD
++++ b/java/dagger/internal/codegen/BUILD
+@@ -121,6 +121,7 @@ java_library(
+         "BindingDeclaration.java",
+         "BindingFactory.java",
+         "BindingGraph.java",
++        "BindingNodeImpl.java",
+         "BindingType.java",
+         "BindingTypeMapper.java",
+         "BindingVariableNamer.java",  # needed by FrameworkField
+@@ -196,6 +197,7 @@ java_library(
+     name = "internal_validation",
+     srcs = [
+         "BindingGraphValidationModule.java",
++        "DuplicateBindingsValidation.java",
+         "InjectBindingValidation.java",
+         "MapMultibindingValidation.java",
+         "MembersInjectionBindingValidation.java",
+diff --git a/java/dagger/internal/codegen/BindingDeclarationFormatter.java b/java/dagger/internal/codegen/BindingDeclarationFormatter.java
+index 6acb4ed29..13a960c4e 100644
+--- a/java/dagger/internal/codegen/BindingDeclarationFormatter.java
++++ b/java/dagger/internal/codegen/BindingDeclarationFormatter.java
+@@ -32,6 +32,7 @@
+ import com.google.common.collect.Iterables;
+ import dagger.model.BindingKind;
+ import javax.inject.Inject;
++import javax.lang.model.element.Element;
+ import javax.lang.model.type.TypeKind;
+ import javax.lang.model.type.TypeMirror;
+ 
+@@ -85,42 +86,34 @@ public String format(BindingDeclaration bindingDeclaration) {
+       return formatSubcomponentDeclaration((SubcomponentDeclaration) bindingDeclaration);
+     }
+ 
+-    if (bindingDeclaration instanceof ContributionBinding) {
+-      ContributionBinding binding = (ContributionBinding) bindingDeclaration;
+-      switch (binding.kind()) {
+-        case RELEASABLE_REFERENCE_MANAGER:
+-          return String.format(
+-              "binding for %s from the scope declaration",
+-              stripCommonTypePrefixes(binding.key().toString()));
+-        case RELEASABLE_REFERENCE_MANAGERS:
+-          return String.format(
+-              "Dagger-generated binding for %s",
+-              stripCommonTypePrefixes(binding.key().toString()));
++    if (bindingDeclaration.bindingElement().isPresent()) {
++      Element bindingElement = bindingDeclaration.bindingElement().get();
++      switch (bindingElement.asType().getKind()) {
++        case EXECUTABLE:
++          return methodSignatureFormatter.format(
++              MoreElements.asExecutable(bindingElement),
++              bindingDeclaration
++                  .contributingModule()
++                  .map(module -> MoreTypes.asDeclared(module.asType())));
++
++        case DECLARED:
++          return stripCommonTypePrefixes(bindingElement.asType().toString());
++
+         default:
+-          break;
++          throw new IllegalArgumentException(
++              "Formatting unsupported for element: " + bindingElement);
+       }
+     }
+ 
+-    return bindingDeclaration
+-        .bindingElement()
+-        .map(
+-            bindingElement -> {
+-              switch (bindingElement.asType().getKind()) {
+-                case EXECUTABLE:
+-                  return methodSignatureFormatter.format(
+-                      MoreElements.asExecutable(bindingElement),
+-                      bindingDeclaration
+-                          .contributingModule()
+-                          .map(module -> MoreTypes.asDeclared(module.asType())));
+-                case DECLARED:
+-                  return stripCommonTypePrefixes(bindingElement.asType().toString());
+-                default:
+-                  throw new IllegalArgumentException(
+-                      "Formatting unsupported for element: " + bindingElement);
+-              }
+-            })
+-        // TODO(dpb): Give synthetic bindings a better string representation.
+-        .orElseGet(() -> "synthetic binding for " + bindingDeclaration.key());
++    if (isReleasableReferenceManagerBinding(bindingDeclaration)) {
++      return String.format(
++          "binding for %s from the scope declaration",
++          stripCommonTypePrefixes(bindingDeclaration.key().toString()));
++    }
++
++    return String.format(
++        "Dagger-generated binding for %s",
++        stripCommonTypePrefixes(bindingDeclaration.key().toString()));
+   }
+ 
+   private String formatSubcomponentDeclaration(SubcomponentDeclaration subcomponentDeclaration) {
+@@ -150,4 +143,9 @@ private String formatSubcomponentDeclaration(SubcomponentDeclaration subcomponen
+         annotationValue,
+         subcomponentDeclaration.contributingModule().get());
+   }
++
++  private boolean isReleasableReferenceManagerBinding(BindingDeclaration bindingDeclaration) {
++    return bindingDeclaration instanceof ContributionBinding
++        && ((ContributionBinding) bindingDeclaration).kind().equals(RELEASABLE_REFERENCE_MANAGER);
++  }
+ }
+diff --git a/java/dagger/internal/codegen/BindingGraphConverter.java b/java/dagger/internal/codegen/BindingGraphConverter.java
+index e827dbad3..f35b5ce7f 100644
+--- a/java/dagger/internal/codegen/BindingGraphConverter.java
++++ b/java/dagger/internal/codegen/BindingGraphConverter.java
+@@ -16,26 +16,25 @@
+ 
+ package dagger.internal.codegen;
+ 
+-import static dagger.internal.codegen.DaggerStreams.toImmutableSet;
++import static dagger.internal.codegen.DaggerStreams.instancesOf;
+ import static dagger.model.BindingGraphProxies.childFactoryMethodEdge;
+ import static dagger.model.BindingGraphProxies.componentNode;
+ import static dagger.model.BindingGraphProxies.dependencyEdge;
+ 
+-import com.google.common.collect.ImmutableList;
+ import com.google.common.collect.ImmutableSet;
++import com.google.common.collect.Iterables;
+ import com.google.common.graph.MutableNetwork;
+ import com.google.common.graph.NetworkBuilder;
+ import dagger.internal.codegen.ComponentDescriptor.ComponentMethodDescriptor;
+ import dagger.model.BindingGraph.BindingNode;
+ import dagger.model.BindingGraph.ComponentNode;
++import dagger.model.BindingGraph.DependencyEdge;
+ import dagger.model.BindingGraph.Edge;
+ import dagger.model.BindingGraph.MissingBindingNode;
+ import dagger.model.BindingGraph.Node;
+ import dagger.model.BindingGraphProxies;
+ import dagger.model.DependencyRequest;
+-import java.util.Collection;
+ import javax.inject.Inject;
+-import javax.lang.model.element.Element;
+ import javax.lang.model.element.ExecutableElement;
+ 
+ /** Converts {@link dagger.internal.codegen.BindingGraph}s to {@link dagger.model.BindingGraph}s. */
+@@ -83,11 +82,11 @@ protected void visitComponent(BindingGraph graph) {
+       network.addNode(currentComponent);
+ 
+       for (ComponentMethodDescriptor method : graph.componentDescriptor().entryPointMethods()) {
+-        addDependencyEdges(currentComponent, method.dependencyRequest().get(), graph);
++        addDependencyEdges(currentComponent, method.dependencyRequest().get());
+       }
+ 
+       for (ResolvedBindings resolvedBindings : graph.resolvedBindings()) {
+-        bindingNodes(resolvedBindings).forEach(node -> addBindingNode(node, graph));
++        bindingNodes(resolvedBindings).forEach(node -> addBindingNode(node));
+       }
+ 
+       super.visitComponent(graph);
+@@ -107,14 +106,12 @@ protected void visitSubcomponentFactoryMethod(
+      * Adds a {@link dagger.model.BindingGraph.DependencyEdge} from a node to the binding(s) that
+      * satisfy a dependency request.
+      */
+-    private void addDependencyEdges(
+-        Node source, DependencyRequest dependencyRequest, BindingGraph graph) {
+-      ResolvedBindings dependencies =
+-          graph.resolvedBindings(dependencyRequest.kind(), dependencyRequest.key());
++    private void addDependencyEdges(Node source, DependencyRequest dependencyRequest) {
++      ResolvedBindings dependencies = resolvedDependencies(source, dependencyRequest);
+       if (dependencies.isEmpty()) {
+         addDependencyEdge(source, dependencyRequest, missingBindingNode(dependencies));
+       } else {
+-        for (Node dependency : bindingNodes(dependencies)) {
++        for (BindingNode dependency : bindingNodes(dependencies)) {
+           addDependencyEdge(source, dependencyRequest, dependency);
+         }
+       }
+@@ -122,8 +119,36 @@ private void addDependencyEdges(
+ 
+     private void addDependencyEdge(
+         Node source, DependencyRequest dependencyRequest, Node dependency) {
+-      network.addEdge(
+-          source, dependency, dependencyEdge(dependencyRequest, source instanceof ComponentNode));
++      network.addNode(dependency);
++      if (!hasDependencyEdge(source, dependency, dependencyRequest)) {
++        network.addEdge(
++            source, dependency, dependencyEdge(dependencyRequest, source instanceof ComponentNode));
++      }
++    }
++
++    private boolean hasDependencyEdge(
++        Node source, Node dependency, DependencyRequest dependencyRequest) {
++      return network
++          .edgesConnecting(source, dependency)
++          .stream()
++          .flatMap(instancesOf(DependencyEdge.class))
++          .anyMatch(edge -> edge.dependencyRequest().equals(dependencyRequest));
++    }
++
++    private ResolvedBindings resolvedDependencies(
++        Node source, DependencyRequest dependencyRequest) {
++      return componentTreePath()
++          .pathFromRootToAncestor(source.componentPath().currentComponent())
++          .currentGraph()
++          .resolvedBindings(dependencyRequest.kind(), dependencyRequest.key());
++    }
++
++    /** Adds a binding node and edges for all its dependencies. */
++    private void addBindingNode(BindingNode node) {
++      network.addNode(node);
++      for (DependencyRequest dependencyRequest : node.binding().dependencies()) {
++        addDependencyEdges(node, dependencyRequest);
++      }
+     }
+ 
+     private ImmutableSet<BindingNode> bindingNodes(ResolvedBindings resolvedBindings) {
+@@ -140,38 +165,29 @@ private void addDependencyEdge(
+       return bindingNodes.build();
+     }
+ 
+-    /** Adds a binding node and edges for all its dependencies. */
+-    private void addBindingNode(BindingNode node, BindingGraph graph) {
+-      network.addNode(node);
+-      for (DependencyRequest dependencyRequest : node.binding().dependencies()) {
+-        addDependencyEdges(node, dependencyRequest, graph);
+-      }
+-    }
+-
+     private BindingNode bindingNode(
+         ResolvedBindings resolvedBindings, Binding binding, ComponentDescriptor owningComponent) {
+-      return BindingGraphProxies.bindingNode(
+-          componentTreePath().pathFromRootToAncestor(owningComponent).toComponentPath(),
++      return BindingNodeImpl.create(
++          componentTreePath()
++              .pathFromRootToAncestor(owningComponent.componentDefinitionType())
++              .toComponentPath(),
+           binding,
+           associatedDeclaringElements(resolvedBindings),
+           () -> bindingDeclarationFormatter.format(binding));
+     }
+ 
+-    private ImmutableSet<Element> associatedDeclaringElements(ResolvedBindings resolvedBindings) {
+-      return ImmutableList.of(
+-              resolvedBindings.multibindingDeclarations(),
+-              resolvedBindings.optionalBindingDeclarations(),
+-              resolvedBindings.subcomponentDeclarations())
+-          .stream()
+-          .flatMap(Collection::stream)
+-          .map(declaration -> declaration.bindingElement().get())
+-          .collect(toImmutableSet());
++    private Iterable<BindingDeclaration> associatedDeclaringElements(
++        ResolvedBindings resolvedBindings) {
++      return Iterables.concat(
++          resolvedBindings.multibindingDeclarations(),
++          resolvedBindings.optionalBindingDeclarations(),
++          resolvedBindings.subcomponentDeclarations());
+     }
+ 
+     private MissingBindingNode missingBindingNode(ResolvedBindings dependencies) {
+       return BindingGraphProxies.missingBindingNode(
+           componentTreePath()
+-              .pathFromRootToAncestor(dependencies.owningComponent())
++              .pathFromRootToAncestor(dependencies.owningComponent().componentDefinitionType())
+               .toComponentPath(),
+           dependencies.key());
+     }
+diff --git a/java/dagger/internal/codegen/BindingGraphValidationModule.java b/java/dagger/internal/codegen/BindingGraphValidationModule.java
+index fe8d26b1a..fc231522b 100644
+--- a/java/dagger/internal/codegen/BindingGraphValidationModule.java
++++ b/java/dagger/internal/codegen/BindingGraphValidationModule.java
+@@ -25,6 +25,11 @@
+ @Module
+ interface BindingGraphValidationModule {
+ 
++  @Binds
++  @IntoSet
++  @Validation
++  BindingGraphPlugin duplicateBindings(DuplicateBindingsValidation validation);
++
+   @Binds
+   @IntoSet
+   @Validation
+diff --git a/java/dagger/internal/codegen/BindingGraphValidator.java b/java/dagger/internal/codegen/BindingGraphValidator.java
+index aec303cd4..a9767df95 100644
+--- a/java/dagger/internal/codegen/BindingGraphValidator.java
++++ b/java/dagger/internal/codegen/BindingGraphValidator.java
+@@ -19,7 +19,6 @@
+ import static com.google.auto.common.MoreTypes.asDeclared;
+ import static com.google.auto.common.MoreTypes.asExecutable;
+ import static com.google.auto.common.MoreTypes.asTypeElements;
+-import static com.google.common.base.Verify.verify;
+ import static com.google.common.collect.Iterables.getOnlyElement;
+ import static dagger.internal.codegen.ComponentRequirement.Kind.BOUND_INSTANCE;
+ import static dagger.internal.codegen.ComponentRequirement.Kind.MODULE;
+@@ -30,9 +29,6 @@
+ import static dagger.internal.codegen.DiagnosticFormatting.stripCommonTypePrefixes;
+ import static dagger.internal.codegen.ErrorMessages.CONTAINS_DEPENDENCY_CYCLE_FORMAT;
+ import static dagger.internal.codegen.ErrorMessages.DEPENDS_ON_PRODUCTION_EXECUTOR_FORMAT;
+-import static dagger.internal.codegen.ErrorMessages.DUPLICATE_BINDINGS_FOR_KEY_FORMAT;
+-import static dagger.internal.codegen.ErrorMessages.DUPLICATE_SIZE_LIMIT;
+-import static dagger.internal.codegen.ErrorMessages.MULTIPLE_CONTRIBUTION_TYPES_FOR_KEY_FORMAT;
+ import static dagger.internal.codegen.ErrorMessages.abstractModuleHasInstanceBindingMethods;
+ import static dagger.internal.codegen.Formatter.INDENT;
+ import static dagger.internal.codegen.RequestKinds.extractKeyType;
+@@ -52,12 +48,8 @@
+ import com.google.auto.common.MoreTypes;
+ import com.google.common.base.Equivalence;
+ import com.google.common.collect.ImmutableList;
+-import com.google.common.collect.ImmutableListMultimap;
+ import com.google.common.collect.ImmutableSet;
+-import com.google.common.collect.ImmutableSetMultimap;
+-import com.google.common.collect.ImmutableSortedMap;
+ import com.google.common.collect.LinkedHashMultimap;
+-import com.google.common.collect.Multimaps;
+ import com.google.common.collect.SetMultimap;
+ import com.google.common.collect.Sets;
+ import dagger.BindsOptionalOf;
+@@ -67,21 +59,17 @@
+ import dagger.internal.codegen.ComponentDescriptor.BuilderSpec;
+ import dagger.internal.codegen.ComponentDescriptor.ComponentMethodDescriptor;
+ import dagger.internal.codegen.ComponentRequirement.NullPolicy;
+-import dagger.internal.codegen.ContributionType.HasContributionType;
+ import dagger.internal.codegen.ErrorMessages.ComponentBuilderMessages;
+-import dagger.model.BindingKind;
+ import dagger.model.DependencyRequest;
+ import dagger.model.Key;
+ import dagger.model.RequestKind;
+ import dagger.model.Scope;
+ import java.util.ArrayDeque;
+ import java.util.Deque;
+-import java.util.Formatter;
+ import java.util.LinkedHashMap;
+ import java.util.List;
+ import java.util.Map;
+ import java.util.Optional;
+-import java.util.Queue;
+ import java.util.Set;
+ import java.util.concurrent.atomic.AtomicBoolean;
+ import javax.inject.Inject;
+@@ -101,7 +89,6 @@
+   private final Elements elements;
+   private final DaggerTypes types;
+   private final CompilerOptions compilerOptions;
+-  private final BindingDeclarationFormatter bindingDeclarationFormatter;
+   private final MethodSignatureFormatter methodSignatureFormatter;
+   private final DependencyRequestFormatter dependencyRequestFormatter;
+   private final KeyFactory keyFactory;
+@@ -111,14 +98,12 @@
+       Elements elements,
+       DaggerTypes types,
+       CompilerOptions compilerOptions,
+-      BindingDeclarationFormatter bindingDeclarationFormatter,
+       MethodSignatureFormatter methodSignatureFormatter,
+       DependencyRequestFormatter dependencyRequestFormatter,
+       KeyFactory keyFactory) {
+     this.elements = elements;
+     this.types = types;
+     this.compilerOptions = compilerOptions;
+-    this.bindingDeclarationFormatter = bindingDeclarationFormatter;
+     this.methodSignatureFormatter = methodSignatureFormatter;
+     this.dependencyRequestFormatter = dependencyRequestFormatter;
+     this.keyFactory = keyFactory;
+@@ -566,14 +551,6 @@ protected void visitDependencyRequest(DependencyRequest dependencyRequest) {
+         }
+       }
+ 
+-      @Override
+-      protected void visitResolvedBindings(ResolvedBindings resolvedBindings) {
+-        if (resolvedBindings.bindings().size() > 1) {
+-          reportDuplicateBindings();
+-        }
+-        super.visitResolvedBindings(resolvedBindings);
+-      }
+-
+       @Override
+       protected void visitContributionBinding(
+           ContributionBinding binding, ComponentDescriptor owningComponent) {
+@@ -596,121 +573,12 @@ protected void visitContributionBinding(
+         super.visitContributionBinding(binding, owningComponent);
+       }
+ 
+-      /**
+-       * Returns the binding declarations that can be reported for {@code resolvedBindings}, indexed
+-       * by the component that owns each declaration.
+-       *
+-       * <p>Contains all {@link MultibindingDeclaration}s, {@link SubcomponentDeclaration}s, and
+-       * {@link OptionalBindingDeclaration}s within {@code resolvedBindings}, as well as all {@link
+-       * ContributionBinding}s with present {@linkplain BindingDeclaration#bindingElement() binding
+-       * elements}.
+-       *
+-       * <p>Includes {@link BindingKind#RELEASABLE_REFERENCE_MANAGER} or
+-       * {@link BindingKind#RELEASABLE_REFERENCE_MANAGERS} bindings, even
+-       * though they have no binding elements, because they will be reported via the declared
+-       * scopes.
+-       *
+-       * <p>For other bindings without binding elements, such as the {@link
+-       * ContributionBinding#isSyntheticMultibinding()}, includes the conflicting declarations in
+-       * their resolved dependencies.
+-       */
+-      private ImmutableSetMultimap<ComponentDescriptor, BindingDeclaration>
+-          reportableDeclarations() {
+-        ImmutableSetMultimap.Builder<ComponentDescriptor, BindingDeclaration> declarations =
+-            ImmutableSetMultimap.builder();
+-
+-        Queue<ResolvedBindings> queue = new ArrayDeque<>();
+-        queue.add(resolvedBindings());
+-
+-        while (!queue.isEmpty()) {
+-          ResolvedBindings queued = queue.remove();
+-          declarations
+-              .putAll(queued.owningComponent(), queued.multibindingDeclarations())
+-              .putAll(queued.owningComponent(), queued.subcomponentDeclarations())
+-              .putAll(queued.owningComponent(), queued.optionalBindingDeclarations());
+-          queued
+-              .allContributionBindings()
+-              .asMap()
+-              .forEach(
+-                  (owningComponent, bindings) -> {
+-                    BindingGraph owningGraph =
+-                        componentTreePath().graphForComponent(owningComponent);
+-                    for (ContributionBinding binding : bindings) {
+-                      if (bindingDeclarationFormatter.canFormat(binding)) {
+-                        declarations.put(owningComponent, binding);
+-                      } else {
+-                        queue.addAll(owningGraph.resolvedDependencies(binding));
+-                      }
+-                    }
+-                  });
+-        }
+-
+-        return declarations.build();
+-      }
+-
+       @SuppressWarnings("resource") // Appendable is a StringBuilder.
+       private void reportDependsOnProductionExecutor() {
+         reportErrorAtEntryPoint(
+             DEPENDS_ON_PRODUCTION_EXECUTOR_FORMAT, formatCurrentDependencyRequestKey());
+       }
+ 
+-      @SuppressWarnings("resource") // Appendable is a StringBuilder.
+-      private void reportDuplicateBindings() {
+-        // If any of the duplicate bindings results from multibinding contributions or declarations,
+-        // report the conflict using those contributions and declarations.
+-        if (resolvedBindings()
+-            .contributionBindings()
+-            .stream()
+-            // TODO(dpb): Kill with fire.
+-            .anyMatch(ContributionBinding::isSyntheticMultibinding)) {
+-          reportMultipleContributionTypes();
+-          return;
+-        }
+-        StringBuilder builder = new StringBuilder();
+-        new Formatter(builder)
+-            .format(DUPLICATE_BINDINGS_FOR_KEY_FORMAT, formatCurrentDependencyRequestKey());
+-        ImmutableSetMultimap<ComponentDescriptor, BindingDeclaration> duplicateDeclarations =
+-            reportableDeclarations();
+-        bindingDeclarationFormatter.formatIndentedList(
+-            builder, duplicateDeclarations.values(), 1, DUPLICATE_SIZE_LIMIT);
+-        reportErrorAtEntryPoint(
+-            componentTreePath().rootmostGraph(duplicateDeclarations.keySet()), builder.toString());
+-      }
+-
+-      @SuppressWarnings("resource") // Appendable is a StringBuilder.
+-      private void reportMultipleContributionTypes() {
+-        StringBuilder builder = new StringBuilder();
+-        new Formatter(builder)
+-            .format(
+-                MULTIPLE_CONTRIBUTION_TYPES_FOR_KEY_FORMAT, formatCurrentDependencyRequestKey());
+-        ImmutableSetMultimap<ComponentDescriptor, BindingDeclaration> duplicateDeclarations =
+-            reportableDeclarations();
+-        ImmutableListMultimap<ContributionType, BindingDeclaration> duplicateDeclarationsByType =
+-            Multimaps.index(
+-                duplicateDeclarations.values(),
+-                declaration ->
+-                    declaration instanceof HasContributionType
+-                        ? ((HasContributionType) declaration).contributionType()
+-                        : ContributionType.UNIQUE);
+-        verify(
+-            duplicateDeclarationsByType.keySet().size() > 1,
+-            "expected multiple contribution types for %s: %s",
+-            dependencyRequest().key(),
+-            duplicateDeclarationsByType);
+-        ImmutableSortedMap.copyOf(Multimaps.asMap(duplicateDeclarationsByType))
+-            .forEach(
+-                (contributionType, declarations) -> {
+-                  builder.append(INDENT);
+-                  builder.append(formatContributionType(contributionType));
+-                  builder.append(" bindings and declarations:");
+-                  bindingDeclarationFormatter.formatIndentedList(
+-                      builder, declarations, 2, DUPLICATE_SIZE_LIMIT);
+-                  builder.append('\n');
+-                });
+-        reportErrorAtEntryPoint(
+-            componentTreePath().rootmostGraph(duplicateDeclarations.keySet()), builder.toString());
+-      }
+-
+       // TODO(cgruber): Provide a hint for the start and end of the cycle.
+       private void reportDependencyCycle() {
+         if (!providersBreakingCycle().isEmpty()) {
+@@ -817,17 +685,4 @@ private void appendIndentedComponentsList(StringBuilder message, Iterable<TypeEl
+   private ImmutableSet<TypeElement> scopedTypesIn(Set<TypeElement> types) {
+     return types.stream().filter(type -> !scopesOf(type).isEmpty()).collect(toImmutableSet());
+   }
+-
+-  private String formatContributionType(ContributionType type) {
+-    switch (type) {
+-      case MAP:
+-        return "Map";
+-      case SET:
+-      case SET_VALUES:
+-        return "Set";
+-      case UNIQUE:
+-        return "Unique";
+-    }
+-    throw new AssertionError(type);
+-  }
+ }
+diff --git a/java/dagger/internal/codegen/BindingNodeImpl.java b/java/dagger/internal/codegen/BindingNodeImpl.java
+new file mode 100644
+index 000000000..3c2b32859
+--- /dev/null
++++ b/java/dagger/internal/codegen/BindingNodeImpl.java
+@@ -0,0 +1,67 @@
++/*
++ * Copyright (C) 2018 The Dagger Authors.
++ *
++ * Licensed under the Apache License, Version 2.0 (the "License");
++ * you may not use this file except in compliance with the License.
++ * You may obtain a copy of the License at
++ *
++ * http://www.apache.org/licenses/LICENSE-2.0
++ *
++ * Unless required by applicable law or agreed to in writing, software
++ * distributed under the License is distributed on an "AS IS" BASIS,
++ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++ * See the License for the specific language governing permissions and
++ * limitations under the License.
++ */
++
++package dagger.internal.codegen;
++
++import static com.google.common.base.Preconditions.checkNotNull;
++
++import com.google.auto.value.AutoValue;
++import com.google.common.collect.ImmutableSet;
++import dagger.BindsOptionalOf;
++import dagger.Module;
++import dagger.model.BindingGraph.BindingNode;
++import dagger.model.ComponentPath;
++import dagger.multibindings.Multibinds;
++import java.util.function.Supplier;
++import javax.lang.model.element.Element;
++
++/**
++ * An implementation of {@link BindingNode} that also exposes {@link BindingDeclaration}s associated
++ * with the binding.
++ */
++@AutoValue
++abstract class BindingNodeImpl implements BindingNode {
++  static BindingNode create(
++      ComponentPath component,
++      dagger.model.Binding binding,
++      Iterable<BindingDeclaration> associatedDeclarations,
++      Supplier<String> toStringFunction) {
++    BindingNodeImpl node =
++        new AutoValue_BindingNodeImpl(
++            component, binding, ImmutableSet.copyOf(associatedDeclarations));
++    node.toStringFunction = checkNotNull(toStringFunction);
++    return node;
++  }
++
++  private Supplier<String> toStringFunction;
++
++  /**
++   * The {@link Element}s (other than the binding's {@link dagger.model.Binding#bindingElement()})
++   * that are associated with the binding.
++   *
++   * <ul>
++   *   <li>{@linkplain BindsOptionalOf optional binding} declarations
++   *   <li>{@linkplain Module#subcomponents() module subcomponent} declarations
++   *   <li>{@linkplain Multibinds multibinding} declarations
++   * </ul>
++   */
++  abstract ImmutableSet<BindingDeclaration> associatedDeclarations();
++
++  @Override
++  public final String toString() {
++    return toStringFunction.get();
++  }
++}
+diff --git a/java/dagger/internal/codegen/ComponentTreeTraverser.java b/java/dagger/internal/codegen/ComponentTreeTraverser.java
+index 5a19a67be..778c651e9 100644
+--- a/java/dagger/internal/codegen/ComponentTreeTraverser.java
++++ b/java/dagger/internal/codegen/ComponentTreeTraverser.java
+@@ -616,19 +616,16 @@ public BindingGraph graphForComponent(ComponentDescriptor component) {
+      * Returns the subpath from the root component to the matching {@code ancestor} of the current
+      * component.
+      */
+-    ComponentTreePath pathFromRootToAncestor(ComponentDescriptor ancestor) {
+-      checkNotNull(ancestor);
++    ComponentTreePath pathFromRootToAncestor(TypeElement ancestor) {
+       ImmutableList.Builder<BindingGraph> path = ImmutableList.builder();
+       for (BindingGraph graph : graphsInPath()) {
+         path.add(graph);
+-        if (graph.componentDescriptor().equals(ancestor)) {
++        if (graph.componentDescriptor().componentDefinitionType().equals(ancestor)) {
+           return create(path.build());
+         }
+       }
+       throw new IllegalArgumentException(
+-          String.format(
+-              "%s is not in the current path: %s",
+-              ancestor.componentDefinitionType().getQualifiedName(), this));
++          String.format("%s is not in the current path: %s", ancestor.getQualifiedName(), this));
+     }
+ 
+     /**
+diff --git a/java/dagger/internal/codegen/DaggerStreams.java b/java/dagger/internal/codegen/DaggerStreams.java
+index 97072e3b6..83a4e30d1 100644
+--- a/java/dagger/internal/codegen/DaggerStreams.java
++++ b/java/dagger/internal/codegen/DaggerStreams.java
+@@ -22,6 +22,7 @@
+ import com.google.common.collect.ImmutableList;
+ import com.google.common.collect.ImmutableMap;
+ import com.google.common.collect.ImmutableSet;
++import com.google.common.collect.ImmutableSetMultimap;
+ import com.google.common.collect.Maps;
+ import java.util.Map;
+ import java.util.function.Function;
+@@ -36,6 +37,7 @@
+    * Returns a {@link Collector} that accumulates the input elements into a new {@link
+    * ImmutableList}, in encounter order.
+    */
++  // TODO(b/68008628): Use ImmutableList.toImmutableList().
+   public static <T> Collector<T, ?, ImmutableList<T>> toImmutableList() {
+     return collectingAndThen(toList(), ImmutableList::copyOf);
+   }
+@@ -44,6 +46,7 @@
+    * Returns a {@link Collector} that accumulates the input elements into a new {@link
+    * ImmutableSet}, in encounter order.
+    */
++  // TODO(b/68008628): Use ImmutableSet.toImmutableSet().
+   public static <T> Collector<T, ?, ImmutableSet<T>> toImmutableSet() {
+     return collectingAndThen(toList(), ImmutableSet::copyOf);
+   }
+@@ -53,6 +56,7 @@
+    * and values are the result of applying the provided mapping functions to the input elements.
+    * Entries appear in the result {@code ImmutableMap} in encounter order.
+    */
++  // TODO(b/68008628): Use ImmutableMap.toImmutableMap().
+   public static <T, K, V> Collector<T, ?, ImmutableMap<K, V>> toImmutableMap(
+       Function<? super T, K> keyMapper, Function<? super T, V> valueMapper) {
+     return Collectors.mapping(
+@@ -64,6 +68,24 @@
+             ImmutableMap.Builder::build));
+   }
+ 
++  /**
++   * Returns a {@link Collector} that accumulates elements into an {@code ImmutableSetMultimap}
++   * whose keys and values are the result of applying the provided mapping functions to the input
++   * elements. Entries appear in the result {@code ImmutableSetMultimap} in encounter order.
++   */
++  // TODO(b/68008628): Use ImmutableSetMultimap.toImmutableSetMultimap().
++  public static <T, K, V> Collector<T, ?, ImmutableSetMultimap<K, V>> toImmutableSetMultimap(
++      Function<? super T, ? extends K> keyMapper, Function<? super T, ? extends V> valueMapper) {
++    return Collectors.mapping(
++        value -> Maps.immutableEntry(keyMapper.apply(value), valueMapper.apply(value)),
++        Collector.of(
++            ImmutableSetMultimap::builder,
++            (ImmutableSetMultimap.Builder<K, V> builder, Map.Entry<K, V> entry) ->
++                builder.put(entry),
++            (left, right) -> left.putAll(right.build()),
++            ImmutableSetMultimap.Builder::build));
++  }
++
+   /**
+    * Returns a function from {@link Object} to {@code Stream<T>}, which returns a stream containing
+    * its input if its input is an instance of {@code T}.
+diff --git a/java/dagger/internal/codegen/DuplicateBindingsValidation.java b/java/dagger/internal/codegen/DuplicateBindingsValidation.java
+new file mode 100644
+index 000000000..6074d38fe
+--- /dev/null
++++ b/java/dagger/internal/codegen/DuplicateBindingsValidation.java
+@@ -0,0 +1,230 @@
++/*
++ * Copyright (C) 2018 The Dagger Authors.
++ *
++ * Licensed under the Apache License, Version 2.0 (the "License");
++ * you may not use this file except in compliance with the License.
++ * You may obtain a copy of the License at
++ *
++ * http://www.apache.org/licenses/LICENSE-2.0
++ *
++ * Unless required by applicable law or agreed to in writing, software
++ * distributed under the License is distributed on an "AS IS" BASIS,
++ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++ * See the License for the specific language governing permissions and
++ * limitations under the License.
++ */
++
++package dagger.internal.codegen;
++
++import static com.google.common.base.Verify.verify;
++import static com.google.common.collect.Iterables.getOnlyElement;
++import static dagger.internal.codegen.DaggerStreams.instancesOf;
++import static dagger.internal.codegen.DaggerStreams.toImmutableSet;
++import static dagger.internal.codegen.DaggerStreams.toImmutableSetMultimap;
++import static dagger.internal.codegen.DuplicateBindingsValidation.SourceAndRequest.indexEdgesBySourceAndRequest;
++import static dagger.internal.codegen.ErrorMessages.DUPLICATE_SIZE_LIMIT;
++import static dagger.internal.codegen.Formatter.INDENT;
++import static dagger.internal.codegen.Optionals.emptiesLast;
++import static java.util.Comparator.comparing;
++import static javax.tools.Diagnostic.Kind.ERROR;
++
++import com.google.auto.value.AutoValue;
++import com.google.common.collect.ImmutableList;
++import com.google.common.collect.ImmutableSet;
++import com.google.common.collect.ImmutableSetMultimap;
++import com.google.common.collect.Iterables;
++import com.google.common.collect.Multimaps;
++import com.google.common.collect.Sets;
++import dagger.model.BindingGraph;
++import dagger.model.BindingGraph.BindingNode;
++import dagger.model.BindingGraph.DependencyEdge;
++import dagger.model.BindingGraph.Node;
++import dagger.model.DependencyRequest;
++import dagger.spi.BindingGraphPlugin;
++import dagger.spi.DiagnosticReporter;
++import java.util.Comparator;
++import java.util.Set;
++import javax.inject.Inject;
++import javax.lang.model.element.Element;
++import javax.lang.model.element.TypeElement;
++
++/** Reports errors for conflicting bindings with the same key. */
++final class DuplicateBindingsValidation implements BindingGraphPlugin {
++
++  // 1. contributing module or enclosing type
++  // 2. binding element's simple name
++  // 3. binding element's type
++  private static final Comparator<BindingDeclaration> BINDING_DECLARATION_COMPARATOR =
++      comparing(
++              (BindingDeclaration declaration) ->
++                  declaration.contributingModule().isPresent()
++                      ? declaration.contributingModule()
++                      : declaration.bindingTypeElement(),
++              emptiesLast(comparing((TypeElement type) -> type.getQualifiedName().toString())))
++          .thenComparing(
++              (BindingDeclaration declaration) -> declaration.bindingElement(),
++              emptiesLast(
++                  comparing((Element element) -> element.getSimpleName().toString())
++                      .thenComparing((Element element) -> element.asType().toString())));
++
++  private final BindingDeclarationFormatter bindingDeclarationFormatter;
++
++  @Inject
++  DuplicateBindingsValidation(BindingDeclarationFormatter bindingDeclarationFormatter) {
++    this.bindingDeclarationFormatter = bindingDeclarationFormatter;
++  }
++
++  @Override
++  public String pluginName() {
++    return "Dagger/DuplicateBindings";
++  }
++
++  @Override
++  public void visitGraph(BindingGraph bindingGraph, DiagnosticReporter diagnosticReporter) {
++    Multimaps.asMap(indexEdgesBySourceAndRequest(bindingGraph))
++        .forEach(
++            (sourceAndRequest, dependencyEdges) -> {
++              if (dependencyEdges.size() > 1) {
++                reportDuplicateBindings(
++                    sourceAndRequest.request(), dependencyEdges, bindingGraph, diagnosticReporter);
++              }
++            });
++  }
++
++  private void reportDuplicateBindings(
++      DependencyRequest dependencyRequest,
++      Set<DependencyEdge> duplicateDependencies,
++      BindingGraph bindingGraph,
++      DiagnosticReporter diagnosticReporter) {
++    ImmutableSet<BindingNode> duplicateBindings =
++        duplicateDependencies
++            .stream()
++            .map(edge -> bindingGraph.incidentNodes(edge).target())
++            .flatMap(instancesOf(BindingNode.class))
++            .collect(toImmutableSet());
++    diagnosticReporter.reportDependency(
++        ERROR,
++        Iterables.get(duplicateDependencies, 0),
++        Iterables.any(duplicateBindings, node -> node.binding().kind().isMultibinding())
++            ? incompatibleBindingsMessage(dependencyRequest, duplicateBindings, bindingGraph)
++            : duplicateBindingMessage(dependencyRequest, duplicateBindings, bindingGraph));
++  }
++
++  private String duplicateBindingMessage(
++      DependencyRequest dependencyRequest,
++      ImmutableSet<BindingNode> duplicateBindings,
++      BindingGraph graph) {
++    StringBuilder message =
++        new StringBuilder().append(dependencyRequest.key()).append(" is bound multiple times:");
++    formatDeclarations(message, 1, declarations(graph, duplicateBindings));
++    return message.toString();
++  }
++
++  private String incompatibleBindingsMessage(
++      DependencyRequest dependencyRequest,
++      ImmutableSet<BindingNode> duplicateBindings,
++      BindingGraph graph) {
++    ImmutableSet<BindingNode> multibindings =
++        duplicateBindings
++            .stream()
++            .filter(node -> node.binding().kind().isMultibinding())
++            .collect(toImmutableSet());
++    verify(
++        multibindings.size() == 1,
++        "expected only one multibinding for %s: %s",
++        dependencyRequest,
++        multibindings);
++    StringBuilder message = new StringBuilder();
++    java.util.Formatter messageFormatter = new java.util.Formatter(message);
++    messageFormatter.format(
++        "%s has incompatible bindings or declarations:\n", dependencyRequest.key());
++    message.append(INDENT);
++    BindingNode multibinding = getOnlyElement(multibindings);
++    messageFormatter.format("%s bindings and declarations:", multibindingTypeString(multibinding));
++    formatDeclarations(message, 2, declarations(graph, multibindings));
++
++    Set<BindingNode> uniqueBindings =
++        Sets.filter(duplicateBindings, binding -> !binding.equals(multibinding));
++    message.append(INDENT).append("Unique bindings and declarations:");
++    formatDeclarations(
++        message,
++        2,
++        Sets.filter(
++            declarations(graph, uniqueBindings),
++            declaration -> !(declaration instanceof MultibindingDeclaration)));
++    return message.toString();
++  }
++
++  private void formatDeclarations(
++      StringBuilder builder,
++      int indentLevel,
++      Iterable<? extends BindingDeclaration> bindingDeclarations) {
++    bindingDeclarationFormatter.formatIndentedList(
++        builder, ImmutableList.copyOf(bindingDeclarations), indentLevel, DUPLICATE_SIZE_LIMIT);
++    builder.append('\n');
++  }
++
++  private ImmutableSet<BindingDeclaration> declarations(
++      BindingGraph graph, Set<BindingNode> bindings) {
++    return bindings
++        .stream()
++        .flatMap(node -> declarations(graph, node).stream())
++        .distinct()
++        .sorted(BINDING_DECLARATION_COMPARATOR)
++        .collect(toImmutableSet());
++  }
++
++  private ImmutableSet<BindingDeclaration> declarations(BindingGraph graph, BindingNode node) {
++    ImmutableSet.Builder<BindingDeclaration> declarations = ImmutableSet.builder();
++    ((BindingNodeImpl) node).associatedDeclarations().forEach(declarations::add);
++    if (node.binding() instanceof BindingDeclaration) {
++      BindingDeclaration declaration = ((BindingDeclaration) node.binding());
++      if (bindingDeclarationFormatter.canFormat(declaration)) {
++        declarations.add(declaration);
++      } else {
++        graph
++            .successors(node)
++            .stream()
++            .flatMap(instancesOf(BindingNode.class))
++            .flatMap(dependency -> declarations(graph, dependency).stream())
++            .forEach(declarations::add);
++      }
++    }
++    return declarations.build();
++  }
++
++  private String multibindingTypeString(BindingNode multibinding) {
++    switch (multibinding.binding().kind()) {
++      case MULTIBOUND_MAP:
++        return "Map";
++      case MULTIBOUND_SET:
++        return "Set";
++      default:
++        throw new AssertionError(multibinding);
++    }
++  }
++
++  @AutoValue
++  abstract static class SourceAndRequest {
++
++    abstract Node source();
++
++    abstract DependencyRequest request();
++
++    static ImmutableSetMultimap<SourceAndRequest, DependencyEdge> indexEdgesBySourceAndRequest(
++        BindingGraph bindingGraph) {
++      return bindingGraph
++          .dependencyEdges()
++          .stream()
++          .collect(
++              toImmutableSetMultimap(
++                  edge ->
++                      create(bindingGraph.incidentNodes(edge).source(), edge.dependencyRequest()),
++                  edge -> edge));
++    }
++
++    static SourceAndRequest create(Node source, DependencyRequest request) {
++      return new AutoValue_DuplicateBindingsValidation_SourceAndRequest(source, request);
++    }
++  }
++}
+diff --git a/java/dagger/internal/codegen/ErrorMessages.java b/java/dagger/internal/codegen/ErrorMessages.java
+index b14beb8a0..742349cde 100644
+--- a/java/dagger/internal/codegen/ErrorMessages.java
++++ b/java/dagger/internal/codegen/ErrorMessages.java
+@@ -109,9 +109,6 @@
+    * These are errors that relate specifically to the Dagger configuration API (@Module, @Provides,
+    * etc.)
+    */
+-  static final String DUPLICATE_BINDINGS_FOR_KEY_FORMAT =
+-      "%s is bound multiple times:";
+-
+   static final String COMPONENT_ANNOTATED_REUSABLE =
+       "@Reusable cannot be applied to components or subcomponents.";
+ 
+@@ -134,9 +131,6 @@
+   static final String BINDING_METHOD_SET_VALUES_RAW_SET =
+       "@%s methods of type set values cannot return a raw Set";
+ 
+-  static final String BINDS_ELEMENTS_INTO_SET_METHOD_RAW_SET_PARAMETER =
+-      "@Binds @ElementsIntoSet methods cannot take a raw Set parameter";
+-
+   static final String BINDING_METHOD_SET_VALUES_RETURN_SET =
+       "@%s methods of type set values must return a Set";
+ 
+@@ -218,9 +212,8 @@
+   static final String BINDING_METHOD_MULTIPLE_QUALIFIERS =
+       "Cannot use more than one @Qualifier";
+ 
+-  /* mapKey errors*/
+-  static final String MAPKEY_WITHOUT_MEMBERS =
+-      "Map key annotations must have members";
++  /* mapKey errors */
++  static final String MAPKEY_WITHOUT_MEMBERS = "Map key annotations must have members";
+ 
+   static final String UNWRAPPED_MAP_KEY_WITH_TOO_MANY_MEMBERS=
+       "Map key annotations with unwrapped values must have exactly one member";
+@@ -228,10 +221,7 @@
+   static final String UNWRAPPED_MAP_KEY_WITH_ARRAY_MEMBER =
+       "Map key annotations with unwrapped values cannot use arrays";
+ 
+-  /* collection binding errors */
+-  static final String MULTIPLE_CONTRIBUTION_TYPES_FOR_KEY_FORMAT =
+-      "%s has incompatible bindings or declarations:\n";
+-
++  /* producer errors */
+   static final String DEPENDS_ON_PRODUCTION_EXECUTOR_FORMAT =
+       "%s may not depend on the production executor.";
+ 
+diff --git a/java/dagger/internal/codegen/Optionals.java b/java/dagger/internal/codegen/Optionals.java
+index e74be14e4..f8963db36 100644
+--- a/java/dagger/internal/codegen/Optionals.java
++++ b/java/dagger/internal/codegen/Optionals.java
+@@ -16,6 +16,7 @@
+ 
+ package dagger.internal.codegen;
+ 
++import static com.google.common.base.Preconditions.checkNotNull;
+ import static com.google.common.collect.Lists.asList;
+ 
+ import java.util.Comparator;
+@@ -32,6 +33,11 @@
+         .thenComparing(Optional::get);
+   }
+ 
++  static <T> Comparator<Optional<T>> emptiesLast(Comparator<? super T> valueComparator) {
++    checkNotNull(valueComparator);
++    return Comparator.comparing(o -> o.orElse(null), Comparator.nullsLast(valueComparator));
++  }
++
+   /** Returns the first argument that is present, or empty if none are. */
+   @SafeVarargs
+   static <T> Optional<T> firstPresent(Optional<T> first, Optional<T> second, Optional<T>... rest) {
+diff --git a/java/dagger/model/BindingGraph.java b/java/dagger/model/BindingGraph.java
+index 2468f5403..f37cfc760 100644
+--- a/java/dagger/model/BindingGraph.java
++++ b/java/dagger/model/BindingGraph.java
+@@ -17,7 +17,6 @@
+ package dagger.model;
+ 
+ import static com.google.common.base.MoreObjects.toStringHelper;
+-import static com.google.common.base.Preconditions.checkNotNull;
+ import static com.google.common.collect.Sets.intersection;
+ import static com.google.common.graph.Graphs.inducedSubgraph;
+ import static com.google.common.graph.Graphs.reachableNodes;
+@@ -31,15 +30,11 @@
+ import com.google.common.collect.ImmutableSet;
+ import com.google.common.graph.ImmutableNetwork;
+ import com.google.common.graph.Network;
+-import dagger.BindsOptionalOf;
+ import dagger.Module;
+ import dagger.model.BindingGraph.Edge;
+ import dagger.model.BindingGraph.Node;
+-import dagger.multibindings.Multibinds;
+ import java.util.Optional;
+-import java.util.function.Supplier;
+ import java.util.stream.Stream;
+-import javax.lang.model.element.Element;
+ import javax.lang.model.element.ExecutableElement;
+ import javax.lang.model.element.TypeElement;
+ 
+@@ -303,45 +298,14 @@ public String toString() {
+    * A <b>binding node</b> in the binding graph. If a binding is owned by more than one component,
+    * there is one binding node for that binding for every owning component.
+    */
+-  @AutoValue
+-  public abstract static class BindingNode implements Node {
+-    static BindingNode create(
+-        ComponentPath component,
+-        Binding binding,
+-        Iterable<Element> associatedDeclarations,
+-        Supplier<String> toStringFunction) {
+-      BindingNode bindingNode =
+-          new AutoValue_BindingGraph_BindingNode(
+-              component, binding, ImmutableSet.copyOf(associatedDeclarations));
+-      bindingNode.toStringFunction = checkNotNull(toStringFunction);
+-      return bindingNode;
+-    }
+-
+-    private Supplier<String> toStringFunction;
++  public interface BindingNode extends Node {
+ 
+     /** The component that owns the {@link #binding()}. */
+     @Override
+-    public abstract ComponentPath componentPath();
++    ComponentPath componentPath();
+ 
+     /** The binding. */
+-    public abstract Binding binding();
+-
+-    /**
+-     * The {@link Element}s (other than the binding's {@link Binding#bindingElement()}) that are
+-     * associated with the binding.
+-     *
+-     * <ul>
+-     *   <li>{@linkplain BindsOptionalOf optional binding} declarations
+-     *   <li>{@linkplain Module#subcomponents() module subcomponent} declarations
+-     *   <li>{@linkplain Multibinds multibinding} declarations
+-     * </ul>
+-     */
+-    public abstract ImmutableSet<Element> associatedDeclarations();
+-
+-    @Override
+-    public String toString() {
+-      return toStringFunction.get();
+-    }
++    Binding binding();
+   }
+ 
+   /** A node in the binding graph that represents a missing binding for a key in a component. */
+diff --git a/java/dagger/model/BindingGraphProxies.java b/java/dagger/model/BindingGraphProxies.java
+index 1c444c67a..a5e24ff3e 100644
+--- a/java/dagger/model/BindingGraphProxies.java
++++ b/java/dagger/model/BindingGraphProxies.java
+@@ -18,7 +18,6 @@
+ 
+ import com.google.common.collect.ImmutableSet;
+ import com.google.common.graph.Network;
+-import dagger.model.BindingGraph.BindingNode;
+ import dagger.model.BindingGraph.ChildFactoryMethodEdge;
+ import dagger.model.BindingGraph.ComponentNode;
+ import dagger.model.BindingGraph.DependencyEdge;
+@@ -26,8 +25,6 @@
+ import dagger.model.BindingGraph.MissingBindingNode;
+ import dagger.model.BindingGraph.Node;
+ import dagger.model.BindingGraph.SubcomponentBuilderBindingEdge;
+-import java.util.function.Supplier;
+-import javax.lang.model.element.Element;
+ import javax.lang.model.element.ExecutableElement;
+ import javax.lang.model.element.TypeElement;
+ 
+@@ -42,15 +39,6 @@ public static BindingGraph bindingGraph(Network<Node, Edge> network) {
+     return new BindingGraph(network);
+   }
+ 
+-  /** Creates a new {@link BindingNode}. */
+-  public static BindingNode bindingNode(
+-      ComponentPath component,
+-      Binding binding,
+-      Iterable<Element> associatedDeclarations,
+-      Supplier<String> toStringFunction) {
+-    return BindingNode.create(component, binding, associatedDeclarations, toStringFunction);
+-  }
+-
+   /** Creates a new {@link MissingBindingNode}. */
+   public static MissingBindingNode missingBindingNode(ComponentPath component, Key key) {
+     return MissingBindingNode.create(component, key);
+diff --git a/java/dagger/model/BindingKind.java b/java/dagger/model/BindingKind.java
+index 6bcdb575d..3ea2f9c93 100644
+--- a/java/dagger/model/BindingKind.java
++++ b/java/dagger/model/BindingKind.java
+@@ -106,4 +106,19 @@
+   /** A binding for a members injection method on a component. */
+   MEMBERS_INJECTION,
+   ;
++
++  /**
++   * Returns {@code true} if this is a kind of multibinding (not a contribution to a multibinding,
++   * but the multibinding itself).
++   */
++  public boolean isMultibinding() {
++    switch (this) {
++      case MULTIBOUND_MAP:
++      case MULTIBOUND_SET:
++        return true;
++
++      default:
++        return false;
++    }
++  }
+ }
+diff --git a/javatests/dagger/internal/codegen/GraphValidationTest.java b/javatests/dagger/internal/codegen/GraphValidationTest.java
+index 6883cb3b8..1d0d0c110 100644
+--- a/javatests/dagger/internal/codegen/GraphValidationTest.java
++++ b/javatests/dagger/internal/codegen/GraphValidationTest.java
+@@ -943,9 +943,11 @@ public void missingBindingWithSameKeyAsMembersInjectionMethod() {
+         "  }",
+         "}");
+ 
+-    String expectedError = "test.Outer.A is bound multiple times:\n"
+-        + "      test.Outer.A test.Outer.Parent.getA()\n"
+-        + "      @Provides test.Outer.A test.Outer.AModule.provideA(String)";
++    String expectedError =
++        error(
++            "test.Outer.A is bound multiple times:",
++            "@Provides test.Outer.A test.Outer.AModule.provideA(String)",
++            "test.Outer.A test.Outer.Parent.getA()");
+ 
+     assertAbout(javaSource()).that(component)
+         .processedWith(new ComponentProcessor())
+@@ -1101,27 +1103,29 @@ public void duplicateExplicitBindings_ProvidesVsBinds() {
+         "}");
+ 
+     String expectedSetError =
+-        "java.util.Set<java.lang.String> has incompatible bindings or declarations:\n"
+-            + "      Set bindings and declarations:\n"
+-            + "          @Provides @dagger.multibindings.IntoSet String "
+-            + "test.Outer.TestModule1.stringSetElement()\n"
+-            + "          @Binds @dagger.multibindings.IntoSet String "
+-            + "test.Outer.TestModule1.bindStringSetElement(@test.Outer.SomeQualifier String)\n"
+-            + "      Unique bindings and declarations:\n"
+-            + "          @Provides Set<String> test.Outer.TestModule2.stringSet()";
++        error(
++            "java.util.Set<java.lang.String> has incompatible bindings or declarations:",
++            "Set bindings and declarations:",
++            "    @Binds @dagger.multibindings.IntoSet String "
++                + "test.Outer.TestModule1.bindStringSetElement(@test.Outer.SomeQualifier String)",
++            "    @Provides @dagger.multibindings.IntoSet String "
++                + "test.Outer.TestModule1.stringSetElement()",
++            "Unique bindings and declarations:",
++            "    @Provides Set<String> test.Outer.TestModule2.stringSet()");
+ 
+     String expectedMapError =
+-        "java.util.Map<java.lang.String,java.lang.String> has incompatible bindings "
+-            + "or declarations:\n"
+-            + "      Map bindings and declarations:\n"
+-            + "          @Provides @dagger.multibindings.IntoMap "
+-            + "@test.Outer.StringKey(\"foo\") String"
+-            + " test.Outer.TestModule1.stringMapEntry()\n"
+-            + "          @Binds @dagger.multibindings.IntoMap "
+-            + "@test.Outer.StringKey(\"bar\") String"
+-            + " test.Outer.TestModule1.bindStringMapEntry(@test.Outer.SomeQualifier String)\n"
+-            + "      Unique bindings and declarations:\n"
+-            + "          @Provides Map<String,String> test.Outer.TestModule2.stringMap()";
++        error(
++            "java.util.Map<java.lang.String,java.lang.String> has incompatible bindings "
++                + "or declarations:",
++            "Map bindings and declarations:",
++            "    @Binds @dagger.multibindings.IntoMap "
++                + "@test.Outer.StringKey(\"bar\") String"
++                + " test.Outer.TestModule1.bindStringMapEntry(@test.Outer.SomeQualifier String)",
++            "    @Provides @dagger.multibindings.IntoMap "
++                + "@test.Outer.StringKey(\"foo\") String"
++                + " test.Outer.TestModule1.stringMapEntry()",
++            "Unique bindings and declarations:",
++            "    @Provides Map<String,String> test.Outer.TestModule2.stringMap()");
+ 
+     assertAbout(javaSource())
+         .that(component)
+@@ -1208,113 +1212,117 @@ public void duplicateExplicitBindings_UniqueBindingAndMultibindingDeclaration()
+   }
+ 
+   @Test public void duplicateBindings_TruncateAfterLimit() {
+-    JavaFileObject component = JavaFileObjects.forSourceLines("test.Outer",
+-        "package test;",
+-        "",
+-        "import dagger.Component;",
+-        "import dagger.Module;",
+-        "import dagger.Provides;",
+-        "import javax.inject.Inject;",
+-        "",
+-        "final class Outer {",
+-        "  interface A {}",
+-        "",
+-        "  @Module",
+-        "  static class Module1 {",
+-        "    @Provides A provideA() { return new A() {}; }",
+-        "  }",
+-        "",
+-        "  @Module",
+-        "  static class Module2 {",
+-        "    @Provides A provideA() { return new A() {}; }",
+-        "  }",
+-        "",
+-        "  @Module",
+-        "  static class Module3 {",
+-        "    @Provides A provideA() { return new A() {}; }",
+-        "  }",
+-        "",
+-        "  @Module",
+-        "  static class Module4 {",
+-        "    @Provides A provideA() { return new A() {}; }",
+-        "  }",
+-        "",
+-        "  @Module",
+-        "  static class Module5 {",
+-        "    @Provides A provideA() { return new A() {}; }",
+-        "  }",
+-        "",
+-        "  @Module",
+-        "  static class Module6 {",
+-        "    @Provides A provideA() { return new A() {}; }",
+-        "  }",
+-        "",
+-        "  @Module",
+-        "  static class Module7 {",
+-        "    @Provides A provideA() { return new A() {}; }",
+-        "  }",
+-        "",
+-        "  @Module",
+-        "  static class Module8 {",
+-        "    @Provides A provideA() { return new A() {}; }",
+-        "  }",
+-        "",
+-        "  @Module",
+-        "  static class Module9 {",
+-        "    @Provides A provideA() { return new A() {}; }",
+-        "  }",
+-        "",
+-        "  @Module",
+-        "  static class Module10 {",
+-        "    @Provides A provideA() { return new A() {}; }",
+-        "  }",
+-        "",
+-        "  @Module",
+-        "  static class Module11 {",
+-        "    @Provides A provideA() { return new A() {}; }",
+-        "  }",
+-        "",
+-        "  @Module",
+-        "  static class Module12 {",
+-        "    @Provides A provideA() { return new A() {}; }",
+-        "  }",
+-        "",
+-        "  @Component(modules = {",
+-        "    Module1.class,",
+-        "    Module2.class,",
+-        "    Module3.class,",
+-        "    Module4.class,",
+-        "    Module5.class,",
+-        "    Module6.class,",
+-        "    Module7.class,",
+-        "    Module8.class,",
+-        "    Module9.class,",
+-        "    Module10.class,",
+-        "    Module11.class,",
+-        "    Module12.class",
+-        "  })",
+-        "  interface TestComponent {",
+-        "    A getA();",
+-        "  }",
+-        "}");
+-
+-    String expectedError = "test.Outer.A is bound multiple times:\n"
+-        + "      @Provides test.Outer.A test.Outer.Module1.provideA()\n"
+-        + "      @Provides test.Outer.A test.Outer.Module2.provideA()\n"
+-        + "      @Provides test.Outer.A test.Outer.Module3.provideA()\n"
+-        + "      @Provides test.Outer.A test.Outer.Module4.provideA()\n"
+-        + "      @Provides test.Outer.A test.Outer.Module5.provideA()\n"
+-        + "      @Provides test.Outer.A test.Outer.Module6.provideA()\n"
+-        + "      @Provides test.Outer.A test.Outer.Module7.provideA()\n"
+-        + "      @Provides test.Outer.A test.Outer.Module8.provideA()\n"
+-        + "      @Provides test.Outer.A test.Outer.Module9.provideA()\n"
+-        + "      @Provides test.Outer.A test.Outer.Module10.provideA()\n"
+-        + "      and 2 others";
++    JavaFileObject component =
++        JavaFileObjects.forSourceLines(
++            "test.Outer",
++            "package test;",
++            "",
++            "import dagger.Component;",
++            "import dagger.Module;",
++            "import dagger.Provides;",
++            "import javax.inject.Inject;",
++            "",
++            "final class Outer {",
++            "  interface A {}",
++            "",
++            "  @Module",
++            "  static class Module01 {",
++            "    @Provides A provideA() { return new A() {}; }",
++            "  }",
++            "",
++            "  @Module",
++            "  static class Module02 {",
++            "    @Provides A provideA() { return new A() {}; }",
++            "  }",
++            "",
++            "  @Module",
++            "  static class Module03 {",
++            "    @Provides A provideA() { return new A() {}; }",
++            "  }",
++            "",
++            "  @Module",
++            "  static class Module04 {",
++            "    @Provides A provideA() { return new A() {}; }",
++            "  }",
++            "",
++            "  @Module",
++            "  static class Module05 {",
++            "    @Provides A provideA() { return new A() {}; }",
++            "  }",
++            "",
++            "  @Module",
++            "  static class Module06 {",
++            "    @Provides A provideA() { return new A() {}; }",
++            "  }",
++            "",
++            "  @Module",
++            "  static class Module07 {",
++            "    @Provides A provideA() { return new A() {}; }",
++            "  }",
++            "",
++            "  @Module",
++            "  static class Module08 {",
++            "    @Provides A provideA() { return new A() {}; }",
++            "  }",
++            "",
++            "  @Module",
++            "  static class Module09 {",
++            "    @Provides A provideA() { return new A() {}; }",
++            "  }",
++            "",
++            "  @Module",
++            "  static class Module10 {",
++            "    @Provides A provideA() { return new A() {}; }",
++            "  }",
++            "",
++            "  @Module",
++            "  static class Module11 {",
++            "    @Provides A provideA() { return new A() {}; }",
++            "  }",
++            "",
++            "  @Module",
++            "  static class Module12 {",
++            "    @Provides A provideA() { return new A() {}; }",
++            "  }",
++            "",
++            "  @Component(modules = {",
++            "    Module01.class,",
++            "    Module02.class,",
++            "    Module03.class,",
++            "    Module04.class,",
++            "    Module05.class,",
++            "    Module06.class,",
++            "    Module07.class,",
++            "    Module08.class,",
++            "    Module09.class,",
++            "    Module10.class,",
++            "    Module11.class,",
++            "    Module12.class",
++            "  })",
++            "  interface TestComponent {",
++            "    A getA();",
++            "  }",
++            "}");
+ 
+-    assertAbout(javaSource()).that(component)
+-        .processedWith(new ComponentProcessor())
+-        .failsToCompile()
+-        .withErrorContaining(expectedError).in(component).onLine(86);
++    Compilation compilation = daggerCompiler().compile(component);
++    assertThat(compilation).failed();
++    assertThat(compilation)
++        .hadErrorContaining(
++            error(
++                "test.Outer.A is bound multiple times:",
++                "@Provides test.Outer.A test.Outer.Module01.provideA()",
++                "@Provides test.Outer.A test.Outer.Module02.provideA()",
++                "@Provides test.Outer.A test.Outer.Module03.provideA()",
++                "@Provides test.Outer.A test.Outer.Module04.provideA()",
++                "@Provides test.Outer.A test.Outer.Module05.provideA()",
++                "@Provides test.Outer.A test.Outer.Module06.provideA()",
++                "@Provides test.Outer.A test.Outer.Module07.provideA()",
++                "@Provides test.Outer.A test.Outer.Module08.provideA()",
++                "@Provides test.Outer.A test.Outer.Module09.provideA()",
++                "@Provides test.Outer.A test.Outer.Module10.provideA()",
++                "and 2 others"))
++        .inFile(component)
++        .onLineContaining("getA();");
+   }
+ 
+   @Test public void longChainOfDependencies() {
+@@ -1532,11 +1540,15 @@ public void bindsMissingRightHandSide() {
+     Compilation compilation = daggerCompiler().compile(duplicates, component);
+     assertThat(compilation).failed();
+     assertThat(compilation)
+-        .hadErrorContaining("test.Duplicates.BoundTwice is bound multiple times:")
+-        .inFile(component)
+-        .onLineContaining("boundTwice();");
+-    assertThat(compilation)
+-        .hadErrorContaining("test.Duplicates.DuplicatesModule.bindWithUnresolvedKey")
++        .hadErrorContaining(
++            error(
++                "test.Duplicates.BoundTwice is bound multiple times:",
++                "@Binds test.Duplicates.BoundTwice "
++                    + "test.Duplicates.DuplicatesModule"
++                    + ".bindWithResolvedKey(test.Duplicates.BoundImpl)",
++                "@Binds test.Duplicates.BoundTwice "
++                    + "test.Duplicates.DuplicatesModule"
++                    + ".bindWithUnresolvedKey(test.Duplicates.NotBound)"))
+         .inFile(component)
+         .onLineContaining("boundTwice();");
+     assertThat(compilation)
+@@ -2091,178 +2103,197 @@ public void nullCheckForOptionalProviderOfLazy() {
+   }
+ 
+   @Test
+-  public void subcomponentBindingConflictsWithParent() {
+-    JavaFileObject parentChildConflict =
++  public void childBindingConflictsWithParent() {
++    JavaFileObject aComponent =
+         JavaFileObjects.forSourceLines(
+-            "test.ParentChildConflict",
++            "test.A",
+             "package test;",
+             "",
+-            "import javax.inject.Qualifier;",
++            "import dagger.Component;",
++            "import dagger.Module;",
++            "import dagger.Provides;",
+             "",
+-            "@Qualifier @interface ParentChildConflict {}");
+-    JavaFileObject parentGrandchildConflict =
+-        JavaFileObjects.forSourceLines(
+-            "test.ParentGrandchildConflict",
+-            "package test;",
++            "@Component(modules = A.AModule.class)",
++            "interface A {",
++            "  Object conflict();",
+             "",
+-            "import javax.inject.Qualifier;",
++            "  B b();",
+             "",
+-            "@Qualifier @interface ParentGrandchildConflict {}");
+-    JavaFileObject childGrandchildConflict =
++            "  @Module",
++            "  static class AModule {",
++            "    @Provides static Object abConflict() {",
++            "      return \"a\";",
++            "    }",
++            "  }",
++            "}");
++    JavaFileObject bComponent =
+         JavaFileObjects.forSourceLines(
+-            "test.ChildGrandchildConflict",
++            "test.B",
+             "package test;",
+             "",
+-            "import javax.inject.Qualifier;",
++            "import dagger.Module;",
++            "import dagger.Provides;",
++            "import dagger.Subcomponent;",
+             "",
+-            "@Qualifier @interface ChildGrandchildConflict {}");
++            "@Subcomponent(modules = B.BModule.class)",
++            "interface B {",
++            "  Object conflict();",
++            "",
++            "  @Module",
++            "  static class BModule {",
++            "    @Provides static Object abConflict() {",
++            "      return \"b\";",
++            "    }",
++            "  }",
++            "}");
++    Compilation compilation = daggerCompiler().compile(aComponent, bComponent);
++    assertThat(compilation).failed();
++    assertThat(compilation)
++        .hadErrorContaining(
++            error(
++                "[test.B.conflict()] java.lang.Object is bound multiple times:",
++                "@Provides Object test.A.AModule.abConflict()",
++                "@Provides Object test.B.BModule.abConflict()"))
++        .inFile(aComponent)
++        .onLineContaining("interface A {");
++  }
+ 
+-    /* Some annotation processor implementations do not report more than one error per element. So
+-     * separate parents for testing parent-conflicts-with-child and
+-     * parent-conflicts-with-grandchild.
+-     */
+-    JavaFileObject parentConflictsWithChild =
++  @Test
++  public void grandchildBindingConflictsWithGrandparent() {
++    JavaFileObject aComponent =
+         JavaFileObjects.forSourceLines(
+-            "test.ParentConflictsWithChild",
++            "test.A",
+             "package test;",
+             "",
+             "import dagger.Component;",
+             "import dagger.Module;",
+             "import dagger.Provides;",
+             "",
+-            "@Component(modules = ParentConflictsWithChild.ParentModule.class)",
+-            "interface ParentConflictsWithChild {",
+-            "  @ParentChildConflict Object parentChildConflict();",
++            "@Component(modules = A.AModule.class)",
++            "interface A {",
++            "  Object conflict();",
+             "",
+-            "  Child child();",
++            "  B b();",
+             "",
+             "  @Module",
+-            "  static class ParentModule {",
+-            "    @Provides @ParentChildConflict static Object parentChildConflict() {",
+-            "      return \"parent\";",
++            "  static class AModule {",
++            "    @Provides static Object acConflict() {",
++            "      return \"a\";",
+             "    }",
+             "  }",
+             "}");
+-    JavaFileObject parentConflictsWithGrandchild =
++    JavaFileObject bComponent =
+         JavaFileObjects.forSourceLines(
+-            "test.ParentConflictsWithGrandchild",
++            "test.B",
++            "package test;",
++            "",
++            "import dagger.Subcomponent;",
++            "",
++            "@Subcomponent",
++            "interface B {",
++            "  C c();",
++            "}");
++    JavaFileObject cComponent =
++        JavaFileObjects.forSourceLines(
++            "test.C",
+             "package test;",
+             "",
+-            "import dagger.Component;",
+             "import dagger.Module;",
+             "import dagger.Provides;",
++            "import dagger.Subcomponent;",
+             "",
+-            "@Component(modules = ParentConflictsWithGrandchild.ParentModule.class)",
+-            "interface ParentConflictsWithGrandchild {",
+-            "  @ParentGrandchildConflict Object parentGrandchildConflict();",
+-            "",
+-            "  Child child();",
++            "@Subcomponent(modules = C.CModule.class)",
++            "interface C {",
++            "  Object conflict();",
+             "",
+             "  @Module",
+-            "  static class ParentModule {",
+-            "    @Provides @ParentGrandchildConflict static Object parentGrandchildConflict() {",
+-            "      return \"parent\";",
++            "  static class CModule {",
++            "    @Provides static Object acConflict() {",
++            "      return \"c\";",
+             "    }",
+             "  }",
+             "}");
+-    JavaFileObject child =
++    Compilation compilation = daggerCompiler().compile(aComponent, bComponent, cComponent);
++    assertThat(compilation).failed();
++    assertThat(compilation)
++        .hadErrorContaining(
++            error(
++                "[test.C.conflict()] java.lang.Object is bound multiple times:",
++                "@Provides Object test.A.AModule.acConflict()",
++                "@Provides Object test.C.CModule.acConflict()"))
++        .inFile(aComponent)
++        .onLineContaining("interface A {");
++  }
++
++  @Test
++  public void grandchildBindingConflictsWithChild() {
++    JavaFileObject aComponent =
+         JavaFileObjects.forSourceLines(
+-            "test.Child",
++            "test.A",
++            "package test;",
++            "",
++            "import dagger.Component;",
++            "",
++            "@Component",
++            "interface A {",
++            "  B b();",
++            "}");
++    JavaFileObject bComponent =
++        JavaFileObjects.forSourceLines(
++            "test.B",
+             "package test;",
+             "",
+             "import dagger.Module;",
+             "import dagger.Provides;",
+             "import dagger.Subcomponent;",
+             "",
+-            "@Subcomponent(modules = Child.ChildModule.class)",
+-            "interface Child {",
+-            "  @ParentChildConflict Object parentChildConflict();",
+-            "  @ChildGrandchildConflict Object childGrandchildConflict();",
++            "@Subcomponent(modules = B.BModule.class)",
++            "interface B {",
++            "  Object conflict();",
+             "",
+-            "  Grandchild grandchild();",
++            "  C c();",
+             "",
+             "  @Module",
+-            "  static class ChildModule {",
+-            "    @Provides @ParentChildConflict static Object parentChildConflict() {",
+-            "      return \"child\";",
+-            "    }",
+-            "",
+-            "    @Provides @ChildGrandchildConflict static Object childGrandchildConflict() {",
+-            "      return \"child\";",
++            "  static class BModule {",
++            "    @Provides static Object bcConflict() {",
++            "      return \"b\";",
+             "    }",
+             "  }",
+             "}");
+-    JavaFileObject grandchild =
++    JavaFileObject cComponent =
+         JavaFileObjects.forSourceLines(
+-            "test.Grandchild",
++            "test.C",
+             "package test;",
+             "",
+             "import dagger.Module;",
+             "import dagger.Provides;",
+             "import dagger.Subcomponent;",
+             "",
+-            "@Subcomponent(modules = Grandchild.GrandchildModule.class)",
+-            "interface Grandchild {",
+-            "  @ParentChildConflict Object parentChildConflict();",
+-            "  @ParentGrandchildConflict Object parentGrandchildConflict();",
+-            "  @ChildGrandchildConflict Object childGrandchildConflict();",
++            "@Subcomponent(modules = C.CModule.class)",
++            "interface C {",
++            "  Object conflict();",
+             "",
+             "  @Module",
+-            "  static class GrandchildModule {",
+-            "    @Provides @ParentGrandchildConflict static Object parentGrandchildConflict() {",
+-            "      return \"grandchild\";",
+-            "    }",
+-            "",
+-            "    @Provides @ChildGrandchildConflict static Object childGrandchildConflict() {",
+-            "      return \"grandchild\";",
++            "  static class CModule {",
++            "    @Provides static Object bcConflict() {",
++            "      return \"c\";",
+             "    }",
+             "  }",
+             "}");
+-    assertAbout(javaSources())
+-        .that(
+-            ImmutableList.of(
+-                parentChildConflict,
+-                parentGrandchildConflict,
+-                childGrandchildConflict,
+-                parentConflictsWithChild,
+-                parentConflictsWithGrandchild,
+-                child,
+-                grandchild))
+-        .processedWith(new ComponentProcessor())
+-        .failsToCompile()
+-        .withErrorContaining(
+-            "[test.Child.parentChildConflict()] "
+-                + "@test.ParentChildConflict java.lang.Object is bound multiple times:\n"
+-                + "      @Provides @test.ParentChildConflict Object"
+-                + " test.ParentConflictsWithChild.ParentModule.parentChildConflict()\n"
+-                + "      @Provides @test.ParentChildConflict Object"
+-                + " test.Child.ChildModule.parentChildConflict()")
+-        .in(parentConflictsWithChild)
+-        .onLine(8)
+-        .and()
+-        .withErrorContaining(
+-            "[test.Grandchild.parentGrandchildConflict()] "
+-                + "@test.ParentGrandchildConflict java.lang.Object is bound multiple times:\n"
+-                + "      @Provides @test.ParentGrandchildConflict Object"
+-                + " test.ParentConflictsWithGrandchild.ParentModule.parentGrandchildConflict()\n"
+-                + "      @Provides @test.ParentGrandchildConflict Object"
+-                + " test.Grandchild.GrandchildModule.parentGrandchildConflict()")
+-        .in(parentConflictsWithGrandchild)
+-        .onLine(8)
+-        .and()
+-        .withErrorContaining(
+-            "[test.Grandchild.childGrandchildConflict()] "
+-                + "@test.ChildGrandchildConflict java.lang.Object is bound multiple times:\n"
+-                + "      @Provides @test.ChildGrandchildConflict Object"
+-                + " test.Child.ChildModule.childGrandchildConflict()\n"
+-                + "      @Provides @test.ChildGrandchildConflict Object"
+-                + " test.Grandchild.GrandchildModule.childGrandchildConflict()")
+-        .in(child)
+-        .onLine(8);
++    Compilation compilation = daggerCompiler().compile(aComponent, bComponent, cComponent);
++    assertThat(compilation).failed();
++    assertThat(compilation)
++        .hadErrorContaining(
++            error(
++                "[test.C.conflict()] java.lang.Object is bound multiple times:",
++                "@Provides Object test.B.BModule.bcConflict()",
++                "@Provides Object test.C.CModule.bcConflict()"))
++        .inFile(aComponent)
++        .onLineContaining("interface A {");
+   }
+ 
+   @Test
+-  public void subcomponentBindingConflictsWithParentWithNullableViolationAsWarning() {
++  public void grandchildBindingConflictsWithParentWithNullableViolationAsWarning() {
+     JavaFileObject parentConflictsWithChild =
+         JavaFileObjects.forSourceLines(
+             "test.ParentConflictsWithChild",
+@@ -2310,12 +2341,12 @@ public void subcomponentBindingConflictsWithParentWithNullableViolationAsWarning
+         .processedWith(new ComponentProcessor())
+         .failsToCompile()
+         .withErrorContaining(
+-            "[test.Child.parentChildConflictThatViolatesNullability()] "
+-                + "java.lang.Object is bound multiple times:\n"
+-                + "      @Provides @javax.annotation.Nullable Object"
+-                + " test.ParentConflictsWithChild.ParentModule.nullableParentChildConflict()\n"
+-                + "      @Provides Object"
+-                + " test.Child.ChildModule.nonNullableParentChildConflict()")
++            error(
++                "[test.Child.parentChildConflictThatViolatesNullability()] "
++                    + "java.lang.Object is bound multiple times:",
++                "@Provides Object test.Child.ChildModule.nonNullableParentChildConflict()",
++                "@Provides @javax.annotation.Nullable Object"
++                    + " test.ParentConflictsWithChild.ParentModule.nullableParentChildConflict()"))
+         .in(parentConflictsWithChild)
+         .onLine(9);
+   }
+diff --git a/javatests/dagger/internal/codegen/SubcomponentBuilderValidationTest.java b/javatests/dagger/internal/codegen/SubcomponentBuilderValidationTest.java
+index f4cb9ed51..1351702e0 100644
+--- a/javatests/dagger/internal/codegen/SubcomponentBuilderValidationTest.java
++++ b/javatests/dagger/internal/codegen/SubcomponentBuilderValidationTest.java
+@@ -719,18 +719,17 @@ public void testMultipleSettersPerBoundInstanceTypeFails() {
+             "    @BindsInstance void set2(String s);",
+             "  }",
+             "}");
+-    assertAbout(javaSources())
+-        .that(ImmutableList.of(componentFile, childComponentFile))
+-        .processedWith(new ComponentProcessor())
+-        .failsToCompile()
+-        .withErrorContaining(
++    Compilation compilation = daggerCompiler().compile(componentFile, childComponentFile);
++    assertThat(compilation).failed();
++    assertThat(compilation)
++        .hadErrorContaining(
+             Joiner.on("\n      ")
+                 .join(
+-                    "java.lang.String is bound multiple times:",
++                    "[test.ChildComponent.s()] java.lang.String is bound multiple times:",
+                     "@BindsInstance void test.ChildComponent.Builder.set1(String)",
+                     "@BindsInstance void test.ChildComponent.Builder.set2(String)"))
+-        .in(childComponentFile)
+-        .onLine(8);
++        .inFile(componentFile)
++        .onLineContaining("interface ParentComponent {");
+   }
+ 
+   @Test

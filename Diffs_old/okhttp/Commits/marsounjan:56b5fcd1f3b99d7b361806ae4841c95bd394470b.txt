@@ -1,0 +1,185 @@
+diff --git a/okhttp/src/main/java/okhttp3/HttpUrl.kt b/okhttp/src/main/java/okhttp3/HttpUrl.kt
+index 5def5a8549..ab6d584585 100644
+--- a/okhttp/src/main/java/okhttp3/HttpUrl.kt
++++ b/okhttp/src/main/java/okhttp3/HttpUrl.kt
+@@ -1246,6 +1246,36 @@ class HttpUrl internal constructor(builder: Builder) {
+         }
+       }
+ 
++      /*
++      * add IPv6 interface scope to host when base host and new host are IPv6 link local addresses
++      * used mainly for correct redirection while using link local addresses
++       */
++      this.host?.also { host ->
++        if(base != null
++                && base.host.contains(":")
++                && (base.host.startsWith("fe80::") || base.host.startsWith("fe80::", 1))
++                && base.host.contains("%")
++                && host.contains(":")
++                && !host.contains("%")
++                && (host.startsWith("fe80::") || host.startsWith("fe80::", 1))
++        ){
++          val interfaceScope = base.host.substring(
++                  base.host.indexOf("%"),
++                  if(base.host.endsWith("]")){
++                    base.host.length - 1
++                  } else {
++                    base.host.length
++                  }
++          )
++
++          this.host = if(host.endsWith("]")){
++            host.replace("]", "$interfaceScope]")
++          } else {
++            "$host$interfaceScope"
++          }
++        }
++      }
++
+       // Resolve the relative path.
+       val pathDelimiterOffset = delimiterOffset(input, pos, limit, "?#")
+       resolvePath(input, pos, pathDelimiterOffset)
+diff --git a/okhttp/src/main/java/okhttp3/internal/Util.java b/okhttp/src/main/java/okhttp3/internal/Util.java
+index fd15c72554..9b52bc4182 100644
+--- a/okhttp/src/main/java/okhttp3/internal/Util.java
++++ b/okhttp/src/main/java/okhttp3/internal/Util.java
+@@ -263,14 +263,25 @@ public static boolean nonEmptyIntersection(
+     return false;
+   }
+ 
+-  public static String hostHeader(HttpUrl url, boolean includeDefaultPort) {
+-    String host = url.host().contains(":")
+-        ? "[" + url.host() + "]"
+-        : url.host();
+-    return includeDefaultPort || url.port() != HttpUrl.defaultPort(url.scheme())
+-        ? host + ":" + url.port()
+-        : host;
+-  }
++    public static String hostHeader(HttpUrl url, boolean includeDefaultPort) {
++        String host;
++        if (url.host().contains(":")) {
++            int intfScopeStartIndex = url.host().indexOf("%");
++            //make sure interface scope is removed for IPv6 link local hosts
++            host = "["
++                    + url.host().substring(
++                            0,
++                            intfScopeStartIndex != -1 ? intfScopeStartIndex : url.host().length()
++                    )
++                    + "]";
++        } else {
++            host = url.host();
++        }
++
++        return includeDefaultPort || url.port() != HttpUrl.defaultPort(url.scheme())
++                ? host + ":" + url.port()
++                : host;
++    }
+ 
+   /**
+    * Returns true if {@code e} is due to a firmware bug fixed after Android 4.2.2.
+@@ -372,18 +383,32 @@ public static int delimiterOffset(String input, int pos, int limit, char delimit
+    * if the result contains unsupported ASCII characters.
+    */
+   public static String canonicalizeHost(String host) {
+-    // If the input contains a :, it’s an IPv6 address.
+-    if (host.contains(":")) {
+-      // If the input is encased in square braces "[...]", drop 'em.
+-      InetAddress inetAddress = host.startsWith("[") && host.endsWith("]")
+-          ? decodeIpv6(host, 1, host.length() - 1)
+-          : decodeIpv6(host, 0, host.length());
+-      if (inetAddress == null) return null;
+-      byte[] address = inetAddress.getAddress();
+-      if (address.length == 16) return inet6AddressToAscii(address);
+-      if (address.length == 4) return inetAddress.getHostAddress(); // An IPv4-mapped IPv6 address.
+-      throw new AssertionError("Invalid IPv6 address: '" + host + "'");
+-    }
++      // If the input contains a :, it’s an IPv6 address.
++      if (host.contains(":")) {
++          // If the input is encased in square braces "[...]", drop 'em.
++            String hostNoBraces = host.startsWith("[") && host.endsWith("]")
++                    ? host.substring(1, host.length() - 1) : host;
++            int percentIndex = hostNoBraces.indexOf("%");
++            InetAddress inetAddress = decodeIpv6(
++                    hostNoBraces,
++                    0, percentIndex > 0 ? percentIndex : hostNoBraces.length()
++            );
++            if (inetAddress == null || (!inetAddress.isLinkLocalAddress() && percentIndex > 0)) {
++                return null;
++            }
++            byte[] address = inetAddress.getAddress();
++            if (address.length == 16) {
++                if (percentIndex > 0) {
++                    return inet6AddressToAscii(address) + hostNoBraces.substring(percentIndex);
++                } else {
++                    return inet6AddressToAscii(address);
++                }
++            }
++            if (address.length == 4) {
++                return inetAddress.getHostAddress(); // An IPv4-mapped IPv6 address.
++            }
++            throw new AssertionError("Invalid IPv6 address: '" + host + "'");
++        }
+ 
+     try {
+       String result = IDN.toASCII(host).toLowerCase(Locale.US);
+diff --git a/okhttp/src/test/java/okhttp3/CallTest.java b/okhttp/src/test/java/okhttp3/CallTest.java
+index 288d4ca235..b6557469f6 100644
+--- a/okhttp/src/test/java/okhttp3/CallTest.java
++++ b/okhttp/src/test/java/okhttp3/CallTest.java
+@@ -3390,6 +3390,32 @@ private RequestBody requestBody(final boolean chunked, final long size, final in
+     };
+   }
+ 
++  @Test public void ipv6LinkLocalScopedHost() throws Exception {
++    // Use a proxy to fake IPv6 connectivity, even if localhost doesn't have IPv6.
++    server.useHttps(handshakeCertificates.sslSocketFactory(), true);
++    server.setProtocols(Collections.singletonList(Protocol.HTTP_1_1));
++    server.enqueue(new MockResponse()
++            .setSocketPolicy(SocketPolicy.UPGRADE_TO_SSL_AT_END)
++            .clearHeaders());
++    server.enqueue(new MockResponse());
++
++    client = client.newBuilder()
++            .sslSocketFactory(
++                    handshakeCertificates.sslSocketFactory(), handshakeCertificates.trustManager())
++            .hostnameVerifier(new RecordingHostnameVerifier())
++            .proxy(server.toProxyAddress())
++            .build();
++
++    Request request = new Request.Builder()
++            .url("https://[fe80::1%eth0]/")
++            .build();
++
++    client.newCall(request).execute();
++
++    RecordedRequest connect = server.takeRequest();
++    assertThat(connect.getHeader("Host")).isEqualTo("[fe80::1]:443");
++  }
++
+   @Test public void emptyResponseBody() throws Exception {
+     server.enqueue(new MockResponse()
+         .addHeader("abc", "def"));
+diff --git a/okhttp/src/test/java/okhttp3/HttpUrlTest.java b/okhttp/src/test/java/okhttp3/HttpUrlTest.java
+index f6db518bdd..eb01327112 100644
+--- a/okhttp/src/test/java/okhttp3/HttpUrlTest.java
++++ b/okhttp/src/test/java/okhttp3/HttpUrlTest.java
+@@ -509,8 +509,18 @@ HttpUrl parse(String url) {
+   }
+ 
+   @Test public void hostIpv6ScopedAddress() throws Exception {
+-    // java.net.InetAddress parses scoped addresses. These aren't valid in URLs.
++    // java.net.InetAddress parses scoped addresses. These are valid only for link local URLs.
+     assertInvalid("http://[::1%2544]", "Invalid URL host: \"[::1%2544]\"");
++    assertThat(parse("http://[fe80::1%eth0]").toString()).isEqualTo("http://[fe80::1%eth0]/");
++    assertThat(parse("http://[fe80::1%eth0]:9999").toString()).isEqualTo("http://[fe80::1%eth0]:9999/");
++  }
++
++  @Test public void hostIpv6ScopedHost() throws Exception {
++    HttpUrl.Builder base = new HttpUrl.Builder();
++    base.scheme("http");
++
++    assertThat(base.host("fe80::1%eth0").build().host()).isEqualTo("fe80::1%eth0");
++    assertThat(base.host("[fe80::1%eth0]").build().host()).isEqualTo("fe80::1%eth0");
+   }
+ 
+   @Test public void hostIpv6AddressTooManyLeadingZeros() throws Exception {

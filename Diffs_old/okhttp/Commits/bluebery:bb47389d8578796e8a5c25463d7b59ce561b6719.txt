@@ -1,0 +1,157 @@
+diff --git a/okhttp-android-support/src/main/java/com/squareup/okhttp/internal/huc/JavaApiConverter.java b/okhttp-android-support/src/main/java/com/squareup/okhttp/internal/huc/JavaApiConverter.java
+index 603a559980..06d44d203c 100644
+--- a/okhttp-android-support/src/main/java/com/squareup/okhttp/internal/huc/JavaApiConverter.java
++++ b/okhttp-android-support/src/main/java/com/squareup/okhttp/internal/huc/JavaApiConverter.java
+@@ -338,8 +338,8 @@ private static String extractStatusLine(HttpURLConnection httpUrlConnection) {
+ 
+   /**
+    * Extracts the status line from the supplied Java API {@link java.net.CacheResponse}.
+-   * As per the spec, the status line is held as the header with the null key. Returns {@code null}
+-   * if there is no status line.
++   * As per the spec, the status line is held as the header with the null key. Throws a
++   * {@link ProtocolException} if there is no status line.
+    */
+   private static String extractStatusLine(CacheResponse javaResponse) throws IOException {
+     Map<String, List<String>> javaResponseHeaders = javaResponse.getHeaders();
+@@ -347,10 +347,14 @@ private static String extractStatusLine(CacheResponse javaResponse) throws IOExc
+   }
+ 
+   // VisibleForTesting
+-  static String extractStatusLine(Map<String, List<String>> javaResponseHeaders) {
++  static String extractStatusLine(Map<String, List<String>> javaResponseHeaders)
++      throws ProtocolException {
+     List<String> values = javaResponseHeaders.get(null);
+     if (values == null || values.size() == 0) {
+-      return null;
++      // The status line is missing. This suggests a badly behaving cache.
++      throw new ProtocolException(
++          "CacheResponse is missing a \'null\' header containing the status line. Headers="
++          + javaResponseHeaders);
+     }
+     return values.get(0);
+   }
+diff --git a/okhttp-android-support/src/test/java/com/squareup/okhttp/internal/huc/JavaApiConverterTest.java b/okhttp-android-support/src/test/java/com/squareup/okhttp/internal/huc/JavaApiConverterTest.java
+index d5dfcd8557..7766da3b84 100644
+--- a/okhttp-android-support/src/test/java/com/squareup/okhttp/internal/huc/JavaApiConverterTest.java
++++ b/okhttp-android-support/src/test/java/com/squareup/okhttp/internal/huc/JavaApiConverterTest.java
+@@ -233,6 +233,30 @@ private void testCreateOkResponseInternal(HttpURLConnectionFactory httpUrlConnec
+     assertNull(response.handshake());
+   }
+ 
++  /** Test for https://code.google.com/p/android/issues/detail?id=160522 */
++  @Test public void createOkResponse_fromCacheResponseWithMissingStatusLine() throws Exception {
++    URI uri = new URI("http://foo/bar");
++    Request request = new Request.Builder().url(uri.toURL()).build();
++    CacheResponse cacheResponse = new CacheResponse() {
++      @Override public Map<String, List<String>> getHeaders() throws IOException {
++        Map<String, List<String>> headers = new HashMap<>();
++        // Headers is deliberately missing an entry with a null key.
++        headers.put("xyzzy", Arrays.asList("bar", "baz"));
++        return headers;
++      }
++
++      @Override public InputStream getBody() throws IOException {
++        return null; // Should never be called
++      }
++    };
++
++    try {
++      JavaApiConverter.createOkResponse(request, cacheResponse);
++      fail();
++    } catch (IOException expected) {
++    }
++  }
++
+   @Test public void createOkResponse_fromSecureCacheResponse() throws Exception {
+     final String statusLine = "HTTP/1.1 200 Fantastic";
+     final Principal localPrincipal = LOCAL_CERT.getSubjectX500Principal();
+@@ -669,15 +693,18 @@ private void assertHeadersContainsMapping(Map<String, List<String>> headers, Str
+     assertEquals(Arrays.asList("value2"), okHeaders.values("key2"));
+   }
+ 
+-  @Test public void extractStatusLine() {
++  @Test public void extractStatusLine() throws Exception {
+     Map<String, List<String>> javaResponseHeaders = new HashMap<>();
+     javaResponseHeaders.put(null, Arrays.asList("StatusLine"));
+     javaResponseHeaders.put("key1", Arrays.asList("value1_1", "value1_2"));
+     javaResponseHeaders.put("key2", Arrays.asList("value2"));
+     assertEquals("StatusLine", JavaApiConverter.extractStatusLine(javaResponseHeaders));
+ 
+-    assertNull(
+-        JavaApiConverter.extractStatusLine(Collections.<String, List<String>>emptyMap()));
++    try {
++      JavaApiConverter.extractStatusLine(Collections.<String, List<String>>emptyMap());
++      fail();
++    } catch (IOException expected) {
++    }
+   }
+ 
+   private URL configureServer(MockResponse mockResponse) throws Exception {
+diff --git a/okhttp-android-support/src/test/java/com/squareup/okhttp/internal/huc/ResponseCacheTest.java b/okhttp-android-support/src/test/java/com/squareup/okhttp/internal/huc/ResponseCacheTest.java
+index 3c91fb5851..18956a3611 100644
+--- a/okhttp-android-support/src/test/java/com/squareup/okhttp/internal/huc/ResponseCacheTest.java
++++ b/okhttp-android-support/src/test/java/com/squareup/okhttp/internal/huc/ResponseCacheTest.java
+@@ -40,12 +40,14 @@
+ import java.net.CookieManager;
+ import java.net.HttpCookie;
+ import java.net.HttpURLConnection;
++import java.net.ProtocolException;
+ import java.net.ResponseCache;
+ import java.net.SecureCacheResponse;
+ import java.net.URI;
+ import java.net.URISyntaxException;
+ import java.net.URL;
+ import java.net.URLConnection;
++import java.nio.charset.StandardCharsets;
+ import java.security.Principal;
+ import java.security.cert.Certificate;
+ import java.util.ArrayList;
+@@ -1303,6 +1305,48 @@ public void assertCookies(CookieManager cookieManager, URL url, String... expect
+     assertFalse(aborted.get()); // The best behavior is ambiguous, but RI 6 doesn't abort here
+   }
+ 
++  /**
++   * Fail if a badly-behaved cache returns a null status line header.
++   * https://code.google.com/p/android/issues/detail?id=160522
++   */
++  @Test public void responseCacheReturnsNullStatusLine() throws Exception {
++    String cachedContentString = "Hello";
++    final byte[] cachedContent = cachedContentString.getBytes(StandardCharsets.US_ASCII);
++
++    Internal.instance.setCache(client, new CacheAdapter(new AbstractResponseCache() {
++      @Override
++      public CacheResponse get(URI uri, String requestMethod,
++          Map<String, List<String>> requestHeaders)
++          throws IOException {
++        return new CacheResponse() {
++          @Override public Map<String, List<String>> getHeaders() throws IOException {
++            String contentType = "text/plain";
++            Map<String, List<String>> headers = new HashMap<>();
++            headers.put("Content-Length", Arrays.asList(Integer.toString(cachedContent.length)));
++            headers.put("Content-Type", Arrays.asList(contentType));
++            headers.put("Expires", Arrays.asList(formatDate(-1, TimeUnit.HOURS)));
++            headers.put("Cache-Control", Arrays.asList("max-age=60"));
++            // Crucially, the header with a null key is missing, which renders the cache response
++            // unusable because OkHttp only caches responses with cacheable response codes.
++            return headers;
++          }
++
++          @Override public InputStream getBody() throws IOException {
++            return new ByteArrayInputStream(cachedContent);
++          }
++        };
++      }
++    }));
++    HttpURLConnection connection = openConnection(server.getUrl("/"));
++    // If there was no status line from the cache an exception will be thrown. No network request
++    // should be made.
++    try {
++      connection.getResponseCode();
++      fail();
++    } catch (ProtocolException expected) {
++    }
++  }
++
+   /**
+    * @param delta the offset from the current date to use. Negative
+    * values yield dates in the past; positive values yield dates in the

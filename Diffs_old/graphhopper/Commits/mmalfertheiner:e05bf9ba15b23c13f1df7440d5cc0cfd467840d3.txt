@@ -1,0 +1,498 @@
+diff --git a/core/src/main/java/com/graphhopper/GraphHopper.java b/core/src/main/java/com/graphhopper/GraphHopper.java
+index 4aafec5530..652481f07c 100644
+--- a/core/src/main/java/com/graphhopper/GraphHopper.java
++++ b/core/src/main/java/com/graphhopper/GraphHopper.java
+@@ -1110,7 +1110,7 @@ public GHResponse route( GHRequest request )
+             Path path = algo.calcPath(fromQResult.getClosestNode(), toQResult.getClosestNode());
+ 
+             //Update time to profile of user
+-            path.updateTime();
++            path.updateTime(request.getHints());
+ 
+             if (path.getTime() < 0)
+                 throw new RuntimeException("Time was negative. Please report as bug and include:" + request);
+diff --git a/core/src/main/java/com/graphhopper/routing/Path.java b/core/src/main/java/com/graphhopper/routing/Path.java
+index 5d16cebe9a..da743c3580 100644
+--- a/core/src/main/java/com/graphhopper/routing/Path.java
++++ b/core/src/main/java/com/graphhopper/routing/Path.java
+@@ -17,14 +17,13 @@
+  */
+ package com.graphhopper.routing;
+ 
+-import com.graphhopper.routing.util.BikeGenericFlagEncoder;
+-import com.graphhopper.routing.util.DefaultEdgeFilter;
+-import com.graphhopper.routing.util.DynamicWeighting;
+-import com.graphhopper.routing.util.FlagEncoder;
++import com.graphhopper.routing.util.*;
+ import com.graphhopper.storage.EdgeEntry;
+ import com.graphhopper.storage.Graph;
+ import com.graphhopper.storage.NodeAccess;
+ import com.graphhopper.util.*;
++import com.graphhopper.util.profiles.ProfileManager;
++import com.graphhopper.util.profiles.RidersProfile;
+ import gnu.trove.list.TIntList;
+ import gnu.trove.list.array.TIntArrayList;
+ 
+@@ -370,16 +369,23 @@ public void next( EdgeIteratorState eb, int index )
+         return points;
+     }
+ 
+-    public void updateTime(){
++    public void updateTime(PMap params){
+ 
+         time = 0;
++        String profileName = params.get("profile", "");
++        RidersProfile ridersProfile = null;
++
++        if(!profileName.equals(""))
++            ridersProfile = new ProfileManager().getProfile(profileName);
++
++        final SpeedProvider speedProvider = new ProfileSpeedProvider(encoder, ridersProfile);
+ 
+         forEveryEdge(new EdgeVisitor() {
+ 
+             @Override
+             public void next(EdgeIteratorState edgeBase, int index) {
+ 
+-                double speed = encoder.getSpeed(edgeBase.getFlags());
++                double speed = speedProvider.calcSpeed(edgeBase, false);
+ 
+                 if (Double.isInfinite(speed) || Double.isNaN(speed) || speed < 0)
+                     throw new IllegalStateException("Invalid speed stored in edge! " + speed);
+@@ -387,9 +393,6 @@ public void next(EdgeIteratorState edgeBase, int index) {
+                 if (speed == 0)
+                     throw new IllegalStateException("Speed cannot be 0 for unblocked edge, use access properties to mark edge blocked! Should only occur for shortest path calculation. See #242.");
+ 
+-
+-                speed = adjustSpeed(speed, edgeBase, false);
+-
+                 double edgeTime = edgeBase.getDistance() / speed * 3600;
+ 
+                 // add direction penalties at start/stop/via points
+@@ -403,40 +406,6 @@ public void next(EdgeIteratorState edgeBase, int index) {
+ 
+     }
+ 
+-    private double adjustSpeed(double speed, EdgeIteratorState edgeState, boolean reverse) {
+-
+-        double incElevation = encoder.getDouble(edgeState.getFlags(), DynamicWeighting.INC_SLOPE_KEY) / 100;
+-        double decElevation = encoder.getDouble(edgeState.getFlags(), DynamicWeighting.DEC_SLOPE_KEY) / 100;
+-        double incDistPercentage = encoder.getDouble(edgeState.getFlags(), DynamicWeighting.INC_DIST_PERCENTAGE_KEY) / 100;
+-
+-
+-        double incDist2DSum = edgeState.getDistance() * incDistPercentage;
+-        double decDist2DSum = edgeState.getDistance() - incDist2DSum;
+-
+-        double adjustedSpeed = speed;
+-
+-        if (!reverse)
+-        {
+-            // use weighted mean so that longer incline infuences speed more than shorter
+-            double fwdFaster = 1 + 30 * keepIn(decElevation, 0, 0.1);
+-            fwdFaster = Math.sqrt(fwdFaster);
+-            double fwdSlower = 1 - 5 * keepIn(incElevation, 0, 0.2);
+-            fwdSlower = fwdSlower * fwdSlower;
+-            adjustedSpeed = keepIn(speed * (fwdSlower * incDist2DSum + fwdFaster * decDist2DSum) / edgeState.getDistance(), BikeGenericFlagEncoder.PUSHING_SECTION_SPEED / 2, 50);
+-        } else {
+-            double fwdFaster = 1 + 30 * keepIn(incElevation, 0, 0.1);
+-            fwdFaster = Math.sqrt(fwdFaster);
+-            double fwdSlower = 1 - 5 * keepIn(decElevation, 0, 0.2);
+-            fwdSlower = fwdSlower * fwdSlower;
+-            adjustedSpeed = keepIn(speed * (fwdSlower * decDist2DSum + fwdFaster * incDist2DSum) / edgeState.getDistance(), BikeGenericFlagEncoder.PUSHING_SECTION_SPEED / 2, 50);
+-        }
+-        System.out.println("NEW SPEED: " + Helper.round2(adjustedSpeed) + ", SPEED: " + speed + ", INC ELE: " + incElevation +
+-                ", DEC ELE: " + decElevation + ", PERCENTAGE: " + incDistPercentage +
+-                ", INC DIST: " + incDist2DSum + ", DEC DIST: " + decDist2DSum);
+-
+-        return adjustedSpeed;
+-    }
+-
+     /**
+      * @return the list of instructions for this path.
+      */
+diff --git a/core/src/main/java/com/graphhopper/routing/util/DynamicWeighting.java b/core/src/main/java/com/graphhopper/routing/util/DynamicWeighting.java
+index 0cc9c38c65..8e599ec7e0 100644
+--- a/core/src/main/java/com/graphhopper/routing/util/DynamicWeighting.java
++++ b/core/src/main/java/com/graphhopper/routing/util/DynamicWeighting.java
+@@ -40,13 +40,11 @@
+     final static double DEFAULT_HEADING_PENALTY = 300; //[s]
+     private final double heading_penalty;
+     protected final FlagEncoder flagEncoder;
+-    private final double maxSpeed;
+-    private Map<Integer, double[]> userSpeeds;
++    protected RidersProfile profile;
+ 
+     /**
+      * For now used only in BikeGenericFlagEncoder
+      */
+-    public static final int PRIORITY_KEY = 101;
+     public static final int INC_SLOPE_KEY = 102;
+     public static final int DEC_SLOPE_KEY = 103;
+     public static final int INC_DIST_PERCENTAGE_KEY = 104;
+@@ -61,11 +59,7 @@ public DynamicWeighting(FlagEncoder encoder, PMap pMap)
+         this.flagEncoder = encoder;
+         heading_penalty = pMap.getDouble("heading_penalty", DEFAULT_HEADING_PENALTY);
+         String user = pMap.get("profile", "");
+-        maxSpeed = encoder.getMaxSpeed() / SPEED_CONV;
+-
+-        RidersProfile profile = new ProfileManager().getProfile(user);
+-        if(profile != null)
+-            userSpeeds = profile.getFilterSpeeds();
++        profile = new ProfileManager().getProfile(user);
+ 
+     }
+ 
+@@ -77,7 +71,9 @@ public DynamicWeighting(FlagEncoder encoder)
+     @Override
+     public double calcWeight( EdgeIteratorState edgeState, boolean reverse, int prevOrNextEdgeId )
+     {
+-        double speed = getUserSpeed(edgeState, reverse);
++        SpeedProvider speedProvider = new ProfileSpeedProvider(flagEncoder, profile);
++
++        double speed = speedProvider.calcSpeed(edgeState, reverse);
+ 
+         if (speed == 0)
+             return Double.POSITIVE_INFINITY;
+@@ -92,49 +88,6 @@ public double calcWeight( EdgeIteratorState edgeState, boolean reverse, int prev
+         return time / (0.5 + getUserPreference(edgeState));
+     }
+ 
+-    private double getUserSpeed(EdgeIteratorState edgeState, boolean reverse){
+-
+-        double speed = 0;
+-        int wayType = (int) flagEncoder.getDouble(edgeState.getFlags(), DynamicWeighting.WAY_TYPE_KEY);
+-
+-        if(userSpeeds != null){
+-            double[] speeds = userSpeeds.get(wayType);
+-            if(speeds != null){
+-
+-                int incElevation = (int)flagEncoder.getDouble(edgeState.getFlags(), DynamicWeighting.INC_SLOPE_KEY);
+-                int decElevation = (int)flagEncoder.getDouble(edgeState.getFlags(), DynamicWeighting.DEC_SLOPE_KEY);
+-                double incDistPercentage = flagEncoder.getDouble(edgeState.getFlags(), DynamicWeighting.INC_DIST_PERCENTAGE_KEY) / 100;
+-
+-                double incSpeed = speeds[RidersProfile.SLOPES / 2 + incElevation];
+-                double decSpeed = speeds[RidersProfile.SLOPES / 2 - decElevation];
+-
+-                double incDist2DSum = edgeState.getDistance() * incDistPercentage;
+-                double decDist2DSum = edgeState.getDistance() - incDist2DSum;
+-
+-                if (!reverse)
+-                {
+-                    speed = keepIn((incSpeed * incDist2DSum + decSpeed * decDist2DSum) / edgeState.getDistance(), BikeGenericFlagEncoder.PUSHING_SECTION_SPEED / 2, 50);
+-                } else {
+-                    speed = keepIn((decSpeed * incDist2DSum + incSpeed * decDist2DSum) / edgeState.getDistance(), BikeGenericFlagEncoder.PUSHING_SECTION_SPEED / 2, 50);
+-                }
+-
+-            }
+-
+-        }
+-
+-        if(speed == 0){
+-            speed = flagEncoder.getSpeed(edgeState.getFlags());
+-
+-            if (speed == 0)
+-                return Double.POSITIVE_INFINITY;
+-
+-            speed = adjustSpeed(speed, edgeState, reverse);
+-        }
+-
+-        return speed;
+-    }
+-
+-
+     private double getUserPreference(EdgeIteratorState edgeState) {
+ 
+         int wayType = (int) flagEncoder.getDouble(edgeState.getFlags(), DynamicWeighting.WAY_TYPE_KEY);
+@@ -168,41 +121,9 @@ else if(wayType >= 10 && wayType <= 12) {
+ 
+     }
+ 
+-    private double adjustSpeed(double speed, EdgeIteratorState edgeState, boolean reverse) {
+-
+-        double incElevation = flagEncoder.getDouble(edgeState.getFlags(), DynamicWeighting.INC_SLOPE_KEY) / 100;
+-        double decElevation = flagEncoder.getDouble(edgeState.getFlags(), DynamicWeighting.DEC_SLOPE_KEY) / 100;
+-        double incDistPercentage = flagEncoder.getDouble(edgeState.getFlags(), DynamicWeighting.INC_DIST_PERCENTAGE_KEY) / 100;
+-
+-        double incDist2DSum = edgeState.getDistance() * incDistPercentage;
+-        double decDist2DSum = edgeState.getDistance() - incDist2DSum;
+-
+-        double adjustedSpeed = speed;
+-
+-        if (!reverse)
+-        {
+-            // use weighted mean so that longer incline infuences speed more than shorter
+-            double fwdFaster = 1 + 30 * keepIn(decElevation, 0, 0.1);
+-            fwdFaster = Math.sqrt(fwdFaster);
+-            double fwdSlower = 1 - 5 * keepIn(incElevation, 0, 0.2);
+-            fwdSlower = fwdSlower * fwdSlower;
+-            adjustedSpeed = keepIn(speed * (fwdSlower * incDist2DSum + fwdFaster * decDist2DSum) / edgeState.getDistance(), BikeGenericFlagEncoder.PUSHING_SECTION_SPEED / 2, 50);
+-        } else {
+-            double fwdFaster = 1 + 30 * keepIn(incElevation, 0, 0.1);
+-            fwdFaster = Math.sqrt(fwdFaster);
+-            double fwdSlower = 1 - 5 * keepIn(decElevation, 0, 0.2);
+-            fwdSlower = fwdSlower * fwdSlower;
+-            adjustedSpeed = keepIn(speed * (fwdSlower * decDist2DSum + fwdFaster * incDist2DSum) / edgeState.getDistance(), BikeGenericFlagEncoder.PUSHING_SECTION_SPEED / 2, 50);
+-        }
+-
+-        //System.out.println("NEW SPEED: " + Helper.round2(adjustedSpeed) + ", SPEED: " + speed + ", INC ELE: " + incElevation + ", DEC ELE: " + decElevation + ", PERCENTAGE: " + incDistPercentage);
+-
+-        return adjustedSpeed;
+-    }
+-
+     @Override
+     public double getMinWeight(double distance) {
+-        return distance / maxSpeed;
++        return distance / flagEncoder.getMaxSpeed();
+     }
+ 
+     @Override
+diff --git a/core/src/main/java/com/graphhopper/routing/util/ProfileSpeedProvider.java b/core/src/main/java/com/graphhopper/routing/util/ProfileSpeedProvider.java
+new file mode 100644
+index 0000000000..a5994af5a8
+--- /dev/null
++++ b/core/src/main/java/com/graphhopper/routing/util/ProfileSpeedProvider.java
+@@ -0,0 +1,108 @@
++package com.graphhopper.routing.util;
++
++import com.graphhopper.util.EdgeIteratorState;
++import com.graphhopper.util.profiles.RidersProfile;
++
++import java.util.Map;
++
++import static com.graphhopper.util.Helper.keepIn;
++
++public class ProfileSpeedProvider implements SpeedProvider {
++
++    protected final static double SPEED_CONV = 3.6;
++    protected final FlagEncoder encoder;
++    private final double maxSpeed;
++    private Map<Integer, double[]> userSpeeds;
++
++
++    public ProfileSpeedProvider(FlagEncoder flagEncoder, RidersProfile ridersProfile){
++        this.encoder = flagEncoder;
++        maxSpeed = encoder.getMaxSpeed() / SPEED_CONV;
++
++        if(ridersProfile != null)
++            this.userSpeeds = ridersProfile.getFilterSpeeds();
++    }
++
++    @Override
++    public double calcSpeed(EdgeIteratorState edgeIteratorState, boolean reverse) {
++        return getUserSpeed(edgeIteratorState, reverse);
++    }
++
++    private double getUserSpeed(EdgeIteratorState edgeState, boolean reverse){
++
++        double speed = 0;
++        int wayType = (int) encoder.getDouble(edgeState.getFlags(), DynamicWeighting.WAY_TYPE_KEY);
++
++        if(userSpeeds != null){
++            double[] speeds = userSpeeds.get(wayType);
++            if(speeds != null){
++
++                int incElevation = (int)encoder.getDouble(edgeState.getFlags(), DynamicWeighting.INC_SLOPE_KEY);
++                int decElevation = (int)encoder.getDouble(edgeState.getFlags(), DynamicWeighting.DEC_SLOPE_KEY);
++                double incDistPercentage = encoder.getDouble(edgeState.getFlags(), DynamicWeighting.INC_DIST_PERCENTAGE_KEY) / 100;
++
++                int incIndex = incElevation > RidersProfile.SLOPES / 2 ? RidersProfile.SLOPES : RidersProfile.SLOPES / 2 + incElevation;
++                int decIndex = decElevation > RidersProfile.SLOPES / 2 ? 0 : RidersProfile.SLOPES / 2 - decElevation;
++
++                double incSpeed = speeds[incIndex];
++                double decSpeed = speeds[decIndex];
++
++                double incDist2DSum = edgeState.getDistance() * incDistPercentage;
++                double decDist2DSum = edgeState.getDistance() - incDist2DSum;
++
++                if (!reverse)
++                {
++                    speed = keepIn((incSpeed * incDist2DSum + decSpeed * decDist2DSum) / edgeState.getDistance(), BikeGenericFlagEncoder.PUSHING_SECTION_SPEED / 2, 50);
++                } else {
++                    speed = keepIn((decSpeed * incDist2DSum + incSpeed * decDist2DSum) / edgeState.getDistance(), BikeGenericFlagEncoder.PUSHING_SECTION_SPEED / 2, 50);
++                }
++
++            }
++
++        }
++
++        if(speed == 0){
++            speed = encoder.getSpeed(edgeState.getFlags());
++
++            if (speed == 0)
++                return 0;
++
++            speed = adjustSpeed(speed, edgeState, reverse);
++        }
++
++        return speed;
++    }
++
++    private double adjustSpeed(double speed, EdgeIteratorState edgeState, boolean reverse) {
++
++        double incElevation = encoder.getDouble(edgeState.getFlags(), DynamicWeighting.INC_SLOPE_KEY) / 100;
++        double decElevation = encoder.getDouble(edgeState.getFlags(), DynamicWeighting.DEC_SLOPE_KEY) / 100;
++        double incDistPercentage = encoder.getDouble(edgeState.getFlags(), DynamicWeighting.INC_DIST_PERCENTAGE_KEY) / 100;
++
++        double incDist2DSum = edgeState.getDistance() * incDistPercentage;
++        double decDist2DSum = edgeState.getDistance() - incDist2DSum;
++
++        double adjustedSpeed = speed;
++
++        if (!reverse)
++        {
++            // use weighted mean so that longer incline infuences speed more than shorter
++            double fwdFaster = 1 + 30 * keepIn(decElevation, 0, 0.1);
++            fwdFaster = Math.sqrt(fwdFaster);
++            double fwdSlower = 1 - 5 * keepIn(incElevation, 0, 0.2);
++            fwdSlower = fwdSlower * fwdSlower;
++            adjustedSpeed = keepIn(speed * (fwdSlower * incDist2DSum + fwdFaster * decDist2DSum) / edgeState.getDistance(), BikeGenericFlagEncoder.PUSHING_SECTION_SPEED / 2, 50);
++        } else {
++            double fwdFaster = 1 + 30 * keepIn(incElevation, 0, 0.1);
++            fwdFaster = Math.sqrt(fwdFaster);
++            double fwdSlower = 1 - 5 * keepIn(decElevation, 0, 0.2);
++            fwdSlower = fwdSlower * fwdSlower;
++            adjustedSpeed = keepIn(speed * (fwdSlower * decDist2DSum + fwdFaster * incDist2DSum) / edgeState.getDistance(), BikeGenericFlagEncoder.PUSHING_SECTION_SPEED / 2, 50);
++        }
++
++        //System.out.println("NEW SPEED: " + Helper.round2(adjustedSpeed) + ", SPEED: " + speed + ", INC ELE: " + incElevation + ", DEC ELE: " + decElevation + ", PERCENTAGE: " + incDistPercentage);
++
++        return adjustedSpeed;
++    }
++
++}
+diff --git a/core/src/main/java/com/graphhopper/routing/util/SpeedProvider.java b/core/src/main/java/com/graphhopper/routing/util/SpeedProvider.java
+new file mode 100644
+index 0000000000..fd9b414b92
+--- /dev/null
++++ b/core/src/main/java/com/graphhopper/routing/util/SpeedProvider.java
+@@ -0,0 +1,9 @@
++package com.graphhopper.routing.util;
++
++import com.graphhopper.util.EdgeIteratorState;
++
++public interface SpeedProvider {
++
++    double calcSpeed(EdgeIteratorState edgeIteratorState, boolean reverse);
++
++}
+diff --git a/core/src/main/java/com/graphhopper/util/profiles/Profiles.java b/core/src/main/java/com/graphhopper/util/profiles/Profiles.java
+index 07c2d6f036..31eeff26c6 100644
+--- a/core/src/main/java/com/graphhopper/util/profiles/Profiles.java
++++ b/core/src/main/java/com/graphhopper/util/profiles/Profiles.java
+@@ -1,9 +1,6 @@
+ package com.graphhopper.util.profiles;
+ 
+-import com.graphhopper.util.profiles.operations.AddToProfileOperation;
+-import com.graphhopper.util.profiles.operations.CreateProfileOperation;
+-import com.graphhopper.util.profiles.operations.Operation;
+-import com.graphhopper.util.profiles.operations.PrintProfileOperation;
++import com.graphhopper.util.profiles.operations.*;
+ 
+ public class Profiles {
+ 
+@@ -25,105 +22,5 @@ public static void main(String[] args) {
+         if(op != null)
+             op.run();
+ 
+-        /*
+-        // import OpenStreetMap data
+-        GraphHopper hopper = new GraphHopper();
+-        hopper.setOSMFile("./" + pbfFileName);
+-        hopper.setGraphHopperLocation("./cache");
+-        BikeGenericFlagEncoder encoder = new BikeGenericFlagEncoder();
+-
+-        hopper.setEncodingManager(new EncodingManager(encoder));
+-        hopper.setElevation(true);
+-        hopper.setElevationProvider(new HighPrecisionSRTMProvider());
+-        hopper.setCHEnable(false);
+-        hopper.setPreciseIndexResolution(300);
+-        hopper.importOrLoad();
+-
+-        // create MapMatching object, can and should be shared accross threads
+-        GraphHopperStorage graph = hopper.getGraphHopperStorage();
+-        LocationIndexMatch locationIndex = new LocationIndexMatch(graph, (LocationIndexTree) hopper.getLocationIndex());
+-
+-
+-        MapMatching mapMatching = new MapMatching(graph, locationIndex, encoder);
+-        mapMatching.setForceRepair(true);
+-        mapMatching.setMaxSearchMultiplier(100);
+-
+-        // do the actual matching, get the GPX entries from a file or via stream
+-
+-        GPXDataExtractor gpxDataExtractor = new GPXDataExtractor();
+-        gpxDataExtractor.setupMapMatching(mapMatching, encoder);
+-        gpxDataExtractor.configFilter(GPXDataExtractor.FILTER_KALMAN_COMBINED, 100);
+-
+-        String[] files = null;
+-
+-        files = new String[]{ "Garmin_150629_Seis_Seiser_Alm.gpx",
+-                "Garmin_150629_Seiser_Alm_Seis.gpx",
+-                "Garmin_150704_Konstantin_Seis.gpx",
+-                "Garmin_150704_Seis_Konstantin.gpx",
+-                "Garmin_150706_Ritsch_Kompatsch.gpx",
+-                "Garmin_150706_Seis_Pufls_Seiser_Alm.gpx",
+-                "Garmin_150706_Seiser_Alm_Seis.gpx",
+-                "Garmin_160915_Seis_Fursch.gpx",
+-                "Garmin_200915_Kastelruth_Seis.gpx",
+-                "Garmin_200915_Seis_Kastelruth.gpx"};
+-
+-        //files = new String[]{"Sella_Ronda_-_Ed._2014.gpx", "Sellaronda_hero_2014.gpx" };
+-
+-        GPXFile gpxFile;
+-        RidersProfile ridersProfile = new RidersProfile();
+-        int skippedTrackParts = 0;
+-
+-        for(int i = 0; i < files.length; i++){
+-            gpxFile = new GPXFile().doImport("./track-data/" + files[i]);
+-            gpxDataExtractor.setFile(gpxFile);
+-            skippedTrackParts += ridersProfile.update(gpxDataExtractor.extract());
+-        }
+-
+-
+-        /*int waytype = 0;
+-
+-        for(int i = -30; i < 30; i++) {
+-
+-            if(ridersProfile.getEntry(waytype,i) == null)
+-                continue;
+-
+-            System.out.println(i + " " + ridersProfile.getEntry(waytype,i).getSpeed());
+-
+-        }
+-
+-        //System.out.println(ridersProfile);
+-        System.out.println(ridersProfile.getTotalDistance());
+-        System.out.println(ridersProfile.getDistance(0));
+-
+-        double[] tmp = ridersProfile.getWayTypePriority();
+-        double totalDist = ridersProfile.getTotalDistance();
+-
+-        double distancePerWay = tmp[14] * totalDist / 100;
+-
+-        System.out.println("Skipped: " + skippedTrackParts);
+-
+-
+-
+-        Map<Integer, double[]> speedsMap = ridersProfile.getFilterSpeeds();
+-
+-        int waytype = 0;
+-
+-
+-        for(double[] speeds : speedsMap.values()) {
+-
+-            System.out.println("-----------------------------");
+-            int i = -30;
+-
+-            for (double speed : speeds) {
+-                System.out.println(i + ", " + speed);
+-                i++;
+-            }
+-        }
+-        */
+-    }
+-
+-
+-    private void setup(){
+-
+     }
+ }

@@ -1,0 +1,508 @@
+diff --git a/CHANGELOG.md b/CHANGELOG.md
+index d06a3f4..602cc8e 100644
+--- a/CHANGELOG.md
++++ b/CHANGELOG.md
+@@ -1,3 +1,7 @@
++## 1.2.1
++* Add option to override the default background executor, see #292
++* Don't keep a strong reference to finished jobs to allow freeing memory, see #299
++
+ ## 1.2.0 (2017-10-05)
+ 
+ * Extract `JobManager.Config` class into `JobConfig` class to make it possible to change settings before the `JobManager` is created
+diff --git a/build.gradle b/build.gradle
+index 55470de..c0c22ba 100644
+--- a/build.gradle
++++ b/build.gradle
+@@ -4,7 +4,7 @@ buildscript {
+         google()
+     }
+     dependencies {
+-        classpath 'com.android.tools.build:gradle:3.0.0-beta7'
++        classpath 'com.android.tools.build:gradle:3.0.0-rc1'
+         classpath 'com.github.ben-manes:gradle-versions-plugin:0.15.0'
+     }
+ }
+diff --git a/gradle.properties b/gradle.properties
+index 4347d6d..cc94efe 100644
+--- a/gradle.properties
++++ b/gradle.properties
+@@ -1,3 +1,3 @@
+-#VERSION_NAME=1.2.0
+-VERSION_NAME=1.2.0-SNAPSHOT
++#VERSION_NAME=1.2.1
++VERSION_NAME=1.2.1-SNAPSHOT
+ VERSION_CODE=1
+\ No newline at end of file
+diff --git a/library/src/main/java/com/evernote/android/job/JobConfig.java b/library/src/main/java/com/evernote/android/job/JobConfig.java
+index 2b4ea8b..93ad09a 100644
+--- a/library/src/main/java/com/evernote/android/job/JobConfig.java
++++ b/library/src/main/java/com/evernote/android/job/JobConfig.java
+@@ -35,7 +35,11 @@
+ import com.evernote.android.job.util.JobPreconditions;
+ 
+ import java.util.EnumMap;
++import java.util.concurrent.ExecutorService;
++import java.util.concurrent.Executors;
++import java.util.concurrent.ThreadFactory;
+ import java.util.concurrent.TimeUnit;
++import java.util.concurrent.atomic.AtomicInteger;
+ 
+ /**
+  * A global configuration for the job library.
+@@ -57,6 +61,23 @@ private JobConfig() {
+     private static final EnumMap<JobApi, Boolean> ENABLED_APIS;
+     private static final JobCat CAT = new JobCat("JobConfig");
+ 
++    private static final ExecutorService DEFAULT_EXECUTOR_SERVICE = Executors.newCachedThreadPool(new ThreadFactory() {
++
++        private final AtomicInteger mThreadNumber = new AtomicInteger();
++
++        @Override
++        public Thread newThread(@NonNull Runnable r) {
++            Thread thread = new Thread(r, "AndroidJob-" + mThreadNumber.incrementAndGet());
++            if (thread.isDaemon()) {
++                thread.setDaemon(false);
++            }
++            if (thread.getPriority() != Thread.NORM_PRIORITY) {
++                thread.setPriority(Thread.NORM_PRIORITY);
++            }
++            return thread;
++        }
++    });
++
+     private static volatile boolean allowSmallerIntervals;
+     private static volatile boolean forceAllowApi14 = false;
+ 
+@@ -68,6 +89,7 @@ private JobConfig() {
+     private static volatile boolean forceRtc = false;
+ 
+     private static volatile Clock clock = Clock.DEFAULT;
++    private static volatile ExecutorService executorService = DEFAULT_EXECUTOR_SERVICE;
+ 
+     static {
+         ENABLED_APIS = new EnumMap<>(JobApi.class);
+@@ -276,6 +298,23 @@ public static Clock getClock() {
+         JobConfig.clock = clock;
+     }
+ 
++    /**
++     * @return The executor service for all parallel execution.
++     */
++    public static ExecutorService getExecutorService() {
++        return executorService;
++    }
++
++    /**
++     * Overrides the executor service for all parallel execution. This could be helpful for Espresso
++     * tests.
++     *
++     * @param executorService The new executor service.
++     */
++    public static void setExecutorService(@NonNull ExecutorService executorService) {
++        JobConfig.executorService = JobPreconditions.checkNotNull(executorService);
++    }
++
+     /**
+      * Resets all adjustments in the config.
+      */
+@@ -290,6 +329,7 @@ public static void reset() {
+         jobIdOffset = 0;
+         forceRtc = false;
+         clock = Clock.DEFAULT;
++        executorService = DEFAULT_EXECUTOR_SERVICE;
+         JobCat.setLogcatEnabled(true);
+         JobCat.clearLogger();
+     }
+diff --git a/library/src/main/java/com/evernote/android/job/JobExecutor.java b/library/src/main/java/com/evernote/android/job/JobExecutor.java
+index ec4c735..19ea602 100644
+--- a/library/src/main/java/com/evernote/android/job/JobExecutor.java
++++ b/library/src/main/java/com/evernote/android/job/JobExecutor.java
+@@ -25,11 +25,13 @@
+  */
+ package com.evernote.android.job;
+ 
++import android.annotation.SuppressLint;
+ import android.content.Context;
+ import android.os.Bundle;
+ import android.os.PowerManager;
+ import android.support.annotation.NonNull;
+ import android.support.annotation.Nullable;
++import android.support.annotation.VisibleForTesting;
+ import android.util.LruCache;
+ import android.util.SparseArray;
+ 
+@@ -37,13 +39,13 @@
+ 
+ import net.vrallev.android.cat.CatLog;
+ 
++import java.lang.ref.WeakReference;
++import java.util.HashMap;
+ import java.util.HashSet;
+ import java.util.Locale;
+ import java.util.Map;
+ import java.util.Set;
+ import java.util.concurrent.Callable;
+-import java.util.concurrent.ExecutorService;
+-import java.util.concurrent.Executors;
+ import java.util.concurrent.Future;
+ import java.util.concurrent.TimeUnit;
+ 
+@@ -56,17 +58,16 @@
+     private static final CatLog CAT = new JobCat("JobExecutor");
+     private static final long WAKE_LOCK_TIMEOUT = TimeUnit.MINUTES.toMillis(3);
+ 
+-    private final ExecutorService mExecutorService;
+-
+     private final SparseArray<Job> mJobs; // only cached in memory, that's fine
+-    private final LruCache<Integer, Job> mFinishedJobsCache;
++    private final LruCache<Integer, WeakReference<Job>> mFinishedJobsCache;
++    private final SparseArray<Job.Result> mFinishedJobResults;
+ 
+     private final Set<JobRequest> mStartingRequests;
+ 
+     public JobExecutor() {
+-        mExecutorService = Executors.newCachedThreadPool(JobProxy.Common.COMMON_THREAD_FACTORY);
+         mJobs = new SparseArray<>();
+         mFinishedJobsCache = new LruCache<>(20);
++        mFinishedJobResults = new SparseArray<>();
+         mStartingRequests = new HashSet<>();
+     }
+ 
+@@ -85,12 +86,16 @@ public JobExecutor() {
+         CAT.i("Executing %s, context %s", request, context.getClass().getSimpleName());
+ 
+         mJobs.put(request.getJobId(), job);
+-        return mExecutorService.submit(new JobCallable(job));
++        return JobConfig.getExecutorService().submit(new JobCallable(job));
+     }
+ 
+     public synchronized Job getJob(int jobId) {
+         Job job = mJobs.get(jobId);
+-        return job != null ? job : mFinishedJobsCache.get(jobId);
++        if (job != null) {
++            return job;
++        }
++        WeakReference<Job> reference = mFinishedJobsCache.get(jobId);
++        return reference != null ? reference.get() : null;
+     }
+ 
+     public synchronized Set<Job> getAllJobs() {
+@@ -106,8 +111,13 @@ public synchronized Job getJob(int jobId) {
+             }
+         }
+ 
+-        Map<Integer, Job> snapshot = mFinishedJobsCache.snapshot();
+-        for (Job job : snapshot.values()) {
++        Map<Integer, WeakReference<Job>> snapshot = mFinishedJobsCache.snapshot();
++        for (WeakReference<Job> reference : snapshot.values()) {
++            Job job = reference.get();
++            if (job == null) {
++                continue;
++            }
++
+             if (tag == null || tag.equals(job.getParams().getTag())) {
+                 result.add(job);
+             }
+@@ -116,6 +126,10 @@ public synchronized Job getJob(int jobId) {
+         return result;
+     }
+ 
++    public SparseArray<Job.Result> getAllJobResults() {
++        return mFinishedJobResults.clone();
++    }
++
+     public synchronized void markJobRequestStarting(@NonNull JobRequest request) {
+         mStartingRequests.add(request);
+     }
+@@ -124,10 +138,24 @@ public synchronized boolean isRequestStarting(JobRequest request) {
+         return request != null && mStartingRequests.contains(request);
+     }
+ 
+-    private synchronized void markJobAsFinished(Job job) {
++    @VisibleForTesting
++    /*package*/ synchronized void markJobAsFinished(Job job) {
+         int id = job.getParams().getId();
+         mJobs.remove(id);
+-        mFinishedJobsCache.put(id, job);
++        cleanUpRoutine(mFinishedJobsCache);
++        mFinishedJobResults.put(id, job.getResult());
++        mFinishedJobsCache.put(id, new WeakReference<>(job));
++    }
++
++    @VisibleForTesting
++    @SuppressLint("UseSparseArrays")
++    /*package*/ void cleanUpRoutine(LruCache<Integer, WeakReference<Job>> cache) {
++        Map<Integer, WeakReference<Job>> snapshot = new HashMap<>(cache.snapshot());
++        for (Integer key : snapshot.keySet()) {
++            if (snapshot.get(key) == null || snapshot.get(key).get() == null) {
++                cache.remove(key);
++            }
++        }
+     }
+ 
+     private final class JobCallable implements Callable<Job.Result> {
+diff --git a/library/src/main/java/com/evernote/android/job/JobManager.java b/library/src/main/java/com/evernote/android/job/JobManager.java
+index 73f54b5..5788f94 100644
+--- a/library/src/main/java/com/evernote/android/job/JobManager.java
++++ b/library/src/main/java/com/evernote/android/job/JobManager.java
+@@ -36,6 +36,7 @@
+ import android.support.annotation.NonNull;
+ import android.support.annotation.Nullable;
+ import android.text.TextUtils;
++import android.util.SparseArray;
+ 
+ import com.evernote.android.job.util.JobCat;
+ import com.evernote.android.job.util.JobPreconditions;
+@@ -44,6 +45,7 @@
+ 
+ import net.vrallev.android.cat.CatLog;
+ 
++import java.lang.ref.WeakReference;
+ import java.util.Collections;
+ import java.util.Iterator;
+ import java.util.List;
+@@ -304,7 +306,9 @@ public JobRequest getJobRequest(int jobId) {
+ 
+     /**
+      * Jobs are cached in memory even if they already have finished. But finished jobs are never
+-     * restored after the app has launched.
++     * restored after the app has launched. Since finished jobs could cause memory leaks, they wrapped
++     * inside of a {@link WeakReference} and can be removed from memory. If you need to know the results
++     * of finished jobs or whether a job has been run, you can call {@link #getAllJobResults()}.
+      *
+      * @param jobId The unique ID of the running or finished {@link Job}.
+      * @return The {@link Job} if it's running or has been finished and is still cached. Returns
+@@ -316,7 +320,9 @@ public Job getJob(int jobId) {
+ 
+     /**
+      * Jobs are cached in memory even if they already have finished. But finished jobs are never
+-     * restored after the app has relaunched.
++     * restored after the app has relaunched. Since finished jobs could cause memory leaks, they wrapped
++     * inside of a {@link WeakReference} and can be removed from memory. If you need to know the results
++     * of finished jobs or whether a job has been run, you can call {@link #getAllJobResults()}.
+      *
+      * @return A duplicate {@link Set} containing all running and cached finished jobs or an empty set.
+      * Never returns {@code null}. The set may be modified without direct effects to the actual
+@@ -329,7 +335,9 @@ public Job getJob(int jobId) {
+ 
+     /**
+      * Jobs are cached in memory even if they already have finished. But finished jobs are never
+-     * restored after the app has relaunched.
++     * restored after the app has relaunched. Since finished jobs could cause memory leaks, they wrapped
++     * inside of a {@link WeakReference} and can be removed from memory. If you need to know the results
++     * of finished jobs or whether a job has been run, you can call {@link #getAllJobResults()}.
+      *
+      * @param tag The tag of the running or finished jobs.
+      * @return A duplicate {@link Set} containing all running and cached finished jobs associated with
+@@ -341,6 +349,18 @@ public Job getJob(int jobId) {
+         return mJobExecutor.getAllJobsForTag(tag);
+     }
+ 
++    /**
++     * Finished jobs are kept in memory until the garbage collector cleans them up. This method returns
++     * the results of all finished jobs even after they have been cleaned up. However, neither finished jobs
++     * nor their results are restored after the has been relaunched.
++     *
++     * @return The results of all finished jobs. They key is the corresponding job ID.
++     */
++    @NonNull
++    public SparseArray<Job.Result> getAllJobResults() {
++        return mJobExecutor.getAllJobResults();
++    }
++
+     /**
+      * Cancel either the pending {@link JobRequest} or the running {@link Job}.
+      *
+diff --git a/library/src/main/java/com/evernote/android/job/JobProxy.java b/library/src/main/java/com/evernote/android/job/JobProxy.java
+index d471820..d596d4d 100644
+--- a/library/src/main/java/com/evernote/android/job/JobProxy.java
++++ b/library/src/main/java/com/evernote/android/job/JobProxy.java
+@@ -41,8 +41,6 @@
+ import java.util.Locale;
+ import java.util.concurrent.ExecutionException;
+ import java.util.concurrent.Future;
+-import java.util.concurrent.ThreadFactory;
+-import java.util.concurrent.atomic.AtomicInteger;
+ 
+ /**
+  * A proxy for each {@link JobApi}.
+@@ -66,23 +64,6 @@
+ 
+         private static final Object COMMON_MONITOR = new Object();
+ 
+-        public static final ThreadFactory COMMON_THREAD_FACTORY = new ThreadFactory() {
+-
+-            private final AtomicInteger mThreadNumber = new AtomicInteger();
+-
+-            @Override
+-            public Thread newThread(@NonNull Runnable r) {
+-                Thread thread = new Thread(r, "AndroidJob-" + mThreadNumber.incrementAndGet());
+-                if (thread.isDaemon()) {
+-                    thread.setDaemon(false);
+-                }
+-                if (thread.getPriority() != Thread.NORM_PRIORITY) {
+-                    thread.setPriority(Thread.NORM_PRIORITY);
+-                }
+-                return thread;
+-            }
+-        };
+-
+         // see Google Guava: https://github.com/google/guava/blob/master/guava/src/com/google/common/math/LongMath.java
+         private static long checkedAdd(long a, long b) {
+             long result = a + b;
+diff --git a/library/src/main/java/com/evernote/android/job/v14/PlatformAlarmServiceExact.java b/library/src/main/java/com/evernote/android/job/v14/PlatformAlarmServiceExact.java
+index b7593a0..3b434ea 100644
+--- a/library/src/main/java/com/evernote/android/job/v14/PlatformAlarmServiceExact.java
++++ b/library/src/main/java/com/evernote/android/job/v14/PlatformAlarmServiceExact.java
+@@ -32,6 +32,7 @@
+ import android.os.IBinder;
+ import android.support.annotation.Nullable;
+ 
++import com.evernote.android.job.JobConfig;
+ import com.evernote.android.job.JobProxy;
+ import com.evernote.android.job.util.JobCat;
+ 
+@@ -39,8 +40,6 @@
+ 
+ import java.util.HashSet;
+ import java.util.Set;
+-import java.util.concurrent.ExecutorService;
+-import java.util.concurrent.Executors;
+ 
+ /**
+  * @author rwondratschek
+@@ -60,14 +59,12 @@ public static Intent createIntent(Context context, int jobId, @Nullable Bundle t
+ 
+     private final Object mMonitor = new Object();
+ 
+-    private volatile ExecutorService mExecutorService;
+     private volatile Set<Integer> mStartIds;
+     private volatile int mLastStartId;
+ 
+     @Override
+     public void onCreate() {
+         super.onCreate();
+-        mExecutorService = Executors.newCachedThreadPool(JobProxy.Common.COMMON_THREAD_FACTORY);
+         mStartIds = new HashSet<>();
+     }
+ 
+@@ -78,7 +75,7 @@ public int onStartCommand(@Nullable final Intent intent, int flags, final int st
+             mLastStartId = startId;
+         }
+ 
+-        mExecutorService.execute(new Runnable() {
++        JobConfig.getExecutorService().execute(new Runnable() {
+             @Override
+             public void run() {
+                 try {
+@@ -95,9 +92,6 @@ public void run() {
+ 
+     @Override
+     public void onDestroy() {
+-        mExecutorService.shutdown();
+-        mExecutorService = null;
+-
+         synchronized (mMonitor) {
+             mStartIds = null;
+             mLastStartId = 0;
+diff --git a/library/src/main/java/com/evernote/android/job/v21/PlatformJobService.java b/library/src/main/java/com/evernote/android/job/v21/PlatformJobService.java
+index 2748da1..2f50433 100644
+--- a/library/src/main/java/com/evernote/android/job/v21/PlatformJobService.java
++++ b/library/src/main/java/com/evernote/android/job/v21/PlatformJobService.java
+@@ -32,6 +32,7 @@
+ import android.os.Bundle;
+ 
+ import com.evernote.android.job.Job;
++import com.evernote.android.job.JobConfig;
+ import com.evernote.android.job.JobManager;
+ import com.evernote.android.job.JobProxy;
+ import com.evernote.android.job.JobRequest;
+@@ -39,9 +40,6 @@
+ 
+ import net.vrallev.android.cat.Cat;
+ 
+-import java.util.concurrent.ExecutorService;
+-import java.util.concurrent.Executors;
+-
+ /**
+  * @author rwondratschek
+  */
+@@ -53,7 +51,6 @@
+      */
+ 
+     private static final JobCat CAT = new JobCat("PlatformJobService");
+-    private static final ExecutorService EXECUTOR_SERVICE = Executors.newCachedThreadPool(JobProxy.Common.COMMON_THREAD_FACTORY);
+ 
+     @Override
+     public boolean onStartJob(final JobParameters params) {
+@@ -82,7 +79,7 @@ public boolean onStartJob(final JobParameters params) {
+ 
+         common.markStarting(request);
+ 
+-        EXECUTOR_SERVICE.execute(new Runnable() {
++        JobConfig.getExecutorService().execute(new Runnable() {
+             @Override
+             public void run() {
+                 try {
+diff --git a/library/src/test/java/com/evernote/android/job/JobExecutorTest.java b/library/src/test/java/com/evernote/android/job/JobExecutorTest.java
+new file mode 100644
+index 0000000..6189663
+--- /dev/null
++++ b/library/src/test/java/com/evernote/android/job/JobExecutorTest.java
+@@ -0,0 +1,55 @@
++package com.evernote.android.job;
++
++import android.util.LruCache;
++
++import com.evernote.android.job.test.JobRobolectricTestRunner;
++
++import org.junit.FixMethodOrder;
++import org.junit.Test;
++import org.junit.runner.RunWith;
++import org.junit.runners.MethodSorters;
++
++import java.lang.ref.WeakReference;
++
++import static org.assertj.core.api.Assertions.assertThat;
++import static org.mockito.Mockito.mock;
++import static org.mockito.Mockito.when;
++
++/**
++ * @author rwondratschek
++ */
++@FixMethodOrder(MethodSorters.JVM)
++@RunWith(JobRobolectricTestRunner.class)
++public class JobExecutorTest {
++
++    @Test
++    public void verifyGetAllJobResultsReturnsAllResults() {
++        JobExecutor executor = new JobExecutor();
++
++        executor.markJobAsFinished(createJobMock(1));
++        executor.markJobAsFinished(createJobMock(2));
++
++        assertThat(executor.getAllJobs()).hasSize(2);
++        assertThat(executor.getAllJobResults().size()).isEqualTo(2);
++    }
++
++    @Test
++    public void verifyCleanUpRoutine() {
++        LruCache<Integer, WeakReference<Job>> cache = new LruCache<>(20);
++        cache.put(1, new WeakReference<>(createJobMock(1)));
++        cache.put(2, new WeakReference<Job>(null));
++
++        new JobExecutor().cleanUpRoutine(cache);
++
++        assertThat(cache.size()).isEqualTo(1);
++    }
++
++    private Job createJobMock(int id) {
++        Job.Params params = mock(Job.Params.class);
++        when(params.getId()).thenReturn(id);
++
++        Job job = mock(Job.class);
++        when(job.getParams()).thenReturn(params);
++        return job;
++    }
++}

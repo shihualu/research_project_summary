@@ -1,0 +1,2028 @@
+diff --git a/CONTRIBUTORS.md b/CONTRIBUTORS.md
+index 5f1708cac1..9d656156d6 100644
+--- a/CONTRIBUTORS.md
++++ b/CONTRIBUTORS.md
+@@ -4,6 +4,7 @@
+  * andreaswolf, flag encoder versioning and more
+  * agouge, discussion and API refactoring
+  * b3nn0, Android improvements
++ * boldtrn, motorcycle improvements
+  * cgarreau, increase of routing success rate via subnetwork cleanup
+  * daisy1754, fixed usage of graphhopper.sh script
+  * dardin88, instructions improved
+diff --git a/core/src/main/java/com/graphhopper/GraphHopper.java b/core/src/main/java/com/graphhopper/GraphHopper.java
+index 7368983b12..d928d3c393 100644
+--- a/core/src/main/java/com/graphhopper/GraphHopper.java
++++ b/core/src/main/java/com/graphhopper/GraphHopper.java
+@@ -101,7 +101,7 @@
+     private ElevationProvider eleProvider = ElevationProvider.NOOP;
+ 
+     public GraphHopper()
+-    {       
++    {
+         setCHPrepareThreads(1);
+     }
+ 
+@@ -580,7 +580,7 @@ public GraphHopper init( CmdArgs args )
+         removeZipped = args.getBool("graph.removeZipped", removeZipped);
+         int bytesForFlags = args.getInt("graph.bytesForFlags", 4);
+         String flagEncoders = args.get("graph.flagEncoders", "");
+-        if (!flagEncoders.isEmpty())            
++        if (!flagEncoders.isEmpty())
+             setEncodingManager(new EncodingManager(flagEncoders, bytesForFlags));
+ 
+         if (args.get("graph.locktype", "native").equals("simple"))
+@@ -943,9 +943,16 @@ public Weighting createWeighting( WeightingMap weightingMap, FlagEncoder encoder
+                 return new PriorityWeighting(encoder, weightingMap);
+             else
+                 return new FastestWeighting(encoder, weightingMap);
++        } else if ("curvature".equalsIgnoreCase(weighting))
++        {
++            if (encoder.supports(CurvatureWeighting.class))
++                return new CurvatureWeighting(encoder, weightingMap, ghStorage);
++            else
++                return new FastestWeighting(encoder, weightingMap);
+         }
+ 
+         throw new UnsupportedOperationException("weighting " + weighting + " not supported");
++
+     }
+ 
+     public Weighting getWeightingForCH( WeightingMap weightingMap, FlagEncoder encoder )
+diff --git a/core/src/main/java/com/graphhopper/routing/util/CurvatureWeighting.java b/core/src/main/java/com/graphhopper/routing/util/CurvatureWeighting.java
+new file mode 100644
+index 0000000000..2ce1e68e36
+--- /dev/null
++++ b/core/src/main/java/com/graphhopper/routing/util/CurvatureWeighting.java
+@@ -0,0 +1,70 @@
++/*
++ *  Licensed to GraphHopper and Peter Karich under one or more contributor
++ *  license agreements. See the NOTICE file distributed with this work for 
++ *  additional information regarding copyright ownership.
++ * 
++ *  GraphHopper licenses this file to you under the Apache License, 
++ *  Version 2.0 (the "License"); you may not use this file except in 
++ *  compliance with the License. You may obtain a copy of the License at
++ * 
++ *       http://www.apache.org/licenses/LICENSE-2.0
++ * 
++ *  Unless required by applicable law or agreed to in writing, software
++ *  distributed under the License is distributed on an "AS IS" BASIS,
++ *  WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++ *  See the License for the specific language governing permissions and
++ *  limitations under the License.
++ */
++package com.graphhopper.routing.util;
++
++import com.graphhopper.storage.GraphHopperStorage;
++import com.graphhopper.util.EdgeIteratorState;
++import com.graphhopper.util.PMap;
++
++/**
++ * This Class uses bendiness parameter to prefer curvy routes.
++ */
++public class CurvatureWeighting extends PriorityWeighting
++{
++    private final double minFactor;
++
++    public CurvatureWeighting( FlagEncoder flagEncoder, PMap pMap, GraphHopperStorage ghStorage )
++    {
++        super(flagEncoder, pMap);
++
++        double minBendiness = 1; // see correctErrors
++        double maxPriority = 1; // BEST / BEST
++        minFactor = minBendiness / Math.log(flagEncoder.getMaxSpeed()) / (0.5 + maxPriority);
++    }
++
++    @Override
++    public double getMinWeight( double distance )
++    {
++        return minFactor * distance;
++    }
++
++    @Override
++    public double calcWeight( EdgeIteratorState edge, boolean reverse, int prevOrNextEdgeId )
++    {
++        double priority = flagEncoder.getDouble(edge.getFlags(), KEY);
++        double bendiness = flagEncoder.getDouble(edge.getFlags(), MotorcycleFlagEncoder.CURVATURE_KEY);
++        double speed = getRoadSpeed(edge, reverse);
++        double roadDistance = edge.getDistance();
++
++        // We use the log of the speed to decrease the impact of the speed, therefore we don't use the highway
++        double regularWeight = roadDistance / Math.log(speed);
++
++        return (bendiness * regularWeight) / (0.5 + priority);
++    }
++
++    protected double getRoadSpeed( EdgeIteratorState edge, boolean reverse )
++    {
++        return reverse ? flagEncoder.getReverseSpeed(edge.getFlags()) : flagEncoder.getSpeed(edge.getFlags());
++    }
++
++    @Override
++    public String toString()
++    {
++        return "CURVATURE|" + flagEncoder;
++    }
++}
+diff --git a/core/src/main/java/com/graphhopper/routing/util/MotorcycleFlagEncoder.java b/core/src/main/java/com/graphhopper/routing/util/MotorcycleFlagEncoder.java
+index 99cbc46b37..37b01dcb63 100644
+--- a/core/src/main/java/com/graphhopper/routing/util/MotorcycleFlagEncoder.java
++++ b/core/src/main/java/com/graphhopper/routing/util/MotorcycleFlagEncoder.java
+@@ -19,6 +19,7 @@
+ 
+ import com.graphhopper.reader.OSMWay;
+ import com.graphhopper.util.BitUtil;
++import com.graphhopper.util.EdgeIteratorState;
+ import com.graphhopper.util.PMap;
+ 
+ import static com.graphhopper.routing.util.PriorityCode.*;
+@@ -28,12 +29,17 @@
+ /**
+  * Defines bit layout for motorbikes
+  * <p>
++ *
+  * @author Peter Karich
++ * @author boldtrn
+  */
+ public class MotorcycleFlagEncoder extends CarFlagEncoder
+ {
++    public static final int CURVATURE_KEY = 112;
++
+     private EncodedDoubleValue reverseSpeedEncoder;
+     private EncodedValue priorityWayEncoder;
++    private EncodedValue curvatureEncoder;
+     private final HashSet<String> avoidSet = new HashSet<String>();
+     private final HashSet<String> preferSet = new HashSet<String>();
+ 
+@@ -77,8 +83,11 @@ public MotorcycleFlagEncoder( int speedBits, double speedFactor, int maxTurnCost
+         avoidSet.add("motorway");
+         avoidSet.add("trunk");
+         avoidSet.add("motorroad");
++        avoidSet.add("residential");
++
+         preferSet.add("primary");
+         preferSet.add("secondary");
++        preferSet.add("tertiary");
+ 
+         maxPossibleSpeed = 120;
+ 
+@@ -107,6 +116,7 @@ public MotorcycleFlagEncoder( int speedBits, double speedFactor, int maxTurnCost
+         defaultSpeedMap.put("road", 20);
+         // forestry stuff
+         defaultSpeedMap.put("track", 15);
++
+     }
+ 
+     @Override
+@@ -130,6 +140,9 @@ public int defineWayBits( int index, int shift )
+         priorityWayEncoder = new EncodedValue("PreferWay", shift, 3, 1, 3, 7);
+         shift += priorityWayEncoder.getBits();
+ 
++        curvatureEncoder = new EncodedValue("Curvature", shift, 4, 1, 10, 10);
++        shift += curvatureEncoder.getBits();
++
+         return shift;
+     }
+ 
+@@ -235,6 +248,10 @@ public long handleWayTags( OSMWay way, long allowed, long priorityFromRelation )
+ 
+         // relations are not yet stored -> see BikeCommonFlagEncoder.defineRelationBits how to do this
+         encoded = priorityWayEncoder.setValue(encoded, handlePriority(way, priorityFromRelation));
++
++        // Set the curvature to the Maximum
++        encoded = curvatureEncoder.setValue(encoded, 10);
++
+         return encoded;
+     }
+ 
+@@ -307,6 +324,8 @@ public double getDouble( long flags, int key )
+         {
+             case PriorityWeighting.KEY:
+                 return (double) priorityWayEncoder.getValue(flags) / BEST.getValue();
++            case MotorcycleFlagEncoder.CURVATURE_KEY:
++                return (double) curvatureEncoder.getValue(flags) / 10;
+             default:
+                 return super.getDouble(flags, key);
+         }
+@@ -317,23 +336,90 @@ private int handlePriority( OSMWay way, long relationFlags )
+         String highway = way.getTag("highway", "");
+         if (avoidSet.contains(highway))
+         {
+-            return PriorityCode.AVOID_AT_ALL_COSTS.getValue();
++            return PriorityCode.WORST.getValue();
+         } else if (preferSet.contains(highway))
+         {
+-            return PriorityCode.VERY_NICE.getValue();
++            return PriorityCode.BEST.getValue();
+         }
++
+         return PriorityCode.UNCHANGED.getValue();
+     }
+ 
++    @Override
++    public void applyWayTags( OSMWay way, EdgeIteratorState edge )
++    {
++        double speed = this.getSpeed(edge.getFlags());
++        double roadDistance = edge.getDistance();
++        double beelineDistance = getBeelineDistance(way);
++        double bendiness = beelineDistance / roadDistance;
++
++        bendiness = discriminateSlowStreets(bendiness, speed);
++        bendiness = increaseBendinessImpact(bendiness);
++        bendiness = correctErrors(bendiness);
++
++        edge.setFlags(this.curvatureEncoder.setValue(edge.getFlags(), convertToInt(bendiness)));
++    }
++
++    private double getBeelineDistance( OSMWay way )
++    {
++        return way.getTag("estimated_distance", Double.POSITIVE_INFINITY);
++    }
++
++    /**
++     * Streets that slow are not fun and probably in a town.
++     */
++    protected double discriminateSlowStreets( double bendiness, double speed )
++    {
++        if (speed < 51)
++        {
++            return 1;
++        }
++        return bendiness;
++    }
++
++    /**
++     * A really small bendiness or a bendiness greater than 1 indicates an error in the calculation.
++     * Just ignore them. We use bendiness > 1.2 since the beelineDistance is only approximated,
++     * therefore it can happen on straight roads, that the beeline is longer than the road.
++     */
++    protected double correctErrors( double bendiness )
++    {
++        if (bendiness < 0.01 || bendiness > 1)
++        {
++            return 1;
++        }
++        return bendiness;
++    }
++
++    /**
++     * A good bendiness should become a greater impact. A bendiness close to 1 should not be
++     * changed.
++     */
++    protected double increaseBendinessImpact( double bendiness )
++    {
++        return (Math.pow(bendiness, 2));
++    }
++
+     @Override
+     public boolean supports( Class<?> feature )
+     {
+         if (super.supports(feature))
+             return true;
+ 
++        if (CurvatureWeighting.class.isAssignableFrom(feature))
++        {
++            return true;
++        }
++
+         return PriorityWeighting.class.isAssignableFrom(feature);
+     }
+ 
++    protected int convertToInt( double bendiness )
++    {
++        bendiness = bendiness * 10;
++        return (int) bendiness;
++    }
++
+     @Override
+     public String toString()
+     {
+diff --git a/core/src/main/java/com/graphhopper/routing/util/PriorityWeighting.java b/core/src/main/java/com/graphhopper/routing/util/PriorityWeighting.java
+index 7e883a6041..5270bd63cb 100644
+--- a/core/src/main/java/com/graphhopper/routing/util/PriorityWeighting.java
++++ b/core/src/main/java/com/graphhopper/routing/util/PriorityWeighting.java
+@@ -32,15 +32,24 @@
+      * For now used only in BikeCommonFlagEncoder, FootEncoder and MotorcycleFlagEncoder
+      */
+     public static final int KEY = 101;
++    private final double minFactor;
++
++    public PriorityWeighting( FlagEncoder encoder )
++    {
++        this(encoder, new PMap(0));
++    }
+ 
+     public PriorityWeighting( FlagEncoder encoder, PMap pMap )
+     {
+         super(encoder, pMap);
++        double maxPriority = 1; // BEST / BEST
++        minFactor = 1 / (0.5 + maxPriority);
+     }
+ 
+-    public PriorityWeighting( FlagEncoder encoder )
++    @Override
++    public double getMinWeight( double distance )
+     {
+-        this(encoder, new PMap(0));
++        return minFactor * super.getMinWeight(distance);
+     }
+ 
+     @Override
+diff --git a/core/src/main/java/com/graphhopper/util/Helper.java b/core/src/main/java/com/graphhopper/util/Helper.java
+index 40d9e534d9..8441d2da10 100644
+--- a/core/src/main/java/com/graphhopper/util/Helper.java
++++ b/core/src/main/java/com/graphhopper/util/Helper.java
+@@ -124,7 +124,7 @@ public static void loadProperties( Map<String, String> map, Reader tmpReader ) t
+ 
+                 String field = line.substring(0, index);
+                 String value = line.substring(index + 1);
+-                map.put(field, value);
++                map.put(field.trim(), value.trim());
+             }
+         } finally
+         {
+diff --git a/core/src/main/resources/com/graphhopper/util/ar.txt b/core/src/main/resources/com/graphhopper/util/ar.txt
+index 44c9a5f67e..c517b9dc74 100644
+--- a/core/src/main/resources/com/graphhopper/util/ar.txt
++++ b/core/src/main/resources/com/graphhopper/util/ar.txt
+@@ -16,14 +16,15 @@ web.toHint=إلي
+ web.moreButton=المزيد
+ web.gpxExportButton=GPX التصدير
+ web.routeInfo=%1$s ستاخذ %2$s
+-web.totalAscend=
+-web.totalDescend=
+ web.locationsNotFound=لا يوجد طريق من هذه المنطقة
+ web.bike=دراجة
+ web.racingbike=دراجة سباق
+ web.mtb=دراجة جبلية
+ web.car=سيارة
+ web.foot=مشياً
++web.small_truck=
++web.bus=
++web.truck=
+ web.staticlink=رابط ثابت
+ web.motorcycle=دراجة نارية
+ via=من خلال
+@@ -45,3 +46,5 @@ stopover=توقف %1$s
+ roundaboutEnter=أدخل الدوران
+ roundaboutExit=في الدوران ، أتخذ مخرج   %1$s
+ roundaboutExitOnto=في الدوران ، أتخذ مخرج   %1$s من خلال %2$s
++totalAscend=
++totalDescend=
+diff --git a/core/src/main/resources/com/graphhopper/util/ast.txt b/core/src/main/resources/com/graphhopper/util/ast.txt
+index cedbe4f59d..8f19778c18 100644
+--- a/core/src/main/resources/com/graphhopper/util/ast.txt
++++ b/core/src/main/resources/com/graphhopper/util/ast.txt
+@@ -16,14 +16,15 @@ web.toHint=Fasta
+ web.moreButton=más
+ web.gpxExportButton=Esportar GPX
+ web.routeInfo=%1$s tardaràs %2$s
+-web.totalAscend=
+-web.totalDescend=
+ web.locationsNotFound=Nun se puede trazar una ruta. Dalgún llugar nun s'alcuentra nel área
+ web.bike=Bicicleta
+ web.racingbike=Bici de carreres
+ web.mtb=Bici de montaña
+ web.car=Coche
+ web.foot=A pie
++web.small_truck=
++web.bus=
++web.truck=
+ web.staticlink=enllaz estáticu
+ web.motorcycle=Motocicleta
+ via=pasando per
+@@ -45,3 +46,5 @@ stopover=pasando per %1$s
+ roundaboutEnter=Entra na rotonda
+ roundaboutExit=Na rotonda, toma la salida %1$s
+ roundaboutExitOnto=Na rotonda, toma la salida %1$s haza %2$s
++totalAscend=
++totalDescend=
+diff --git a/core/src/main/resources/com/graphhopper/util/bg.txt b/core/src/main/resources/com/graphhopper/util/bg.txt
+index 4bd0d2e154..546f2903a3 100644
+--- a/core/src/main/resources/com/graphhopper/util/bg.txt
++++ b/core/src/main/resources/com/graphhopper/util/bg.txt
+@@ -16,14 +16,15 @@ web.toHint=До
+ web.moreButton=още
+ web.gpxExportButton=GPX експорт
+ web.routeInfo=%1$s ще отнемат %2$s
+-web.totalAscend=
+-web.totalDescend=
+ web.locationsNotFound=Не са изтеглени упътвания. Търсеното местоположение не е открито.
+ web.bike=Велосипед
+ web.racingbike=Състезателно колело
+ web.mtb=Планинско колело
+ web.car=Автомобил
+ web.foot=Пеш
++web.small_truck=
++web.bus=
++web.truck=
+ web.staticlink=статична връзка
+ web.motorcycle=Мотоциклет
+ via=през
+@@ -45,3 +46,5 @@ stopover=прехвърляне %1$s
+ roundaboutEnter=Влез в кръговото кръстовище
+ roundaboutExit=На кръговото кръстовище използвайте изход %1$s
+ roundaboutExitOnto=На кръговото кръстовище използвайте изход %1$s по %2$s
++totalAscend=
++totalDescend=
+diff --git a/core/src/main/resources/com/graphhopper/util/ca.txt b/core/src/main/resources/com/graphhopper/util/ca.txt
+index 5827dd608f..75d02569bc 100644
+--- a/core/src/main/resources/com/graphhopper/util/ca.txt
++++ b/core/src/main/resources/com/graphhopper/util/ca.txt
+@@ -16,14 +16,15 @@ web.toHint=Cap a
+ web.moreButton=més
+ web.gpxExportButton=Exportar GPX
+ web.routeInfo=%1$s trigaràs %2$s
+-web.totalAscend=
+-web.totalDescend=
+ web.locationsNotFound=No hi ha cap ruta. El destí no es troba dins l'àrea.
+ web.bike=Bicicleta
+ web.racingbike=Bicicleta de carrera
+ web.mtb=Bicicleta de montanya
+ web.car=Cotxe
+ web.foot=A peu
++web.small_truck=
++web.bus=
++web.truck=
+ web.staticlink=Enllaç
+ web.motorcycle=Motocicleta
+ via=passant per
+@@ -45,3 +46,5 @@ stopover=passant per %1$s
+ roundaboutEnter=Entra a la rotonda
+ roundaboutExit=A la rotonda, agafa la %1$s sortida
+ roundaboutExitOnto=A la rotonda, agafa la sortida %1$s cap a %2$s
++totalAscend=
++totalDescend=
+diff --git a/core/src/main/resources/com/graphhopper/util/cs_CZ.txt b/core/src/main/resources/com/graphhopper/util/cs_CZ.txt
+index e8d9c0be23..68349639dd 100644
+--- a/core/src/main/resources/com/graphhopper/util/cs_CZ.txt
++++ b/core/src/main/resources/com/graphhopper/util/cs_CZ.txt
+@@ -16,14 +16,15 @@ web.toHint=Do
+ web.moreButton=více
+ web.gpxExportButton=Export do GPX
+ web.routeInfo=%1$s bude trvat %2$s
+-web.totalAscend=
+-web.totalDescend=
+ web.locationsNotFound=Navigování není dostupné. Pozice nenalezena v této oblasti.
+ web.bike=Kolo
+ web.racingbike=Závodní kolo
+ web.mtb=Horské kolo
+ web.car=Automobil
+ web.foot=Pěšky
++web.small_truck=
++web.bus=
++web.truck=
+ web.staticlink=neměnný odkaz
+ web.motorcycle=Motocykl
+ via=přes 
+@@ -45,3 +46,5 @@ stopover=zastávka %1$s
+ roundaboutEnter=Vjeďte na kruhový objezd
+ roundaboutExit=Na kruhovém objezdu použijte %1$s. výjezd
+ roundaboutExitOnto=Na kruhovém objezdu použijte %1$s. výjezd, směrem na %2$s
++totalAscend=
++totalDescend=
+diff --git a/core/src/main/resources/com/graphhopper/util/da_DK.txt b/core/src/main/resources/com/graphhopper/util/da_DK.txt
+index 8305933a24..49efad901d 100644
+--- a/core/src/main/resources/com/graphhopper/util/da_DK.txt
++++ b/core/src/main/resources/com/graphhopper/util/da_DK.txt
+@@ -16,14 +16,15 @@ web.toHint=Til
+ web.moreButton=Mere
+ web.gpxExportButton=Eksportér GPX-fil
+ web.routeInfo=%1$s med køretid %2$s
+-web.totalAscend=
+-web.totalDescend=
+ web.locationsNotFound=Kan ikke beregne ruten. Lokation(erne) kan ikke findes i området.
+ web.bike=Cykel
+ web.racingbike=Racercykel
+ web.mtb=Mountain bike
+ web.car=Bil
+ web.foot=Gang
++web.small_truck=
++web.bus=
++web.truck=
+ web.staticlink=Direkte link
+ web.motorcycle=Motorcykel
+ via=via
+@@ -45,3 +46,5 @@ stopover=delmål %1$s
+ roundaboutEnter=Kør ind i rundskørslen
+ roundaboutExit=I rundkørslen, tag udkørsel %1$s
+ roundaboutExitOnto=I rundskørslen, ta udkørsel %1$s ind på %2$s
++totalAscend=
++totalDescend=
+diff --git a/core/src/main/resources/com/graphhopper/util/de_DE.txt b/core/src/main/resources/com/graphhopper/util/de_DE.txt
+index e1a57713ac..5b1e04ed13 100644
+--- a/core/src/main/resources/com/graphhopper/util/de_DE.txt
++++ b/core/src/main/resources/com/graphhopper/util/de_DE.txt
+@@ -16,14 +16,15 @@ web.toHint=Nach
+ web.moreButton=mehr
+ web.gpxExportButton=GPX export
+ web.routeInfo=%1$s werden %2$s brauchen
+-web.totalAscend=Aufstieg gesamt %1$s
+-web.totalDescend=Abstieg gesamt %1$s
+ web.locationsNotFound=Routing war nicht möglich. Ort(e) nicht gefunden in diesem Gebiet.
+ web.bike=Fahrrad
+ web.racingbike=Rennrad
+ web.mtb=Mountainbike
+ web.car=Auto
+ web.foot=Zu Fuß
++web.small_truck=Kleintransporter
++web.bus=Bus
++web.truck=LKW
+ web.staticlink=Link
+ web.motorcycle=Motorrad
+ via=über
+@@ -45,3 +46,5 @@ stopover=Zwischenziel %1$s
+ roundaboutEnter=In den Kreisverkehr einfahren
+ roundaboutExit=Im Kreisverkehr Ausfahrt %1$s nehmen
+ roundaboutExitOnto=Im Kreisverkehr Ausfahrt %1$s auf %2$s nehmen
++totalAscend=%1$s Gesamtaufstieg
++totalDescend=%1$s Gesamtabstieg
+diff --git a/core/src/main/resources/com/graphhopper/util/el.txt b/core/src/main/resources/com/graphhopper/util/el.txt
+index 5b1f17f1d4..4672ea182d 100644
+--- a/core/src/main/resources/com/graphhopper/util/el.txt
++++ b/core/src/main/resources/com/graphhopper/util/el.txt
+@@ -16,14 +16,15 @@ web.toHint=Προορισμός
+ web.moreButton=περισσότερα
+ web.gpxExportButton=Εξαγωγή GPX
+ web.routeInfo=%1$s σε %2$s
+-web.totalAscend=
+-web.totalDescend=
+ web.locationsNotFound=Η δρομολόγηση δεν είναι δυνατή. Οι τοποθεσίες δεν βρέθηκαν στην περιοχή.
+ web.bike=Ποδήλατο
+ web.racingbike=Αγωνιστικό ποδήλατο
+ web.mtb=Ποδήλατο βουνού
+ web.car=Αυτοκίνητο
+ web.foot=Πεζός
++web.small_truck=
++web.bus=
++web.truck=
+ web.staticlink=στατική διεύθυνση
+ web.motorcycle=Μοτοσυκλέτα
+ via=μέσω
+@@ -45,3 +46,5 @@ stopover=ενδιάμεση στάση %1$s
+ roundaboutEnter=Μπείτε στον κυκλικό κόμβο
+ roundaboutExit=Στον κυκλικό κόμβο βγείτε στην έξοδο %1$s
+ roundaboutExitOnto=Στον κυκλικό κόμβο βγείτε στην έξοδο %1$s στην %2$s
++totalAscend=%1$s συνολική ανάβαση
++totalDescend=%1$s συνολική κατάβαση
+diff --git a/core/src/main/resources/com/graphhopper/util/en_US.txt b/core/src/main/resources/com/graphhopper/util/en_US.txt
+index 9a6f79709e..f8ed1a5506 100644
+--- a/core/src/main/resources/com/graphhopper/util/en_US.txt
++++ b/core/src/main/resources/com/graphhopper/util/en_US.txt
+@@ -16,14 +16,15 @@ web.toHint=To
+ web.moreButton=more
+ web.gpxExportButton=GPX export
+ web.routeInfo=%1$s will take %2$s
+-web.totalAscend=total ascend %1$s
+-web.totalDescend=total descend %1$s
+ web.locationsNotFound=Routing not possible. Location(s) not found in the area.
+ web.bike=Bike
+ web.racingbike=Racingbike
+ web.mtb=Mountainbike
+ web.car=Car
+ web.foot=Foot
++web.small_truck=Small Truck
++web.bus=Bus
++web.truck=Truck
+ web.staticlink=static link
+ web.motorcycle=Motorcycle
+ via=via
+@@ -45,3 +46,5 @@ stopover=stopover %1$s
+ roundaboutEnter=Enter roundabout
+ roundaboutExit=At roundabout, take exit %1$s
+ roundaboutExitOnto=At roundabout, take exit %1$s onto %2$s
++totalAscend=%1$s total ascend
++totalDescend=%1$s total descend
+diff --git a/core/src/main/resources/com/graphhopper/util/es.txt b/core/src/main/resources/com/graphhopper/util/es.txt
+index 489aabc025..03dea6c71d 100644
+--- a/core/src/main/resources/com/graphhopper/util/es.txt
++++ b/core/src/main/resources/com/graphhopper/util/es.txt
+@@ -16,14 +16,15 @@ web.toHint=Hasta
+ web.moreButton=más
+ web.gpxExportButton=Exportar GPX
+ web.routeInfo=%1$s tardará %2$s 
+-web.totalAscend=
+-web.totalDescend=
+ web.locationsNotFound=No se ha encontrado la ruta. El destino no se encuentra en el área.
+ web.bike=Bicicleta
+ web.racingbike=Bicicleta de carrera
+ web.mtb=Bicicleta de montaña
+ web.car=Coche
+ web.foot=A pie
++web.small_truck=
++web.bus=
++web.truck=
+ web.staticlink=enlace estático
+ web.motorcycle=Motocicleta
+ via=pasando por
+@@ -45,3 +46,5 @@ stopover=pasando por %1$s
+ roundaboutEnter=Entre en la rotonda
+ roundaboutExit=En la rotonda, tome la %1$sª salida
+ roundaboutExitOnto=En la rotonda, tome la %1$sª salida hacia %2$s
++totalAscend=
++totalDescend=
+diff --git a/core/src/main/resources/com/graphhopper/util/fa.txt b/core/src/main/resources/com/graphhopper/util/fa.txt
+index 8c9f2ecc0e..2d030cd0b0 100644
+--- a/core/src/main/resources/com/graphhopper/util/fa.txt
++++ b/core/src/main/resources/com/graphhopper/util/fa.txt
+@@ -16,14 +16,15 @@ web.toHint=به
+ web.moreButton=بیشتر
+ web.gpxExportButton=دریافت به صورت GPX
+ web.routeInfo=طی مسافت %1$s به مدت %2$s طول خواهد کشید
+-web.totalAscend=
+-web.totalDescend=
+ web.locationsNotFound=مسیریابی ممکن نیست. محل مورد نظردرناحیه پیدا نشد.
+ web.bike=دوچرخه
+ web.racingbike=دوچرخه کورسی
+ web.mtb=دوچرخه کوهستان
+ web.car=ماشین
+ web.foot=پیاده
++web.small_truck=
++web.bus=
++web.truck=
+ web.staticlink=مسیر ثابت
+ web.motorcycle=موتورسیکلت
+ via=از طریق
+@@ -45,3 +46,5 @@ stopover=توقفگاه  %1$s
+ roundaboutEnter=وارد میدان می شوید
+ roundaboutExit=در میدان خروجی  %1$s را انتخاب کنید
+ roundaboutExitOnto=در میدان خروجی  %1$s به %2$s را انتخاب کنید
++totalAscend=
++totalDescend=
+diff --git a/core/src/main/resources/com/graphhopper/util/fi.txt b/core/src/main/resources/com/graphhopper/util/fi.txt
+index ff6d29d6aa..80942d473c 100644
+--- a/core/src/main/resources/com/graphhopper/util/fi.txt
++++ b/core/src/main/resources/com/graphhopper/util/fi.txt
+@@ -16,14 +16,15 @@ web.toHint=Määränpää
+ web.moreButton=lisää
+ web.gpxExportButton=GPX-tuonti
+ web.routeInfo=%1$s kestää %2$s
+-web.totalAscend=
+-web.totalDescend=
+ web.locationsNotFound=Reittiohjeiden luonti epäonnistui. Paikkaa ei löydy tältä alueelta.
+ web.bike=Pyörällä
+ web.racingbike=Kilpapyörällä
+ web.mtb=Maastopyörällä
+ web.car=Autolla
+ web.foot=Kävellen
++web.small_truck=
++web.bus=
++web.truck=
+ web.staticlink=
+ web.motorcycle=Moottoripyörällä
+ via=kautta
+@@ -45,3 +46,5 @@ stopover=%1$s. pysähdys
+ roundaboutEnter=Aja liikenneympyrään
+ roundaboutExit=Liikenneympyrästä poistu %1$s. liittymästä
+ roundaboutExitOnto=Liikenneympyrästä poistu %1$s. liittymästä suuntaan %2$s
++totalAscend=
++totalDescend=
+diff --git a/core/src/main/resources/com/graphhopper/util/fil.txt b/core/src/main/resources/com/graphhopper/util/fil.txt
+index 3ec492a253..d47ede6d65 100644
+--- a/core/src/main/resources/com/graphhopper/util/fil.txt
++++ b/core/src/main/resources/com/graphhopper/util/fil.txt
+@@ -16,14 +16,15 @@ web.toHint=upang sa
+ web.moreButton=mas
+ web.gpxExportButton=GPX Export
+ web.routeInfo=%1$s ay magdadala sa %2$s
+-web.totalAscend=
+-web.totalDescend=
+ web.locationsNotFound=Routing hindi maaari, hindi nahanap Lokasyon sa lugar.
+ web.bike=Bike
+ web.racingbike=RacingBike
+ web.mtb=MountainBike
+ web.car=kotse
+ web.foot=lumakad
++web.small_truck=
++web.bus=
++web.truck=
+ web.staticlink=static link
+ web.motorcycle=motorsiklo
+ via=sa pamamagitan ng
+@@ -45,3 +46,5 @@ stopover=pamahingahan %1$s
+ roundaboutEnter=Lpasok Rotonda
+ roundaboutExit=Sa rotonda, lumabas sa exit %1$s
+ roundaboutExitOnto=Sa rotonda, lumabas sa exit papunta %1$s %2$s
++totalAscend=
++totalDescend=
+diff --git a/core/src/main/resources/com/graphhopper/util/fr.txt b/core/src/main/resources/com/graphhopper/util/fr.txt
+index 310c9a4b5d..c9b3a6ca6b 100644
+--- a/core/src/main/resources/com/graphhopper/util/fr.txt
++++ b/core/src/main/resources/com/graphhopper/util/fr.txt
+@@ -16,14 +16,15 @@ web.toHint=À
+ web.moreButton=plus
+ web.gpxExportButton=Export GPX
+ web.routeInfo=%1$s durera %2$s 
+-web.totalAscend=
+-web.totalDescend=
+ web.locationsNotFound=Calcul d'itinéraire impossible. Position(s) non trouvée(s) dans la zone.
+ web.bike=Vélo
+ web.racingbike=Vélo de route
+ web.mtb=VTT
+ web.car=Voiture
+ web.foot=À pied
++web.small_truck=
++web.bus=
++web.truck=
+ web.staticlink=Lien
+ web.motorcycle=Vélo
+ via=via
+@@ -45,3 +46,5 @@ stopover=escale %1$s
+ roundaboutEnter=Empruntez le rond-point
+ roundaboutExit=Au rond-point, prennez la %1$s sortie
+ roundaboutExitOnto=Au rond-point, prennez la %1$s sortie vers %2$s
++totalAscend=
++totalDescend=
+diff --git a/core/src/main/resources/com/graphhopper/util/gl.txt b/core/src/main/resources/com/graphhopper/util/gl.txt
+index 6d5ca722f7..171de9c494 100644
+--- a/core/src/main/resources/com/graphhopper/util/gl.txt
++++ b/core/src/main/resources/com/graphhopper/util/gl.txt
+@@ -16,14 +16,15 @@ web.toHint=ata
+ web.moreButton=máis
+ web.gpxExportButton=GPX Exportación
+ web.routeInfo=%1$s tardará %2$s
+-web.totalAscend=
+-web.totalDescend=
+ web.locationsNotFound=Non se atopou a ruta. O destino non se atopa na área
+ web.bike=Bicicleta
+ web.racingbike=Bicleta de carreiras
+ web.mtb=Bicicleta de montaña
+ web.car=automóbil
+ web.foot=A pé
++web.small_truck=
++web.bus=
++web.truck=
+ web.staticlink=Enlace
+ web.motorcycle=Motocicleta
+ via=vía
+@@ -45,3 +46,5 @@ stopover=escala%1$s
+ roundaboutEnter=Entre na rotonda
+ roundaboutExit=Na rotonda tome a saída %1$s
+ roundaboutExitOnto=Na rotonda, tome a saída %1$s cara %2$s
++totalAscend=
++totalDescend=
+diff --git a/core/src/main/resources/com/graphhopper/util/he.txt b/core/src/main/resources/com/graphhopper/util/he.txt
+index 68d0db8ce5..47969537e0 100644
+--- a/core/src/main/resources/com/graphhopper/util/he.txt
++++ b/core/src/main/resources/com/graphhopper/util/he.txt
+@@ -16,14 +16,15 @@ web.toHint=יעד
+ web.moreButton=עוד
+ web.gpxExportButton=ייצוא GPX
+ web.routeInfo=%1$s ייקחו %2$s
+-web.totalAscend=
+-web.totalDescend=
+ web.locationsNotFound=אין נתיב ישיר אל היעד. המיקום לא נמצא באזור.
+ web.bike=אופניים
+ web.racingbike=מסלולי אופניים
+ web.mtb=אופני הרים
+ web.car=מכונית
+ web.foot=רגל
++web.small_truck=
++web.bus=
++web.truck=
+ web.staticlink=קישור קבוע
+ web.motorcycle=אופנוע
+ via=דרך
+@@ -45,3 +46,5 @@ stopover=נקודת עצירה מס׳ %1$s
+ roundaboutEnter=יש להיכנס לכיכר
+ roundaboutExit=בכיכר, יש לצאת ביציאה %1$s
+ roundaboutExitOnto=בכיכר, יש לצאת ביציאה %1$s לתוך %2$s
++totalAscend=
++totalDescend=
+diff --git a/core/src/main/resources/com/graphhopper/util/hsb.txt b/core/src/main/resources/com/graphhopper/util/hsb.txt
+index 7a8387ef40..11c2f877c4 100644
+--- a/core/src/main/resources/com/graphhopper/util/hsb.txt
++++ b/core/src/main/resources/com/graphhopper/util/hsb.txt
+@@ -16,14 +16,15 @@ web.toHint=do
+ web.moreButton=wjac
+ web.gpxExportButton=eksport do GPX
+ web.routeInfo=za %1$s so trjeba %2$s
+-web.totalAscend=
+-web.totalDescend=
+ web.locationsNotFound=Čara njeje móžna. Městno so w tutej kónčinje njenamaka.
+ web.bike=koleso
+ web.racingbike=wubědźowanske koleso
+ web.mtb=mountainbike
+ web.car=awto
+ web.foot=pěši
++web.small_truck=
++web.bus=
++web.truck=
+ web.staticlink=link
+ web.motorcycle=motorske
+ via=via
+@@ -45,3 +46,5 @@ stopover=mjezycil %1$s
+ roundaboutEnter=do kružneho wobchada zajěć
+ roundaboutExit=we kružnym wobchadźe %1$s. wujězd wzać
+ roundaboutExitOnto=we kružnym wobchadźe %1$s. wujězd na %2$s wzać
++totalAscend=
++totalDescend=
+diff --git a/core/src/main/resources/com/graphhopper/util/hu_HU.txt b/core/src/main/resources/com/graphhopper/util/hu_HU.txt
+index 1566908b4d..0c0b945965 100644
+--- a/core/src/main/resources/com/graphhopper/util/hu_HU.txt
++++ b/core/src/main/resources/com/graphhopper/util/hu_HU.txt
+@@ -16,14 +16,15 @@ web.toHint=Hova
+ web.moreButton=Több
+ web.gpxExportButton=GPX export
+ web.routeInfo=%1$s tart %2$s
+-web.totalAscend=
+-web.totalDescend=
+ web.locationsNotFound=Útvonaltervezés nem lehetséges.A megadott hely(ek) nem található(ak).
+ web.bike=Bicikli
+ web.racingbike=Verseny bicikli
+ web.mtb=Terep bicikli
+ web.car=Autó
+ web.foot=Gyalog
++web.small_truck=
++web.bus=
++web.truck=
+ web.staticlink=Statikus hivatkozás
+ web.motorcycle=Motor
+ via=át
+@@ -45,3 +46,5 @@ stopover=Meg kell állni %1$s
+ roundaboutEnter=Hajtson be a körforgalomba
+ roundaboutExit=Hagyja el a körförgalmat, kihajtó %1$s
+ roundaboutExitOnto=Hagyja el a körförgalmat, kihajtó %1$s, aztán hajtson rá %2$s
++totalAscend=
++totalDescend=
+diff --git a/core/src/main/resources/com/graphhopper/util/it.txt b/core/src/main/resources/com/graphhopper/util/it.txt
+index 751f13ff62..5c3a2d0e1a 100644
+--- a/core/src/main/resources/com/graphhopper/util/it.txt
++++ b/core/src/main/resources/com/graphhopper/util/it.txt
+@@ -16,14 +16,15 @@ web.toHint=A
+ web.moreButton=altro
+ web.gpxExportButton=Esporta GPX
+ web.routeInfo=%1$s in %2$s
+-web.totalAscend=
+-web.totalDescend=
+ web.locationsNotFound=Percorso non calcolabile. Località non trovata(e) nell'area.
+ web.bike=Bicicletta
+ web.racingbike=Bici da corsa
+ web.mtb=Mountainbike
+ web.car=Auto
+ web.foot=A piedi
++web.small_truck=
++web.bus=
++web.truck=
+ web.staticlink=permalink
+ web.motorcycle=Moto
+ via=attraverso
+@@ -45,3 +46,5 @@ stopover=sosta %1$s
+ roundaboutEnter=Entrare nella rotatoria
+ roundaboutExit=Nella rotatoria, prendere l'uscita %1$s
+ roundaboutExitOnto=Nella rotatoria, prendere l'uscita %1$s su %2$s
++totalAscend=
++totalDescend=
+diff --git a/core/src/main/resources/com/graphhopper/util/ja.txt b/core/src/main/resources/com/graphhopper/util/ja.txt
+index eabd211e25..59014f605b 100644
+--- a/core/src/main/resources/com/graphhopper/util/ja.txt
++++ b/core/src/main/resources/com/graphhopper/util/ja.txt
+@@ -16,14 +16,15 @@ web.toHint=目的地点
+ web.moreButton=詳細
+ web.gpxExportButton=GPX形式でエクスポート
+ web.routeInfo=%1$s 所要時間 %2$s
+-web.totalAscend=
+-web.totalDescend=
+ web.locationsNotFound=経路を検索できませんでした．指定の地点が存在しません．
+ web.bike=自転車
+ web.racingbike=レースバイク
+ web.mtb=マウンテンバイク
+ web.car=車
+ web.foot=徒歩
++web.small_truck=
++web.bus=
++web.truck=
+ web.staticlink=パーマリンク
+ web.motorcycle=オートバイ
+ via=経由
+@@ -45,3 +46,5 @@ stopover=%1$sで降りる
+ roundaboutEnter=円形交差点に入る
+ roundaboutExit=円形交差点の出口%1$sへ
+ roundaboutExitOnto=円形交差点の出口%1$sから%2$sへ
++totalAscend=
++totalDescend=
+diff --git a/core/src/main/resources/com/graphhopper/util/lt_LT.txt b/core/src/main/resources/com/graphhopper/util/lt_LT.txt
+index 8bd055ffc7..60b84730c1 100644
+--- a/core/src/main/resources/com/graphhopper/util/lt_LT.txt
++++ b/core/src/main/resources/com/graphhopper/util/lt_LT.txt
+@@ -16,14 +16,15 @@ web.toHint=Iki
+ web.moreButton=dar
+ web.gpxExportButton=GPX eksportas
+ web.routeInfo=%1$s užtruksite %2$s
+-web.totalAscend=
+-web.totalDescend=
+ web.locationsNotFound=Neįmanoma sukurti maršruto. Nurodyti taškai nerasti šioje zonoje.
+ web.bike=Dviratis
+ web.racingbike=Plentinis dviratis
+ web.mtb=MTB dviratis
+ web.car=Automobilis
+ web.foot=Pėsčiomis
++web.small_truck=
++web.bus=
++web.truck=
+ web.staticlink=statinė nuoroda
+ web.motorcycle=Motociklas
+ via=per
+@@ -45,3 +46,5 @@ stopover=sustojimas %1$s
+ roundaboutEnter=Įvažiuokite į žiedą
+ roundaboutExit=Žiede išvažiuokite %1$s išvažiavime
+ roundaboutExitOnto=Žiede išvažiuokite %1$s išvažiavime į  %2$s
++totalAscend=
++totalDescend=
+diff --git a/core/src/main/resources/com/graphhopper/util/ne.txt b/core/src/main/resources/com/graphhopper/util/ne.txt
+index 0324342273..3b17738e58 100644
+--- a/core/src/main/resources/com/graphhopper/util/ne.txt
++++ b/core/src/main/resources/com/graphhopper/util/ne.txt
+@@ -16,14 +16,15 @@ web.toHint=अन्त्य
+ web.moreButton=अझै
+ web.gpxExportButton=GPX मा परिबर्तन गर्नुहोस
+ web.routeInfo=%1$s को लागि %2$s लाग्नेछ
+-web.totalAscend=
+-web.totalDescend=
+ web.locationsNotFound=ठाउँ नभेटीनाले बाटो पत्ता लगाउन सकिएन
+ web.bike=बाईक 
+ web.racingbike=छिटो गतिका बाईक
+ web.mtb=माउन्टेन बाईक
+ web.car=गाडी
+ web.foot=पैदल
++web.small_truck=
++web.bus=
++web.truck=
+ web.staticlink=ईस्ट्यातिक लिंक
+ web.motorcycle=मोटरसाइकल 
+ via=बाट
+@@ -45,3 +46,5 @@ stopover=%1$s रोकिने ठाउँ
+ roundaboutEnter=घुम्ती मा छिर्नुहोस
+ roundaboutExit=घुम्तीमा %1$s नम्बर को मोडबाट निस्कनुहोस 
+ roundaboutExitOnto=घुम्तीमा %1$s नम्बर को मोडबाट निस्केर %2$s मा जानुहोस
++totalAscend=
++totalDescend=
+diff --git a/core/src/main/resources/com/graphhopper/util/nl.txt b/core/src/main/resources/com/graphhopper/util/nl.txt
+index 6dd1735709..a3bcc27244 100644
+--- a/core/src/main/resources/com/graphhopper/util/nl.txt
++++ b/core/src/main/resources/com/graphhopper/util/nl.txt
+@@ -16,14 +16,15 @@ web.toHint=naar
+ web.moreButton=meer
+ web.gpxExportButton=GPX export
+ web.routeInfo=%1$s duurt %2$s
+-web.totalAscend=
+-web.totalDescend=
+ web.locationsNotFound=Route niet mogelijk. Locatie(s) niet gevonden.
+ web.bike=fiets
+ web.racingbike=racefiets
+ web.mtb=mountainbike
+ web.car=auto
+ web.foot=te voet
++web.small_truck=
++web.bus=
++web.truck=
+ web.staticlink=statische link
+ web.motorcycle=motorfiets
+ via=via
+@@ -45,3 +46,5 @@ stopover=tussenstop %1$s
+ roundaboutEnter=ga de rotonde op
+ roundaboutExit=neem afslag %1$s op de rotonde 
+ roundaboutExitOnto=neem afslag %1$s naar %2$s op de rotonde 
++totalAscend=
++totalDescend=
+diff --git a/core/src/main/resources/com/graphhopper/util/pl_PL.txt b/core/src/main/resources/com/graphhopper/util/pl_PL.txt
+index 920aa3d064..a196ee69bd 100644
+--- a/core/src/main/resources/com/graphhopper/util/pl_PL.txt
++++ b/core/src/main/resources/com/graphhopper/util/pl_PL.txt
+@@ -16,14 +16,15 @@ web.toHint=Do
+ web.moreButton=więcej
+ web.gpxExportButton=Eksportuj GPX
+ web.routeInfo=%1$s zajmie %2$s
+-web.totalAscend=
+-web.totalDescend=
+ web.locationsNotFound=Nie można wyznaczyć trasy. Lokalizacja(e) nie została(y) znalezione. 
+ web.bike=Rower
+ web.racingbike=Rower wyścigowy
+ web.mtb=Rower górski
+ web.car=Samochod
+ web.foot=Pieszo
++web.small_truck=
++web.bus=
++web.truck=
+ web.staticlink=link
+ web.motorcycle=Motocykl
+ via=przez
+@@ -45,3 +46,5 @@ stopover=przystanek %1$s
+ roundaboutEnter=Wjedź na rondo
+ roundaboutExit=Zjedź z ronda %1$s zjazdem
+ roundaboutExitOnto=Zjedź z ronda %1$s zjazdem na %2$s
++totalAscend=
++totalDescend=
+diff --git a/core/src/main/resources/com/graphhopper/util/pt_BR.txt b/core/src/main/resources/com/graphhopper/util/pt_BR.txt
+index 8cfed827e0..22cb487114 100644
+--- a/core/src/main/resources/com/graphhopper/util/pt_BR.txt
++++ b/core/src/main/resources/com/graphhopper/util/pt_BR.txt
+@@ -16,14 +16,15 @@ web.toHint=Para
+ web.moreButton=mais
+ web.gpxExportButton=Exportar GPX
+ web.routeInfo=%1$s irá levar %2$s
+-web.totalAscend=
+-web.totalDescend=
+ web.locationsNotFound=Roteamento impossível. Localização(ões) não encontrada(s) na área.
+ web.bike=Bicicleta
+ web.racingbike=Bicicleta de corrida
+ web.mtb=Mountainbike
+ web.car=Carro
+ web.foot=A pé
++web.small_truck=
++web.bus=
++web.truck=
+ web.staticlink=Link estático
+ web.motorcycle=Motocicleta
+ via=via
+@@ -45,3 +46,5 @@ stopover=parada %1$s
+ roundaboutEnter=Entre na rotatória
+ roundaboutExit=Na rotatória, saia na %1$s saída
+ roundaboutExitOnto=Na rotatória, saia na %1$s saida em direção a %2$s
++totalAscend=
++totalDescend=
+diff --git a/core/src/main/resources/com/graphhopper/util/pt_PT.txt b/core/src/main/resources/com/graphhopper/util/pt_PT.txt
+index c602ea7243..72d43c3e35 100644
+--- a/core/src/main/resources/com/graphhopper/util/pt_PT.txt
++++ b/core/src/main/resources/com/graphhopper/util/pt_PT.txt
+@@ -16,14 +16,15 @@ web.toHint=Para
+ web.moreButton=mais
+ web.gpxExportButton=Exportar GPX
+ web.routeInfo=%1$s irá demorar %2$s
+-web.totalAscend=
+-web.totalDescend=
+ web.locationsNotFound=Roteamento impossível. Localização(ões) não encontrada(s) na área.
+ web.bike=Bicicleta
+ web.racingbike=Bicicleta de corrida
+ web.mtb=Bicicleta de montanha
+ web.car=Carro
+ web.foot=A pé
++web.small_truck=
++web.bus=
++web.truck=
+ web.staticlink=Ligação permanente
+ web.motorcycle=Motocicleta
+ via=por
+@@ -45,3 +46,5 @@ stopover=paragem %1$s
+ roundaboutEnter=Entre na rotunda
+ roundaboutExit=Na rotunda, saia na %1$s saída
+ roundaboutExitOnto=Na rotunda, saia na %1$s saida em direção a %2$s
++totalAscend=
++totalDescend=
+diff --git a/core/src/main/resources/com/graphhopper/util/ro.txt b/core/src/main/resources/com/graphhopper/util/ro.txt
+index cda68be1ee..32fd565ddb 100644
+--- a/core/src/main/resources/com/graphhopper/util/ro.txt
++++ b/core/src/main/resources/com/graphhopper/util/ro.txt
+@@ -16,14 +16,15 @@ web.toHint=La
+ web.moreButton=mai mult
+ web.gpxExportButton=Exportă GPX
+ web.routeInfo=%1$s durează %2$s
+-web.totalAscend=
+-web.totalDescend=
+ web.locationsNotFound=Traseul nu este posibil. Locul(locurile) nu pot fi găsite în zonă.
+ web.bike=bicicletă
+ web.racingbike=bicicletă de curse
+ web.mtb=Mountainbike
+ web.car=mașină
+ web.foot=pe jos
++web.small_truck=
++web.bus=
++web.truck=
+ web.staticlink=link
+ web.motorcycle=Motocicletă
+ via=prin
+@@ -45,3 +46,5 @@ stopover=escala %1$s
+ roundaboutEnter=Intrați în giratoriu 
+ roundaboutExit=La giratoriu folosiți ieșirea %1$s
+ roundaboutExitOnto=La giratoriu folosiți ieșirea %1$s către %2$s
++totalAscend=
++totalDescend=
+diff --git a/core/src/main/resources/com/graphhopper/util/ru.txt b/core/src/main/resources/com/graphhopper/util/ru.txt
+index 7b0dff1f33..b32ec9e72d 100644
+--- a/core/src/main/resources/com/graphhopper/util/ru.txt
++++ b/core/src/main/resources/com/graphhopper/util/ru.txt
+@@ -16,14 +16,15 @@ web.toHint=До
+ web.moreButton=еще
+ web.gpxExportButton=Экспорт GPX
+ web.routeInfo=%1$s займет %2$s
+-web.totalAscend=
+-web.totalDescend=
+ web.locationsNotFound=Построить маршрут невозможно. Не определено местоположение.
+ web.bike=Велосипед
+ web.racingbike=Гоночный велосипед
+ web.mtb=Горный велосипед
+ web.car=Автомобиль
+ web.foot=Пешком
++web.small_truck=
++web.bus=
++web.truck=
+ web.staticlink=Ссылка
+ web.motorcycle=Мотоцикл
+ via=через
+@@ -45,3 +46,5 @@ stopover=остановка %1$s
+ roundaboutEnter=Въезжайте на кольцо
+ roundaboutExit=У кольца используйте съезд %1$s
+ roundaboutExitOnto=У кольца используйте съезд %1$s на %2$s
++totalAscend=
++totalDescend=
+diff --git a/core/src/main/resources/com/graphhopper/util/si.txt b/core/src/main/resources/com/graphhopper/util/si.txt
+index bb1a1471c0..3421043bb4 100644
+--- a/core/src/main/resources/com/graphhopper/util/si.txt
++++ b/core/src/main/resources/com/graphhopper/util/si.txt
+@@ -16,14 +16,15 @@ web.toHint=Do
+ web.moreButton=več
+ web.gpxExportButton=izvozi GPX
+ web.routeInfo=%1$s bo trajalo %2$s
+-web.totalAscend=
+-web.totalDescend=
+ web.locationsNotFound=Usmerjanje ni mogoče. Lokacije ne pokaže na tem območju.
+ web.bike=Kolo
+ web.racingbike=cestno kolo
+ web.mtb=gorsko kolo
+ web.car=Avto
+ web.foot=Peš
++web.small_truck=
++web.bus=
++web.truck=
+ web.staticlink=povezava
+ web.motorcycle=motorno kolo
+ via=preko
+@@ -45,3 +46,5 @@ stopover=postanek %1$s
+ roundaboutEnter=zapeljite v krožišče
+ roundaboutExit=v krožišču izberite izhod %1$s
+ roundaboutExitOnto=v krožišču izberite izhod %1$s na %2$s
++totalAscend=
++totalDescend=
+diff --git a/core/src/main/resources/com/graphhopper/util/sk.txt b/core/src/main/resources/com/graphhopper/util/sk.txt
+index 301e04c071..855fd7c196 100644
+--- a/core/src/main/resources/com/graphhopper/util/sk.txt
++++ b/core/src/main/resources/com/graphhopper/util/sk.txt
+@@ -16,14 +16,15 @@ web.toHint=Do
+ web.moreButton=viac
+ web.gpxExportButton=Export do GPX
+ web.routeInfo=%1$s bude trvať %2$s
+-web.totalAscend=
+-web.totalDescend=
+ web.locationsNotFound=Navigovanie nie je možné. Umiestnenie nebolo nájdené v oblasti.
+ web.bike=Bicykel
+ web.racingbike=Závodný bicykel
+ web.mtb=Horský bicykel
+ web.car=Automobil
+ web.foot=Pešo
++web.small_truck=
++web.bus=
++web.truck=
+ web.staticlink=nemenný odkaz
+ web.motorcycle=Motocykel
+ via=cez
+@@ -45,3 +46,5 @@ stopover=zastávka %1$s
+ roundaboutEnter=Vojdite na kruhový objazd
+ roundaboutExit=Na kruhovom objazde, ho opustite cez %1$s. výjazd
+ roundaboutExitOnto=Na kruhovom objazde, ho opustite cez %1$s. výjazd na %2$s
++totalAscend=
++totalDescend=
+diff --git a/core/src/main/resources/com/graphhopper/util/sv_SE.txt b/core/src/main/resources/com/graphhopper/util/sv_SE.txt
+index 0db2c3f083..c6e53440a0 100644
+--- a/core/src/main/resources/com/graphhopper/util/sv_SE.txt
++++ b/core/src/main/resources/com/graphhopper/util/sv_SE.txt
+@@ -16,14 +16,15 @@ web.toHint=Till
+ web.moreButton=fler
+ web.gpxExportButton=exportera GPX-fil
+ web.routeInfo=%1$s med körtid %2$s
+-web.totalAscend=
+-web.totalDescend=
+ web.locationsNotFound=Kan inte beräkna rutt. Platsen eller platserna kan inte hittas i området.
+ web.bike=Cykel
+ web.racingbike=Tävlingscykel
+ web.mtb=Mountain bike
+ web.car=Bil
+ web.foot=Gång
++web.small_truck=
++web.bus=
++web.truck=
+ web.staticlink=direktlänk
+ web.motorcycle=Motorcykel
+ via=via
+@@ -45,3 +46,5 @@ stopover=delmål %1$s
+ roundaboutEnter=Kör in i rondellen
+ roundaboutExit=I rondellen, ta avfart %1$s
+ roundaboutExitOnto=I rondellen, ta avfart %1$s in på %2$s
++totalAscend=
++totalDescend=
+diff --git a/core/src/main/resources/com/graphhopper/util/tr.txt b/core/src/main/resources/com/graphhopper/util/tr.txt
+index b0de945785..97423f796a 100644
+--- a/core/src/main/resources/com/graphhopper/util/tr.txt
++++ b/core/src/main/resources/com/graphhopper/util/tr.txt
+@@ -16,14 +16,15 @@ web.toHint=yönüne
+ web.moreButton=daha fazlası
+ web.gpxExportButton=GPX ihracat
+ web.routeInfo=%1$s alacak %2$s
+-web.totalAscend=
+-web.totalDescend=
+ web.locationsNotFound=Rota planlanamadı. Bölgede yer bulunamadı.
+ web.bike=Bisiklet
+ web.racingbike=yaris bisikleti
+ web.mtb=dag bisikleti
+ web.car=Otomobil
+ web.foot=Yürüyerek
++web.small_truck=
++web.bus=
++web.truck=
+ web.staticlink=duragan baglanti
+ web.motorcycle=motorsiklet
+ via=araciligi ile
+@@ -45,3 +46,5 @@ stopover=mola yeri %1$s
+ roundaboutEnter=kavşağa gir
+ roundaboutExit=kavşaktan %1$s cıkışa gir
+ roundaboutExitOnto=kavşaktan %1$s cıkıştan %2$s sokağa gir
++totalAscend=
++totalDescend=
+diff --git a/core/src/main/resources/com/graphhopper/util/uk.txt b/core/src/main/resources/com/graphhopper/util/uk.txt
+index 0cef660598..e086612dd5 100644
+--- a/core/src/main/resources/com/graphhopper/util/uk.txt
++++ b/core/src/main/resources/com/graphhopper/util/uk.txt
+@@ -16,14 +16,15 @@ web.toHint=До
+ web.moreButton=ще
+ web.gpxExportButton=Експорт в GPX
+ web.routeInfo=%1$s займе %2$s
+-web.totalAscend=
+-web.totalDescend=
+ web.locationsNotFound=Побудова маршруту неможлива. Місцезнаходження не визначено.
+ web.bike=Велосипед
+ web.racingbike=Шосейний велосипед
+ web.mtb=Гірський велосипед
+ web.car=Автомобіль
+ web.foot=Пішки
++web.small_truck=
++web.bus=
++web.truck=
+ web.staticlink=статичне посилання
+ web.motorcycle=Мотоцикл
+ via=через
+@@ -45,3 +46,5 @@ stopover=зупинка %1$s
+ roundaboutEnter=В’їжджайте на кільце
+ roundaboutExit=На кільці використовуйте з’їзд %1$s
+ roundaboutExitOnto=На кільці використовуйте з’їзд %1$s на %2$s
++totalAscend=
++totalDescend=
+diff --git a/core/src/main/resources/com/graphhopper/util/vi_VI.txt b/core/src/main/resources/com/graphhopper/util/vi_VI.txt
+index 3924782cdc..29aff5bec4 100644
+--- a/core/src/main/resources/com/graphhopper/util/vi_VI.txt
++++ b/core/src/main/resources/com/graphhopper/util/vi_VI.txt
+@@ -16,14 +16,15 @@ web.toHint=Đến
+ web.moreButton=thêm
+ web.gpxExportButton=Xuất GPX
+ web.routeInfo=%1$s mất %2$s
+-web.totalAscend=
+-web.totalDescend=
+ web.locationsNotFound=Không tìm thấy lộ trình! Các điểm đã chọn không tìm thấy trong vùng này
+ web.bike=Xe đạp
+ web.racingbike=Xe đua
+ web.mtb=Xe leo núi
+ web.car=Ô tô
+ web.foot=Đi bộ
++web.small_truck=
++web.bus=
++web.truck=
+ web.staticlink=liên kết tĩnh
+ web.motorcycle=Mô tô
+ via=qua
+@@ -45,3 +46,5 @@ stopover=điểm nghỉ %1$s
+ roundaboutEnter=
+ roundaboutExit=
+ roundaboutExitOnto=
++totalAscend=
++totalDescend=
+diff --git a/core/src/main/resources/com/graphhopper/util/zh_CN.txt b/core/src/main/resources/com/graphhopper/util/zh_CN.txt
+index 049b401f42..ea06543b95 100644
+--- a/core/src/main/resources/com/graphhopper/util/zh_CN.txt
++++ b/core/src/main/resources/com/graphhopper/util/zh_CN.txt
+@@ -16,14 +16,15 @@ web.toHint=终点
+ web.moreButton=更多
+ web.gpxExportButton=GPX导出
+ web.routeInfo=%1$s 的路线，需要 %2$s 时间
+-web.totalAscend=
+-web.totalDescend=
+ web.locationsNotFound=地点未找到
+ web.bike=自行车
+ web.racingbike=竞技自行车
+ web.mtb=山地自行车
+ web.car=驾车
+ web.foot=步行
++web.small_truck=
++web.bus=
++web.truck=
+ web.staticlink=静态链接
+ web.motorcycle=摩托车
+ via=途经
+@@ -45,3 +46,5 @@ stopover=途中休息 %1$s
+ roundaboutEnter=进入环岛
+ roundaboutExit=在环岛内，使用%1$s出口出环岛
+ roundaboutExitOnto=在环岛内，使用%1$s出口出环岛，进入%2$s
++totalAscend=
++totalDescend=
+diff --git a/core/src/test/java/com/graphhopper/routing/AbstractRoutingAlgorithmTester.java b/core/src/test/java/com/graphhopper/routing/AbstractRoutingAlgorithmTester.java
+index 819dfad67f..7e0f7c8a40 100644
+--- a/core/src/test/java/com/graphhopper/routing/AbstractRoutingAlgorithmTester.java
++++ b/core/src/test/java/com/graphhopper/routing/AbstractRoutingAlgorithmTester.java
+@@ -794,6 +794,34 @@ else if (adj == 4)
+         assertEquals(37009621, p.getTime());
+         assertEquals(616827, p.getDistance(), 1);
+         assertEquals(493462, p.getWeight(), 1);
++    }        
++
++    @Test
++    public void testMultipleVehicles_issue548()
++    {
++        FastestWeighting footWeighting = new FastestWeighting(footEncoder);
++        AlgorithmOptions footOptions = AlgorithmOptions.start().flagEncoder(footEncoder).
++                weighting(footWeighting).build();
++        
++        FastestWeighting carWeighting = new FastestWeighting(carEncoder);
++        AlgorithmOptions carOptions = AlgorithmOptions.start().flagEncoder(carEncoder).
++                weighting(carWeighting).build();
++
++        GraphHopperStorage ghStorage = createGHStorage(encodingManager,
++                Arrays.asList(footOptions.getWeighting(), carOptions.getWeighting()), false);
++        initFootVsCar(ghStorage);
++        
++        // normal path would be 0-4-6-7 but block 4-6
++        GHUtility.getEdge(ghStorage, 4, 6).setFlags(carEncoder.setProperties(20, false, false));
++        
++        RoutingAlgorithm algoFoot = createFactory(ghStorage, footOptions).
++                createAlgo(getGraph(ghStorage, footWeighting), footOptions);
++                        
++        RoutingAlgorithm algoCar = createFactory(ghStorage, carOptions).
++                createAlgo(getGraph(ghStorage, carWeighting), carOptions);
++        Path p1 = algoCar.calcPath(0, 7);
++        assertEquals(Helper.createTList(0, 1, 5, 6, 7), p1.calcNodes());
++        assertEquals(p1.toString(), 26000, p1.getDistance(), 1e-6);
+     }
+ 
+     // 0-1-2
+diff --git a/core/src/test/java/com/graphhopper/routing/RoutingAlgorithmIT.java b/core/src/test/java/com/graphhopper/routing/RoutingAlgorithmIT.java
+index c08eb3c6eb..1dcf0bcd2d 100644
+--- a/core/src/test/java/com/graphhopper/routing/RoutingAlgorithmIT.java
++++ b/core/src/test/java/com/graphhopper/routing/RoutingAlgorithmIT.java
+@@ -101,9 +101,9 @@ public void testMonaco()
+     public void testMonacoMotorcycle()
+     {
+         List<OneRun> list = new ArrayList<OneRun>();
+-        list.add(new OneRun(43.730729, 7.42135, 43.727697, 7.419199, 2697, 117));
++        list.add(new OneRun(43.730729, 7.42135, 43.727697, 7.419199, 2703, 119));
+         list.add(new OneRun(43.727687, 7.418737, 43.74958, 7.436566, 3749, 170));
+-        list.add(new OneRun(43.728677, 7.41016, 43.739213, 7.4277, 3164, 165));
++        list.add(new OneRun(43.728677, 7.41016, 43.739213, 7.4277, 3175, 169));
+         list.add(new OneRun(43.733802, 7.413433, 43.739662, 7.424355, 2423, 141));
+         list.add(new OneRun(43.730949, 7.412338, 43.739643, 7.424542, 2253, 120));
+         list.add(new OneRun(43.727592, 7.419333, 43.727712, 7.419333, 0, 1));
+@@ -113,6 +113,22 @@ public void testMonacoMotorcycle()
+         assertEquals(testCollector.toString(), 0, testCollector.errors.size());
+     }
+ 
++    @Test
++    public void testMonacoMotorcycleCurvature()
++    {
++        List<OneRun> list = new ArrayList<OneRun>();
++        list.add(new OneRun(43.730729, 7.42135, 43.727697, 7.419199, 2703, 119));
++        list.add(new OneRun(43.727687, 7.418737, 43.74958, 7.436566, 3749, 170));
++        list.add(new OneRun(43.728677, 7.41016, 43.739213, 7.4277, 3175, 169));
++        list.add(new OneRun(43.733802, 7.413433, 43.739662, 7.424355, 2423, 141));
++        list.add(new OneRun(43.730949, 7.412338, 43.739643, 7.424542, 2253, 120));
++        list.add(new OneRun(43.727592, 7.419333, 43.727712, 7.419333, 0, 1));
++        runAlgo(testCollector, "files/monaco.osm.gz", "target/monaco-mc-gh",
++                list, "motorcycle", true, "motorcycle", "curvature", true);
++
++        assertEquals(testCollector.toString(), 0, testCollector.errors.size());
++    }
++
+     @Test
+     public void testBike2_issue432()
+     {
+diff --git a/core/src/test/java/com/graphhopper/routing/ch/DijkstraBidirectionCHTest.java b/core/src/test/java/com/graphhopper/routing/ch/DijkstraBidirectionCHTest.java
+index ed3850f7e6..e4e6b9b153 100644
+--- a/core/src/test/java/com/graphhopper/routing/ch/DijkstraBidirectionCHTest.java
++++ b/core/src/test/java/com/graphhopper/routing/ch/DijkstraBidirectionCHTest.java
+@@ -45,7 +45,7 @@ protected CHGraph getGraph( GraphHopperStorage ghStorage, Weighting weighting )
+     }
+ 
+     @Override
+-    protected GraphHopperStorage createGHStorage( EncodingManager em, 
++    protected GraphHopperStorage createGHStorage( EncodingManager em,
+                                                   List<? extends Weighting> weightings, boolean is3D )
+     {
+         return new GraphHopperStorage(weightings, new RAMDirectory(),
+@@ -166,10 +166,4 @@ public void testBaseGraphMultipleVehicles()
+         assertEquals(p3.toString(), 12240 * 1000, p3.getTime());
+         assertEquals(Helper.createTList(0, 4, 5, 7), p3.calcNodes());
+     }
+-
+-    @Override
+-    public void testRekeyBugOfIntBinHeap()
+-    {
+-        super.testRekeyBugOfIntBinHeap(); //To change body of generated methods, choose Tools | Templates.
+-    }
+ }
+diff --git a/core/src/test/java/com/graphhopper/routing/util/MotorcycleFlagEncoderTest.java b/core/src/test/java/com/graphhopper/routing/util/MotorcycleFlagEncoderTest.java
+index 725da43dd8..8e7934592f 100644
+--- a/core/src/test/java/com/graphhopper/routing/util/MotorcycleFlagEncoderTest.java
++++ b/core/src/test/java/com/graphhopper/routing/util/MotorcycleFlagEncoderTest.java
+@@ -18,6 +18,11 @@
+ package com.graphhopper.routing.util;
+ 
+ import com.graphhopper.reader.OSMWay;
++import com.graphhopper.storage.*;
++import com.graphhopper.util.EdgeIteratorState;
++import com.graphhopper.util.GHUtility;
++import com.graphhopper.util.Helper;
++import com.graphhopper.util.PointList;
+ import org.junit.Test;
+ 
+ import static org.junit.Assert.*;
+@@ -30,6 +35,21 @@
+     private final EncodingManager em = new EncodingManager("motorcycle,foot");
+     private final MotorcycleFlagEncoder encoder = (MotorcycleFlagEncoder) em.getEncoder("motorcycle");
+ 
++    private Graph initExampleGraph()
++    {
++        GraphHopperStorage gs = new GraphHopperStorage(new RAMDirectory(), em, true, new GraphExtension.NoOpExtension()).create(1000);
++        NodeAccess na = gs.getNodeAccess();
++        // 50--(0.0001)-->49--(0.0004)-->55--(0.0005)-->60
++        na.setNode(0, 51.1, 12.001, 50);
++        na.setNode(1, 51.1, 12.002, 60);
++        EdgeIteratorState edge = gs.edge(0, 1).
++                setWayGeometry(Helper.createPointList3D(51.1, 12.0011, 49, 51.1, 12.0015, 55));
++        edge.setDistance(100);
++
++        edge.setFlags(encoder.setReverseSpeed(encoder.setProperties(10, true, true), 15));
++        return gs;
++    }
++
+     @Test
+     public void testHandleWayTags()
+     {
+@@ -53,4 +73,28 @@ public void testSetSpeed0_issue367()
+         assertFalse(encoder.isForward(flags));
+         assertTrue(encoder.isBackward(flags));
+     }
++
++    @Test
++    public void testCurvature()
++    {
++        Graph graph = initExampleGraph();
++        EdgeIteratorState edge = GHUtility.getEdge(graph, 0, 1);
++
++        double bendinessOfStraightWay = getBendiness(edge, 100.0);
++        double bendinessOfCurvyWay = getBendiness(edge, 10.0);
++
++        assertTrue("The bendiness of the straight road is smaller than the one of the curvy road", bendinessOfCurvyWay < bendinessOfStraightWay);
++    }
++
++    private double getBendiness( EdgeIteratorState edge, double estimatedDistance )
++    {
++        OSMWay way = new OSMWay(1);
++        way.setTag("highway", "primary");
++        way.setTag("estimated_distance", estimatedDistance);
++        long includeWay = encoder.acceptWay(way);
++        long flags = encoder.handleWayTags(way, includeWay, 0l);
++        edge.setFlags(flags);
++        encoder.applyWayTags(way, edge);
++        return encoder.getDouble(edge.getFlags(), MotorcycleFlagEncoder.CURVATURE_KEY);
++    }
+ }
+diff --git a/core/src/test/java/com/graphhopper/util/HelperTest.java b/core/src/test/java/com/graphhopper/util/HelperTest.java
+index 84ff8d2cae..082bad914b 100644
+--- a/core/src/test/java/com/graphhopper/util/HelperTest.java
++++ b/core/src/test/java/com/graphhopper/util/HelperTest.java
+@@ -18,7 +18,11 @@
+ package com.graphhopper.util;
+ 
+ import java.io.File;
++import java.io.IOException;
++import java.io.StringReader;
++import java.util.HashMap;
+ import java.util.Locale;
++import java.util.Map;
+ 
+ import org.junit.After;
+ import org.junit.Test;
+@@ -89,4 +93,13 @@ public void testKeepIn()
+         assertEquals(3, Helper.keepIn(2, 3, 4), 1e-2);
+         assertEquals(3, Helper.keepIn(-2, 3, 4), 1e-2);
+     }
++
++    @Test
++    public void testLoadProperties() throws IOException
++    {
++        Map<String, String> map = new HashMap<String, String>();
++        Helper.loadProperties(map, new StringReader("blup=test\n blup2 = xy"));
++        assertEquals("test", map.get("blup"));
++        assertEquals("xy", map.get("blup2"));
++    }
+ }
+diff --git a/docs/index.md b/docs/index.md
+index 2fe0bfeb7b..6fc027d9f3 100644
+--- a/docs/index.md
++++ b/docs/index.md
+@@ -24,7 +24,7 @@
+  * [Create custom weighting](./core/weighting.md): Documentation about how to create a custom weighting class to influence the track calculation.
+  * [Elevation](./core/elevation.md): Documentation how to enable the usage of elevation for the output of the track.
+  * [Technical overview](./core/technical.md): Technical details about how GraphHopper its calculations are working.
+- * [Slides from 2014](https://graphhopper.com/public/slides/): Small presentations about how GraphHopper ist working.
++ * [Slides](https://graphhopper.com/public/slides/): Small presentations about how GraphHopper ist working.
+  * [Contraction Hierarchies](./core/ch.md): Details about speeding up the track calculations by [Contraction Hierarchies](http://en.wikipedia.org/wiki/Contraction_hierarchies).
+ 
+ ## Web
+diff --git a/docs/web/api-doc.md b/docs/web/api-doc.md
+index 4b0027bd75..bb20cd11c4 100644
+--- a/docs/web/api-doc.md
++++ b/docs/web/api-doc.md
+@@ -28,6 +28,9 @@ type               | json    | Specifies the resulting format of the route, for
+ heading            | NaN     | Favored heading direction for points. Specify either one heading for the start point or as many as there are points. In this case headings are associated by their order to the specific points. Headings are given as north based clockwise angle between 0 and 360 degree, NaN indicates non specific heading. Does only give valid results in the flexibility mode.
+ heading_penalty    | 120     | Penalty for omitting a specified heading. The penalty corresponds to the accepted time delay in seconds in comparison to the route without a heading.
+ pass_through       | false   | If `true` u-turns are avoided at via-points with regard to the heading_penalty. Does only give valid results in the flexibility mode.
++gpx.track       | true   | Include `<trk>` tag in gpx result. Only applicable if `type=gpx` is specified.
++gpx.route       | true   | Include `<rte>` tag in gpx result. Only applicable if `type=gpx` is specified.
++gpx.waypoints   | false  | Include `<wpt>` tag in gpx result. Only applicable if `type=gpx` is specified.
+ 
+ ## Example output for the case type=json
+ 
+diff --git a/web/src/main/webapp/img/bus.png b/web/src/main/webapp/img/bus.png
+new file mode 100644
+index 0000000000..07de3a723f
+Binary files /dev/null and b/web/src/main/webapp/img/bus.png differ
+diff --git a/web/src/main/webapp/img/bus.svg b/web/src/main/webapp/img/bus.svg
+new file mode 100644
+index 0000000000..39b9496fa7
+--- /dev/null
++++ b/web/src/main/webapp/img/bus.svg
+@@ -0,0 +1,171 @@
++<?xml version="1.0" encoding="UTF-8" standalone="no"?>
++<!-- Created with Inkscape (http://www.inkscape.org/) -->
++
++<svg
++   xmlns:dc="http://purl.org/dc/elements/1.1/"
++   xmlns:cc="http://creativecommons.org/ns#"
++   xmlns:rdf="http://www.w3.org/1999/02/22-rdf-syntax-ns#"
++   xmlns:svg="http://www.w3.org/2000/svg"
++   xmlns="http://www.w3.org/2000/svg"
++   xmlns:sodipodi="http://sodipodi.sourceforge.net/DTD/sodipodi-0.dtd"
++   xmlns:inkscape="http://www.inkscape.org/namespaces/inkscape"
++   width="24"
++   height="24"
++   id="svg4460"
++   version="1.1"
++   inkscape:version="0.48.4 r9939"
++   sodipodi:docname="bus.svg"
++   inkscape:export-filename="/home/peterk/Documents/quell/graphhopper/web/src/main/webapp/img/bus.png"
++   inkscape:export-xdpi="180"
++   inkscape:export-ydpi="180">
++  <defs
++     id="defs4462" />
++  <sodipodi:namedview
++     id="base"
++     pagecolor="#ffffff"
++     bordercolor="#666666"
++     borderopacity="1.0"
++     inkscape:pageopacity="0.0"
++     inkscape:pageshadow="2"
++     inkscape:zoom="16"
++     inkscape:cx="7.5934648"
++     inkscape:cy="15.972315"
++     inkscape:document-units="px"
++     inkscape:current-layer="layer1"
++     showgrid="true"
++     showguides="true"
++     inkscape:guide-bbox="true"
++     inkscape:window-width="1220"
++     inkscape:window-height="833"
++     inkscape:window-x="56"
++     inkscape:window-y="20"
++     inkscape:window-maximized="0"
++     inkscape:snap-global="false">
++    <inkscape:grid
++       type="xygrid"
++       id="grid4468"
++       empspacing="5"
++       visible="true"
++       enabled="true"
++       snapvisiblegridlinesonly="true" />
++    <sodipodi:guide
++       orientation="1,0"
++       position="0,20"
++       id="guide4470" />
++    <sodipodi:guide
++       orientation="0,1"
++       position="4,24"
++       id="guide4472" />
++    <sodipodi:guide
++       orientation="1,0"
++       position="24,13"
++       id="guide4474" />
++    <sodipodi:guide
++       orientation="0,1"
++       position="15,0"
++       id="guide4476" />
++    <sodipodi:guide
++       orientation="1,0"
++       position="23,20"
++       id="guide4478" />
++    <sodipodi:guide
++       orientation="0,1"
++       position="20,23"
++       id="guide4480" />
++    <sodipodi:guide
++       orientation="1,0"
++       position="2,5"
++       id="guide4482" />
++    <sodipodi:guide
++       orientation="0,1"
++       position="7,2"
++       id="guide4484" />
++  </sodipodi:namedview>
++  <metadata
++     id="metadata4465">
++    <rdf:RDF>
++      <cc:Work
++         rdf:about="">
++        <dc:format>image/svg+xml</dc:format>
++        <dc:type
++           rdf:resource="http://purl.org/dc/dcmitype/StillImage" />
++        <dc:title></dc:title>
++      </cc:Work>
++    </rdf:RDF>
++  </metadata>
++  <g
++     inkscape:label="Layer 1"
++     inkscape:groupmode="layer"
++     id="layer1"
++     transform="translate(0,-1028.3622)">
++    <rect
++       style="fill:none;stroke:#474747;stroke-width:1.33421469;stroke-linecap:round;stroke-linejoin:round;stroke-miterlimit:4;stroke-opacity:1;stroke-dasharray:none"
++       id="rect3819"
++       width="17.326307"
++       height="7.9521236"
++       x="5.0082417"
++       y="1036.2206"
++       ry="0.3880125" />
++    <rect
++       style="fill:#474747;fill-opacity:1;stroke:none"
++       id="rect3841"
++       width="20.209675"
++       height="4.4683132"
++       x="2.0193949"
++       y="1040.3743" />
++    <path
++       style="fill:none;stroke:#474747;stroke-width:1.14444017;stroke-linecap:round;stroke-linejoin:round;stroke-miterlimit:4;stroke-opacity:1;stroke-dasharray:none"
++       d="m 2.5239261,1036.1426 c -1.1362769,5.6181 -0.8027954,5.2172 -0.8382136,8.1612 l 3.5827761,-0.019 0.7595011,-1.2889 0.9114011,-0.5562 1.0126681,-0.2022 1.1139348,0.1518 0.1518995,-6.2691 c -0.6533213,-0.021 -5.9804379,0.02 -6.658164,0.021 z"
++       id="path3839"
++       inkscape:connector-curvature="0"
++       sodipodi:nodetypes="cccccccccc" />
++    <path
++       sodipodi:type="arc"
++       style="fill:#ffffff;fill-opacity:1;stroke:#474747;stroke-width:2.78317332;stroke-miterlimit:4;stroke-opacity:1;stroke-dasharray:none"
++       id="path3037-4-7-6-8"
++       sodipodi:cx="-10.915961"
++       sodipodi:cy="15.558912"
++       sodipodi:rx="4.6403885"
++       sodipodi:ry="4.6403885"
++       d="m -6.2755728,15.558912 a 4.6403885,4.6403885 0 1 1 -9.2807772,0 4.6403885,4.6403885 0 1 1 9.2807772,0 z"
++       transform="matrix(0.29672221,0,0,0.29672221,22.364294,1040.5197)" />
++    <path
++       sodipodi:type="arc"
++       style="fill:#ffffff;fill-opacity:1;stroke:#474747;stroke-width:2.78317332;stroke-miterlimit:4;stroke-opacity:1;stroke-dasharray:none"
++       id="path3037-4-7-6-8-0"
++       sodipodi:cx="-10.915961"
++       sodipodi:cy="15.558912"
++       sodipodi:rx="4.6403885"
++       sodipodi:ry="4.6403885"
++       d="m -6.2755728,15.558912 a 4.6403885,4.6403885 0 1 1 -9.2807772,0 4.6403885,4.6403885 0 1 1 9.2807772,0 z"
++       transform="matrix(0.29672221,0,0,0.29672221,8.8239299,1040.5179)" />
++    <rect
++       style="fill:#474747;fill-opacity:1;stroke:none"
++       id="rect3841-4"
++       width="17.070721"
++       height="4.4683132"
++       x="4.7324042"
++       y="1036.1534" />
++    <rect
++       style="fill:#ffffff;fill-opacity:1;stroke:none"
++       id="rect3841-9-0-4-57"
++       width="4.5614247"
++       height="3.7079268"
++       x="5.5476799"
++       y="1036.6974" />
++    <rect
++       style="fill:#ffffff;fill-opacity:1;stroke:none"
++       id="rect3841-9-0-4-57-8"
++       width="4.598062"
++       height="3.7079268"
++       x="11.388758"
++       y="1036.6854" />
++    <rect
++       style="fill:#ffffff;fill-opacity:1;stroke:none"
++       id="rect3841-9-0-4-57-0"
++       width="4.4470658"
++       height="3.7079268"
++       x="17.159487"
++       y="1036.6953" />
++  </g>
++</svg>
+diff --git a/web/src/main/webapp/img/small_truck.png b/web/src/main/webapp/img/small_truck.png
+new file mode 100644
+index 0000000000..1f6bd47cae
+Binary files /dev/null and b/web/src/main/webapp/img/small_truck.png differ
+diff --git a/web/src/main/webapp/img/small_truck.svg b/web/src/main/webapp/img/small_truck.svg
+new file mode 100644
+index 0000000000..e001e957ec
+--- /dev/null
++++ b/web/src/main/webapp/img/small_truck.svg
+@@ -0,0 +1,163 @@
++<?xml version="1.0" encoding="UTF-8" standalone="no"?>
++<!-- Created with Inkscape (http://www.inkscape.org/) -->
++
++<svg
++   xmlns:dc="http://purl.org/dc/elements/1.1/"
++   xmlns:cc="http://creativecommons.org/ns#"
++   xmlns:rdf="http://www.w3.org/1999/02/22-rdf-syntax-ns#"
++   xmlns:svg="http://www.w3.org/2000/svg"
++   xmlns="http://www.w3.org/2000/svg"
++   xmlns:sodipodi="http://sodipodi.sourceforge.net/DTD/sodipodi-0.dtd"
++   xmlns:inkscape="http://www.inkscape.org/namespaces/inkscape"
++   width="24"
++   height="24"
++   id="svg4460"
++   version="1.1"
++   inkscape:version="0.48.4 r9939"
++   sodipodi:docname="small_truck.svg"
++   inkscape:export-filename="/home/peterk/Documents/quell/graphhopper/web/src/main/webapp/img/small_truck.png"
++   inkscape:export-xdpi="180"
++   inkscape:export-ydpi="180">
++  <defs
++     id="defs4462" />
++  <sodipodi:namedview
++     id="base"
++     pagecolor="#ffffff"
++     bordercolor="#666666"
++     borderopacity="1.0"
++     inkscape:pageopacity="0.0"
++     inkscape:pageshadow="2"
++     inkscape:zoom="31.999999"
++     inkscape:cx="11.672079"
++     inkscape:cy="10.801908"
++     inkscape:document-units="px"
++     inkscape:current-layer="layer1"
++     showgrid="true"
++     showguides="true"
++     inkscape:guide-bbox="true"
++     inkscape:window-width="1220"
++     inkscape:window-height="833"
++     inkscape:window-x="56"
++     inkscape:window-y="20"
++     inkscape:window-maximized="0"
++     inkscape:snap-global="false">
++    <inkscape:grid
++       type="xygrid"
++       id="grid4468"
++       empspacing="5"
++       visible="true"
++       enabled="true"
++       snapvisiblegridlinesonly="true" />
++    <sodipodi:guide
++       orientation="1,0"
++       position="0,20"
++       id="guide4470" />
++    <sodipodi:guide
++       orientation="0,1"
++       position="4,24"
++       id="guide4472" />
++    <sodipodi:guide
++       orientation="1,0"
++       position="24,13"
++       id="guide4474" />
++    <sodipodi:guide
++       orientation="0,1"
++       position="15,0"
++       id="guide4476" />
++    <sodipodi:guide
++       orientation="1,0"
++       position="23,20"
++       id="guide4478" />
++    <sodipodi:guide
++       orientation="0,1"
++       position="20,23"
++       id="guide4480" />
++    <sodipodi:guide
++       orientation="1,0"
++       position="2,5"
++       id="guide4482" />
++    <sodipodi:guide
++       orientation="0,1"
++       position="7,2"
++       id="guide4484" />
++  </sodipodi:namedview>
++  <metadata
++     id="metadata4465">
++    <rdf:RDF>
++      <cc:Work
++         rdf:about="">
++        <dc:format>image/svg+xml</dc:format>
++        <dc:type
++           rdf:resource="http://purl.org/dc/dcmitype/StillImage" />
++        <dc:title></dc:title>
++      </cc:Work>
++    </rdf:RDF>
++  </metadata>
++  <g
++     inkscape:label="Layer 1"
++     inkscape:groupmode="layer"
++     id="layer1"
++     transform="translate(0,-1028.3622)">
++    <rect
++       style="fill:#474747;fill-opacity:1;stroke:#474747;stroke-width:1.10638154;stroke-linecap:round;stroke-linejoin:round;stroke-miterlimit:4;stroke-opacity:1;stroke-dasharray:none"
++       id="rect3819"
++       width="11.388587"
++       height="8.3191271"
++       x="9.6028833"
++       y="1036.0035"
++       ry="0.40591982" />
++    <rect
++       style="fill:#474747;fill-opacity:1;stroke:none"
++       id="rect3841-9"
++       width="5.9674673"
++       height="3.0629871"
++       x="4.0269899"
++       y="1040.379" />
++    <rect
++       style="fill:#474747;fill-opacity:1;stroke:none"
++       id="rect3841"
++       width="9.0854111"
++       height="3.505249"
++       x="3.215656"
++       y="1041.373" />
++    <path
++       style="fill:none;stroke:#474747;stroke-width:1.00072384px;stroke-linecap:round;stroke-linejoin:round;stroke-opacity:1"
++       d="m 5.8770049,1037.2051 c -3.4317547,6.8227 -2.9215641,4.6267 -2.9525005,7.2023 l 3.1294053,-0.016 0.6633925,-1.1278 0.7960708,-0.4862 0.8845231,-0.177 0.9729758,0.1325 0.1326781,-5.4838 c -0.5706491,-0.018 -3.0345797,-0.045 -3.6265451,-0.044 z"
++       id="path3839"
++       inkscape:connector-curvature="0"
++       sodipodi:nodetypes="cccccccccc" />
++    <path
++       sodipodi:type="arc"
++       style="fill:#ffffff;fill-opacity:1;stroke:#474747;stroke-width:2.78317332;stroke-miterlimit:4;stroke-opacity:1;stroke-dasharray:none"
++       id="path3037-4-7-6"
++       sodipodi:cx="-10.915961"
++       sodipodi:cy="15.558912"
++       sodipodi:rx="4.6403885"
++       sodipodi:ry="4.6403885"
++       d="m -6.2755728,15.558912 a 4.6403885,4.6403885 0 1 1 -9.2807772,0 4.6403885,4.6403885 0 1 1 9.2807772,0 z"
++       transform="matrix(0.29808451,0,0,0.29808451,9.4846938,1040.2185)" />
++    <path
++       style="fill:#474747;fill-opacity:1;stroke:none"
++       d="m 5.6641236,1036.7454 3.9457924,-1.2085 0.085489,1.4914 z"
++       id="path4047"
++       inkscape:connector-curvature="0"
++       sodipodi:nodetypes="cccc" />
++    <path
++       sodipodi:type="arc"
++       style="fill:#ffffff;fill-opacity:1;stroke:#474747;stroke-width:2.78317332;stroke-miterlimit:4;stroke-opacity:1;stroke-dasharray:none"
++       id="path3037-4-7-6-8"
++       sodipodi:cx="-10.915961"
++       sodipodi:cy="15.558912"
++       sodipodi:rx="4.6403885"
++       sodipodi:ry="4.6403885"
++       d="m -6.2755728,15.558912 a 4.6403885,4.6403885 0 1 1 -9.2807772,0 4.6403885,4.6403885 0 1 1 9.2807772,0 z"
++       transform="matrix(0.29808451,0,0,0.29808451,21.646887,1040.2627)" />
++    <rect
++       style="fill:#474747;fill-opacity:1;stroke:none"
++       id="rect3841-9-0"
++       width="5.9674673"
++       height="3.0629871"
++       x="8.1561842"
++       y="1037.4869" />
++  </g>
++</svg>
+diff --git a/web/src/main/webapp/img/truck.png b/web/src/main/webapp/img/truck.png
+index dcc7536853..052de16454 100644
+Binary files a/web/src/main/webapp/img/truck.png and b/web/src/main/webapp/img/truck.png differ
+diff --git a/web/src/main/webapp/img/truck.svg b/web/src/main/webapp/img/truck.svg
+index 773496582a..75f1e2f048 100644
+--- a/web/src/main/webapp/img/truck.svg
++++ b/web/src/main/webapp/img/truck.svg
+@@ -27,19 +27,19 @@
+      borderopacity="1.0"
+      inkscape:pageopacity="0.0"
+      inkscape:pageshadow="2"
+-     inkscape:zoom="22.627416"
+-     inkscape:cx="10.635409"
+-     inkscape:cy="15.468485"
++     inkscape:zoom="22.627417"
++     inkscape:cx="5.6057415"
++     inkscape:cy="16.830517"
+      inkscape:document-units="px"
+      inkscape:current-layer="layer1"
+      showgrid="true"
+      showguides="true"
+      inkscape:guide-bbox="true"
+-     inkscape:window-width="1220"
+-     inkscape:window-height="833"
+-     inkscape:window-x="56"
+-     inkscape:window-y="20"
+-     inkscape:window-maximized="0"
++     inkscape:window-width="1600"
++     inkscape:window-height="1146"
++     inkscape:window-x="0"
++     inkscape:window-y="0"
++     inkscape:window-maximized="1"
+      inkscape:snap-global="false">
+     <inkscape:grid
+        type="xygrid"
+@@ -99,20 +99,29 @@
+      id="layer1"
+      transform="translate(0,-1028.3622)">
+     <rect
+-       style="fill:#474747;fill-opacity:1;stroke:#474747;stroke-width:1.20503712;stroke-linecap:round;stroke-linejoin:round;stroke-miterlimit:4;stroke-opacity:1;stroke-dasharray:none"
++       style="fill:#474747;fill-opacity:1;stroke:none"
++       id="rect3841-0"
++       width="7.3367667"
++       height="2.8106334"
++       x="6.4433584"
++       y="1042.5483"
++       ry="0.68756628" />
++    <rect
++       style="fill:#474747;fill-opacity:1;stroke:#474747;stroke-width:1.22422004;stroke-linecap:round;stroke-linejoin:round;stroke-miterlimit:4;stroke-opacity:1;stroke-dasharray:none"
+        id="rect3819"
+-       width="11.280894"
+-       height="9.9631157"
+-       x="9.694931"
+-       y="1034.7893"
+-       ry="0.4861359" />
++       width="13.350307"
++       height="8.6889143"
++       x="9.4435234"
++       y="1036.0636"
++       ry="0.4239631" />
+     <rect
+        style="fill:#474747;fill-opacity:1;stroke:none"
+        id="rect3841"
+-       width="4.4636116"
+-       height="3.1819806"
+-       x="4.5190678"
+-       y="1041.6671" />
++       width="7.1593165"
++       height="4.5141554"
++       x="1.4221706"
++       y="1040.8457"
++       ry="0.0218533" />
+     <path
+        sodipodi:type="arc"
+        style="fill:#ffffff;fill-opacity:1;stroke:#474747;stroke-width:2.78317332;stroke-miterlimit:4;stroke-opacity:1;stroke-dasharray:none"
+@@ -122,22 +131,40 @@
+        sodipodi:rx="4.6403885"
+        sodipodi:ry="4.6403885"
+        d="m -6.2755728,15.558912 a 4.6403885,4.6403885 0 1 1 -9.2807772,0 4.6403885,4.6403885 0 1 1 9.2807772,0 z"
+-       transform="matrix(0.39311538,0,0,0.39311538,12.51135,1038.9096)" />
++       transform="matrix(0.33204356,0,0,0.33204356,8.6540613,1040.1559)" />
++    <path
++       style="fill:none;stroke:#474747;stroke-width:1.20126379px;stroke-linecap:round;stroke-linejoin:round;stroke-opacity:1"
++       d="m 1.2689962,1044.7756 2.0592761,0 0.1444046,-1.5623 1.007107,-0.5541 2.0851643,-0.2015 1.4083588,0.1156 -0.00959,-5.6085 c -1.1943357,0.021 -6.178957,-0.012 -6.6830157,-10e-5 -0.027605,3.0299 -0.00284,5.6084 -0.011699,7.8109 z"
++       id="path3839"
++       inkscape:connector-curvature="0"
++       sodipodi:nodetypes="ccccccccc" />
+     <path
+        sodipodi:type="arc"
+        style="fill:#ffffff;fill-opacity:1;stroke:#474747;stroke-width:2.78317332;stroke-miterlimit:4;stroke-opacity:1;stroke-dasharray:none"
+-       id="path3037-4-7-6-5"
++       id="path3037-4-7-6-4"
+        sodipodi:cx="-10.915961"
+        sodipodi:cy="15.558912"
+        sodipodi:rx="4.6403885"
+        sodipodi:ry="4.6403885"
+        d="m -6.2755728,15.558912 a 4.6403885,4.6403885 0 1 1 -9.2807772,0 4.6403885,4.6403885 0 1 1 9.2807772,0 z"
+-       transform="matrix(0.39311538,0,0,0.39311538,21.924709,1038.9096)" />
++       transform="matrix(0.33204356,0,0,0.33204356,19.798839,1040.1754)" />
+     <path
+-       style="fill:none;stroke:#474747;stroke-width:1px;stroke-linecap:round;stroke-linejoin:round;stroke-opacity:1"
+-       d="m 5.9220195,1037.6897 -1.6793786,3.7565 -0.044194,3.8449 2.0329321,0 0.5303301,-1.5468 0.7954951,-0.4861 0.8838835,-0.1768 0.9722719,0.1326 0.1325825,-5.4801 c -3.0635295,-0.04 -2.26e-5,-0.021 -3.6239226,-0.044 z"
+-       id="path3839"
+-       inkscape:connector-curvature="0"
+-       sodipodi:nodetypes="ccccccccccc" />
++       sodipodi:type="arc"
++       style="fill:#ffffff;fill-opacity:1;stroke:#474747;stroke-width:2.78317332;stroke-miterlimit:4;stroke-opacity:1;stroke-dasharray:none"
++       id="path3037-4-7-6-8"
++       sodipodi:cx="-10.915961"
++       sodipodi:cy="15.558912"
++       sodipodi:rx="4.6403885"
++       sodipodi:ry="4.6403885"
++       d="m -6.2755728,15.558912 a 4.6403885,4.6403885 0 1 1 -9.2807772,0 4.6403885,4.6403885 0 1 1 9.2807772,0 z"
++       transform="matrix(0.33204356,0,0,0.33204356,23.809213,1040.1754)" />
++    <rect
++       style="fill:#474747;fill-opacity:1;stroke:none"
++       id="rect3841-8"
++       width="2.3410294"
++       height="4.5141554"
++       x="5.5147619"
++       y="1037.1342"
++       ry="0.0218533" />
+   </g>
+ </svg>

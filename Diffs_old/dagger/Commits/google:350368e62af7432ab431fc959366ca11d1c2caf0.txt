@@ -1,0 +1,484 @@
+diff --git a/java/dagger/internal/codegen/BindingGraphFactory.java b/java/dagger/internal/codegen/BindingGraphFactory.java
+index 5d033484b..d49a503a2 100644
+--- a/java/dagger/internal/codegen/BindingGraphFactory.java
++++ b/java/dagger/internal/codegen/BindingGraphFactory.java
+@@ -686,9 +686,13 @@ private ComponentPath componentPath(Resolver destination) {
+     private ImmutableSet<ContributionBinding> getLocalExplicitBindings(Key key) {
+       return new ImmutableSet.Builder<ContributionBinding>()
+           .addAll(explicitBindings.get(key))
++          // @Binds @IntoMap declarations have key Map<K, V>, unlike @Provides @IntoMap or @Produces
++          // @IntoMap, which have Map<K, Provider/Producer<V>> keys. So unwrap the key's type's
++          // value type if it's a Map<K, Provider/Producer<V>> before looking in
++          // delegateDeclarations. createDelegateBindings() will create bindings with the properly
++          // wrapped key type.
+           .addAll(
+-              createDelegateBindings(
+-                  delegateDeclarations.get(keyFactory.convertToDelegateKey(key))))
++              createDelegateBindings(delegateDeclarations.get(keyFactory.unwrapMapValueType(key))))
+           .build();
+     }
+ 
+@@ -714,11 +718,14 @@ private ComponentPath componentPath(Resolver destination) {
+       if (!MapType.isMap(key)
+           || MapType.from(key).isRawType()
+           || MapType.from(key).valuesAreFrameworkType()) {
+-        // There are no @Binds @IntoMap delegate declarations for Map<K, V> requests. All
+-        // @IntoMap requests must be for Map<K, Framework<V>>.
++        // @Binds @IntoMap declarations have key Map<K, V>, unlike @Provides @IntoMap or @Produces
++        // @IntoMap, which have Map<K, Provider/Producer<V>> keys. So unwrap the key's type's
++        // value type if it's a Map<K, Provider/Producer<V>> before looking in
++        // delegateMultibindingDeclarations. createDelegateBindings() will create bindings with the
++        // properly wrapped key type.
+         multibindings.addAll(
+             createDelegateBindings(
+-                delegateMultibindingDeclarations.get(keyFactory.convertToDelegateKey(key))));
++                delegateMultibindingDeclarations.get(keyFactory.unwrapMapValueType(key))));
+       }
+       return multibindings.build();
+     }
+diff --git a/java/dagger/internal/codegen/KeyFactory.java b/java/dagger/internal/codegen/KeyFactory.java
+index 22e644887..edbd62935 100644
+--- a/java/dagger/internal/codegen/KeyFactory.java
++++ b/java/dagger/internal/codegen/KeyFactory.java
+@@ -30,6 +30,7 @@
+ import static dagger.internal.codegen.Optionals.firstPresent;
+ import static dagger.internal.codegen.RequestKinds.extractKeyType;
+ import static dagger.internal.codegen.RequestKinds.getRequestKind;
++import static java.util.Arrays.asList;
+ import static javax.lang.model.element.ElementKind.METHOD;
+ 
+ import com.google.auto.common.MoreTypes;
+@@ -308,29 +309,26 @@ Key forProductionComponentMonitor() {
+   }
+ 
+   /**
+-   * Keys for map contributions from {@link dagger.Provides} and {@link dagger.producers.Produces}
+-   * are in the form {@code Map<K, Framework<V>>}, but keys for {@link Binds} methods are just
+-   * {@code Map<K, V>} since the framework type is not known until graph resolution. This
+-   * translates from the {@code @Provides}/{@code @Produces} format into the {@code @Binds}
+-   * format. If {@link Key#type() possibleMapKey.type()} is not a {@code Map<K, Framework<V>>},
+-   * returns {@code possibleMapKey}.
++   * If {@code key}'s type is {@code Map<K, Provider<V>>}, {@code Map<K, Producer<V>>}, or {@code
++   * Map<K, Produced<V>>}, returns a key with the same qualifier and {@link
++   * Key#multibindingContributionIdentifier()} whose type is simply {@code Map<K, V>}.
++   *
++   * <p>Otherwise, returns {@code key}.
+    */
+-  Key convertToDelegateKey(Key possibleMapKey) {
+-    if (!MapType.isMap(possibleMapKey)) {
+-      return possibleMapKey;
+-    }
+-    MapType mapType = MapType.from(possibleMapKey);
+-    TypeMirror wrappedValueType;
+-    if (mapType.isRawType()) {
+-      return possibleMapKey;
+-    } else if (mapType.valuesAreTypeOf(Provider.class)) {
+-      wrappedValueType = mapType.unwrappedValueType(Provider.class);
+-    } else if (mapType.valuesAreTypeOf(Producer.class)) {
+-      wrappedValueType = mapType.unwrappedValueType(Producer.class);
+-    } else {
+-      return possibleMapKey;
++  Key unwrapMapValueType(Key key) {
++    if (MapType.isMap(key)) {
++      MapType mapType = MapType.from(key);
++      if (!mapType.isRawType()) {
++        for (Class<?> frameworkClass : asList(Provider.class, Producer.class, Produced.class)) {
++          if (mapType.valuesAreTypeOf(frameworkClass)) {
++            return key.toBuilder()
++                .type(mapOf(mapType.keyType(), mapType.unwrappedValueType(frameworkClass)))
++                .build();
++          }
++        }
++      }
+     }
+-    return possibleMapKey.toBuilder().type(mapOf(mapType.keyType(), wrappedValueType)).build();
++    return key;
+   }
+ 
+   /**
+diff --git a/java/dagger/internal/codegen/MapMultibindingValidator.java b/java/dagger/internal/codegen/MapMultibindingValidator.java
+index f604a8b80..ea47679c7 100644
+--- a/java/dagger/internal/codegen/MapMultibindingValidator.java
++++ b/java/dagger/internal/codegen/MapMultibindingValidator.java
+@@ -17,8 +17,10 @@
+ package dagger.internal.codegen;
+ 
+ import static com.google.common.base.Preconditions.checkArgument;
++import static com.google.common.collect.Multimaps.filterKeys;
+ import static dagger.internal.codegen.DaggerStreams.instancesOf;
+ import static dagger.internal.codegen.DaggerStreams.toImmutableSet;
++import static dagger.internal.codegen.DaggerStreams.toImmutableSetMultimap;
+ import static dagger.internal.codegen.Formatter.INDENT;
+ import static dagger.model.BindingKind.MULTIBOUND_MAP;
+ import static javax.tools.Diagnostic.Kind.ERROR;
+@@ -28,13 +30,16 @@
+ import com.google.common.collect.ImmutableSet;
+ import com.google.common.collect.ImmutableSetMultimap;
+ import com.google.common.collect.Multimaps;
++import com.google.common.collect.SetMultimap;
+ import dagger.model.BindingGraph;
+ import dagger.model.BindingGraph.BindingNode;
+ import dagger.model.Key;
++import dagger.producers.Producer;
+ import dagger.spi.BindingGraphPlugin;
+ import dagger.spi.DiagnosticReporter;
+ import java.util.Set;
+ import javax.inject.Inject;
++import javax.inject.Provider;
+ import javax.lang.model.type.DeclaredType;
+ 
+ /**
+@@ -44,10 +49,13 @@
+ final class MapMultibindingValidator implements BindingGraphPlugin {
+ 
+   private final BindingDeclarationFormatter bindingDeclarationFormatter;
++  private final KeyFactory keyFactory;
+ 
+   @Inject
+-  MapMultibindingValidator(BindingDeclarationFormatter bindingDeclarationFormatter) {
++  MapMultibindingValidator(
++      BindingDeclarationFormatter bindingDeclarationFormatter, KeyFactory keyFactory) {
+     this.bindingDeclarationFormatter = bindingDeclarationFormatter;
++    this.keyFactory = keyFactory;
+   }
+ 
+   @Override
+@@ -57,14 +65,61 @@ public String pluginName() {
+ 
+   @Override
+   public void visitGraph(BindingGraph bindingGraph, DiagnosticReporter diagnosticReporter) {
+-    for (BindingNode node : bindingGraph.bindingNodes()) {
+-      if (node.binding().kind().equals(MULTIBOUND_MAP)) {
+-        ImmutableSet<ContributionBinding> contributions =
+-            mapBindingContributions(node, bindingGraph);
+-        checkForDuplicateMapKeys(node, contributions, diagnosticReporter);
+-        checkForInconsistentMapKeyAnnotationTypes(node, contributions, diagnosticReporter);
+-      }
+-    }
++    mapMultibindings(bindingGraph)
++        .forEach(
++            binding -> {
++              ImmutableSet<ContributionBinding> contributions =
++                  mapBindingContributions(binding, bindingGraph);
++              checkForDuplicateMapKeys(binding, contributions, diagnosticReporter);
++              checkForInconsistentMapKeyAnnotationTypes(binding, contributions, diagnosticReporter);
++            });
++  }
++
++  /**
++   * Returns the map multibindings in the binding graph. If a graph contains bindings for more than
++   * one of the following for the same {@code K} and {@code V}, then only the first one found will
++   * be returned so we don't report the same map contribution problem more than once.
++   *
++   * <ol>
++   *   <li>{@code Map<K, V>}
++   *   <li>{@code Map<K, Provider<V>>}
++   *   <li>{@code Map<K, Producer<V>>}
++   * </ol>
++   */
++  private ImmutableSet<BindingNode> mapMultibindings(BindingGraph bindingGraph) {
++    ImmutableSetMultimap<Key, BindingNode> mapMultibindings =
++        bindingGraph.bindingNodes().stream()
++            .filter(node -> node.binding().kind().equals(MULTIBOUND_MAP))
++            .collect(toImmutableSetMultimap(BindingNode::key, node -> node));
++
++    // Mutlbindings for Map<K, V>
++    SetMultimap<Key, BindingNode> plainValueMapMultibindings =
++        filterKeys(mapMultibindings, key -> !MapType.from(key).valuesAreFrameworkType());
++
++    // Multibindings for Map<K, Provider<V>> where Map<K, V> isn't in plainValueMapMultibindings
++    SetMultimap<Key, BindingNode> providerValueMapMultibindings =
++        filterKeys(
++            mapMultibindings,
++            key ->
++                MapType.from(key).valuesAreTypeOf(Provider.class)
++                    && !plainValueMapMultibindings.containsKey(keyFactory.unwrapMapValueType(key)));
++
++    // Multibindings for Map<K, Producer<V>> where Map<K, V> isn't in plainValueMapMultibindings and
++    // Map<K, Provider<V>> isn't in providerValueMapMultibindings
++    SetMultimap<Key, BindingNode> producerValueMapMultibindings =
++        filterKeys(
++            mapMultibindings,
++            key ->
++                MapType.from(key).valuesAreTypeOf(Producer.class)
++                    && !plainValueMapMultibindings.containsKey(keyFactory.unwrapMapValueType(key))
++                    && !providerValueMapMultibindings.containsKey(
++                        keyFactory.rewrapMapKey(key, Producer.class, Provider.class).get()));
++
++    return new ImmutableSet.Builder<BindingNode>()
++        .addAll(plainValueMapMultibindings.values())
++        .addAll(providerValueMapMultibindings.values())
++        .addAll(producerValueMapMultibindings.values())
++        .build();
+   }
+ 
+   private ImmutableSet<ContributionBinding> mapBindingContributions(
+diff --git a/javatests/dagger/internal/codegen/MapMultibindingValidationTest.java b/javatests/dagger/internal/codegen/MapMultibindingValidationTest.java
+index 66681bc55..487fd1054 100644
+--- a/javatests/dagger/internal/codegen/MapMultibindingValidationTest.java
++++ b/javatests/dagger/internal/codegen/MapMultibindingValidationTest.java
+@@ -19,6 +19,7 @@
+ import static com.google.testing.compile.CompilationSubject.assertThat;
+ import static dagger.internal.codegen.Compilers.daggerCompiler;
+ 
++import com.google.common.collect.ImmutableList;
+ import com.google.testing.compile.Compilation;
+ import com.google.testing.compile.JavaFileObjects;
+ import javax.tools.JavaFileObject;
+@@ -50,26 +51,98 @@ public void duplicateMapKeys() {
+             "    return \"one again\";",
+             "  }",
+             "}");
+-    JavaFileObject componentFile =
+-        JavaFileObjects.forSourceLines(
+-            "test.TestComponent",
+-            "package test;",
+-            "",
+-            "import dagger.Component;",
+-            "import java.util.Map;",
+-            "import javax.inject.Provider;",
+-            "",
+-            "@Component(modules = {MapModule.class})",
+-            "interface TestComponent {",
+-            "  Map<String, Object> objects();",
+-            "}");
+ 
+-    Compilation compilation = daggerCompiler().compile(module, componentFile);
++    // If they're all there, report only Map<K, V>.
++    Compilation compilation =
++        daggerCompiler()
++            .compile(
++                module,
++                component(
++                    "Map<String, Object> objects();",
++                    "Map<String, Provider<Object>> objectProviders();",
++                    "Producer<Map<String, Producer<Object>>> objectProducers();"));
+     assertThat(compilation).failed();
+-    assertThat(compilation).hadErrorContaining("The same map key is bound more than once");
++    assertThat(compilation)
++        .hadErrorContaining(
++            "The same map key is bound more than once for "
++                + "java.util.Map<java.lang.String,java.lang.Object>");
+     assertThat(compilation).hadErrorContaining("provideObjectForAKey()");
+     assertThat(compilation).hadErrorContaining("provideObjectForAKeyAgain()");
+     assertThat(compilation).hadErrorCount(1);
++
++    // If there's Map<K, V> and Map<K, Provider<V>>, report only Map<K, V>.
++    compilation =
++        daggerCompiler()
++            .compile(
++                module,
++                component(
++                    "Map<String, Object> objects();",
++                    "Map<String, Provider<Object>> objectProviders();"));
++    assertThat(compilation).failed();
++    assertThat(compilation)
++        .hadErrorContaining(
++            "The same map key is bound more than once for "
++                + "java.util.Map<java.lang.String,java.lang.Object>");
++    assertThat(compilation).hadErrorCount(1);
++
++    // If there's Map<K, V> and Map<K, Producer<V>>, report only Map<K, V>.
++    compilation =
++        daggerCompiler()
++            .compile(
++                module,
++                component(
++                    "Map<String, Object> objects();",
++                    "Producer<Map<String, Producer<Object>>> objectProducers();"));
++    assertThat(compilation).failed();
++    assertThat(compilation)
++        .hadErrorContaining(
++            "The same map key is bound more than once for "
++                + "java.util.Map<java.lang.String,java.lang.Object>");
++    assertThat(compilation).hadErrorCount(1);
++
++    // If there's Map<K, Provider<V>> and Map<K, Producer<V>>, report only Map<K, Provider<V>>.
++    compilation =
++        daggerCompiler()
++            .compile(
++                module,
++                component(
++                    "Map<String, Provider<Object>> objectProviders();",
++                    "Producer<Map<String, Producer<Object>>> objectProducers();"));
++    assertThat(compilation).failed();
++    assertThat(compilation)
++        .hadErrorContaining(
++            "The same map key is bound more than once for "
++                + "java.util.Map<java.lang.String,javax.inject.Provider<java.lang.Object>>");
++    assertThat(compilation).hadErrorCount(1);
++
++    compilation = daggerCompiler().compile(module, component("Map<String, Object> objects();"));
++    assertThat(compilation).failed();
++    assertThat(compilation)
++        .hadErrorContaining(
++            "The same map key is bound more than once for "
++                + "java.util.Map<java.lang.String,java.lang.Object>");
++    assertThat(compilation).hadErrorCount(1);
++
++    compilation =
++        daggerCompiler()
++            .compile(module, component("Map<String, Provider<Object>> objectProviders();"));
++    assertThat(compilation).failed();
++    assertThat(compilation)
++        .hadErrorContaining(
++            "The same map key is bound more than once for "
++                + "java.util.Map<java.lang.String,javax.inject.Provider<java.lang.Object>>");
++    assertThat(compilation).hadErrorCount(1);
++
++    compilation =
++        daggerCompiler()
++            .compile(
++                module, component("Producer<Map<String, Producer<Object>>> objectProducers();"));
++    assertThat(compilation).failed();
++    assertThat(compilation)
++        .hadErrorContaining(
++            "The same map key is bound more than once for "
++                + "java.util.Map<java.lang.String,dagger.producers.Producer<java.lang.Object>>");
++    assertThat(compilation).hadErrorCount(1);
+   }
+ 
+   @Test
+@@ -105,26 +178,127 @@ public void inconsistentMapKeyAnnotations() {
+             "public @interface StringKeyTwo {",
+             "  String value();",
+             "}");
+-    JavaFileObject componentFile =
+-        JavaFileObjects.forSourceLines(
+-            "test.TestComponent",
+-            "package test;",
+-            "",
+-            "import dagger.Component;",
+-            "import java.util.Map;",
+-            "",
+-            "@Component(modules = {MapModule.class})",
+-            "interface TestComponent {",
+-            "  Map<String, Object> objects();",
+-            "}");
+-    
++
++    // If they're all there, report only Map<K, V>.
+     Compilation compilation =
+         daggerCompiler()
+-            .compile(module, stringKeyTwoFile, componentFile);
++            .compile(
++                module,
++                stringKeyTwoFile,
++                component(
++                    "Map<String, Object> objects();",
++                    "Map<String, Provider<Object>> objectProviders();",
++                    "Producer<Map<String, Producer<Object>>> objectProducers();"));
+     assertThat(compilation).failed();
+-    assertThat(compilation).hadErrorContaining("uses more than one @MapKey annotation type");
++    assertThat(compilation)
++        .hadErrorContaining(
++            "java.util.Map<java.lang.String,java.lang.Object>"
++                + " uses more than one @MapKey annotation type");
+     assertThat(compilation).hadErrorContaining("provideObjectForAKey()");
+     assertThat(compilation).hadErrorContaining("provideObjectForBKey()");
+     assertThat(compilation).hadErrorCount(1);
++
++    // If there's Map<K, V> and Map<K, Provider<V>>, report only Map<K, V>.
++    compilation =
++        daggerCompiler()
++            .compile(
++                module,
++                stringKeyTwoFile,
++                component(
++                    "Map<String, Object> objects();",
++                    "Map<String, Provider<Object>> objectProviders();"));
++    assertThat(compilation).failed();
++    assertThat(compilation)
++        .hadErrorContaining(
++            "java.util.Map<java.lang.String,java.lang.Object>"
++                + " uses more than one @MapKey annotation type");
++    assertThat(compilation).hadErrorCount(1);
++
++    // If there's Map<K, V> and Map<K, Producer<V>>, report only Map<K, V>.
++    compilation =
++        daggerCompiler()
++            .compile(
++                module,
++                stringKeyTwoFile,
++                component(
++                    "Map<String, Object> objects();",
++                    "Producer<Map<String, Producer<Object>>> objectProducers();"));
++    assertThat(compilation).failed();
++    assertThat(compilation)
++        .hadErrorContaining(
++            "java.util.Map<java.lang.String,java.lang.Object>"
++                + " uses more than one @MapKey annotation type");
++    assertThat(compilation).hadErrorCount(1);
++
++    // If there's Map<K, Provider<V>> and Map<K, Producer<V>>, report only Map<K, Provider<V>>.
++    compilation =
++        daggerCompiler()
++            .compile(
++                module,
++                stringKeyTwoFile,
++                component(
++                    "Map<String, Provider<Object>> objectProviders();",
++                    "Producer<Map<String, Producer<Object>>> objectProducers();"));
++    assertThat(compilation).failed();
++    assertThat(compilation)
++        .hadErrorContaining(
++            "java.util.Map<java.lang.String,javax.inject.Provider<java.lang.Object>>"
++                + " uses more than one @MapKey annotation type");
++    assertThat(compilation).hadErrorCount(1);
++
++    compilation =
++        daggerCompiler()
++            .compile(module, stringKeyTwoFile, component("Map<String, Object> objects();"));
++    assertThat(compilation).failed();
++    assertThat(compilation)
++        .hadErrorContaining(
++            "java.util.Map<java.lang.String,java.lang.Object>"
++                + " uses more than one @MapKey annotation type");
++    assertThat(compilation).hadErrorCount(1);
++
++    compilation =
++        daggerCompiler()
++            .compile(
++                module,
++                stringKeyTwoFile,
++                component("Map<String, Provider<Object>> objectProviders();"));
++    assertThat(compilation).failed();
++    assertThat(compilation)
++        .hadErrorContaining(
++            "java.util.Map<java.lang.String,javax.inject.Provider<java.lang.Object>>"
++                + " uses more than one @MapKey annotation type");
++    assertThat(compilation).hadErrorCount(1);
++
++    compilation =
++        daggerCompiler()
++            .compile(
++                module,
++                stringKeyTwoFile,
++                component("Producer<Map<String, Producer<Object>>> objectProducers();"));
++    assertThat(compilation).failed();
++    assertThat(compilation)
++        .hadErrorContaining(
++            "java.util.Map<java.lang.String,dagger.producers.Producer<java.lang.Object>>"
++                + " uses more than one @MapKey annotation type");
++    assertThat(compilation).hadErrorCount(1);
++  }
++
++  private static JavaFileObject component(String... entryPoints) {
++    return JavaFileObjects.forSourceLines(
++        "test.TestComponent",
++        ImmutableList.<String>builder()
++            .add(
++                "package test;",
++                "",
++                "import dagger.Component;",
++                "import dagger.producers.Producer;",
++                "import java.util.Map;",
++                "import javax.inject.Provider;",
++                "",
++                "@Component(modules = {MapModule.class})",
++                "interface TestComponent {")
++            .add(entryPoints)
++            .add("}")
++            .build());
+   }
+ }

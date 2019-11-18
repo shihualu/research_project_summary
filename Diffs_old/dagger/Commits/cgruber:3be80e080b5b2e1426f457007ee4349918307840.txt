@@ -1,0 +1,238 @@
+diff --git a/java/dagger/internal/codegen/ComponentModelBuilder.java b/java/dagger/internal/codegen/ComponentModelBuilder.java
+index 1ecc92ed7..86b560d9e 100644
+--- a/java/dagger/internal/codegen/ComponentModelBuilder.java
++++ b/java/dagger/internal/codegen/ComponentModelBuilder.java
+@@ -22,6 +22,7 @@
+ import static com.squareup.javapoet.MethodSpec.constructorBuilder;
+ import static com.squareup.javapoet.MethodSpec.methodBuilder;
+ import static dagger.internal.codegen.AnnotationSpecs.Suppression.UNCHECKED;
++import static dagger.internal.codegen.BindingRequest.bindingRequest;
+ import static dagger.internal.codegen.CodeBlocks.toParametersCodeBlock;
+ import static dagger.internal.codegen.DaggerStreams.toImmutableList;
+ import static dagger.internal.codegen.GeneratedComponentModel.MethodSpecKind.BUILDER_METHOD;
+@@ -31,7 +32,6 @@
+ import static dagger.internal.codegen.GeneratedComponentModel.MethodSpecKind.INITIALIZE_METHOD;
+ import static dagger.internal.codegen.GeneratedComponentModel.TypeSpecKind.COMPONENT_BUILDER;
+ import static dagger.internal.codegen.GeneratedComponentModel.TypeSpecKind.SUBCOMPONENT;
+-import static dagger.internal.codegen.ProducerNodeInstanceBindingExpression.MAY_INTERRUPT_IF_RUNNING;
+ import static dagger.producers.CancellationPolicy.Propagation.PROPAGATE;
+ import static javax.lang.model.element.Modifier.FINAL;
+ import static javax.lang.model.element.Modifier.PRIVATE;
+@@ -52,7 +52,9 @@
+ import com.squareup.javapoet.TypeSpec;
+ import dagger.internal.codegen.ComponentDescriptor.ComponentMethodDescriptor;
+ import dagger.internal.codegen.ModifiableBindingMethods.ModifiableBindingMethod;
++import dagger.model.Key;
+ import dagger.producers.internal.CancellationListener;
++import dagger.producers.internal.Producers;
+ import java.util.List;
+ import java.util.Optional;
+ import javax.lang.model.element.ExecutableElement;
+@@ -60,6 +62,8 @@
+ 
+ /** Builds the model for an implementation of a component or subcomponent. */
+ abstract class ComponentModelBuilder {
++  private static final String MAY_INTERRUPT_IF_RUNNING = "mayInterruptIfRunning";
++
+   static GeneratedComponentModel buildComponentModel(
+       DaggerTypes types,
+       DaggerElements elements,
+@@ -240,17 +244,6 @@ private void addCancellationListenerImplementation() {
+     generatedComponentModel.addSupertype(elements.getTypeElement(CancellationListener.class));
+     generatedComponentModel.claimMethodName(CANCELLATION_LISTENER_METHOD_NAME);
+ 
+-    // Reversing should order cancellations starting from entry points and going down to leaves
+-    // rather than the other way around. This shouldn't really matter but seems *slightly*
+-    // preferable because:
+-    // When a future that another future depends on is cancelled, that cancellation will propagate
+-    // up the future graph toward the entry point. Cancelling in reverse order should ensure that
+-    // everything that depends on a particular node has already been cancelled when that node is
+-    // cancelled, so there's no need to propagate. Otherwise, when we cancel a leaf node, it might
+-    // propagate through most of the graph, making most of the cancel calls that follow in the
+-    // onProducerFutureCancelled method do nothing.
+-    ImmutableList<CodeBlock> cancellationStatements =
+-        generatedComponentModel.getCancellations().reverse();
+     MethodSpec.Builder methodBuilder =
+         methodBuilder(CANCELLATION_LISTENER_METHOD_NAME)
+             .addModifiers(PUBLIC)
+@@ -261,6 +254,7 @@ private void addCancellationListenerImplementation() {
+           "super.$L($L)", CANCELLATION_LISTENER_METHOD_NAME, MAY_INTERRUPT_IF_RUNNING);
+     }
+ 
++    ImmutableList<CodeBlock> cancellationStatements = cancellationStatements();
+     if (cancellationStatements.size() < STATEMENTS_PER_METHOD) {
+       methodBuilder.addCode(CodeBlocks.concat(cancellationStatements)).build();
+     } else {
+@@ -284,6 +278,35 @@ private void addCancellationListenerImplementation() {
+     generatedComponentModel.addMethod(CANCELLATION_LISTENER_METHOD, methodBuilder.build());
+   }
+ 
++  private ImmutableList<CodeBlock> cancellationStatements() {
++    // Reversing should order cancellations starting from entry points and going down to leaves
++    // rather than the other way around. This shouldn't really matter but seems *slightly*
++    // preferable because:
++    // When a future that another future depends on is cancelled, that cancellation will propagate
++    // up the future graph toward the entry point. Cancelling in reverse order should ensure that
++    // everything that depends on a particular node has already been cancelled when that node is
++    // cancelled, so there's no need to propagate. Otherwise, when we cancel a leaf node, it might
++    // propagate through most of the graph, making most of the cancel calls that follow in the
++    // onProducerFutureCancelled method do nothing.
++    ImmutableList<Key> cancellationKeys =
++        generatedComponentModel.getCancellableProducerKeys().reverse();
++
++    ImmutableList.Builder<CodeBlock> cancellationStatements = ImmutableList.builder();
++    for (Key cancellationKey : cancellationKeys) {
++      cancellationStatements.add(
++          CodeBlock.of(
++              "$T.cancel($L, $N);",
++              Producers.class,
++              bindingExpressions
++                  .getDependencyExpression(
++                      bindingRequest(cancellationKey, FrameworkType.PRODUCER_NODE),
++                      generatedComponentModel.name())
++                  .codeBlock(),
++              MAY_INTERRUPT_IF_RUNNING));
++    }
++    return cancellationStatements.build();
++  }
++
+   protected void addCancelParentStatement(MethodSpec.Builder methodBuilder) {
+     // Does nothing by default. Overridden in subclass(es) to add a statement if and only if the
+     // component being generated is a concrete subcomponent implementation with a parent that allows
+diff --git a/java/dagger/internal/codegen/GeneratedComponentModel.java b/java/dagger/internal/codegen/GeneratedComponentModel.java
+index cf668926a..65bbbf5f7 100644
+--- a/java/dagger/internal/codegen/GeneratedComponentModel.java
++++ b/java/dagger/internal/codegen/GeneratedComponentModel.java
+@@ -49,13 +49,14 @@
+ import dagger.model.DependencyRequest;
+ import dagger.model.Key;
+ import dagger.model.RequestKind;
+-import dagger.producers.internal.CancellationListener;
+ import java.util.ArrayList;
+ import java.util.Arrays;
+ import java.util.HashMap;
++import java.util.LinkedHashSet;
+ import java.util.List;
+ import java.util.Map;
+ import java.util.Optional;
++import java.util.Set;
+ import javax.lang.model.element.Modifier;
+ import javax.lang.model.element.NestingKind;
+ import javax.lang.model.element.TypeElement;
+@@ -120,8 +121,8 @@
+     MODIFIABLE_BINDING_METHOD,
+ 
+     /**
+-     * The {@link CancellationListener#onProducerFutureCancelled(boolean)} method for a production
+-     * component.
++     * The {@link dagger.producers.internal.CancellationListener#onProducerFutureCancelled(boolean)}
++     * method for a production component.
+      */
+     CANCELLATION_LISTENER_METHOD,
+     ;
+@@ -153,7 +154,7 @@
+   private final UniqueNameSet componentFieldNames = new UniqueNameSet();
+   private final UniqueNameSet componentMethodNames = new UniqueNameSet();
+   private final List<CodeBlock> initializations = new ArrayList<>();
+-  private final List<CodeBlock> cancellations = new ArrayList<>();
++  private final Set<Key> cancellableProducerKeys = new LinkedHashSet<>();
+   private final ListMultimap<FieldSpecKind, FieldSpec> fieldSpecsMap =
+       MultimapBuilder.enumKeys(FieldSpecKind.class).arrayListValues().build();
+   private final ListMultimap<MethodSpecKind, MethodSpec> methodSpecsMap =
+@@ -407,9 +408,12 @@ void addInitialization(CodeBlock codeBlock) {
+     initializations.add(codeBlock);
+   }
+ 
+-  /** Adds the given code block to the cancellation listener method of the component. */
+-  void addCancellation(CodeBlock codeBlock) {
+-    cancellations.add(codeBlock);
++  /**
++   * Marks the given key of a producer as one that should have a cancellation statement in the
++   * cancellation listener method of the component.
++   */
++  void addCancellableProducerKey(Key key) {
++    cancellableProducerKeys.add(key);
+   }
+ 
+   /** Records the constructor parameters for an instance of this component. */
+@@ -463,9 +467,12 @@ void claimMethodName(CharSequence name) {
+     return ImmutableList.copyOf(initializations);
+   }
+ 
+-  /** Returns the list of {@link CodeBlock}s that need to go in the cancellation listener method. */
+-  ImmutableList<CodeBlock> getCancellations() {
+-    return ImmutableList.copyOf(cancellations);
++  /**
++   * Returns the list of producer {@link Key}s that need cancellation statements in the cancellation
++   * listener method.
++   */
++  ImmutableList<Key> getCancellableProducerKeys() {
++    return ImmutableList.copyOf(cancellableProducerKeys);
+   }
+ 
+   /**
+diff --git a/java/dagger/internal/codegen/ProducerNodeInstanceBindingExpression.java b/java/dagger/internal/codegen/ProducerNodeInstanceBindingExpression.java
+index dd8689e8e..939cf8dd4 100644
+--- a/java/dagger/internal/codegen/ProducerNodeInstanceBindingExpression.java
++++ b/java/dagger/internal/codegen/ProducerNodeInstanceBindingExpression.java
+@@ -25,6 +25,7 @@
+ import com.squareup.javapoet.FieldSpec;
+ import com.squareup.javapoet.TypeName;
+ import dagger.internal.codegen.ComponentDescriptor.ComponentMethodDescriptor;
++import dagger.model.Key;
+ import dagger.producers.Producer;
+ import dagger.producers.internal.Producers;
+ import javax.lang.model.type.TypeMirror;
+@@ -32,13 +33,11 @@
+ /** Binding expression for producer node instances. */
+ final class ProducerNodeInstanceBindingExpression extends FrameworkInstanceBindingExpression {
+ 
+-  static final String MAY_INTERRUPT_IF_RUNNING = "mayInterruptIfRunning";
+-
+   /** Model for the component defining this binding. */
+   private final GeneratedComponentModel generatedComponentModel;
+ 
++  private final Key key;
+   private final TypeMirror type;
+-  private boolean addedCancellationStatement = false;
+ 
+   ProducerNodeInstanceBindingExpression(
+       ResolvedBindings resolvedBindings,
+@@ -48,6 +47,7 @@
+       GeneratedComponentModel generatedComponentModel) {
+     super(resolvedBindings, frameworkInstanceSupplier, types, elements);
+     this.generatedComponentModel = checkNotNull(generatedComponentModel);
++    this.key = resolvedBindings.key();
+     this.type = types.wrapType(resolvedBindings.key().type(), Producer.class);
+   }
+ 
+@@ -59,13 +59,7 @@ protected FrameworkType frameworkType() {
+   @Override
+   Expression getDependencyExpression(ClassName requestingClass) {
+     Expression result = super.getDependencyExpression(requestingClass);
+-    if (!addedCancellationStatement) {
+-      CodeBlock cancel =
+-          CodeBlock.of(
+-              "$T.cancel($L, $L);", Producers.class, result.codeBlock(), MAY_INTERRUPT_IF_RUNNING);
+-      generatedComponentModel.addCancellation(cancel);
+-      addedCancellationStatement = true;
+-    }
++    generatedComponentModel.addCancellableProducerKey(key);
+     return result;
+   }
+ 
+diff --git a/javatests/dagger/internal/codegen/AheadOfTimeSubcomponentsTest.java b/javatests/dagger/internal/codegen/AheadOfTimeSubcomponentsTest.java
+index 3240397d1..49274d24b 100644
+--- a/javatests/dagger/internal/codegen/AheadOfTimeSubcomponentsTest.java
++++ b/javatests/dagger/internal/codegen/AheadOfTimeSubcomponentsTest.java
+@@ -3374,9 +3374,7 @@ public void productionSubcomponentAndModifiableFrameworkInstance() {
+             "",
+             "  @Override",
+             "  public void onProducerFutureCancelled(boolean mayInterruptIfRunning) {",
+-            // TODO(b/72748365): Reference to DaggerRoot is redundant.
+-            "    Producers.cancel(DaggerRoot.this.responseDependencyProducer,",
+-            "        mayInterruptIfRunning);",
++            "    Producers.cancel(responseDependencyProducer, mayInterruptIfRunning);",
+             "  }",
+             "",
+             "  public static final class Builder {",

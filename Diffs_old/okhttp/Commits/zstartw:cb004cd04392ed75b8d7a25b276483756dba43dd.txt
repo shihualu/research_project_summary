@@ -1,0 +1,330 @@
+diff --git a/okhttp-tests/src/test/java/okhttp3/CallTest.java b/okhttp-tests/src/test/java/okhttp3/CallTest.java
+index df729b5510..16b0b8076a 100644
+--- a/okhttp-tests/src/test/java/okhttp3/CallTest.java
++++ b/okhttp-tests/src/test/java/okhttp3/CallTest.java
+@@ -2031,11 +2031,27 @@ private void cancelDuringConnect(String scheme) throws Exception {
+ 
+   @Test public void cancelImmediatelyAfterEnqueue() throws Exception {
+     server.enqueue(new MockResponse());
++    final CountDownLatch latch = new CountDownLatch(1);
++    client = client.newBuilder()
++        .addNetworkInterceptor(new Interceptor() {
++          @Override public Response intercept(Chain chain) throws IOException {
++            try {
++              latch.await();
++            } catch (InterruptedException e) {
++              throw new AssertionError(e);
++            }
++            return chain.proceed(chain.request());
++          }
++        })
++        .build();
++
+     Call call = client.newCall(new Request.Builder()
+         .url(server.url("/a"))
+         .build());
+     call.enqueue(callback);
+     call.cancel();
++    latch.countDown();
++
+     callback.await(server.url("/a")).assertFailure("Canceled", "Socket closed");
+   }
+ 
+@@ -3125,6 +3141,52 @@ private RequestBody requestBody(final boolean chunked, final long size, final in
+     }
+   }
+ 
++  @Test public void failedAuthenticatorReleasesConnection() throws IOException {
++    server.enqueue(new MockResponse()
++        .setResponseCode(401));
++
++    client.connectionPool().evictAll();
++    client = client.newBuilder()
++        .authenticator(new Authenticator() {
++          @Override public Request authenticate(Route route, Response response) throws IOException {
++            throw new IOException("IOException!");
++          }
++        })
++        .build();
++
++    Request request = new Request.Builder()
++        .url(server.url("/"))
++        .build();
++
++    executeSynchronously(request)
++        .assertFailure(IOException.class);
++
++    assertEquals(1, client.connectionPool().idleConnectionCount());
++  }
++
++  @Test public void failedProxyAuthenticatorReleasesConnection() throws IOException {
++    server.enqueue(new MockResponse()
++        .setResponseCode(407));
++
++    client.connectionPool().evictAll();
++    client = client.newBuilder()
++        .proxyAuthenticator(new Authenticator() {
++          @Override public Request authenticate(Route route, Response response) throws IOException {
++            throw new IOException("IOException!");
++          }
++        })
++        .build();
++
++    Request request = new Request.Builder()
++        .url(server.url("/"))
++        .build();
++
++    executeSynchronously(request)
++        .assertFailure(IOException.class);
++
++    assertEquals(1, client.connectionPool().idleConnectionCount());
++  }
++
+   @Test public void httpsWithIpAddress() throws Exception {
+     String localIpAddress = InetAddress.getLoopbackAddress().getHostAddress();
+ 
+diff --git a/okhttp-tests/src/test/java/okhttp3/internal/http2/Http2ConnectionTest.java b/okhttp-tests/src/test/java/okhttp3/internal/http2/Http2ConnectionTest.java
+index 4f7fb0afaf..2ab31a35de 100644
+--- a/okhttp-tests/src/test/java/okhttp3/internal/http2/Http2ConnectionTest.java
++++ b/okhttp-tests/src/test/java/okhttp3/internal/http2/Http2ConnectionTest.java
+@@ -108,7 +108,6 @@
+     Http2Stream stream = connection.newStream(headerEntries("a", "android"), false);
+ 
+     assertEquals(3368, connection.peerSettings.getInitialWindowSize());
+-    assertEquals(1684, connection.bytesLeftInWriteWindow); // initial wasn't affected.
+     // New Stream is has the most recent initial window size.
+     assertEquals(3368, stream.bytesLeftInWriteWindow);
+   }
+@@ -1234,7 +1233,6 @@
+     peer.sendFrame().ping(true, 1, 0);
+     peer.acceptFrame(); // SYN_STREAM
+     peer.sendFrame().synReply(false, 3, headerEntries("a", "android"));
+-    peer.sendFrame().windowUpdate(3, 5);
+     peer.acceptFrame(); // PING
+     peer.sendFrame().ping(true, 3, 0);
+     peer.acceptFrame(); // DATA
+diff --git a/okhttp-tests/src/test/java/okhttp3/internal/http2/HttpOverHttp2Test.java b/okhttp-tests/src/test/java/okhttp3/internal/http2/HttpOverHttp2Test.java
+index 631632b58d..37c28fdb3b 100644
+--- a/okhttp-tests/src/test/java/okhttp3/internal/http2/HttpOverHttp2Test.java
++++ b/okhttp-tests/src/test/java/okhttp3/internal/http2/HttpOverHttp2Test.java
+@@ -84,6 +84,7 @@
+ import static org.hamcrest.CoreMatchers.containsString;
+ import static org.junit.Assert.assertArrayEquals;
+ import static org.junit.Assert.assertEquals;
++import static org.junit.Assert.assertFalse;
+ import static org.junit.Assert.assertNull;
+ import static org.junit.Assert.assertThat;
+ import static org.junit.Assert.fail;
+@@ -300,6 +301,40 @@ private static OkHttpClient buildHttp2Client() {
+     response2.close();
+   }
+ 
++  @Test public void connectionWindowUpdateAfterCanceling() throws Exception {
++    server.enqueue(new MockResponse()
++        .setBody(new Buffer().write(new byte[Http2Connection.OKHTTP_CLIENT_WINDOW_SIZE + 1])));
++    server.enqueue(new MockResponse()
++        .setBody("abc"));
++
++    Call call1 = client.newCall(new Request.Builder()
++        .url(server.url("/"))
++        .build());
++    Response response1 = call1.execute();
++
++    // Wait until the server has completely filled the stream and connection flow-control windows.
++    int expectedFrameCount = Http2Connection.OKHTTP_CLIENT_WINDOW_SIZE / 16384;
++    int dataFrameCount = 0;
++    while (dataFrameCount < expectedFrameCount) {
++      String log = http2Handler.take();
++      if (log.equals("FINE: << 0x00000003 16384 DATA          ")) {
++        dataFrameCount++;
++      }
++    }
++
++    // Cancel the call and discard what we've buffered for the response body. This should free up
++    // the connection flow-control window so new requests can proceed.
++    call1.cancel();
++    assertFalse("Call should not have completed successfully.",
++        Util.discard(response1.body().source(), 1, TimeUnit.SECONDS));
++
++    Call call2 = client.newCall(new Request.Builder()
++        .url(server.url("/"))
++        .build());
++    Response response2 = call2.execute();
++    assertEquals("abc", response2.body().string());
++  }
++
+   /** https://github.com/square/okhttp/issues/373 */
+   @Test @Ignore public void synchronousRequest() throws Exception {
+     server.enqueue(new MockResponse().setBody("A"));
+diff --git a/okhttp/pom.xml b/okhttp/pom.xml
+index 29f38b6b02..ac8c15df1b 100644
+--- a/okhttp/pom.xml
++++ b/okhttp/pom.xml
+@@ -20,7 +20,7 @@
+     <dependency>
+       <groupId>org.conscrypt</groupId>
+       <artifactId>conscrypt-openjdk-uber</artifactId>
+-      <version>1.0.1</version>
++      <version>1.1.0</version>
+       <scope>provided</scope>
+     </dependency>
+     <dependency>
+diff --git a/okhttp/src/main/java/okhttp3/internal/http/RetryAndFollowUpInterceptor.java b/okhttp/src/main/java/okhttp3/internal/http/RetryAndFollowUpInterceptor.java
+index 07df5e9b08..2c5289aed0 100644
+--- a/okhttp/src/main/java/okhttp3/internal/http/RetryAndFollowUpInterceptor.java
++++ b/okhttp/src/main/java/okhttp3/internal/http/RetryAndFollowUpInterceptor.java
+@@ -155,7 +155,13 @@ public StreamAllocation streamAllocation() {
+             .build();
+       }
+ 
+-      Request followUp = followUpRequest(response, streamAllocation.route());
++      Request followUp;
++      try {
++        followUp = followUpRequest(response, streamAllocation.route());
++      } catch (IOException e) {
++        streamAllocation.release();
++        throw e;
++      }
+ 
+       if (followUp == null) {
+         if (!forWebSocket) {
+diff --git a/okhttp/src/main/java/okhttp3/internal/http2/Http2Connection.java b/okhttp/src/main/java/okhttp3/internal/http2/Http2Connection.java
+index b3d56c1d9a..49c71e8fe2 100644
+--- a/okhttp/src/main/java/okhttp3/internal/http2/Http2Connection.java
++++ b/okhttp/src/main/java/okhttp3/internal/http2/Http2Connection.java
+@@ -71,7 +71,7 @@
+   // operations must synchronize on 'this' last. This ensures that we never
+   // wait for a blocking operation while holding 'this'.
+ 
+-  private static final int OKHTTP_CLIENT_WINDOW_SIZE = 16 * 1024 * 1024;
++  static final int OKHTTP_CLIENT_WINDOW_SIZE = 16 * 1024 * 1024;
+ 
+   /**
+    * Shared executor to send notifications of incoming streams. This executor requires multiple
+@@ -312,14 +312,6 @@ public void writeData(int streamId, boolean outFinished, Buffer buffer, long byt
+     }
+   }
+ 
+-  /**
+-   * {@code delta} will be negative if a settings frame initial window is smaller than the last.
+-   */
+-  void addBytesToWriteWindow(long delta) {
+-    bytesLeftInWriteWindow += delta;
+-    if (delta > 0) Http2Connection.this.notifyAll();
+-  }
+-
+   void writeSynResetLater(final int streamId, final ErrorCode errorCode) {
+     try {
+       writerExecutor.execute(new NamedRunnable("OkHttp %s stream %d", hostname, streamId) {
+@@ -709,7 +701,6 @@ public Http2Connection build() {
+         if (peerInitialWindowSize != -1 && peerInitialWindowSize != priorWriteWindowSize) {
+           delta = peerInitialWindowSize - priorWriteWindowSize;
+           if (!receivedInitialPeerSettings) {
+-            addBytesToWriteWindow(delta);
+             receivedInitialPeerSettings = true;
+           }
+           if (!streams.isEmpty()) {
+diff --git a/okhttp/src/main/java/okhttp3/internal/http2/Http2Stream.java b/okhttp/src/main/java/okhttp3/internal/http2/Http2Stream.java
+index 19ac954d7e..23ddec3aaa 100644
+--- a/okhttp/src/main/java/okhttp3/internal/http2/Http2Stream.java
++++ b/okhttp/src/main/java/okhttp3/internal/http2/Http2Stream.java
+@@ -332,35 +332,53 @@ synchronized void receiveRstStream(ErrorCode errorCode) {
+     @Override public long read(Buffer sink, long byteCount) throws IOException {
+       if (byteCount < 0) throw new IllegalArgumentException("byteCount < 0: " + byteCount);
+ 
+-      long read;
++      long read = -1;
++      ErrorCode errorCode;
+       synchronized (Http2Stream.this) {
+         waitUntilReadable();
+-        checkNotClosed();
+-        if (readBuffer.size() == 0) return -1; // This source is exhausted.
++        if (closed) {
++          throw new IOException("stream closed");
++        }
++        errorCode = Http2Stream.this.errorCode;
+ 
+-        // Move bytes from the read buffer into the caller's buffer.
+-        read = readBuffer.read(sink, Math.min(byteCount, readBuffer.size()));
++        if (readBuffer.size() > 0) {
++          // Move bytes from the read buffer into the caller's buffer.
++          read = readBuffer.read(sink, Math.min(byteCount, readBuffer.size()));
++          unacknowledgedBytesRead += read;
++        }
+ 
+-        // Flow control: notify the peer that we're ready for more data!
+-        unacknowledgedBytesRead += read;
+-        if (unacknowledgedBytesRead
+-            >= connection.okHttpSettings.getInitialWindowSize() / 2) {
++        if (errorCode == null
++            && unacknowledgedBytesRead >= connection.okHttpSettings.getInitialWindowSize() / 2) {
++          // Flow control: notify the peer that we're ready for more data! Only send a WINDOW_UPDATE
++          // if the stream isn't in error.
+           connection.writeWindowUpdateLater(id, unacknowledgedBytesRead);
+           unacknowledgedBytesRead = 0;
+         }
+       }
+ 
+-      // Update connection.unacknowledgedBytesRead outside the stream lock.
+-      synchronized (connection) { // Multiple application threads may hit this section.
+-        connection.unacknowledgedBytesRead += read;
+-        if (connection.unacknowledgedBytesRead
+-            >= connection.okHttpSettings.getInitialWindowSize() / 2) {
+-          connection.writeWindowUpdateLater(0, connection.unacknowledgedBytesRead);
+-          connection.unacknowledgedBytesRead = 0;
++      if (read != -1) {
++        // Update connection.unacknowledgedBytesRead outside the stream lock.
++        synchronized (connection) { // Multiple application threads may hit this section.
++          connection.unacknowledgedBytesRead += read;
++          if (connection.unacknowledgedBytesRead
++              >= connection.okHttpSettings.getInitialWindowSize() / 2) {
++            connection.writeWindowUpdateLater(0, connection.unacknowledgedBytesRead);
++            connection.unacknowledgedBytesRead = 0;
++          }
+         }
++
++        return read;
++      }
++
++      if (errorCode != null) {
++        // We defer throwing the exception until now so that we can refill the connection
++        // flow-control window. This is necessary because we don't transmit window updates until the
++        // application reads the data. If we throw this prior to updating the connection
++        // flow-control window, we risk having it go to 0 preventing the server from sending data.
++        throw new StreamResetException(errorCode);
+       }
+ 
+-      return read;
++      return -1; // This source is exhausted.
+     }
+ 
+     /** Returns once the source is either readable or finished. */
+@@ -427,15 +445,6 @@ void receive(BufferedSource in, long byteCount) throws IOException {
+       }
+       cancelStreamIfNecessary();
+     }
+-
+-    private void checkNotClosed() throws IOException {
+-      if (closed) {
+-        throw new IOException("stream closed");
+-      }
+-      if (errorCode != null) {
+-        throw new StreamResetException(errorCode);
+-      }
+-    }
+   }
+ 
+   void cancelStreamIfNecessary() throws IOException {
+diff --git a/pom.xml b/pom.xml
+index dc7580d228..d2c8721030 100644
+--- a/pom.xml
++++ b/pom.xml
+@@ -343,7 +343,7 @@
+         <dependency>
+           <groupId>org.conscrypt</groupId>
+           <artifactId>conscrypt-openjdk-uber</artifactId>
+-          <version>1.0.1</version>
++          <version>1.1.0</version>
+         </dependency>
+       </dependencies>
+     </profile>

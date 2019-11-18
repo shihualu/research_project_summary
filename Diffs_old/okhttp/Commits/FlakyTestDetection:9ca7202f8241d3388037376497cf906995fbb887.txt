@@ -1,0 +1,166 @@
+diff --git a/okhttp-tests/src/test/java/okhttp3/CallTest.java b/okhttp-tests/src/test/java/okhttp3/CallTest.java
+index d2f1ffbd70..52aefda9cc 100644
+--- a/okhttp-tests/src/test/java/okhttp3/CallTest.java
++++ b/okhttp-tests/src/test/java/okhttp3/CallTest.java
+@@ -83,6 +83,7 @@
+ import static java.net.CookiePolicy.ACCEPT_ORIGINAL_SERVER;
+ import static okhttp3.TestUtil.awaitGarbageCollection;
+ import static okhttp3.TestUtil.defaultClient;
++import static org.junit.Assert.assertArrayEquals;
+ import static org.junit.Assert.assertEquals;
+ import static org.junit.Assert.assertFalse;
+ import static org.junit.Assert.assertNotSame;
+@@ -243,10 +244,9 @@
+         .url(server.url("/"))
+         .head()
+         .build();
+-    executeSynchronously(headRequest)
+-        .assertCode(200)
+-        .assertHeader("Content-Length", "100")
+-        .assertBody("");
++    Response response = client.newCall(headRequest).execute();
++    assertEquals(200, response.code());
++    assertArrayEquals(new byte[0], response.body().bytes());
+ 
+     Request getRequest = new Request.Builder()
+         .url(server.url("/"))
+diff --git a/okhttp/src/main/java/okhttp3/internal/cache/CacheInterceptor.java b/okhttp/src/main/java/okhttp3/internal/cache/CacheInterceptor.java
+index 64aa9cb5aa..787e6b31a9 100644
+--- a/okhttp/src/main/java/okhttp3/internal/cache/CacheInterceptor.java
++++ b/okhttp/src/main/java/okhttp3/internal/cache/CacheInterceptor.java
+@@ -207,8 +207,10 @@ private Response cacheWritingResponse(final CacheRequest cacheRequest, Response
+       }
+     };
+ 
++    String contentType = response.header("Content-Type");
++    long contentLength = response.body().contentLength();
+     return response.newBuilder()
+-        .body(new RealResponseBody(response.headers(), Okio.buffer(cacheWritingSource)))
++        .body(new RealResponseBody(contentType, contentLength, Okio.buffer(cacheWritingSource)))
+         .build();
+   }
+ 
+diff --git a/okhttp/src/main/java/okhttp3/internal/http/BridgeInterceptor.java b/okhttp/src/main/java/okhttp3/internal/http/BridgeInterceptor.java
+index 54b561da88..c10dc34cdc 100644
+--- a/okhttp/src/main/java/okhttp3/internal/http/BridgeInterceptor.java
++++ b/okhttp/src/main/java/okhttp3/internal/http/BridgeInterceptor.java
+@@ -106,7 +106,8 @@ public BridgeInterceptor(CookieJar cookieJar) {
+           .removeAll("Content-Length")
+           .build();
+       responseBuilder.headers(strippedHeaders);
+-      responseBuilder.body(new RealResponseBody(strippedHeaders, Okio.buffer(responseBody)));
++      String contentType = networkResponse.header("Content-Type");
++      responseBuilder.body(new RealResponseBody(contentType, -1L, Okio.buffer(responseBody)));
+     }
+ 
+     return responseBuilder.build();
+diff --git a/okhttp/src/main/java/okhttp3/internal/http/RealResponseBody.java b/okhttp/src/main/java/okhttp3/internal/http/RealResponseBody.java
+index 673189c299..970d7ca949 100644
+--- a/okhttp/src/main/java/okhttp3/internal/http/RealResponseBody.java
++++ b/okhttp/src/main/java/okhttp3/internal/http/RealResponseBody.java
+@@ -15,27 +15,33 @@
+  */
+ package okhttp3.internal.http;
+ 
+-import okhttp3.Headers;
++import javax.annotation.Nullable;
+ import okhttp3.MediaType;
+ import okhttp3.ResponseBody;
+ import okio.BufferedSource;
+ 
+ public final class RealResponseBody extends ResponseBody {
+-  private final Headers headers;
++  /**
++   * Use a string to avoid parsing the content type until needed. This also defers problems caused
++   * by malformed content types.
++   */
++  private final @Nullable String contentTypeString;
++  private final long contentLength;
+   private final BufferedSource source;
+ 
+-  public RealResponseBody(Headers headers, BufferedSource source) {
+-    this.headers = headers;
++  public RealResponseBody(
++      @Nullable String contentTypeString, long contentLength, BufferedSource source) {
++    this.contentTypeString = contentTypeString;
++    this.contentLength = contentLength;
+     this.source = source;
+   }
+ 
+   @Override public MediaType contentType() {
+-    String contentType = headers.get("Content-Type");
+-    return contentType != null ? MediaType.parse(contentType) : null;
++    return contentTypeString != null ? MediaType.parse(contentTypeString) : null;
+   }
+ 
+   @Override public long contentLength() {
+-    return HttpHeaders.contentLength(headers);
++    return contentLength;
+   }
+ 
+   @Override public BufferedSource source() {
+diff --git a/okhttp/src/main/java/okhttp3/internal/http1/Http1Codec.java b/okhttp/src/main/java/okhttp3/internal/http1/Http1Codec.java
+index 027aab8ac5..3919b93df3 100644
+--- a/okhttp/src/main/java/okhttp3/internal/http1/Http1Codec.java
++++ b/okhttp/src/main/java/okhttp3/internal/http1/Http1Codec.java
+@@ -130,28 +130,25 @@ public Http1Codec(OkHttpClient client, StreamAllocation streamAllocation, Buffer
+ 
+   @Override public ResponseBody openResponseBody(Response response) throws IOException {
+     streamAllocation.eventListener.responseBodyStart(streamAllocation.call);
+-    Source source = getTransferStream(response);
+-    return new RealResponseBody(response.headers(), Okio.buffer(source));
+-  }
++    String contentType = response.header("Content-Type");
+ 
+-  private Source getTransferStream(Response response) throws IOException {
+     if (!HttpHeaders.hasBody(response)) {
+-      return newFixedLengthSource(0);
++      Source source = newFixedLengthSource(0);
++      return new RealResponseBody(contentType, 0, Okio.buffer(source));
+     }
+ 
+     if ("chunked".equalsIgnoreCase(response.header("Transfer-Encoding"))) {
+-      return newChunkedSource(response.request().url());
++      Source source = newChunkedSource(response.request().url());
++      return new RealResponseBody(contentType, -1L, Okio.buffer(source));
+     }
+ 
+     long contentLength = HttpHeaders.contentLength(response);
+     if (contentLength != -1) {
+-      return newFixedLengthSource(contentLength);
++      Source source = newFixedLengthSource(contentLength);
++      return new RealResponseBody(contentType, contentLength, Okio.buffer(source));
+     }
+ 
+-    // Wrap the input stream from the connection (rather than just returning
+-    // "socketIn" directly here), so that we can control its use after the
+-    // reference escapes.
+-    return newUnknownLengthSource();
++    return new RealResponseBody(contentType, -1L, Okio.buffer(newUnknownLengthSource()));
+   }
+ 
+   /** Returns true if this connection is closed. */
+diff --git a/okhttp/src/main/java/okhttp3/internal/http2/Http2Codec.java b/okhttp/src/main/java/okhttp3/internal/http2/Http2Codec.java
+index c1f76938d8..5268aa2c91 100644
+--- a/okhttp/src/main/java/okhttp3/internal/http2/Http2Codec.java
++++ b/okhttp/src/main/java/okhttp3/internal/http2/Http2Codec.java
+@@ -32,6 +32,7 @@
+ import okhttp3.internal.Util;
+ import okhttp3.internal.connection.StreamAllocation;
+ import okhttp3.internal.http.HttpCodec;
++import okhttp3.internal.http.HttpHeaders;
+ import okhttp3.internal.http.RealResponseBody;
+ import okhttp3.internal.http.RequestLine;
+ import okhttp3.internal.http.StatusLine;
+@@ -186,8 +187,10 @@ public Http2Codec(OkHttpClient client, Interceptor.Chain chain, StreamAllocation
+ 
+   @Override public ResponseBody openResponseBody(Response response) throws IOException {
+     streamAllocation.eventListener.responseBodyStart(streamAllocation.call);
++    String contentType = response.header("Content-Type");
++    long contentLength = HttpHeaders.contentLength(response);
+     Source source = new StreamFinishingSource(stream.getSource());
+-    return new RealResponseBody(response.headers(), Okio.buffer(source));
++    return new RealResponseBody(contentType, contentLength, Okio.buffer(source));
+   }
+ 
+   @Override public void cancel() {

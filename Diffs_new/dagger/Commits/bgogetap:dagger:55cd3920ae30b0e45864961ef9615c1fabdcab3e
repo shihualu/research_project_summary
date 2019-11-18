@@ -1,0 +1,684 @@
+diff --git a/java/dagger/internal/codegen/AbstractComponentWriter.java b/java/dagger/internal/codegen/AbstractComponentWriter.java
+index add096a01..b930315cb 100644
+--- a/java/dagger/internal/codegen/AbstractComponentWriter.java
++++ b/java/dagger/internal/codegen/AbstractComponentWriter.java
+@@ -27,6 +27,7 @@
+ import static com.squareup.javapoet.MethodSpec.methodBuilder;
+ import static com.squareup.javapoet.TypeSpec.anonymousClassBuilder;
+ import static com.squareup.javapoet.TypeSpec.classBuilder;
++import static dagger.internal.codegen.Accessibility.isRawTypeAccessible;
+ import static dagger.internal.codegen.Accessibility.isTypeAccessibleFrom;
+ import static dagger.internal.codegen.AnnotationSpecs.Suppression.UNCHECKED;
+ import static dagger.internal.codegen.BindingKey.contribution;
+@@ -54,6 +55,7 @@
+ import static dagger.internal.codegen.TypeNames.SINGLE_CHECK;
+ import static dagger.internal.codegen.TypeNames.TYPED_RELEASABLE_REFERENCE_MANAGER_DECORATOR;
+ import static dagger.internal.codegen.TypeNames.providerOf;
++import static dagger.internal.codegen.TypeNames.rawTypeName;
+ import static dagger.internal.codegen.Util.toImmutableList;
+ import static javax.lang.model.element.Modifier.FINAL;
+ import static javax.lang.model.element.Modifier.PRIVATE;
+@@ -657,20 +659,20 @@ private MethodSpec membersInjectionMethod(Key key) {
+                 graph.resolvedBindings().get(BindingKey.contribution(key)))
+             .binding();
+     TypeMirror keyType = binding.key().type();
+-    TypeName membersInjectedType =
+-        isTypeAccessibleFrom(keyType, name.packageName()) ? TypeName.get(keyType) : TypeName.OBJECT;
++    TypeMirror membersInjectedType =
++        isTypeAccessibleFrom(keyType, name.packageName())
++            ? keyType
++            : elements.getTypeElement("java.lang.Object").asType();
++    TypeName membersInjectedTypeName = TypeName.get(membersInjectedType);
+     Name bindingTypeName = binding.bindingTypeElement().get().getSimpleName();
+     // TODO(ronshapiro): include type parameters in this name e.g. injectFooOfT, and outer class
+     // simple names Foo.Builder -> injectFooBuilder
+     String methodName = componentMethodNames.getUniqueName("inject" + bindingTypeName);
+-    ParameterSpec parameter =
+-        ParameterSpec.builder(
+-                membersInjectedType, UPPER_CAMEL.to(LOWER_CAMEL, bindingTypeName.toString()))
+-            .build();
++    ParameterSpec parameter = ParameterSpec.builder(membersInjectedTypeName, "instance").build();
+     MethodSpec.Builder method =
+         methodBuilder(methodName)
+             .addModifiers(PRIVATE)
+-            .returns(membersInjectedType)
++            .returns(membersInjectedTypeName)
+             .addParameter(parameter);
+     TypeElement canIgnoreReturnValue =
+         elements.getTypeElement("com.google.errorprone.annotations.CanIgnoreReturnValue");
+@@ -680,7 +682,12 @@ private MethodSpec membersInjectionMethod(Key key) {
+     CodeBlock instance = CodeBlock.of("$N", parameter);
+     method.addCode(
+         InjectionSiteMethod.invokeAll(
+-            injectionSites(binding), name, instance, this::getRequestFulfillment));
++            injectionSites(binding),
++            name,
++            instance,
++            membersInjectedType,
++            types,
++            request -> getRequestFulfillmentWithPossibleRawtypeCast(request, name)));
+     method.addStatement("return $L", instance);
+ 
+     return method.build();
+@@ -1183,4 +1190,21 @@ private CodeBlock getRequestFulfillment(DependencyRequest dependencyRequest) {
+     return getBindingExpression(dependencyRequest.bindingKey())
+         .getSnippetForDependencyRequest(dependencyRequest, name);
+   }
++
++  // TODO(b/64024402) Consider if this can be merged with getRequestFulfillment(DR) above
++  @Override
++  public CodeBlock getRequestFulfillmentWithPossibleRawtypeCast(
++      DependencyRequest dependencyRequest, ClassName requestingClass) {
++    // This is not simply getRequestFulfillment(dependencyRequest), as that method always uses
++    // `name` as `requestingClass`, while this one does not.
++    CodeBlock snippet =
++        getBindingExpression(dependencyRequest.bindingKey())
++            .getSnippetForDependencyRequest(dependencyRequest, requestingClass);
++
++    TypeMirror requestElementType = dependencyRequest.requestElement().get().asType();
++    return isTypeAccessibleFrom(requestElementType, requestingClass.packageName())
++        || !isRawTypeAccessible(requestElementType, requestingClass.packageName())
++        ? snippet
++        : CodeBlock.of("($T) $L", rawTypeName(TypeName.get(requestElementType)), snippet);
++  }
+ }
+diff --git a/java/dagger/internal/codegen/ComponentProcessor.java b/java/dagger/internal/codegen/ComponentProcessor.java
+index b9b8c512d..b8ec1e251 100644
+--- a/java/dagger/internal/codegen/ComponentProcessor.java
++++ b/java/dagger/internal/codegen/ComponentProcessor.java
+@@ -119,9 +119,10 @@ public SourceVersion getSupportedSourceVersion() {
+         new SubcomponentDeclaration.Factory(keyFactory);
+ 
+     this.factoryGenerator =
+-        new FactoryGenerator(filer, elements, compilerOptions, injectValidatorWhenGeneratingCode);
++        new FactoryGenerator(
++            filer, elements, types, compilerOptions, injectValidatorWhenGeneratingCode);
+     this.membersInjectorGenerator =
+-        new MembersInjectorGenerator(filer, elements, injectValidatorWhenGeneratingCode);
++        new MembersInjectorGenerator(filer, elements, types, injectValidatorWhenGeneratingCode);
+     ComponentGenerator componentGenerator =
+         new ComponentGenerator(filer, elements, types, keyFactory, compilerOptions);
+     ProducerFactoryGenerator producerFactoryGenerator =
+diff --git a/java/dagger/internal/codegen/FactoryGenerator.java b/java/dagger/internal/codegen/FactoryGenerator.java
+index 52a4903ba..0b973fd63 100644
+--- a/java/dagger/internal/codegen/FactoryGenerator.java
++++ b/java/dagger/internal/codegen/FactoryGenerator.java
+@@ -63,6 +63,7 @@
+ import javax.inject.Inject;
+ import javax.lang.model.element.Element;
+ import javax.lang.model.util.Elements;
++import javax.lang.model.util.Types;
+ 
+ /**
+  * Generates {@link Factory} implementations from {@link ProvisionBinding} instances for
+@@ -72,16 +73,18 @@
+  * @since 2.0
+  */
+ final class FactoryGenerator extends SourceFileGenerator<ProvisionBinding> {
+-
++  private final Types types;
+   private final CompilerOptions compilerOptions;
+   private final InjectValidator injectValidator;
+ 
+   FactoryGenerator(
+       Filer filer,
+       Elements elements,
++      Types types,
+       CompilerOptions compilerOptions,
+       InjectValidator injectValidator) {
+     super(filer, elements);
++    this.types = types;
+     this.compilerOptions = compilerOptions;
+     this.injectValidator = injectValidator;
+   }
+@@ -255,6 +258,8 @@ ClassName nameGeneratedType(ProvisionBinding binding) {
+                   binding.injectionSites(),
+                   generatedTypeName,
+                   instance,
++                  binding.key().type(),
++                  types,
+                   frameworkFieldUsages(binding.dependencies(), fields)::get))
+           .addStatement("return $L", instance);
+     } else {
+diff --git a/java/dagger/internal/codegen/HasBindingExpressions.java b/java/dagger/internal/codegen/HasBindingExpressions.java
+index b9691a60f..49fb9db76 100644
+--- a/java/dagger/internal/codegen/HasBindingExpressions.java
++++ b/java/dagger/internal/codegen/HasBindingExpressions.java
+@@ -16,6 +16,7 @@
+ 
+ package dagger.internal.codegen;
+ 
++import com.squareup.javapoet.ClassName;
+ import com.squareup.javapoet.CodeBlock;
+ import com.squareup.javapoet.FieldSpec;
+ import com.squareup.javapoet.MethodSpec;
+@@ -34,6 +35,14 @@
+   @Nullable
+   BindingExpression getBindingExpression(BindingKey bindingKey);
+ 
++  /**
++   * If the type is accessible, use the snippet. If only the raw type is accessible, cast it to the
++   * raw type. If the raw type is inaccessible, the proxy will have an Object method
++   * parameter, so we can again, just use the snippet.
++   */
++  CodeBlock getRequestFulfillmentWithPossibleRawtypeCast(
++      DependencyRequest dependencyRequest, ClassName requestingClass);
++
+   /** Returns the expression used to initialize a binding expression field. */
+   CodeBlock getFieldInitialization(BindingExpression bindingExpression);
+ 
+diff --git a/java/dagger/internal/codegen/InjectionMethods.java b/java/dagger/internal/codegen/InjectionMethods.java
+index d0ca9a36c..d2ebf4ef3 100644
+--- a/java/dagger/internal/codegen/InjectionMethods.java
++++ b/java/dagger/internal/codegen/InjectionMethods.java
+@@ -57,6 +57,7 @@
+ import javax.lang.model.element.VariableElement;
+ import javax.lang.model.type.TypeKind;
+ import javax.lang.model.type.TypeMirror;
++import javax.lang.model.util.Types;
+ 
+ /**
+  * Injection methods are static methods that implement provision and/or injection in one step:
+@@ -242,19 +243,37 @@ static MethodSpec create(InjectionSite injectionSite) {
+     /**
+      * Invokes each of the injection methods for {@code injectionSites}, with the dependencies
+      * transformed using the {@code dependencyUsage} function.
++     *
++     * @param instanceType the type of the {@code instance} parameter
+      */
+     static CodeBlock invokeAll(
+         ImmutableSet<InjectionSite> injectionSites,
+         ClassName generatedTypeName,
+         CodeBlock instanceCodeBlock,
++        TypeMirror instanceType,
++        Types types,
+         Function<DependencyRequest, CodeBlock> dependencyUsage) {
+       return injectionSites
+           .stream()
+           .map(
+-              injectionSite ->
+-                  CodeBlock.of(
+-                      "$L;",
+-                      invoke(injectionSite, generatedTypeName, instanceCodeBlock, dependencyUsage)))
++              injectionSite -> {
++                TypeMirror injectSiteType =
++                    types.erasure(injectionSite.element().getEnclosingElement().asType());
++
++                // If instance has been declared as Object because it is not accessible from the
++                // component, but the injectionSite is in a supertype of instanceType that is
++                // publicly accessible, the InjectionSiteMethod will request the actual type and not
++                // Object as the first parameter. If so, cast to the supertype which is accessible
++                // from within generatedTypeName
++                CodeBlock maybeCastedInstance =
++                    !types.isSubtype(instanceType, injectSiteType)
++                            && isTypeAccessibleFrom(injectSiteType, generatedTypeName.packageName())
++                        ? CodeBlock.of("($T) $L", injectSiteType, instanceCodeBlock)
++                        : instanceCodeBlock;
++                return CodeBlock.of(
++                    "$L;",
++                    invoke(injectionSite, generatedTypeName, maybeCastedInstance, dependencyUsage));
++              })
+           .collect(toConcatenatedCodeBlock());
+     }
+ 
+diff --git a/java/dagger/internal/codegen/MembersInjectorGenerator.java b/java/dagger/internal/codegen/MembersInjectorGenerator.java
+index 4d1a08a48..81620a33b 100644
+--- a/java/dagger/internal/codegen/MembersInjectorGenerator.java
++++ b/java/dagger/internal/codegen/MembersInjectorGenerator.java
+@@ -55,6 +55,7 @@
+ import javax.annotation.processing.Filer;
+ import javax.lang.model.element.Element;
+ import javax.lang.model.util.Elements;
++import javax.lang.model.util.Types;
+ 
+ /**
+  * Generates {@link MembersInjector} implementations from {@link MembersInjectionBinding} instances.
+@@ -63,10 +64,13 @@
+  * @since 2.0
+  */
+ final class MembersInjectorGenerator extends SourceFileGenerator<MembersInjectionBinding> {
++  private final Types types;
+   private final InjectValidator injectValidator;
+ 
+-  MembersInjectorGenerator(Filer filer, Elements elements, InjectValidator injectValidator) {
++  MembersInjectorGenerator(
++      Filer filer, Elements elements, Types types, InjectValidator injectValidator) {
+     super(filer, elements);
++    this.types = types;
+     this.injectValidator = injectValidator;
+   }
+ 
+@@ -178,6 +182,8 @@ ClassName nameGeneratedType(MembersInjectionBinding binding) {
+             binding.injectionSites(),
+             generatedTypeName,
+             CodeBlock.of("instance"),
++            binding.key().type(),
++            types,
+             frameworkFieldUsages(binding.dependencies(), dependencyFields)::get));
+ 
+     if (usesRawFrameworkTypes) {
+diff --git a/java/dagger/internal/codegen/SimpleMethodRequestFulfillment.java b/java/dagger/internal/codegen/SimpleMethodRequestFulfillment.java
+index 260f58dc6..4844d61c2 100644
+--- a/java/dagger/internal/codegen/SimpleMethodRequestFulfillment.java
++++ b/java/dagger/internal/codegen/SimpleMethodRequestFulfillment.java
+@@ -19,7 +19,6 @@
+ import static com.google.auto.common.MoreElements.asExecutable;
+ import static com.google.common.base.Preconditions.checkArgument;
+ import static com.google.common.base.Preconditions.checkState;
+-import static dagger.internal.codegen.Accessibility.isRawTypeAccessible;
+ import static dagger.internal.codegen.Accessibility.isTypeAccessibleFrom;
+ import static dagger.internal.codegen.CodeBlocks.toParametersCodeBlock;
+ import static dagger.internal.codegen.ContributionBinding.Kind.INJECTION;
+@@ -35,7 +34,6 @@
+ import dagger.internal.codegen.InjectionMethods.ProvisionMethod;
+ import javax.lang.model.element.ExecutableElement;
+ import javax.lang.model.type.DeclaredType;
+-import javax.lang.model.type.TypeMirror;
+ 
+ /**
+  * A request fulfillment implementation that invokes methods or constructors directly to fulfill
+@@ -118,15 +116,8 @@ private CodeBlock invokeInjectionMethod(ClassName requestingClass) {
+   }
+ 
+   private CodeBlock dependencyArgument(DependencyRequest dependency, ClassName requestingClass) {
+-    CodeBlock snippet = getDependencySnippet(requestingClass, dependency);
+-    TypeMirror requestElementType = dependency.requestElement().get().asType();
+-    /* If the type is accessible, use the snippet.  If only the raw type is accessible, cast it to
+-     * the raw type.  If the type is completely inaccessible, the proxy will have an Object method
+-     * parameter, so we can again, just use the snippet. */
+-    return isTypeAccessibleFrom(requestElementType, requestingClass.packageName())
+-        || !isRawTypeAccessible(requestElementType, requestingClass.packageName())
+-        ? snippet
+-        : CodeBlock.of("($T) $L", rawTypeName(TypeName.get(requestElementType)), snippet);
++    return hasBindingExpressions.getRequestFulfillmentWithPossibleRawtypeCast(
++        dependency, requestingClass);
+   }
+ 
+   private CodeBlock maybeCheckForNulls(CodeBlock methodCall) {
+@@ -154,10 +145,4 @@ private CodeBlock injectMembers(CodeBlock instance) {
+         hasBindingExpressions.getMembersInjectionMethod(provisionBinding.key()),
+         instance);
+   }
+-
+-  private CodeBlock getDependencySnippet(ClassName requestingClass, DependencyRequest request) {
+-    return hasBindingExpressions
+-        .getBindingExpression(request.bindingKey())
+-        .getSnippetForDependencyRequest(request, requestingClass);
+-  }
+ }
+diff --git a/javatests/dagger/internal/codegen/ComponentProcessorTest.java b/javatests/dagger/internal/codegen/ComponentProcessorTest.java
+index 5be6c3ed7..7a6ef8b94 100644
+--- a/javatests/dagger/internal/codegen/ComponentProcessorTest.java
++++ b/javatests/dagger/internal/codegen/ComponentProcessorTest.java
+@@ -444,9 +444,9 @@ public void componentWithInvalidModule() {
+             "  }",
+             "",
+             "  @CanIgnoreReturnValue",
+-            "  private OuterType.B injectB(OuterType.B b) {",
+-            "    OuterType_B_MembersInjector.injectA(b, new OuterType.A());",
+-            "    return b;",
++            "  private OuterType.B injectB(OuterType.B instance) {",
++            "    OuterType_B_MembersInjector.injectA(instance, new OuterType.A());",
++            "    return instance;",
+             "  }",
+             "",
+             "  public static final class Builder {",
+@@ -1081,10 +1081,10 @@ public void testDefaultPackage() {
+         "  }",
+         "",
+         "  @CanIgnoreReturnValue",
+-        "  private SomeInjectedType injectSomeInjectedType(SomeInjectedType someInjectedType) {",
++        "  private SomeInjectedType injectSomeInjectedType(SomeInjectedType instance) {",
+         "    SomeInjectedType_MembersInjector.injectInjectedField(",
+-        "        someInjectedType, new SomeInjectableType());",
+-        "    return someInjectedType;",
++        "        instance, new SomeInjectableType());",
++        "    return instance;",
+         "  }",
+         "",
+         "  public static final class Builder {",
+@@ -1242,10 +1242,10 @@ public void testDefaultPackage() {
+         "  }",
+         "",
+         "  @CanIgnoreReturnValue",
+-        "  private SomeInjectedType injectSomeInjectedType(SomeInjectedType someInjectedType) {",
++        "  private SomeInjectedType injectSomeInjectedType(SomeInjectedType instance) {",
+         "    SomeInjectedType_MembersInjector.injectInjectedField(",
+-        "        someInjectedType, new SomeInjectableType());",
+-        "    return someInjectedType;",
++        "        instance, new SomeInjectableType());",
++        "    return instance;",
+         "  }",
+         "",
+         "  public static final class Builder {",
+@@ -2638,12 +2638,12 @@ public void nullIncorrectlyReturnedFromNonNullableInlinedProvider() {
+                 "  }",
+                 "",
+                 "  @CanIgnoreReturnValue",
+-                "  private InjectsMember injectInjectsMember(InjectsMember injectsMember) {",
++                "  private InjectsMember injectInjectsMember(InjectsMember instance) {",
+                 "    InjectsMember_MembersInjector.injectMember(",
+-                "        injectsMember,",
++                "        instance,",
+                 "        Preconditions.checkNotNull(",
+                 "            TestModule.nonNullableString(), " + NPE_FROM_PROVIDES_METHOD + "));",
+-                "    return injectsMember;",
++                "    return instance;",
+                 "  }",
+                 "",
+                 "  public static final class Builder {",
+diff --git a/javatests/dagger/internal/codegen/InaccessibleTypeTest.java b/javatests/dagger/internal/codegen/InaccessibleTypeTest.java
+index 27ac52bb3..6228d4355 100644
+--- a/javatests/dagger/internal/codegen/InaccessibleTypeTest.java
++++ b/javatests/dagger/internal/codegen/InaccessibleTypeTest.java
+@@ -241,12 +241,12 @@
+             "  }",
+             "",
+             "  @CanIgnoreReturnValue",
+-            "  private A injectA2(A a) {",
+-            "    D_MembersInjector.injectDep(a, new NoDepClass());",
+-            "    C_MembersInjector.injectDep(a, new NoDepClass());",
+-            "    B_MembersInjector.injectDep(a, new NoDepClass());",
+-            "    A_MembersInjector.injectDep(a, new NoDepClass());",
+-            "    return a;",
++            "  private A injectA2(A instance) {",
++            "    D_MembersInjector.injectDep(instance, new NoDepClass());",
++            "    C_MembersInjector.injectDep(instance, new NoDepClass());",
++            "    B_MembersInjector.injectDep(instance, new NoDepClass());",
++            "    A_MembersInjector.injectDep(instance, new NoDepClass());",
++            "    return instance;",
+             "  }",
+             "",
+             "  public static final class Builder {",
+diff --git a/javatests/dagger/internal/codegen/MembersInjectionTest.java b/javatests/dagger/internal/codegen/MembersInjectionTest.java
+index 3ce6e8e70..4e660341a 100644
+--- a/javatests/dagger/internal/codegen/MembersInjectionTest.java
++++ b/javatests/dagger/internal/codegen/MembersInjectionTest.java
+@@ -178,9 +178,9 @@ public void parentClass_injectedMembersInSupertype() {
+             "  }",
+             "",
+             "  @CanIgnoreReturnValue",
+-            "  private Child injectChild(Child child) {",
+-            "    Parent_MembersInjector.injectDep(child, new Dep());",
+-            "    return child;",
++            "  private Child injectChild(Child instance) {",
++            "    Parent_MembersInjector.injectDep(instance, new Dep());",
++            "    return instance;",
+             "  }",
+             "",
+             "  public static final class Builder {",
+@@ -1296,12 +1296,270 @@ public void accessibility() {
+                 "        injectInaccessible(Inaccessible_Factory.newInaccessible()));",
+                 "  }",
+                 "",
++                // TODO(ronshapiro): if possible, it would be great to rename "instance", but we
++                // need to make sure that this doesn't conflict with any framework field in this or
++                // any parent component
+                 "  @CanIgnoreReturnValue",
+-                "  private Object injectInaccessible(Object inaccessible) {",
+-                "    Inaccessible_MembersInjector.injectFoo(inaccessible, Foo_Factory.newFoo());",
++                "  private Object injectInaccessible(Object instance) {",
++                "    Inaccessible_MembersInjector.injectFoo(instance, Foo_Factory.newFoo());",
+                 "    Inaccessible_MembersInjector.injectMethod(",
+-                "        inaccessible, Foo_Factory.newFoo());",
+-                "    return inaccessible;",
++                "        instance, Foo_Factory.newFoo());",
++                "    return instance;",
++                "  }",
++                "",
++                "  public static final class Builder {",
++                "    private Builder() {}",
++                "",
++                "    public TestComponent build() {",
++                "      return new DaggerTestComponent(this);",
++                "    }",
++                "  }",
++                "}"));
++  }
++
++  @Test
++  public void accessibleRawType_ofInaccessibleType() {
++    JavaFileObject inaccessible =
++        JavaFileObjects.forSourceLines(
++            "other.Inaccessible",
++            "package other;",
++            "",
++            "class Inaccessible {}");
++    JavaFileObject inaccessiblesModule =
++        JavaFileObjects.forSourceLines(
++            "other.InaccessiblesModule",
++            "package other;",
++            "",
++            "import dagger.Module;",
++            "import dagger.Provides;",
++            "import java.util.ArrayList;",
++            "import java.util.List;",
++            "import javax.inject.Provider;",
++            "import javax.inject.Singleton;",
++            "",
++            "@Module",
++            "public class InaccessiblesModule {",
++            // force Provider initialization
++            "  @Provides @Singleton static List<Inaccessible> inaccessibles() {",
++            "    return new ArrayList<>();",
++            "  }",
++            "}");
++    JavaFileObject usesInaccessibles =
++        JavaFileObjects.forSourceLines(
++            "other.UsesInaccessibles",
++            "package other;",
++            "",
++            "import java.util.List;",
++            "import javax.inject.Inject;",
++            "",
++            "public class UsesInaccessibles {",
++            "  @Inject UsesInaccessibles() {}",
++            "  @Inject List<Inaccessible> inaccessibles;",
++            "}");
++    JavaFileObject component =
++        JavaFileObjects.forSourceLines(
++            "test.TestComponent",
++            "package test;",
++            "",
++            "import dagger.Component;",
++            "import javax.inject.Singleton;",
++            "import other.UsesInaccessibles;",
++            "",
++            "@Singleton",
++            "@Component(modules = other.InaccessiblesModule.class)",
++            "interface TestComponent {",
++            "  UsesInaccessibles usesInaccessibles();",
++            "}");
++
++    Compilation compilation =
++        daggerCompiler().compile(inaccessible, inaccessiblesModule, usesInaccessibles, component);
++    assertThat(compilation).succeeded();
++    assertThat(compilation)
++        .generatedSourceFile("test.DaggerTestComponent")
++        .hasSourceEquivalentTo(
++            JavaFileObjects.forSourceLines(
++                "other.DaggerTestComponent",
++                "package test;",
++                "",
++                "import com.google.errorprone.annotations.CanIgnoreReturnValue;",
++                "import dagger.internal.DoubleCheck;",
++                "import dagger.internal.Preconditions;",
++                "import java.util.List;",
++                "import javax.annotation.Generated;",
++                "import javax.inject.Provider;",
++                "import other.InaccessiblesModule;",
++                "import other.InaccessiblesModule_InaccessiblesFactory;",
++                "import other.UsesInaccessibles;",
++                "import other.UsesInaccessibles_Factory;",
++                "import other.UsesInaccessibles_MembersInjector;",
++                "",
++                GENERATED_ANNOTATION,
++                "public final class DaggerTestComponent implements TestComponent {",
++                "  @SuppressWarnings(\"rawtypes\")",
++                "  private Provider inaccessiblesProvider;",
++                "",
++                "  private Provider<UsesInaccessibles> usesInaccessiblesProvider;",
++                "",
++                "  private DaggerTestComponent(Builder builder) {",
++                "    initialize(builder);",
++                "  }",
++                "",
++                "  public static Builder builder() {",
++                "    return new Builder();",
++                "  }",
++                "",
++                "  public static TestComponent create() {",
++                "    return new Builder().build();",
++                "  }",
++                "",
++                "  @SuppressWarnings(\"unchecked\")",
++                "  private void initialize(final Builder builder) {",
++                "    this.inaccessiblesProvider =",
++                "        DoubleCheck.provider(InaccessiblesModule_InaccessiblesFactory.create());",
++                "    this.usesInaccessiblesProvider = ",
++                "        UsesInaccessibles_Factory.create(inaccessiblesProvider);",
++                "  }",
++                "",
++                "  @Override",
++                "  public UsesInaccessibles usesInaccessibles() {",
++                "    return injectUsesInaccessibles(",
++                "        UsesInaccessibles_Factory.newUsesInaccessibles());",
++                "  }",
++                "",
++                "  @CanIgnoreReturnValue",
++                "  private UsesInaccessibles injectUsesInaccessibles(",
++                "        UsesInaccessibles instance) {",
++                "    UsesInaccessibles_MembersInjector.injectInaccessibles(",
++                "        instance, (List) inaccessiblesProvider.get());",
++                "    return instance;",
++                "  }",
++                "",
++                "  public static final class Builder {",
++                "    private Builder() {}",
++                "",
++                "    public TestComponent build() {",
++                "      return new DaggerTestComponent(this);",
++                "    }",
++                "",
++                "    @Deprecated",
++                "    public Builder inaccessiblesModule(InaccessiblesModule inaccessiblesModule) {",
++                "      Preconditions.checkNotNull(inaccessiblesModule);",
++                "      return this;",
++                "    }",
++                "  }",
++                "}"));
++  }
++
++  @Test
++  public void publicSupertypeHiddenSubtype() {
++    JavaFileObject foo =
++        JavaFileObjects.forSourceLines(
++            "other.Foo",
++            "package other;",
++            "",
++            "import javax.inject.Inject;",
++            "",
++            "class Foo {",
++            "  @Inject Foo() {}",
++            "}");
++    JavaFileObject supertype =
++        JavaFileObjects.forSourceLines(
++            "other.Supertype",
++            "package other;",
++            "",
++            "import javax.inject.Inject;",
++            "",
++            "public class Supertype<T> {",
++            "  @Inject T t;",
++            "}");
++    JavaFileObject subtype =
++        JavaFileObjects.forSourceLines(
++            "other.Subtype",
++            "package other;",
++            "",
++            "import javax.inject.Inject;",
++            "",
++            "class Subtype extends Supertype<Foo> {",
++            "  @Inject Subtype() {}",
++            "}");
++    JavaFileObject injectsSubtype =
++        JavaFileObjects.forSourceLines(
++            "other.InjectsSubtype",
++            "package other;",
++            "",
++            "import javax.inject.Inject;",
++            "",
++            "public class InjectsSubtype {",
++            "  @Inject InjectsSubtype(Subtype s) {}",
++            "}");
++    JavaFileObject component =
++        JavaFileObjects.forSourceLines(
++            "test.TestComponent",
++            "package test;",
++            "",
++            "import dagger.Component;",
++            "",
++            "@Component",
++            "interface TestComponent {",
++            "  other.InjectsSubtype injectsSubtype();",
++            "}");
++
++    Compilation compilation =
++        daggerCompiler().compile(foo, supertype, subtype, injectsSubtype, component);
++    assertThat(compilation).succeeded();
++    assertThat(compilation)
++        .generatedSourceFile("test.DaggerTestComponent")
++        .hasSourceEquivalentTo(
++            JavaFileObjects.forSourceLines(
++                "test.DaggerTestComponent",
++                "package test;",
++                "",
++                "import com.google.errorprone.annotations.CanIgnoreReturnValue;",
++                "import javax.annotation.Generated;",
++                "import javax.inject.Provider;",
++                "import other.Foo_Factory;",
++                "import other.InjectsSubtype;",
++                "import other.InjectsSubtype_Factory;",
++                "import other.Subtype_Factory;",
++                "import other.Supertype;",
++                "import other.Supertype_MembersInjector;",
++                "",
++                GENERATED_ANNOTATION,
++                "public final class DaggerTestComponent implements TestComponent {",
++                "  @SuppressWarnings(\"rawtypes\")",
++                "  private Provider subtypeProvider;",
++                "",
++                "  private Provider<InjectsSubtype> injectsSubtypeProvider;",
++                "",
++                "  private DaggerTestComponent(Builder builder) {",
++                "    initialize(builder);",
++                "  }",
++                "",
++                "  public static Builder builder() {",
++                "    return new Builder();",
++                "  }",
++                "",
++                "  public static TestComponent create() {",
++                "    return new Builder().build();",
++                "  }",
++                "",
++                "  @SuppressWarnings(\"unchecked\")",
++                "  private void initialize(final Builder builder) {",
++                "    this.subtypeProvider = Subtype_Factory.create(Foo_Factory.create());",
++                "    this.injectsSubtypeProvider = InjectsSubtype_Factory.create(subtypeProvider);",
++                "  }",
++                "",
++                "  @Override",
++                "  public InjectsSubtype injectsSubtype() {",
++                "    return InjectsSubtype_Factory.newInjectsSubtype(",
++                "        injectSubtype(Subtype_Factory.newSubtype()));",
++                "  }",
++                "",
++                "  @CanIgnoreReturnValue",
++                "  private Object injectSubtype(Object instance) {",
++                "    Supertype_MembersInjector.injectT(",
++                "        (Supertype) instance, Foo_Factory.newFoo());",
++                "    return instance;",
+                 "  }",
+                 "",
+                 "  public static final class Builder {",

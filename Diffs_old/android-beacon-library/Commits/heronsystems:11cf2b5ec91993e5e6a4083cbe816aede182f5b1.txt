@@ -1,0 +1,1005 @@
+diff --git a/CHANGELOG.md b/CHANGELOG.md
+index 49b4e00e..bb174008 100644
+--- a/CHANGELOG.md
++++ b/CHANGELOG.md
+@@ -10,6 +10,12 @@ Bug Fixes:
+ 
+ - Fix failure to stop scanning when unbinding from service or when the between scan period
+   is nonzero. (#507, David G. Young)
++- Fix possible `NullPointerException` with `BackgroundPowerSaver` on devices
++  prior to Android 4.3 Jelly Bean MR 2 (API 18) (#516, Aaron Kromer)
++- Fix rare edge case causing `NoSuchElementException` when using the legacy
++  `BeaconManager#getMonitoringNotifier` and `BeaconManager#getRangingNotifier`
++  where the notifier sets were modified external to `BeaconManager` by another
++  thread (#516, Aaron Kromer)
+ 
+ ### 2.10 / 2017-04-21
+ 
+diff --git a/build.gradle b/build.gradle
+index ac54f10a..dae419f6 100644
+--- a/build.gradle
++++ b/build.gradle
+@@ -56,8 +56,12 @@ android {
+         targetSdkVersion 23
+         versionCode 1
+         versionName version
+-        testInstrumentationRunner "com.google.android.apps.common.testing.testrunner.GoogleInstrumentationTestRunner"
+         consumerProguardFiles 'proguard-rules.pro'
++        testInstrumentationRunner "android.support.test.runner.AndroidJUnitRunner"
++        testOptions {
++            // The test runner needs Espresso 2.2.2 which requires at least 8
++            minSdkVersion 8
++        }
+     }
+ 
+     compileOptions {
+@@ -95,6 +99,17 @@ dependencies {
+     testCompile('org.mockito:mockito-core:1.10.19') {
+         exclude group: 'org.hamcrest'
+     }
++    androidTestCompile('junit:junit:4.12') {
++        exclude group: 'org.hamcrest'
++    }
++    androidTestCompile('org.hamcrest:hamcrest-junit:2.0.0.0') {
++        exclude group: 'junit'
++    }
++    androidTestCompile('com.android.support.test.espresso:espresso-core:2.2.2', {
++        exclude group: 'com.android.support', module: 'support-annotations'
++        exclude group: 'org.hamcrest'
++    })
++    androidTestCompile 'org.apache.commons:commons-math3:3.6.1'
+ }
+ 
+ apply plugin: 'idea'
+diff --git a/src/androidTest/java/org/altbeacon/beacon/NotifierSetCopyBenchmarksTest.java b/src/androidTest/java/org/altbeacon/beacon/NotifierSetCopyBenchmarksTest.java
+new file mode 100644
+index 00000000..b93ede2e
+--- /dev/null
++++ b/src/androidTest/java/org/altbeacon/beacon/NotifierSetCopyBenchmarksTest.java
+@@ -0,0 +1,278 @@
++package org.altbeacon.beacon;
++
++import android.support.test.runner.AndroidJUnit4;
++import android.util.Log;
++
++import org.apache.commons.math3.stat.descriptive.DescriptiveStatistics;
++import org.junit.BeforeClass;
++import org.junit.Test;
++import org.junit.runner.RunWith;
++
++import java.util.Collection;
++import java.util.Collections;
++import java.util.HashSet;
++import java.util.Locale;
++import java.util.Set;
++import java.util.concurrent.CopyOnWriteArraySet;
++
++/*
++ * Set of benchmarks for copying various sized notifier sets.
++ *
++ * As with the current implementation the base sets use `CopyOnWriteArraySet`. In most cases
++ * these notifier sets will only have a single notifier in them. However, it's possible there are
++ * more so this also includes a set of three notifiers. While its very unlikely the notifiers
++ * will grow much larger two bigger sets are also included to help expose the affect of set size on
++ * the performance.
++ *
++ * Sample Test Runs
++ * ================
++ *
++ * All tests were performed with no apps running in the foreground and the devices in airplane
++ * mode. This was done to help minimize background system noise.
++ *
++ * Nexus 6 on Android 7.0
++ *
++ *   |      Type       | Size |   N   |   Min   |   Max   |  Mean   | Std. Dev |     Var     |
++ *   |-----------------|------|-------|---------|---------|---------|----------|-------------|
++ *   |         HashSet |    1 | 10000 |    4062 |   85157 |   11484 |   3429.7 | 1.17626e+07 |
++ *   | UnmodifiableSet |    1 | 10000 |    1718 |  342292 |    4864 |   4907.6 | 2.40841e+07 |
++ *   |         HashSet |    3 | 10000 |    6563 | 4019793 |   14402 |  41514.6 | 1.72346e+09 |
++ *   | UnmodifiableSet |    3 | 10000 |    1666 |  223281 |    5403 |   3091.0 | 9.55441e+06 |
++ *   |         HashSet |   10 | 10000 |    7500 | 1140937 |   16996 |  12741.5 | 1.62345e+08 |
++ *   | UnmodifiableSet |   10 | 10000 |    1666 |  313802 |    4765 |   4146.9 | 1.71966e+07 |
++ *   |         HashSet |   20 | 10000 |   11510 | 1677083 |   21395 |  18560.7 | 3.44500e+08 |
++ *   | UnmodifiableSet |   20 | 10000 |    1718 | 1690104 |    4187 |  17014.1 | 2.89478e+08 |
++ *
++ *
++ * Nexus 5 on Android 4.4.4
++ *
++ *   |      Type       | Size |   N   |   Min   |   Max   |  Mean   | Std. Dev |  Variance   |
++ *   |-----------------|------|-------|---------|---------|---------|----------|-------------|
++ *   |         HashSet |    1 | 10000 |    6354 | 7764219 |   12658 | 154235.5 | 2.37886e+10 |
++ *   | UnmodifiableSet |    1 | 10000 |    1250 |  178334 |    1360 |   1996.4 | 3.98546e+06 |
++ *   |         HashSet |    3 | 10000 |    9479 | 7745833 |   17389 | 171098.2 | 2.92746e+10 |
++ *   | UnmodifiableSet |    3 | 10000 |    1250 |  120001 |    1435 |   1320.4 | 1.74347e+06 |
++ *   |         HashSet |   10 | 10000 |   10000 | 7665208 |   30028 | 252827.8 | 6.39219e+10 |
++ *   | UnmodifiableSet |   10 | 10000 |    1302 |   97865 |    1435 |   1012.2 | 1.02459e+06 |
++ *   |         HashSet |   20 | 10000 |   16354 | 8842240 |   41301 | 333940.7 | 1.11516e+11 |
++ *   | UnmodifiableSet |   20 | 10000 |    1302 |   94479 |    1486 |   1049.3 | 1.10112e+06 |
++ *
++ *
++ * Samsung SM-G900V on Android 4.4.2
++ *
++ *   |      Type       | Size |   N   |   Min   |   Max    |  Mean   | Std. Dev |  Variance   |
++ *   |-----------------|------|-------|---------|----------|---------|----------|-------------|
++ *   |         HashSet |    1 | 10000 |    7084 |   306615 |    8703 |   9694.4 | 9.39809e+07 |
++ *   | UnmodifiableSet |    1 | 10000 |    1562 |    51615 |    1926 |    869.5 | 7.56085e+05 |
++ *   |         HashSet |    3 | 10000 |   10364 |   809427 |   12095 |   9418.6 | 8.87103e+07 |
++ *   | UnmodifiableSet |    3 | 10000 |    1562 |    82605 |    1967 |   1157.5 | 1.33973e+06 |
++ *   |         HashSet |   10 | 10000 |   11094 | 14970052 |   26345 | 155322.0 | 2.41249e+10 |
++ *   | UnmodifiableSet |   10 | 10000 |    1562 |    11563 |    1981 |    545.5 | 2.97536e+05 |
++ *   |         HashSet |   20 | 10000 |   17760 | 13884687 |   29915 | 215507.1 | 4.64433e+10 |
++ *   | UnmodifiableSet |   20 | 10000 |    1562 |   170781 |    1939 |   3229.1 | 1.04269e+07 |
++ *
++ *
++ * Summary
++ * =======
++ *
++ * In all cases usage of the `UnmodifiableSet` was fastest. This is not surprising because the
++ * current implementations are thin object wrappers around the provided set. This means they
++ * store the `CopyOnWriteArraySet` internally and delegate all non-mutation methods to it. So
++ * naturally this is faster than creating a new data structure and copying all elements into it.
++ */
++@RunWith(AndroidJUnit4.class)
++public class NotifierSetCopyBenchmarksTest {
++    private static final Set<RangeNotifier> LARGE_SET  = buildSet(20);
++
++    private static final Set<RangeNotifier> MEDIUM_SET = buildSet(10);
++
++    private static final Set<RangeNotifier> SINGLE_SET = buildSet(1);
++
++    private static final Set<RangeNotifier> SMALL_SET  = buildSet(3);
++
++    private static final String STAT_FORMAT =
++            "| %15s | %4d | %4d | %7d | %7d | %7d | %#8.1f | %.5e |";
++
++    private static final String STAT_HEADER =
++            "|      Type       | Size |   N   |   Min   |   Max   |  Mean   | Std. Dev |  Variance   |\n" +
++            "|-----------------|------|-------|---------|---------|---------|----------|-------------|";
++
++    private static final String TAG = "BenchmarkTests";
++
++    private static final int WARMUP_SIZE = 1_000;
++
++    private static final int SAMPLE_SIZE = 10_000;
++
++    @BeforeClass
++    public static void _displayStatsHeader() {
++        Log.i(TAG, "Benchmarks: NotifierSetCopyBenchmarksTest");
++        Log.i(TAG, STAT_HEADER);
++        // Let things finish loading / processing (such as package name for logging)
++        try {
++            Thread.sleep(2_000);
++        } catch (InterruptedException e) {
++            e.printStackTrace();
++        }
++    }
++
++    private static Set<RangeNotifier> buildSet(int size) {
++        final Set<RangeNotifier> set = new CopyOnWriteArraySet<>();
++        for (int i = 0; i < size; i++) {
++            set.add(
++                    new RangeNotifier() {
++                        @Override
++                        public void didRangeBeaconsInRegion(Collection<Beacon> beacons, Region region) {
++                        }
++                    }
++            );
++        }
++        return set;
++    }
++
++    @Test
++    public void copyHashSet_Size1() {
++        Set<RangeNotifier> copySet = null;
++        double[] raw = new double[SAMPLE_SIZE];
++        for (int i = 0; i < WARMUP_SIZE; i++) {
++            copySet = new HashSet<>(SINGLE_SET);
++        }
++        System.gc();
++        for (int i = 0; i < raw.length; i++) {
++            long t0 = System.nanoTime();
++            copySet = new HashSet<>(SINGLE_SET);
++            raw[i] = System.nanoTime() - t0;
++        }
++        logStats(copySet, raw);
++    }
++
++    @Test
++    public void copyHashSet_Size10() {
++        Set<RangeNotifier> copySet = null;
++        double[] raw = new double[SAMPLE_SIZE];
++        for (int i = 0; i < WARMUP_SIZE; i++) {
++            copySet = new HashSet<>(MEDIUM_SET);
++        }
++        System.gc();
++        for (int i = 0; i < raw.length; i++) {
++            long t0 = System.nanoTime();
++            copySet = new HashSet<>(MEDIUM_SET);
++            raw[i] = System.nanoTime() - t0;
++        }
++        logStats(copySet, raw);
++    }
++
++    @Test
++    public void copyHashSet_Size20() {
++        Set<RangeNotifier> copySet = null;
++        double[] raw = new double[SAMPLE_SIZE];
++        for (int i = 0; i < WARMUP_SIZE; i++) {
++            copySet = new HashSet<>(LARGE_SET);
++        }
++        System.gc();
++        for (int i = 0; i < raw.length; i++) {
++            long t0 = System.nanoTime();
++            copySet = new HashSet<>(LARGE_SET);
++            raw[i] = System.nanoTime() - t0;
++        }
++        logStats(copySet, raw);
++    }
++
++    @Test
++    public void copyHashSet_Size3() {
++        Set<RangeNotifier> copySet = null;
++        double[] raw = new double[SAMPLE_SIZE];
++        for (int i = 0; i < WARMUP_SIZE; i++) {
++            copySet = new HashSet<>(SMALL_SET);
++        }
++        System.gc();
++        for (int i = 0; i < raw.length; i++) {
++            long t0 = System.nanoTime();
++            copySet = new HashSet<>(SMALL_SET);
++            raw[i] = System.nanoTime() - t0;
++        }
++        logStats(copySet, raw);
++    }
++
++    @Test
++    public void copyUnmodifiableSet_Size1() {
++        Set<RangeNotifier> copySet = null;
++        double[] raw = new double[SAMPLE_SIZE];
++        for (int i = 0; i < WARMUP_SIZE; i++) {
++            copySet = new HashSet<>(SINGLE_SET);
++        }
++        System.gc();
++        for (int i = 0; i < raw.length; i++) {
++            long t0 = System.nanoTime();
++            copySet = Collections.unmodifiableSet(SINGLE_SET);
++            raw[i] = System.nanoTime() - t0;
++        }
++        logStats(copySet, raw);
++    }
++
++    @Test
++    public void copyUnmodifiableSet_Size10() {
++        Set<RangeNotifier> copySet = null;
++        double[] raw = new double[SAMPLE_SIZE];
++        for (int i = 0; i < WARMUP_SIZE; i++) {
++            copySet = new HashSet<>(MEDIUM_SET);
++        }
++        System.gc();
++        for (int i = 0; i < raw.length; i++) {
++            long t0 = System.nanoTime();
++            copySet = Collections.unmodifiableSet(MEDIUM_SET);
++            raw[i] = System.nanoTime() - t0;
++        }
++        logStats(copySet, raw);
++    }
++
++    @Test
++    public void copyUnmodifiableSet_Size20() {
++        Set<RangeNotifier> copySet = null;
++        double[] raw = new double[SAMPLE_SIZE];
++        for (int i = 0; i < WARMUP_SIZE; i++) {
++            copySet = new HashSet<>(LARGE_SET);
++        }
++        System.gc();
++        for (int i = 0; i < raw.length; i++) {
++            long t0 = System.nanoTime();
++            copySet = Collections.unmodifiableSet(LARGE_SET);
++            raw[i] = System.nanoTime() - t0;
++        }
++        logStats(copySet, raw);
++    }
++
++    @Test
++    public void copyUnmodifiableSet_Size3() {
++        Set<RangeNotifier> copySet = null;
++        double[] raw = new double[SAMPLE_SIZE];
++        for (int i = 0; i < WARMUP_SIZE; i++) {
++            copySet = new HashSet<>(SMALL_SET);
++        }
++        System.gc();
++        for (int i = 0; i < raw.length; i++) {
++            long t0 = System.nanoTime();
++            copySet = Collections.unmodifiableSet(SMALL_SET);
++            raw[i] = System.nanoTime() - t0;
++        }
++        logStats(copySet, raw);
++    }
++
++    private void logStats(Set<?> set, double[] raw) {
++        DescriptiveStatistics descStats = new DescriptiveStatistics(raw);
++        Log.i(
++                TAG,
++                String.format(
++                        Locale.US,
++                        STAT_FORMAT,
++                        set.getClass().getSimpleName(),
++                        set.size(),
++                        descStats.getN(),
++                        Math.round(descStats.getMin()),
++                        Math.round(descStats.getMax()),
++                        Math.round(descStats.getMean()),
++                        descStats.getStandardDeviation(),
++                        descStats.getVariance()
++                )
++        );
++    }
++}
+diff --git a/src/main/java/org/altbeacon/beacon/BeaconManager.java b/src/main/java/org/altbeacon/beacon/BeaconManager.java
+index 22fff999..44fb41a2 100644
+--- a/src/main/java/org/altbeacon/beacon/BeaconManager.java
++++ b/src/main/java/org/altbeacon/beacon/BeaconManager.java
+@@ -35,6 +35,8 @@
+ import android.os.Message;
+ import android.os.Messenger;
+ import android.os.RemoteException;
++import android.support.annotation.NonNull;
++import android.support.annotation.Nullable;
+ 
+ import org.altbeacon.beacon.logging.LogManager;
+ import org.altbeacon.beacon.logging.Loggers;
+@@ -52,6 +54,7 @@
+ 
+ import java.util.ArrayList;
+ import java.util.Collection;
++import java.util.Collections;
+ import java.util.Iterator;
+ import java.util.List;
+ import java.util.Map;
+@@ -109,23 +112,46 @@
+  * @author Andrew Reitz <andrew@andrewreitz.com>
+  */
+ public class BeaconManager {
++    @NonNull
+     private static final String TAG = "BeaconManager";
+-    private Context mContext;
++
++    @NonNull
++    private final Context mContext;
++
++    @Nullable
+     protected static volatile BeaconManager sInstance = null;
+-    private final ConcurrentMap<BeaconConsumer, ConsumerInfo> consumers = new ConcurrentHashMap<BeaconConsumer,ConsumerInfo>();
++
++    @NonNull
++    private final ConcurrentMap<BeaconConsumer, ConsumerInfo> consumers = new ConcurrentHashMap<>();
++
++    @Nullable
+     private Messenger serviceMessenger = null;
++
++    @NonNull
+     protected final Set<RangeNotifier> rangeNotifiers = new CopyOnWriteArraySet<>();
++
++    @Nullable
+     protected RangeNotifier dataRequestNotifier = null;
++
++    @NonNull
+     protected final Set<MonitorNotifier> monitorNotifiers = new CopyOnWriteArraySet<>();
+-    private final ArrayList<Region> rangedRegions = new ArrayList<Region>();
++
++    @NonNull
++    private final ArrayList<Region> rangedRegions = new ArrayList<>();
++
++    @NonNull
+     private final List<BeaconParser> beaconParsers = new CopyOnWriteArrayList<>();
++
++    @Nullable
+     private NonBeaconLeScanCallback mNonBeaconLeScanCallback;
++
+     private boolean mRegionStatePersistenceEnabled = true;
+     private boolean mBackgroundMode = false;
+     private boolean mBackgroundModeUninitialized = true;
+     private boolean mMainProcess = false;
+-    private Boolean mScannerInSameProcess = null;
+ 
++    @Nullable
++    private Boolean mScannerInSameProcess = null;
+ 
+     private static boolean sAndroidLScanningDisabled = false;
+     private static boolean sManifestCheckingDisabled = false;
+@@ -235,8 +261,9 @@ public void setBackgroundBetweenScanPeriod(long p) {
+      */
+     public static void setRegionExitPeriod(long regionExitPeriod){
+         sExitRegionPeriod = regionExitPeriod;
+-        if (sInstance != null) {
+-            sInstance.applySettings();
++        BeaconManager instance = sInstance;
++        if (instance != null) {
++            instance.applySettings();
+         }
+     }
+     
+@@ -253,7 +280,8 @@ public static long getRegionExitPeriod(){
+      * An accessor for the singleton instance of this class.  A context must be provided, but if you need to use it from a non-Activity
+      * or non-Service class, you can attach it to another singleton or a subclass of the Android Application class.
+      */
+-    public static BeaconManager getInstanceForApplication(Context context) {
++    @NonNull
++    public static BeaconManager getInstanceForApplication(@NonNull Context context) {
+         /*
+          * Follow double check pattern from Effective Java v2 Item 71.
+          *
+@@ -279,7 +307,7 @@ public static BeaconManager getInstanceForApplication(Context context) {
+         return instance;
+     }
+ 
+-    protected BeaconManager(Context context) {
++    protected BeaconManager(@NonNull Context context) {
+         mContext = context.getApplicationContext();
+         checkIfMainProcess();
+         if (!sManifestCheckingDisabled) {
+@@ -334,6 +362,7 @@ protected void checkIfMainProcess() {
+      *
+      * @return list of active BeaconParsers
+      */
++   @NonNull
+     public List<BeaconParser> getBeaconParsers() {
+         return beaconParsers;
+     }
+@@ -359,7 +388,7 @@ public boolean checkAvailability() throws BleNotAvailableException {
+      *
+      * @param consumer the <code>Activity</code> or <code>Service</code> that will receive the callback when the service is ready.
+      */
+-    public void bind(BeaconConsumer consumer) {
++    public void bind(@NonNull BeaconConsumer consumer) {
+         if (!isBleAvailable()) {
+             LogManager.w(TAG, "Method invocation will be ignored.");
+             return;
+@@ -389,7 +418,7 @@ public void bind(BeaconConsumer consumer) {
+      *
+      * @param consumer the <code>Activity</code> or <code>Service</code> that no longer needs to use the service.
+      */
+-    public void unbind(BeaconConsumer consumer) {
++    public void unbind(@NonNull BeaconConsumer consumer) {
+         if (!isBleAvailable()) {
+             LogManager.w(TAG, "Method invocation will be ignored.");
+             return;
+@@ -426,8 +455,10 @@ public void unbind(BeaconConsumer consumer) {
+      * @param consumer
+      * @return
+      */
+-    public boolean isBound(BeaconConsumer consumer) {
++    public boolean isBound(@NonNull BeaconConsumer consumer) {
+         synchronized(consumers) {
++            // Annotation doesn't guarantee we get a non-null, but raising an NPE here is excessive
++            //noinspection ConstantConditions
+             return consumer != null && consumers.get(consumer) != null && (serviceMessenger != null);
+         }
+     }
+@@ -439,7 +470,7 @@ public boolean isBound(BeaconConsumer consumer) {
+      */
+     public boolean isAnyConsumerBound() {
+         synchronized(consumers) {
+-            return consumers.size() > 0 && (serviceMessenger != null);
++            return consumers.isEmpty() && (serviceMessenger != null);
+         }
+     }
+ 
+@@ -499,11 +530,11 @@ public boolean isBackgroundModeUninitialized() {
+      * @deprecated replaced by (@link #addRangeNotifier)
+      */
+     @Deprecated
+-    public void setRangeNotifier(RangeNotifier notifier) {
+-        synchronized (rangeNotifiers) {
+-            rangeNotifiers.clear();
++    public void setRangeNotifier(@Nullable RangeNotifier notifier) {
++        rangeNotifiers.clear();
++        if (null != notifier) {
++            addRangeNotifier(notifier);
+         }
+-        addRangeNotifier(notifier);
+     }
+ 
+     /**
+@@ -517,11 +548,10 @@ public void setRangeNotifier(RangeNotifier notifier) {
+      * @param notifier The {@link RangeNotifier} to register.
+      * @see RangeNotifier
+      */
+-    public void addRangeNotifier(RangeNotifier notifier) {
++    public void addRangeNotifier(@NonNull RangeNotifier notifier) {
++        //noinspection ConstantConditions
+         if (notifier != null) {
+-            synchronized (rangeNotifiers) {
+-                rangeNotifiers.add(notifier);
+-            }
++            rangeNotifiers.add(notifier);
+         }
+     }
+ 
+@@ -531,19 +561,15 @@ public void addRangeNotifier(RangeNotifier notifier) {
+      * @param notifier The {@link RangeNotifier} to unregister.
+      * @see RangeNotifier
+      */
+-    public boolean removeRangeNotifier(RangeNotifier notifier) {
+-        synchronized (rangeNotifiers) {
+-            return rangeNotifiers.remove(notifier);
+-        }
++    public boolean removeRangeNotifier(@NonNull RangeNotifier notifier) {
++        return rangeNotifiers.remove(notifier);
+     }
+ 
+     /**
+      * Remove all the Range Notifiers.
+      */
+     public void removeAllRangeNotifiers() {
+-        synchronized (rangeNotifiers) {
+-            rangeNotifiers.clear();
+-        }
++        rangeNotifiers.clear();
+     }
+ 
+     /**
+@@ -561,14 +587,14 @@ public void removeAllRangeNotifiers() {
+      * @deprecated replaced by {@link #addMonitorNotifier}
+      */
+     @Deprecated
+-    public void setMonitorNotifier(MonitorNotifier notifier) {
++    public void setMonitorNotifier(@Nullable MonitorNotifier notifier) {
+         if (determineIfCalledFromSeparateScannerProcess()) {
+             return;
+         }
+-        synchronized (monitorNotifiers) {
+-            monitorNotifiers.clear();
++        monitorNotifiers.clear();
++        if (null != notifier) {
++            addMonitorNotifier(notifier);
+         }
+-        addMonitorNotifier(notifier);
+     }
+ 
+     /**
+@@ -584,14 +610,13 @@ public void setMonitorNotifier(MonitorNotifier notifier) {
+      * @see #startMonitoringBeaconsInRegion(Region)
+      * @see Region
+      */
+-    public void addMonitorNotifier(MonitorNotifier notifier) {
++    public void addMonitorNotifier(@NonNull MonitorNotifier notifier) {
+         if (determineIfCalledFromSeparateScannerProcess()) {
+             return;
+         }
++        //noinspection ConstantConditions
+         if (notifier != null) {
+-            synchronized (monitorNotifiers) {
+-                monitorNotifiers.add(notifier);
+-            }
++            monitorNotifiers.add(notifier);
+         }
+     }
+ 
+@@ -600,7 +625,7 @@ public void addMonitorNotifier(MonitorNotifier notifier) {
+      * @deprecated Misspelled. Replaced by {@link #removeMonitorNotifier}
+      */
+     @Deprecated
+-    public boolean removeMonitoreNotifier(MonitorNotifier notifier) {
++    public boolean removeMonitoreNotifier(@NonNull MonitorNotifier notifier) {
+         return removeMonitorNotifier(notifier);
+     }
+ 
+@@ -612,13 +637,11 @@ public boolean removeMonitoreNotifier(MonitorNotifier notifier) {
+      * @see #startMonitoringBeaconsInRegion(Region)
+      * @see Region
+      */
+-    public boolean removeMonitorNotifier(MonitorNotifier notifier) {
++    public boolean removeMonitorNotifier(@NonNull MonitorNotifier notifier) {
+         if (determineIfCalledFromSeparateScannerProcess()) {
+             return false;
+         }
+-        synchronized (monitorNotifiers) {
+-            return monitorNotifiers.remove(notifier);
+-        }
++        return monitorNotifiers.remove(notifier);
+     }
+ 
+     /**
+@@ -628,9 +651,7 @@ public void removeAllMonitorNotifiers() {
+         if (determineIfCalledFromSeparateScannerProcess()) {
+             return;
+         }
+-        synchronized (monitorNotifiers) {
+-            monitorNotifiers.clear();
+-        }
++        monitorNotifiers.clear();
+     }
+ 
+     /**
+@@ -677,7 +698,7 @@ public boolean isRegionStatePersistenceEnabled() {
+      * method.  If it is not a monitored region, it will be ignored.
+      * @param region
+      */
+-    public void requestStateForRegion(Region region) {
++    public void requestStateForRegion(@NonNull Region region) {
+         if (determineIfCalledFromSeparateScannerProcess()) {
+             return;
+         }
+@@ -687,10 +708,8 @@ public void requestStateForRegion(Region region) {
+         if (stateObj != null && stateObj.getInside()) {
+             state = MonitorNotifier.INSIDE;
+         }
+-        synchronized (monitorNotifiers) {
+-            for (MonitorNotifier notifier: monitorNotifiers) {
+-                notifier.didDetermineStateForRegion(state, region);
+-            }
++        for (MonitorNotifier notifier : monitorNotifiers) {
++            notifier.didDetermineStateForRegion(state, region);
+         }
+     }
+ 
+@@ -707,7 +726,7 @@ public void requestStateForRegion(Region region) {
+      * @see Region
+      */
+     @TargetApi(18)
+-    public void startRangingBeaconsInRegion(Region region) throws RemoteException {
++    public void startRangingBeaconsInRegion(@NonNull Region region) throws RemoteException {
+         if (!isBleAvailable()) {
+             LogManager.w(TAG, "Method invocation will be ignored.");
+             return;
+@@ -737,7 +756,7 @@ public void startRangingBeaconsInRegion(Region region) throws RemoteException {
+      * @see Region
+      */
+     @TargetApi(18)
+-    public void stopRangingBeaconsInRegion(Region region) throws RemoteException {
++    public void stopRangingBeaconsInRegion(@NonNull Region region) throws RemoteException {
+         if (!isBleAvailable()) {
+             LogManager.w(TAG, "Method invocation will be ignored.");
+             return;
+@@ -771,18 +790,13 @@ public void applySettings() {
+         if (determineIfCalledFromSeparateScannerProcess()) {
+             return;
+         }
+-        if (isAnyConsumerBound() && !isScannerInDifferentProcess() == false) {
++        if (!isAnyConsumerBound()) {
++            LogManager.d(TAG, "Not synchronizing settings to service, as it has not started up yet");
++        } else if (isScannerInDifferentProcess()) {
+             LogManager.d(TAG, "Synchronizing settings to service");
+             syncSettingsToService();
+-        }
+-        else {
+-            if (isAnyConsumerBound() == false) {
+-                LogManager.d(TAG, "Not synchronizing settings to service, as it has not started up yet");
+-
+-            }
+-            else {
+-                LogManager.d(TAG, "Not synchronizing settings to service, as it is in the same process");
+-            }
++        } else {
++            LogManager.d(TAG, "Not synchronizing settings to service, as it is in the same process");
+         }
+     }
+ 
+@@ -797,7 +811,7 @@ protected void syncSettingsToService() {
+             serviceMessenger.send(msg);
+         }
+         catch (RemoteException e) {
+-            LogManager.e(TAG, "Failed to sync settings to service", e);
++            LogManager.e(e, TAG, "Failed to sync settings to service");
+         }
+     }
+ 
+@@ -813,7 +827,7 @@ protected void syncSettingsToService() {
+      * @see Region
+      */
+     @TargetApi(18)
+-    public void startMonitoringBeaconsInRegion(Region region) throws RemoteException {
++    public void startMonitoringBeaconsInRegion(@NonNull Region region) throws RemoteException {
+         if (!isBleAvailable()) {
+             LogManager.w(TAG, "Method invocation will be ignored.");
+             return;
+@@ -846,7 +860,7 @@ public void startMonitoringBeaconsInRegion(Region region) throws RemoteException
+      * @see Region
+      */
+     @TargetApi(18)
+-    public void stopMonitoringBeaconsInRegion(Region region) throws RemoteException {
++    public void stopMonitoringBeaconsInRegion(@NonNull Region region) throws RemoteException {
+         if (!isBleAvailable()) {
+             LogManager.w(TAG, "Method invocation will be ignored.");
+             return;
+@@ -902,20 +916,33 @@ private String callbackPackageName() {
+      * @deprecated replaced by (@link #getMonitorNotifiers)
+      */
+     @Deprecated
++    @Nullable
+     public MonitorNotifier getMonitoringNotifier() {
+-        synchronized (monitorNotifiers) {
+-            if (monitorNotifiers.size() > 0) {
+-                return monitorNotifiers.iterator().next();
+-            }
+-            return null;
++        Iterator<MonitorNotifier> iterator = monitorNotifiers.iterator();
++        if (iterator.hasNext()) {
++            return iterator.next();
+         }
++        return null;
+     }
+ 
+     /**
+-     * @return the list of registered monitorNotifier
++     * Read-only access to the registered {@link MonitorNotifier} instances
++     * <p>
++     * This provides a thread-safe "read-only" view of the {@link Set} of registered monitor
++     * notifiers. Attempts to modify the returned set, or its iterator, will throw an
++     * {@link UnsupportedOperationException}. Modifications to the underlying set should be made
++     * through {@link #addMonitorNotifier(MonitorNotifier)} and
++     * {@link #removeMonitorNotifier(MonitorNotifier)}.
++     *
++     * @return a thread-safe {@linkplain Collections#unmodifiableSet(Set) unmodifiable view}
++     * providing "read-only" access to the registered {@link MonitorNotifier} instances
++     * @see #addMonitorNotifier(MonitorNotifier)
++     * @see #removeMonitorNotifier(MonitorNotifier)
++     * @see Collections#unmodifiableSet(Set)
+      */
++    @NonNull
+     public Set<MonitorNotifier> getMonitoringNotifiers(){
+-        return monitorNotifiers;
++        return Collections.unmodifiableSet(monitorNotifiers);
+     }
+ 
+     /**
+@@ -923,25 +950,39 @@ public MonitorNotifier getMonitoringNotifier() {
+      * @deprecated replaced by (@link #getRangeNotifiers)
+      */
+     @Deprecated
++    @Nullable
+     public RangeNotifier getRangingNotifier() {
+-        synchronized (rangeNotifiers) {
+-            if (rangeNotifiers.size() > 0) {
+-                return rangeNotifiers.iterator().next();
+-            }
+-            return null;
++        Iterator<RangeNotifier> iterator = rangeNotifiers.iterator();
++        if (iterator.hasNext()) {
++            return iterator.next();
+         }
++        return null;
+     }
+ 
+     /**
+-     * @return the list of registered rangeNotifier
++     * Read-only access to the registered {@link RangeNotifier} instances
++     * <p>
++     * This provides a thread-safe "read-only" view of the {@link Set} of registered range
++     * notifiers. Attempts to modify the returned set, or its iterator, will throw an
++     * {@link UnsupportedOperationException}. Modifications to the underlying set should be made
++     * through {@link #addRangeNotifier(RangeNotifier)} and
++     * {@link #removeRangeNotifier(RangeNotifier)}.
++     *
++     * @return a thread-safe {@linkplain Collections#unmodifiableSet(Set) unmodifiable view}
++     * providing "read-only" access to the registered {@link RangeNotifier} instances
++     * @see #addRangeNotifier(RangeNotifier)
++     * @see #removeRangeNotifier(RangeNotifier)
++     * @see Collections#unmodifiableSet(Set)
+      */
++    @NonNull
+     public Set<RangeNotifier> getRangingNotifiers() {
+-        return rangeNotifiers;
++        return Collections.unmodifiableSet(rangeNotifiers);
+     }
+ 
+     /**
+      * @return the list of regions currently being monitored
+      */
++    @NonNull
+     public Collection<Region> getMonitoredRegions() {
+         return MonitoringStatus.getInstanceForApplication(mContext).regions();
+     }
+@@ -949,9 +990,10 @@ public RangeNotifier getRangingNotifier() {
+     /**
+      * @return the list of regions currently being ranged
+      */
++    @NonNull
+     public Collection<Region> getRangedRegions() {
+         synchronized(this.rangedRegions) {
+-            return new ArrayList<Region>(this.rangedRegions);
++            return new ArrayList<>(this.rangedRegions);
+         }
+     }
+ 
+@@ -983,6 +1025,7 @@ public static void logDebug(String tag, String message, Throwable t) {
+         LogManager.d(t, tag, message);
+     }
+ 
++    @Nullable
+     protected static BeaconSimulator beaconSimulator;
+ 
+     protected static String distanceModelUpdateUrl = "http://data.altbeacon.org/android-distance.json";
+@@ -991,7 +1034,7 @@ public static String getDistanceModelUpdateUrl() {
+         return distanceModelUpdateUrl;
+     }
+ 
+-    public static void setDistanceModelUpdateUrl(String url) {
++    public static void setDistanceModelUpdateUrl(@NonNull String url) {
+         warnIfScannerNotInSameProcess();
+         distanceModelUpdateUrl = url;
+     }
+@@ -1001,7 +1044,7 @@ public static void setDistanceModelUpdateUrl(String url) {
+      */
+     protected static Class rssiFilterImplClass = RunningAverageRssiFilter.class;
+ 
+-    public static void setRssiFilterImplClass(Class c) {
++    public static void setRssiFilterImplClass(@NonNull Class c) {
+         warnIfScannerNotInSameProcess();
+         rssiFilterImplClass = c;
+     }
+@@ -1035,24 +1078,27 @@ public static void setBeaconSimulator(BeaconSimulator beaconSimulator) {
+         BeaconManager.beaconSimulator = beaconSimulator;
+     }
+ 
++    @Nullable
+     public static BeaconSimulator getBeaconSimulator() {
+         return BeaconManager.beaconSimulator;
+     }
+ 
+ 
+-    protected void setDataRequestNotifier(RangeNotifier notifier) {
++    protected void setDataRequestNotifier(@Nullable RangeNotifier notifier) {
+         this.dataRequestNotifier = notifier;
+     }
+ 
++    @Nullable
+     protected RangeNotifier getDataRequestNotifier() {
+         return this.dataRequestNotifier;
+     }
+ 
++    @Nullable
+     public NonBeaconLeScanCallback getNonBeaconLeScanCallback() {
+         return mNonBeaconLeScanCallback;
+     }
+ 
+-    public void setNonBeaconLeScanCallback(NonBeaconLeScanCallback callback) {
++    public void setNonBeaconLeScanCallback(@Nullable NonBeaconLeScanCallback callback) {
+         mNonBeaconLeScanCallback = callback;
+     }
+ 
+@@ -1097,6 +1143,8 @@ private void verifyServiceDeclaration() {
+ 
+     private class ConsumerInfo {
+         public boolean isConnected = false;
++
++        @NonNull
+         public BeaconServiceConnection beaconServiceConnection;
+ 
+         public ConsumerInfo() {
+@@ -1163,8 +1211,9 @@ public static boolean isAndroidLScanningDisabled() {
+      */
+     public static void setAndroidLScanningDisabled(boolean disabled) {
+         sAndroidLScanningDisabled = disabled;
+-        if (sInstance != null) {
+-            sInstance.applySettings();
++        BeaconManager instance = sInstance;
++        if (instance != null) {
++            instance.applySettings();
+         }
+     }
+ 
+@@ -1206,7 +1255,8 @@ private boolean determineIfCalledFromSeparateScannerProcess() {
+     }
+ 
+     private static void warnIfScannerNotInSameProcess() {
+-        if (sInstance != null && sInstance.isScannerInDifferentProcess()) {
++        BeaconManager instance = sInstance;
++        if (instance != null && instance.isScannerInDifferentProcess()) {
+             LogManager.w(TAG,
+                     "Unsupported configuration change made for BeaconScanner in separate process");
+         }
+diff --git a/src/main/java/org/altbeacon/beacon/distance/ModelSpecificDistanceCalculator.java b/src/main/java/org/altbeacon/beacon/distance/ModelSpecificDistanceCalculator.java
+index 42f7db77..4688c15c 100644
+--- a/src/main/java/org/altbeacon/beacon/distance/ModelSpecificDistanceCalculator.java
++++ b/src/main/java/org/altbeacon/beacon/distance/ModelSpecificDistanceCalculator.java
+@@ -189,8 +189,12 @@ private boolean loadModelMapFromFile() {
+             buildModelMapWithLock(sb.toString());
+             return true;
+         } catch (JSONException e) {
+-            LogManager.e(TAG, "Cannot update distance models from online database at %s with JSON",
+-                    e, mRemoteUpdateUrlString, sb.toString());
++            LogManager.e(
++                    e,
++                    TAG,
++                    "Cannot update distance models from online database at %s with JSON: %s",
++                    mRemoteUpdateUrlString, sb.toString()
++            );
+             return false;
+         }
+     }
+diff --git a/src/main/java/org/altbeacon/beacon/powersave/BackgroundPowerSaver.java b/src/main/java/org/altbeacon/beacon/powersave/BackgroundPowerSaver.java
+index ff6186c9..1349ad49 100644
+--- a/src/main/java/org/altbeacon/beacon/powersave/BackgroundPowerSaver.java
++++ b/src/main/java/org/altbeacon/beacon/powersave/BackgroundPowerSaver.java
+@@ -5,36 +5,37 @@
+ import android.app.Application;
+ import android.content.Context;
+ import android.os.Bundle;
++import android.support.annotation.NonNull;
+ 
+ import org.altbeacon.beacon.BeaconManager;
+ import org.altbeacon.beacon.logging.LogManager;
+ 
+ /**
+- *
+  * Simply creating an instance of this class and holding a reference to it in your Application can
+  * improve battery life by 60% by slowing down scans when your app is in the background.
+- *
+  */
+ @TargetApi(18)
+ public class BackgroundPowerSaver implements Application.ActivityLifecycleCallbacks {
++    @NonNull
+     private static final String TAG = "BackgroundPowerSaver";
+-    private BeaconManager beaconManager;
++
++    @NonNull
++    private final BeaconManager beaconManager;
++
+     private int activeActivityCount = 0;
+ 
+     /**
+-     *
+      * Constructs a new BackgroundPowerSaver
+      *
+-     * @param context
+-     * @deprecated the countActiveActivityStrategy flag is no longer used.
+-     *
++     * @deprecated the {@code countActiveActivityStrategy} flag is no longer used. Use
++     * {@link #BackgroundPowerSaver(Context)}
+      */
++    @Deprecated
+     public BackgroundPowerSaver(Context context, boolean countActiveActivityStrategy) {
+         this(context);
+     }
+ 
+     /**
+-     *
+      * Constructs a new BackgroundPowerSaver using the default background determination strategy
+      *
+      * @param context
+@@ -42,7 +43,6 @@ public BackgroundPowerSaver(Context context, boolean countActiveActivityStrategy
+     public BackgroundPowerSaver(Context context) {
+         if (android.os.Build.VERSION.SDK_INT < 18) {
+             LogManager.w(TAG, "BackgroundPowerSaver requires API 18 or higher.");
+-            return;
+         }
+         beaconManager = BeaconManager.getInstanceForApplication(context);
+         ((Application)context.getApplicationContext()).registerActivityLifecycleCallbacks(this);
+@@ -70,7 +70,12 @@ public void onActivityResumed(Activity activity) {
+     @Override
+     public void onActivityPaused(Activity activity) {
+         activeActivityCount--;
+-        LogManager.d(TAG, "activity paused: %s active activities: %s", activity, activeActivityCount);
++        LogManager.d(
++                TAG,
++                "activity paused: %s active activities: %s",
++                activity,
++                activeActivityCount
++        );
+         if (activeActivityCount < 1) {
+             LogManager.d(TAG, "setting background mode");
+             beaconManager.setBackgroundMode(true);
+diff --git a/src/main/java/org/altbeacon/beacon/service/scanner/CycledLeScannerForLollipop.java b/src/main/java/org/altbeacon/beacon/service/scanner/CycledLeScannerForLollipop.java
+index 5a7ad075..b08c0640 100644
+--- a/src/main/java/org/altbeacon/beacon/service/scanner/CycledLeScannerForLollipop.java
++++ b/src/main/java/org/altbeacon/beacon/service/scanner/CycledLeScannerForLollipop.java
+@@ -198,7 +198,7 @@ public void run() {
+                     LogManager.w(TAG, "Cannot start scan. Bluetooth may be turned off.");
+                 } catch (NullPointerException npe) {
+                     // Necessary because of https://code.google.com/p/android/issues/detail?id=160503
+-                    LogManager.e(TAG, "Cannot start scan. Unexpected NPE.", npe);
++                    LogManager.e(npe, TAG, "Cannot start scan. Unexpected NPE.");
+                 } catch (SecurityException e) {
+                     // Thrown by Samsung Knox devices if bluetooth access denied for an app
+                     LogManager.e(TAG, "Cannot start scan.  Security Exception");
+@@ -229,7 +229,7 @@ public void run() {
+                     LogManager.w(TAG, "Cannot stop scan. Bluetooth may be turned off.");
+                 } catch (NullPointerException npe) {
+                     // Necessary because of https://code.google.com/p/android/issues/detail?id=160503
+-                    LogManager.e(TAG, "Cannot stop scan. Unexpected NPE.", npe);
++                    LogManager.e(npe, TAG, "Cannot stop scan. Unexpected NPE.");
+                 } catch (SecurityException e) {
+                     // Thrown by Samsung Knox devices if bluetooth access denied for an app
+                     LogManager.e(TAG, "Cannot stop scan.  Security Exception");

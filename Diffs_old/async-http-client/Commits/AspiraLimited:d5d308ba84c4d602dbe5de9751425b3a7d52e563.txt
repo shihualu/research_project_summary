@@ -1,0 +1,690 @@
+diff --git a/client/src/main/java/org/asynchttpclient/netty/channel/DefaultChannelPool.java b/client/src/main/java/org/asynchttpclient/netty/channel/DefaultChannelPool.java
+index 96075ec7b..771f7e55e 100755
+--- a/client/src/main/java/org/asynchttpclient/netty/channel/DefaultChannelPool.java
++++ b/client/src/main/java/org/asynchttpclient/netty/channel/DefaultChannelPool.java
+@@ -15,11 +15,6 @@
+ 
+ import static org.asynchttpclient.util.Assertions.assertNotNull;
+ import static org.asynchttpclient.util.DateUtils.unpreciseMillisTime;
+-import io.netty.channel.Channel;
+-import io.netty.channel.ChannelId;
+-import io.netty.util.Timeout;
+-import io.netty.util.Timer;
+-import io.netty.util.TimerTask;
+ 
+ import java.net.InetSocketAddress;
+ import java.util.*;
+@@ -27,6 +22,7 @@
+ import java.util.concurrent.ConcurrentLinkedDeque;
+ import java.util.concurrent.TimeUnit;
+ import java.util.concurrent.atomic.AtomicBoolean;
++import java.util.concurrent.atomic.AtomicIntegerFieldUpdater;
+ import java.util.function.Function;
+ import java.util.function.Predicate;
+ import java.util.stream.Collectors;
+@@ -36,6 +32,12 @@
+ import org.slf4j.Logger;
+ import org.slf4j.LoggerFactory;
+ 
++import io.netty.channel.Channel;
++import io.netty.channel.ChannelId;
++import io.netty.util.Timeout;
++import io.netty.util.Timer;
++import io.netty.util.TimerTask;
++
+ /**
+  * A simple implementation of {@link ChannelPool} based on a {@link java.util.concurrent.ConcurrentHashMap}
+  */
+@@ -106,9 +108,13 @@ private void scheduleNewIdleChannelDetector(TimerTask task) {
+     }
+ 
+     private static final class IdleChannel {
++        
++        private static final AtomicIntegerFieldUpdater<IdleChannel> ownedField = AtomicIntegerFieldUpdater.newUpdater(IdleChannel.class, "owned");
++        
+         final Channel channel;
+         final long start;
+-        final AtomicBoolean owned = new AtomicBoolean(false);
++        @SuppressWarnings("unused")
++        private volatile int owned = 0;
+ 
+         IdleChannel(Channel channel, long start) {
+             this.channel = assertNotNull(channel, "channel");
+@@ -116,7 +122,7 @@ private void scheduleNewIdleChannelDetector(TimerTask task) {
+         }
+ 
+         public boolean takeOwnership() {
+-            return owned.compareAndSet(false, true);
++            return ownedField.getAndSet(this, 1) == 0;
+         }
+ 
+         public Channel getChannel() {
+@@ -312,7 +318,7 @@ else if (isRemotelyClosed(idleChannel.channel)) {
+      */
+     public boolean removeAll(Channel channel) {
+         ChannelCreation creation = connectionTtlEnabled ? channelId2Creation.remove(channel.id()) : null;
+-        return !isClosed.get() && creation != null && partitions.get(creation.partitionKey).remove(channel);
++        return !isClosed.get() && creation != null && partitions.get(creation.partitionKey).remove(new IdleChannel(channel, Long.MIN_VALUE));
+     }
+ 
+     /**
+diff --git a/client/src/main/java/org/asynchttpclient/netty/handler/AsyncHttpClientHandler.java b/client/src/main/java/org/asynchttpclient/netty/handler/AsyncHttpClientHandler.java
+index 0829722a9..c3c5e4861 100755
+--- a/client/src/main/java/org/asynchttpclient/netty/handler/AsyncHttpClientHandler.java
++++ b/client/src/main/java/org/asynchttpclient/netty/handler/AsyncHttpClientHandler.java
+@@ -226,15 +226,13 @@ private boolean isHandledByReactiveStreams(ChannelHandlerContext ctx) {
+         return Channels.getAttribute(ctx.channel()) instanceof StreamedResponsePublisher;
+     }
+     
+-    protected void finishUpdate(NettyResponseFuture<?> future, Channel channel, boolean keepAlive, boolean expectOtherChunks) throws IOException {
++    protected void finishUpdate(NettyResponseFuture<?> future, Channel channel, boolean close) throws IOException {
+         future.cancelTimeouts();
+         
+-        if (!keepAlive) {
++        if (close) {
+             channelManager.closeChannel(channel);
+-        } else if (expectOtherChunks) {
+-            channelManager.drainChannelAndOffer(channel, future);
+         } else {
+-            channelManager.tryToOfferChannelToPool(channel, future.getAsyncHandler(), keepAlive, future.getPartitionKey());
++            channelManager.tryToOfferChannelToPool(channel, future.getAsyncHandler(), true, future.getPartitionKey());
+         }
+ 
+         try {
+diff --git a/client/src/main/java/org/asynchttpclient/netty/handler/HttpHandler.java b/client/src/main/java/org/asynchttpclient/netty/handler/HttpHandler.java
+index 906d0a3fd..c4e5ce305 100755
+--- a/client/src/main/java/org/asynchttpclient/netty/handler/HttpHandler.java
++++ b/client/src/main/java/org/asynchttpclient/netty/handler/HttpHandler.java
+@@ -87,7 +87,7 @@ private void handleHttpResponse(final HttpResponse response, final Channel chann
+                     abortAfterHandlingReactiveStreams(channel, future, handler);
+ 
+             if (abort) {
+-                finishUpdate(future, channel, false, true);
++                finishUpdate(future, channel, true);
+             }
+         }
+     }
+@@ -116,8 +116,8 @@ private void handleChunk(HttpContent chunk,//
+         }
+ 
+         if (abort || last) {
+-            boolean keepAlive = !abort && future.isKeepAlive();
+-            finishUpdate(future, channel, keepAlive, !last);
++            boolean close = abort || !future.isKeepAlive();
++            finishUpdate(future, channel, close);
+         }
+     }
+ 
+@@ -168,7 +168,7 @@ private void readFailed(Channel channel, NettyResponseFuture<?> future, Throwabl
+         } catch (Exception abortException) {
+             logger.debug("Abort failed", abortException);
+         } finally {
+-            finishUpdate(future, channel, false, false);
++            finishUpdate(future, channel, true);
+         }
+     }
+ 
+diff --git a/client/src/main/java/org/asynchttpclient/netty/handler/StreamedResponsePublisher.java b/client/src/main/java/org/asynchttpclient/netty/handler/StreamedResponsePublisher.java
+index 9357ae08f..0b5d8ce55 100644
+--- a/client/src/main/java/org/asynchttpclient/netty/handler/StreamedResponsePublisher.java
++++ b/client/src/main/java/org/asynchttpclient/netty/handler/StreamedResponsePublisher.java
+@@ -42,16 +42,15 @@ public StreamedResponsePublisher(EventExecutor executor, ChannelManager channelM
+     protected void cancelled() {
+         logger.debug("Subscriber cancelled, ignoring the rest of the body");
+ 
+-        // The subscriber cancelled early, we need to drain the remaining elements from the stream
+-        channelManager.drainChannelAndOffer(channel, future);
+-        channel.pipeline().remove(StreamedResponsePublisher.class);
+-
+         try {
+             future.done();
+         } catch (Exception t) {
+             // Never propagate exception once we know we are done.
+             logger.debug(t.getMessage(), t);
+         }
++
++        // The subscriber cancelled early - this channel is dead and should be closed.
++        channelManager.closeChannel(channel);
+     }
+ 
+     NettyResponseFuture<?> future() {
+diff --git a/client/src/main/java/org/asynchttpclient/netty/handler/WebSocketHandler.java b/client/src/main/java/org/asynchttpclient/netty/handler/WebSocketHandler.java
+index da80d1bd6..fe895dccb 100755
+--- a/client/src/main/java/org/asynchttpclient/netty/handler/WebSocketHandler.java
++++ b/client/src/main/java/org/asynchttpclient/netty/handler/WebSocketHandler.java
+@@ -87,7 +87,7 @@ private void abort(Channel channel, NettyResponseFuture<?> future, WebSocketUpgr
+         try {
+             handler.onThrowable(new IOException("Invalid Status code=" + status.getStatusCode() + " text=" + status.getStatusText()));
+         } finally {
+-            finishUpdate(future, channel, false, false);
++            finishUpdate(future, channel, true);
+         }
+     }
+ 
+diff --git a/client/src/main/java/org/asynchttpclient/netty/request/NettyRequestSender.java b/client/src/main/java/org/asynchttpclient/netty/request/NettyRequestSender.java
+index 6e3e0e0f6..53e07c1ec 100755
+--- a/client/src/main/java/org/asynchttpclient/netty/request/NettyRequestSender.java
++++ b/client/src/main/java/org/asynchttpclient/netty/request/NettyRequestSender.java
+@@ -527,6 +527,7 @@ public boolean applyIoExceptionFiltersAndReplayRequest(NettyResponseFuture<?> fu
+         }
+ 
+         if (fc.replayRequest() && future.incrementRetryAndCheck() && future.isReplayPossible()) {
++            future.setKeepAlive(false);
+             replayRequest(future, fc, channel);
+             replayed = true;
+         }
+diff --git a/client/src/main/java/org/asynchttpclient/request/body/multipart/part/FileMultipartPart.java b/client/src/main/java/org/asynchttpclient/request/body/multipart/part/FileMultipartPart.java
+index 70ebc4185..007778cf6 100644
+--- a/client/src/main/java/org/asynchttpclient/request/body/multipart/part/FileMultipartPart.java
++++ b/client/src/main/java/org/asynchttpclient/request/body/multipart/part/FileMultipartPart.java
+@@ -31,6 +31,7 @@
+     private final long length;
+     private long position = 0L;
+ 
++    @SuppressWarnings("resource")
+     public FileMultipartPart(FilePart part, byte[] boundary) {
+         super(part, boundary);
+         try {
+diff --git a/client/src/test/java/org/asynchttpclient/AsyncStreamLifecycleTest.java b/client/src/test/java/org/asynchttpclient/AsyncStreamLifecycleTest.java
+index d3c27d564..2cd0282b3 100644
+--- a/client/src/test/java/org/asynchttpclient/AsyncStreamLifecycleTest.java
++++ b/client/src/test/java/org/asynchttpclient/AsyncStreamLifecycleTest.java
+@@ -17,7 +17,6 @@
+ 
+ import static org.asynchttpclient.Dsl.asyncHttpClient;
+ import static org.testng.Assert.*;
+-import io.netty.handler.codec.http.HttpHeaders;
+ 
+ import java.io.IOException;
+ import java.io.PrintWriter;
+@@ -29,17 +28,18 @@
+ import java.util.concurrent.atomic.AtomicBoolean;
+ import java.util.concurrent.atomic.AtomicInteger;
+ 
++import javax.servlet.AsyncContext;
+ import javax.servlet.ServletException;
+ import javax.servlet.http.HttpServletRequest;
+ import javax.servlet.http.HttpServletResponse;
+ 
+-import org.eclipse.jetty.continuation.Continuation;
+-import org.eclipse.jetty.continuation.ContinuationSupport;
+ import org.eclipse.jetty.server.Request;
+ import org.eclipse.jetty.server.handler.AbstractHandler;
+ import org.testng.annotations.AfterClass;
+ import org.testng.annotations.Test;
+ 
++import io.netty.handler.codec.http.HttpHeaders;
++
+ /**
+  * Tests default asynchronous life cycle.
+  * 
+@@ -61,8 +61,7 @@ public AbstractHandler configureHandler() throws Exception {
+             public void handle(String s, Request request, HttpServletRequest req, final HttpServletResponse resp) throws IOException, ServletException {
+                 resp.setContentType("text/plain;charset=utf-8");
+                 resp.setStatus(200);
+-                final Continuation continuation = ContinuationSupport.getContinuation(req);
+-                continuation.suspend();
++                final AsyncContext asyncContext = request.startAsync();
+                 final PrintWriter writer = resp.getWriter();
+                 executorService.submit(new Runnable() {
+                     public void run() {
+@@ -86,7 +85,7 @@ public void run() {
+                         logger.info("Delivering part2.");
+                         writer.write("part2");
+                         writer.flush();
+-                        continuation.complete();
++                        asyncContext.complete();
+                     }
+                 });
+                 request.setHandled(true);
+diff --git a/client/src/test/java/org/asynchttpclient/PerRequestTimeoutTest.java b/client/src/test/java/org/asynchttpclient/PerRequestTimeoutTest.java
+index f8b783d37..7b878ec13 100644
+--- a/client/src/test/java/org/asynchttpclient/PerRequestTimeoutTest.java
++++ b/client/src/test/java/org/asynchttpclient/PerRequestTimeoutTest.java
+@@ -25,12 +25,11 @@
+ import java.util.concurrent.TimeUnit;
+ import java.util.concurrent.TimeoutException;
+ 
++import javax.servlet.AsyncContext;
+ import javax.servlet.ServletException;
+ import javax.servlet.http.HttpServletRequest;
+ import javax.servlet.http.HttpServletResponse;
+ 
+-import org.eclipse.jetty.continuation.Continuation;
+-import org.eclipse.jetty.continuation.ContinuationSupport;
+ import org.eclipse.jetty.server.Request;
+ import org.eclipse.jetty.server.handler.AbstractHandler;
+ import org.testng.annotations.Test;
+@@ -60,8 +59,7 @@ public AbstractHandler configureHandler() throws Exception {
+     private class SlowHandler extends AbstractHandler {
+         public void handle(String target, Request baseRequest, HttpServletRequest request, final HttpServletResponse response) throws IOException, ServletException {
+             response.setStatus(HttpServletResponse.SC_OK);
+-            final Continuation continuation = ContinuationSupport.getContinuation(request);
+-            continuation.suspend();
++            final AsyncContext asyncContext = request.startAsync();
+             new Thread(new Runnable() {
+                 public void run() {
+                     try {
+@@ -81,7 +79,7 @@ public void run() {
+                         Thread.sleep(3000);
+                         response.getOutputStream().print(MSG);
+                         response.getOutputStream().flush();
+-                        continuation.complete();
++                        asyncContext.complete();
+                     } catch (InterruptedException e) {
+                         logger.error(e.getMessage(), e);
+                     } catch (IOException e) {
+diff --git a/client/src/test/java/org/asynchttpclient/RemoteSiteTest.java b/client/src/test/java/org/asynchttpclient/RemoteSiteTest.java
+deleted file mode 100644
+index 60f369d55..000000000
+--- a/client/src/test/java/org/asynchttpclient/RemoteSiteTest.java
++++ /dev/null
+@@ -1,223 +0,0 @@
+-/*
+- * Copyright 2010 Ning, Inc.
+- *
+- * This program is licensed to you under the Apache License, version 2.0
+- * (the "License"); you may not use this file except in compliance with the
+- * License.  You may obtain a copy of the License at:
+- *
+- *    http://www.apache.org/licenses/LICENSE-2.0
+- *
+- * Unless required by applicable law or agreed to in writing, software
+- * distributed under the License is distributed on an "AS IS" BASIS, WITHOUT
+- * WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.  See the
+- * License for the specific language governing permissions and limitations
+- * under the License.
+- */
+-package org.asynchttpclient;
+-
+-import static io.netty.handler.codec.http.HttpHeaderNames.CONTENT_LENGTH;
+-import static java.nio.charset.StandardCharsets.UTF_8;
+-import static org.asynchttpclient.Dsl.*;
+-import static org.testng.Assert.*;
+-import io.netty.handler.codec.http.HttpHeaders;
+-import io.netty.handler.codec.http.cookie.Cookie;
+-import io.netty.handler.codec.http.cookie.DefaultCookie;
+-
+-import java.io.InputStream;
+-import java.net.URLEncoder;
+-import java.util.concurrent.CountDownLatch;
+-import java.util.concurrent.TimeUnit;
+-
+-import org.apache.commons.io.IOUtils;
+-import org.testng.annotations.Test;
+-
+-/**
+- * Unit tests for remote site. <br>
+- * see http://github.com/MSch/ning-async-http-client-bug/tree/master
+- * 
+- * @author Martin Schurrer
+- */
+-public class RemoteSiteTest extends AbstractBasicTest {
+-
+-    public static final String URL = "http://google.com?q=";
+-    public static final String REQUEST_PARAM = "github github \n" + "github";
+-
+-    @Test(groups = "online")
+-    public void testGoogleCom() throws Exception {
+-        try (AsyncHttpClient c = asyncHttpClient(config().setRequestTimeout(10000))) {
+-            Response response = c.prepareGet("http://www.google.com/").execute().get(10, TimeUnit.SECONDS);
+-            assertNotNull(response);
+-        }
+-    }
+-
+-    @Test(groups = "online", enabled = false)
+-    // FIXME
+-    public void testMicrosoftCom() throws Exception {
+-        try (AsyncHttpClient c = asyncHttpClient(config().setRequestTimeout(10000))) {
+-            Response response = c.prepareGet("http://microsoft.com/").execute().get(10, TimeUnit.SECONDS);
+-            assertNotNull(response);
+-            assertEquals(response.getStatusCode(), 301);
+-        }
+-    }
+-
+-    @Test(groups = "online", enabled = false)
+-    // FIXME
+-    public void testWwwMicrosoftCom() throws Exception {
+-        try (AsyncHttpClient c = asyncHttpClient(config().setRequestTimeout(10000))) {
+-            Response response = c.prepareGet("http://www.microsoft.com/").execute().get(10, TimeUnit.SECONDS);
+-            assertNotNull(response);
+-            assertEquals(response.getStatusCode(), 302);
+-        }
+-    }
+-
+-    @Test(groups = "online", enabled = false)
+-    // FIXME
+-    public void testUpdateMicrosoftCom() throws Exception {
+-        try (AsyncHttpClient c = asyncHttpClient(config().setRequestTimeout(10000))) {
+-            Response response = c.prepareGet("http://update.microsoft.com/").execute().get(10, TimeUnit.SECONDS);
+-            assertNotNull(response);
+-            assertEquals(response.getStatusCode(), 302);
+-        }
+-    }
+-
+-    @Test(groups = "online")
+-    public void testGoogleComWithTimeout() throws Exception {
+-        try (AsyncHttpClient c = asyncHttpClient(config().setRequestTimeout(10000))) {
+-            Response response = c.prepareGet("http://google.com/").execute().get(10, TimeUnit.SECONDS);
+-            assertNotNull(response);
+-            assertTrue(response.getStatusCode() == 301 || response.getStatusCode() == 302);
+-        }
+-    }
+-
+-    @Test(groups = "online")
+-    public void asyncStatusHEADContentLenghtTest() throws Exception {
+-        try (AsyncHttpClient p = asyncHttpClient(config().setFollowRedirect(true))) {
+-            final CountDownLatch l = new CountDownLatch(1);
+-
+-            p.executeRequest(head("http://www.google.com/"), new AsyncCompletionHandlerAdapter() {
+-                @Override
+-                public Response onCompleted(Response response) throws Exception {
+-                    try {
+-                        assertEquals(response.getStatusCode(), 200);
+-                        return response;
+-                    } finally {
+-                        l.countDown();
+-                    }
+-                }
+-            }).get();
+-
+-            if (!l.await(5, TimeUnit.SECONDS)) {
+-                fail("Timeout out");
+-            }
+-        }
+-    }
+-
+-    @Test(groups = "online", enabled = false)
+-    public void invalidStreamTest2() throws Exception {
+-        AsyncHttpClientConfig config = config()//
+-                .setRequestTimeout(10000)//
+-                .setFollowRedirect(true)//
+-                .setKeepAlive(false)//
+-                .setMaxRedirects(6)//
+-                .build();
+-
+-        try (AsyncHttpClient c = asyncHttpClient(config)) {
+-            Response response = c.prepareGet("http://bit.ly/aUjTtG").execute().get();
+-            if (response != null) {
+-                System.out.println(response);
+-            }
+-        } catch (Throwable t) {
+-            t.printStackTrace();
+-            assertNotNull(t.getCause());
+-            assertEquals(t.getCause().getMessage(), "invalid version format: ICY");
+-        }
+-    }
+-
+-    @Test(groups = "online")
+-    public void asyncFullBodyProperlyRead() throws Exception {
+-        try (AsyncHttpClient client = asyncHttpClient()) {
+-            Response r = client.prepareGet("http://www.typesafe.com/").execute().get();
+-
+-            InputStream stream = r.getResponseBodyAsStream();
+-            int contentLength = Integer.valueOf(r.getHeader(CONTENT_LENGTH));
+-
+-            assertEquals(contentLength, IOUtils.toByteArray(stream).length);
+-        }
+-    }
+-
+-    // FIXME Get a 302 in France...
+-    @Test(groups = "online", enabled = false)
+-    public void testUrlRequestParametersEncoding() throws Exception {
+-        try (AsyncHttpClient client = asyncHttpClient()) {
+-            String requestUrl2 = URL + URLEncoder.encode(REQUEST_PARAM, UTF_8.name());
+-            logger.info(String.format("Executing request [%s] ...", requestUrl2));
+-            Response response = client.prepareGet(requestUrl2).execute().get();
+-            assertEquals(response.getStatusCode(), 302);
+-        }
+-    }
+-
+-    @Test(groups = "online")
+-    public void stripQueryStringTest() throws Exception {
+-
+-        try (AsyncHttpClient c = asyncHttpClient(config().setFollowRedirect(true))) {
+-            Response response = c.prepareGet("http://www.freakonomics.com/?p=55846").execute().get();
+-
+-            assertNotNull(response);
+-            assertEquals(response.getStatusCode(), 200);
+-        }
+-    }
+-
+-    @Test(groups = "online")
+-    public void evilCookieTest() throws Exception {
+-        try (AsyncHttpClient c = asyncHttpClient()) {
+-            Cookie cookie = new DefaultCookie("evilcookie", "test");
+-            cookie.setDomain(".google.com");
+-            cookie.setPath("/");
+-
+-            RequestBuilder builder = get("http://localhost")//
+-                    .setFollowRedirect(true)//
+-                    .setUrl("http://www.google.com/")//
+-                    .addHeader("Content-Type", "text/plain")//
+-                    .addCookie(cookie);
+-
+-            Response response = c.executeRequest(builder.build()).get();
+-            assertNotNull(response);
+-            assertEquals(response.getStatusCode(), 200);
+-        }
+-    }
+-
+-    @Test(groups = "online", enabled = false)
+-    public void testAHC62Com() throws Exception {
+-        try (AsyncHttpClient c = asyncHttpClient(config().setFollowRedirect(true))) {
+-            Response response = c.prepareGet("http://api.crunchbase.com/v/1/financial-organization/kinsey-hills-group.js").execute(new AsyncHandler<Response>() {
+-
+-                private Response.ResponseBuilder builder = new Response.ResponseBuilder();
+-
+-                public void onThrowable(Throwable t) {
+-                    t.printStackTrace();
+-                }
+-
+-                public State onBodyPartReceived(HttpResponseBodyPart bodyPart) throws Exception {
+-                    builder.accumulate(bodyPart);
+-                    return State.CONTINUE;
+-                }
+-
+-                public State onStatusReceived(HttpResponseStatus responseStatus) throws Exception {
+-                    builder.accumulate(responseStatus);
+-                    return State.CONTINUE;
+-                }
+-
+-                public State onHeadersReceived(HttpHeaders headers) throws Exception {
+-                    builder.accumulate(headers);
+-                    return State.CONTINUE;
+-                }
+-
+-                public Response onCompleted() throws Exception {
+-                    return builder.build();
+-                }
+-            }).get(10, TimeUnit.SECONDS);
+-            assertNotNull(response);
+-            assertTrue(response.getResponseBody().length() >= 3870);
+-        }
+-    }
+-}
+diff --git a/client/src/test/java/org/asynchttpclient/netty/NettyRequestThrottleTimeoutTest.java b/client/src/test/java/org/asynchttpclient/netty/NettyRequestThrottleTimeoutTest.java
+index b58644a00..cec2b0ef5 100644
+--- a/client/src/test/java/org/asynchttpclient/netty/NettyRequestThrottleTimeoutTest.java
++++ b/client/src/test/java/org/asynchttpclient/netty/NettyRequestThrottleTimeoutTest.java
+@@ -24,6 +24,7 @@
+ import java.util.concurrent.Semaphore;
+ import java.util.concurrent.TimeUnit;
+ 
++import javax.servlet.AsyncContext;
+ import javax.servlet.ServletException;
+ import javax.servlet.http.HttpServletRequest;
+ import javax.servlet.http.HttpServletResponse;
+@@ -32,8 +33,6 @@
+ import org.asynchttpclient.AsyncCompletionHandler;
+ import org.asynchttpclient.AsyncHttpClient;
+ import org.asynchttpclient.Response;
+-import org.eclipse.jetty.continuation.Continuation;
+-import org.eclipse.jetty.continuation.ContinuationSupport;
+ import org.eclipse.jetty.server.Request;
+ import org.eclipse.jetty.server.handler.AbstractHandler;
+ import org.testng.annotations.Test;
+@@ -51,15 +50,14 @@ public AbstractHandler configureHandler() throws Exception {
+         public void handle(String target, Request baseRequest, HttpServletRequest request, final HttpServletResponse response)
+                 throws IOException, ServletException {
+             response.setStatus(HttpServletResponse.SC_OK);
+-            final Continuation continuation = ContinuationSupport.getContinuation(request);
+-            continuation.suspend();
++            final AsyncContext asyncContext = request.startAsync();
+             new Thread(new Runnable() {
+                 public void run() {
+                     try {
+                         Thread.sleep(SLEEPTIME_MS);
+                         response.getOutputStream().print(MSG);
+                         response.getOutputStream().flush();
+-                        continuation.complete();
++                        asyncContext.complete();
+                     } catch (InterruptedException e) {
+                         logger.error(e.getMessage(), e);
+                     } catch (IOException e) {
+diff --git a/client/src/test/java/org/asynchttpclient/request/body/multipart/MultipartBasicAuthTest.java b/client/src/test/java/org/asynchttpclient/request/body/multipart/MultipartBasicAuthTest.java
+index 297fd9d24..ecb24ab4e 100644
+--- a/client/src/test/java/org/asynchttpclient/request/body/multipart/MultipartBasicAuthTest.java
++++ b/client/src/test/java/org/asynchttpclient/request/body/multipart/MultipartBasicAuthTest.java
+@@ -13,19 +13,19 @@
+  */
+ package org.asynchttpclient.request.body.multipart;
+ 
+-import static io.netty.handler.codec.http.HttpHeaderNames.CONTENT_LENGTH;
+-import static io.netty.handler.codec.http.HttpHeaderValues.APPLICATION_OCTET_STREAM;
++import static io.netty.handler.codec.http.HttpHeaderNames.*;
++import static io.netty.handler.codec.http.HttpHeaderValues.*;
+ import static java.nio.charset.StandardCharsets.UTF_8;
+ import static org.asynchttpclient.Dsl.*;
+ import static org.asynchttpclient.test.TestUtils.*;
+-import static org.testng.Assert.assertEquals;
++import static org.testng.Assert.*;
+ 
+ import java.io.File;
++import java.io.IOException;
++import java.util.concurrent.ExecutionException;
++import java.util.function.Function;
+ 
+-import org.asynchttpclient.AbstractBasicTest;
+-import org.asynchttpclient.AsyncHttpClient;
+-import org.asynchttpclient.BasicAuthTest;
+-import org.asynchttpclient.Response;
++import org.asynchttpclient.*;
+ import org.eclipse.jetty.server.Server;
+ import org.eclipse.jetty.server.ServerConnector;
+ import org.eclipse.jetty.server.handler.AbstractHandler;
+@@ -37,7 +37,6 @@
+     @BeforeClass(alwaysRun = true)
+     @Override
+     public void setUpGlobal() throws Exception {
+-
+         server = new Server();
+         ServerConnector connector1 = addHttpConnector(server);
+         addBasicAuthHandler(server, configureHandler());
+@@ -51,31 +50,56 @@ public AbstractHandler configureHandler() throws Exception {
+         return new BasicAuthTest.SimpleHandler();
+     }
+ 
+-    @Test(groups = "standalone", enabled = false)
+-    public void testNoRealm() throws Exception {
++    private void expectBrokenPipe(Function<BoundRequestBuilder, BoundRequestBuilder> f) throws Exception {
+         File file = createTempFile(1024 * 1024);
+ 
++        Throwable cause = null;
+         try (AsyncHttpClient client = asyncHttpClient()) {
+-            for (int i = 0; i < 20; i++) {
+-                Response response = client.preparePut(getTargetUrl())//
+-                        .addBodyPart(new FilePart("test", file, APPLICATION_OCTET_STREAM.toString(), UTF_8)).execute().get();
+-                assertEquals(response.getStatusCode(), 401);
++            try {
++                for (int i = 0; i < 20 && cause == null; i++) {
++                    f.apply(client.preparePut(getTargetUrl())//
++                            .addBodyPart(new FilePart("test", file, APPLICATION_OCTET_STREAM.toString(), UTF_8)))//
++                            .execute().get();
++                }
++            } catch (ExecutionException e) {
++                cause = e.getCause();
+             }
+         }
++
++        assertTrue(cause instanceof IOException, "Expected an IOException");
+     }
+ 
+-    @Test(groups = "standalone", enabled = false)
+-    public void testAuthorizedRealm() throws Exception {
++    @Test(groups = "standalone")
++    public void noRealmCausesServerToCloseSocket() throws Exception {
++        expectBrokenPipe(rb -> rb);
++    }
++
++    @Test(groups = "standalone")
++    public void unauthorizedNonPreemptiveRealmCausesServerToCloseSocket() throws Exception {
++        expectBrokenPipe(rb -> rb.setRealm(basicAuthRealm(USER, ADMIN)));
++    }
++
++    private void expectSuccess(Function<BoundRequestBuilder, BoundRequestBuilder> f) throws Exception {
+         File file = createTempFile(1024 * 1024);
+ 
+         try (AsyncHttpClient client = asyncHttpClient()) {
+             for (int i = 0; i < 20; i++) {
+-                Response response = client.preparePut(getTargetUrl())//
+-                        .setRealm(basicAuthRealm(USER, ADMIN).build())//
+-                        .addBodyPart(new FilePart("test", file, APPLICATION_OCTET_STREAM.toString(), UTF_8)).execute().get();
++                Response response = f.apply(client.preparePut(getTargetUrl())//
++                        .addBodyPart(new FilePart("test", file, APPLICATION_OCTET_STREAM.toString(), UTF_8)))//
++                        .execute().get();
+                 assertEquals(response.getStatusCode(), 200);
+                 assertEquals(response.getResponseBodyAsBytes().length, Integer.valueOf(response.getHeader("X-" + CONTENT_LENGTH)).intValue());
+             }
+         }
+     }
++
++    @Test(groups = "standalone")
++    public void authorizedPreemptiveRealmWorks() throws Exception {
++        expectSuccess(rb -> rb.setRealm(basicAuthRealm(USER, ADMIN).setUsePreemptiveAuth(true)));
++    }
++
++    @Test(groups = "standalone")
++    public void authorizedNonPreemptiveRealmWorksWithExpectContinue() throws Exception {
++        expectSuccess(rb -> rb.setRealm(basicAuthRealm(USER, ADMIN)).setHeader(EXPECT, CONTINUE));
++    }
+ }
+diff --git a/client/src/test/java/org/asynchttpclient/request/body/multipart/part/MultipartPartTest.java b/client/src/test/java/org/asynchttpclient/request/body/multipart/part/MultipartPartTest.java
+index b7b9890ce..87b57bc83 100644
+--- a/client/src/test/java/org/asynchttpclient/request/body/multipart/part/MultipartPartTest.java
++++ b/client/src/test/java/org/asynchttpclient/request/body/multipart/part/MultipartPartTest.java
+@@ -193,7 +193,7 @@ public void testVisitPostContents() {
+ 
+     @Test
+     public void transferToShouldWriteStringPart() throws IOException, URISyntaxException {
+-        String text = FileUtils.readFileToString(TestUtils.resourceAsFile("test_sample_message.eml"));
++        String text = FileUtils.readFileToString(TestUtils.resourceAsFile("test_sample_message.eml"), UTF_8);
+ 
+         List<Part> parts = new ArrayList<>();
+         parts.add(new StringPart("test_sample_message.eml", text));
+diff --git a/pom.xml b/pom.xml
+index 0a3dcb6f5..7e0e342c2 100644
+--- a/pom.xml
++++ b/pom.xml
+@@ -382,16 +382,16 @@
+ 		<surefire.redirectTestOutputToFile>true</surefire.redirectTestOutputToFile>
+ 		<source.property>1.8</source.property>
+ 		<target.property>1.8</target.property>
+-		<netty.version>4.1.15.Final</netty.version>
++		<netty.version>4.1.16.Final</netty.version>
+ 		<slf4j.version>1.7.25</slf4j.version>
+ 		<reactive-streams.version>1.0.0</reactive-streams.version>
+ 		<netty-reactive-streams.version>2.0.0</netty-reactive-streams.version>
+-		<rxjava.version>1.3.0</rxjava.version>
+-		<rxjava2.version>2.1.3</rxjava2.version>
++		<rxjava.version>1.3.2</rxjava.version>
++		<rxjava2.version>2.1.4</rxjava2.version>
+ 		<logback.version>1.2.3</logback.version>
+ 		<testng.version>6.11</testng.version>
+-		<jetty.version>9.4.6.v20170531</jetty.version>
+-		<tomcat.version>8.5.20</tomcat.version>
++		<jetty.version>9.4.7.v20170914</jetty.version>
++		<tomcat.version>8.5.21</tomcat.version>
+ 		<commons-io.version>2.5</commons-io.version>
+ 		<commons-fileupload.version>1.3.3</commons-fileupload.version>
+ 		<privilegedaccessor.version>1.2.2</privilegedaccessor.version>

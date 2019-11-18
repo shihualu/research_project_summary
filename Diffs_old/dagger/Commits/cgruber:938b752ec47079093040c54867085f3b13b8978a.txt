@@ -1,0 +1,292 @@
+diff --git a/compiler/src/main/java/dagger/internal/codegen/BindingGraph.java b/compiler/src/main/java/dagger/internal/codegen/BindingGraph.java
+index 869af2334..2d9d28e07 100644
+--- a/compiler/src/main/java/dagger/internal/codegen/BindingGraph.java
++++ b/compiler/src/main/java/dagger/internal/codegen/BindingGraph.java
+@@ -605,13 +605,18 @@ void resolve(DependencyRequest request) {
+           return;
+         }
+ 
+-        // If the binding was previously resolved in a supercomponent, then test to see if it
+-        // depends on multibindings with contributions from this subcomponent. If it does, then we
+-        // have to resolve it in this subcomponent so that it sees the local contributions. If it
+-        // does not, then we can stop resolving it in this subcomponent and rely on the
+-        // supercomponent resolution.
++        /* If the binding was previously resolved in a supercomponent, then we may be able to avoid
++         * resolving it here and just depend on the supercomponent resolution.
++         *
++         * 1. If it depends on multibindings with contributions from this subcomponent, then we have
++         *    to resolve it in this subcomponent so that it sees the local contributions.
++         *
++         * 2. If there are any explicit bindings in this component, they may conflict with those in
++         *    the supercomponent, so resolve them here so that conflicts can be caught.
++         */
+         if (getPreviouslyResolvedBindings(bindingKey).isPresent()
+-            && !new MultibindingDependencies().dependsOnLocalMultibindings(bindingKey)) {
++            && !new MultibindingDependencies().dependsOnLocalMultibindings(bindingKey)
++            && getExplicitBindings(bindingKey.key()).isEmpty()) {
+           return;
+         }
+ 
+diff --git a/compiler/src/main/java/dagger/internal/codegen/BindingGraphValidator.java b/compiler/src/main/java/dagger/internal/codegen/BindingGraphValidator.java
+index 90a897d0f..fea2628a7 100644
+--- a/compiler/src/main/java/dagger/internal/codegen/BindingGraphValidator.java
++++ b/compiler/src/main/java/dagger/internal/codegen/BindingGraphValidator.java
+@@ -138,19 +138,23 @@
+   }
+ 
+   private class Validation {
+-    final BindingGraph topLevelGraph;
+     final BindingGraph subject;
+     final ValidationReport.Builder<TypeElement> reportBuilder;
++    final Optional<Validation> parent;
+ 
+-    Validation(BindingGraph topLevelGraph, BindingGraph subject) {
+-      this.topLevelGraph = topLevelGraph;
++    Validation(BindingGraph subject, Optional<Validation> parent) {
+       this.subject = subject;
+       this.reportBuilder =
+           ValidationReport.about(subject.componentDescriptor().componentDefinitionType());
++      this.parent = parent;
+     }
+ 
+     Validation(BindingGraph topLevelGraph) {
+-      this(topLevelGraph, topLevelGraph);
++      this(topLevelGraph, Optional.<Validation>absent());
++    }
++
++    BindingGraph topLevelGraph() {
++      return parent.isPresent() ? parent.get().topLevelGraph() : subject;
+     }
+ 
+     ValidationReport<TypeElement> buildReport() {
+@@ -186,8 +190,7 @@ void validateSubgraph() {
+       }
+ 
+       for (BindingGraph subgraph : subject.subgraphs().values()) {
+-        Validation subgraphValidation =
+-            new Validation(topLevelGraph, subgraph);
++        Validation subgraphValidation = new Validation(subgraph, Optional.of(this));
+         subgraphValidation.validateSubgraph();
+         reportBuilder.addSubreport(subgraphValidation.buildReport());
+       }
+@@ -913,7 +916,7 @@ private void reportMissingBinding(Deque<ResolvedRequest> path) {
+           printableDependencyPath.subList(1, printableDependencyPath.size())) {
+         errorMessage.append('\n').append(dependency);
+       }
+-      for (String suggestion : MissingBindingSuggestions.forKey(topLevelGraph, bindingKey)) {
++      for (String suggestion : MissingBindingSuggestions.forKey(topLevelGraph(), bindingKey)) {
+         errorMessage.append('\n').append(suggestion);
+       }
+       reportBuilder.addError(errorMessage.toString(), path.getLast().request().requestElement());
+@@ -939,12 +942,48 @@ private void reportDuplicateBindings(Deque<ResolvedRequest> path) {
+       StringBuilder builder = new StringBuilder();
+       new Formatter(builder)
+           .format(ErrorMessages.DUPLICATE_BINDINGS_FOR_KEY_FORMAT, formatRootRequestKey(path));
++      ImmutableSet<ContributionBinding> duplicateBindings =
++          inlineSyntheticContributions(resolvedBinding).contributionBindings();
+       hasSourceElementFormatter.formatIndentedList(
+-          builder,
+-          inlineSyntheticContributions(resolvedBinding).contributionBindings(),
+-          1,
+-          DUPLICATE_SIZE_LIMIT);
+-      reportBuilder.addError(builder.toString(), path.getLast().request().requestElement());
++          builder, duplicateBindings, 1, DUPLICATE_SIZE_LIMIT);
++      owningReportBuilder(duplicateBindings)
++          .addError(builder.toString(), path.getLast().request().requestElement());
++    }
++
++    /**
++     * Returns the report builder for the rootmost component that contains any of the duplicate
++     * bindings.
++     */
++    private ValidationReport.Builder<TypeElement> owningReportBuilder(
++        Iterable<ContributionBinding> duplicateBindings) {
++      ImmutableSet.Builder<ComponentDescriptor> owningComponentsBuilder = ImmutableSet.builder();
++      for (ContributionBinding binding : duplicateBindings) {
++        BindingKey bindingKey = BindingKey.create(BindingKey.Kind.CONTRIBUTION, binding.key());
++        ResolvedBindings resolvedBindings = subject.resolvedBindings().get(bindingKey);
++        owningComponentsBuilder.addAll(
++            resolvedBindings.allContributionBindings().inverse().get(binding));
++      }
++      ImmutableSet<ComponentDescriptor> owningComponents = owningComponentsBuilder.build();
++      for (Validation validation : validationPath()) {
++        if (owningComponents.contains(validation.subject.componentDescriptor())) {
++          return validation.reportBuilder;
++        }
++      }
++      throw new AssertionError(
++          "cannot find owning component for duplicate bindings: " + duplicateBindings);
++    }
++
++    /**
++     * The path from the {@link Validation} of the root graph down to this {@link Validation}.
++     */
++    private ImmutableList<Validation> validationPath() {
++      ImmutableList.Builder<Validation> validationPath = ImmutableList.builder();
++      for (Optional<Validation> validation = Optional.of(this);
++          validation.isPresent();
++          validation = validation.get().parent) {
++        validationPath.add(validation.get());
++      }
++      return validationPath.build().reverse();
+     }
+ 
+     @SuppressWarnings("resource") // Appendable is a StringBuilder.
+diff --git a/compiler/src/test/java/dagger/internal/codegen/GraphValidationTest.java b/compiler/src/test/java/dagger/internal/codegen/GraphValidationTest.java
+index 33a897670..663e0085d 100644
+--- a/compiler/src/test/java/dagger/internal/codegen/GraphValidationTest.java
++++ b/compiler/src/test/java/dagger/internal/codegen/GraphValidationTest.java
+@@ -478,7 +478,7 @@ public void falsePositiveCyclicDependencyIndirectionDetected() {
+         .compilesWithoutError();
+         //.compilesWithoutWarning(); //TODO(cgruber)
+   }
+-
++  
+   @Test public void duplicateExplicitBindings_ProvidesAndComponentProvision() {
+     JavaFileObject component = JavaFileObjects.forSourceLines("test.Outer",
+         "package test;",
+@@ -562,7 +562,7 @@ public void falsePositiveCyclicDependencyIndirectionDetected() {
+         .failsToCompile()
+         .withErrorContaining(expectedError).in(component).onLine(24);
+   }
+-
++  
+   @Test public void duplicateExplicitBindings_MultipleProvisionTypes() {
+     JavaFileObject component = JavaFileObjects.forSourceLines("test.Outer",
+         "package test;",
+@@ -714,7 +714,7 @@ public void duplicateExplicitBindings_UniqueBindingAndMultibindingDeclaration()
+         .in(component)
+         .onLine(38);
+   }
+-
++  
+   @Test public void duplicateBindings_TruncateAfterLimit() {
+     JavaFileObject component = JavaFileObjects.forSourceLines("test.Outer",
+         "package test;",
+@@ -1223,9 +1223,8 @@ public void duplicateExplicitBindings_UniqueBindingAndMultibindingDeclaration()
+         .and()
+         .withErrorContaining(shortErrorMessage).in(shortLifetime);
+   }
+-
++  
+   @Test
+-  @Ignore
+   public void subcomponentBindingConflictsWithParent() {
+     JavaFileObject parentChildConflict =
+         JavaFileObjects.forSourceLines(
+@@ -1251,19 +1250,23 @@ public void subcomponentBindingConflictsWithParent() {
+             "import javax.inject.Qualifier;",
+             "",
+             "@Qualifier @interface ChildGrandchildConflict {}");
+-    JavaFileObject parent =
++    
++    /* Some annotation processor implementations do not report more than one error per element. So
++     * separate parents for testing parent-conflicts-with-child and
++     * parent-conflicts-with-grandchild.
++     */
++    JavaFileObject parentConflictsWithChild =
+         JavaFileObjects.forSourceLines(
+-            "test.Parent",
++            "test.ParentConflictsWithChild",
+             "package test;",
+             "",
+             "import dagger.Component;",
+             "import dagger.Module;",
+             "import dagger.Provides;",
+             "",
+-            "@Component(modules = Parent.ParentModule.class)",
+-            "interface Parent {",
++            "@Component(modules = ParentConflictsWithChild.ParentModule.class)",
++            "interface ParentConflictsWithChild {",
+             "  @ParentChildConflict Object parentChildConflict();",
+-            "  @ParentGrandchildConflict Object parentGrandchildConflict();",
+             "",
+             "  Child child();",
+             "",
+@@ -1272,7 +1275,25 @@ public void subcomponentBindingConflictsWithParent() {
+             "    @Provides @ParentChildConflict static Object parentChildConflict() {",
+             "      return \"parent\";",
+             "    }",
++            "  }",
++            "}");
++    JavaFileObject parentConflictsWithGrandchild =
++        JavaFileObjects.forSourceLines(
++            "test.ParentConflictsWithGrandchild",
++            "package test;",
++            "",
++            "import dagger.Component;",
++            "import dagger.Module;",
++            "import dagger.Provides;",
+             "",
++            "@Component(modules = ParentConflictsWithGrandchild.ParentModule.class)",
++            "interface ParentConflictsWithGrandchild {",
++            "  @ParentGrandchildConflict Object parentGrandchildConflict();",
++            "",
++            "  Child child();",
++            "",
++            "  @Module",
++            "  static class ParentModule {",
+             "    @Provides @ParentGrandchildConflict static Object parentGrandchildConflict() {",
+             "      return \"parent\";",
+             "    }",
+@@ -1337,36 +1358,40 @@ public void subcomponentBindingConflictsWithParent() {
+                 parentChildConflict,
+                 parentGrandchildConflict,
+                 childGrandchildConflict,
+-                parent,
++                parentConflictsWithChild,
++                parentConflictsWithGrandchild,
+                 child,
+                 grandchild))
+         .processedWith(new ComponentProcessor())
+         .failsToCompile()
+         .withErrorContaining(
+-            "@ParentChildConflict Object is rebound in test.Child:\n"
+-                + "      @Provides @ParentChildConflict Object"
+-                + " test.Parent.ParentModule.parentChildConflict()\n"
+-                + "      @Provides @ParentChildConflict Object"
+-                + " test.Child.ChildModule.parentChildConflict()\n")
+-        .in(parent)
+-        .onLine(12)
++            "[test.Child.parentChildConflict()] "
++                + "@test.ParentChildConflict java.lang.Object is bound multiple times:\n"
++                + "      @Provides @test.ParentChildConflict Object"
++                + " test.ParentConflictsWithChild.ParentModule.parentChildConflict()\n"
++                + "      @Provides @test.ParentChildConflict Object"
++                + " test.Child.ChildModule.parentChildConflict()")
++        .in(parentConflictsWithChild)
++        .onLine(8)
+         .and()
+         .withErrorContaining(
+-            "@ParentGrandchildConflict Object is rebound in test.Grandchild:\n"
+-                + "      @Provides @ParentGrandchildConflict Object"
+-                + " test.Parent.ParentModule.parentGrandchildConflict()\n"
+-                + "      @Provides @ParentGrandchildConflict Object"
+-                + " test.Grandchild.GrandchildModule.parentGrandchildConflict()\n")
+-        .in(parent)
+-        .onLine(12)
++            "[test.Grandchild.parentGrandchildConflict()] "
++                + "@test.ParentGrandchildConflict java.lang.Object is bound multiple times:\n"
++                + "      @Provides @test.ParentGrandchildConflict Object"
++                + " test.ParentConflictsWithGrandchild.ParentModule.parentGrandchildConflict()\n"
++                + "      @Provides @test.ParentGrandchildConflict Object"
++                + " test.Grandchild.GrandchildModule.parentGrandchildConflict()")
++        .in(parentConflictsWithGrandchild)
++        .onLine(8)
+         .and()
+         .withErrorContaining(
+-            "@ChildGrandchildConflict Object is rebound in test.Grandchild:\n"
+-                + "      @Provides @ChildGrandchildConflict Object"
++            "[test.Grandchild.childGrandchildConflict()] "
++                + "@test.ChildGrandchildConflict java.lang.Object is bound multiple times:\n"
++                + "      @Provides @test.ChildGrandchildConflict Object"
+                 + " test.Child.ChildModule.childGrandchildConflict()\n"
+-                + "      @Provides @ChildGrandchildConflict Object"
+-                + " test.Grandchild.GrandchildModule.childGrandchildConflict()\n")
++                + "      @Provides @test.ChildGrandchildConflict Object"
++                + " test.Grandchild.GrandchildModule.childGrandchildConflict()")
+         .in(child)
+-        .onLine(12);
++        .onLine(8);
+   }
+ }

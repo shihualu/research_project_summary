@@ -1,0 +1,179 @@
+diff --git a/okhttp-tests/src/test/java/okhttp3/internal/http2/HpackTest.java b/okhttp-tests/src/test/java/okhttp3/internal/http2/HpackTest.java
+index 99d54a4fdb..d19cedfc20 100644
+--- a/okhttp-tests/src/test/java/okhttp3/internal/http2/HpackTest.java
++++ b/okhttp-tests/src/test/java/okhttp3/internal/http2/HpackTest.java
+@@ -925,6 +925,77 @@ private void checkReadThirdRequestWithHuffman() {
+     assertEquals(expected, actual);
+   }
+ 
++  @Test public void staticTableIndexedHeader() throws IOException {
++    hpackWriter.writeHeaders(headerEntries(":method", "GET"));
++    assertBytes(0x82);
++    assertEquals(0, hpackWriter.headerCount);
++  }
++
++  @Test public void dynamicTableIndexedHeader() throws IOException {
++    hpackWriter.writeHeaders(headerEntries("custom-key", "custom-header"));
++    assertBytes(0x40,
++        10, 'c', 'u', 's', 't', 'o', 'm', '-', 'k', 'e', 'y',
++        13, 'c', 'u', 's', 't', 'o', 'm', '-', 'h', 'e', 'a', 'd', 'e', 'r');
++    assertEquals(1, hpackWriter.headerCount);
++
++    hpackWriter.writeHeaders(headerEntries("custom-key", "custom-header"));
++    assertBytes(0xbe);
++    assertEquals(1, hpackWriter.headerCount);
++  }
++
++  @Test public void doNotIndexPseudoHeaders() throws IOException {
++    hpackWriter.writeHeaders(headerEntries(":method", "PUT"));
++    assertBytes(0x02, 3, 'P', 'U', 'T');
++    assertEquals(0, hpackWriter.headerCount);
++
++    hpackWriter.writeHeaders(headerEntries(":method", "PUT"));
++    assertBytes(0x02, 3, 'P', 'U', 'T');
++    assertEquals(0, hpackWriter.headerCount);
++  }
++
++  @Test public void incrementalIndexingWithAuthorityPseudoHeader() throws IOException {
++    hpackWriter.writeHeaders(headerEntries(":authority", "foo.com"));
++    assertBytes(0x41, 7, 'f', 'o', 'o', '.', 'c', 'o', 'm');
++    assertEquals(1, hpackWriter.headerCount);
++
++    hpackWriter.writeHeaders(headerEntries(":authority", "foo.com"));
++    assertBytes(0xbe);
++    assertEquals(1, hpackWriter.headerCount);
++
++    // If the :authority header somehow changes, it should be re-added to the dynamic table.
++    hpackWriter.writeHeaders(headerEntries(":authority", "bar.com"));
++    assertBytes(0x41, 7, 'b', 'a', 'r', '.', 'c', 'o', 'm');
++    assertEquals(2, hpackWriter.headerCount);
++
++    hpackWriter.writeHeaders(headerEntries(":authority", "bar.com"));
++    assertBytes(0xbe);
++    assertEquals(2, hpackWriter.headerCount);
++  }
++
++  @Test public void incrementalIndexingWithStaticTableIndexedName() throws IOException {
++    hpackWriter.writeHeaders(headerEntries("accept-encoding", "gzip"));
++    assertBytes(0x50, 4, 'g', 'z', 'i', 'p');
++    assertEquals(1, hpackWriter.headerCount);
++
++    hpackWriter.writeHeaders(headerEntries("accept-encoding", "gzip"));
++    assertBytes(0xbe);
++    assertEquals(1, hpackWriter.headerCount);
++  }
++
++  @Test public void incrementalIndexingWithDynamcTableIndexedName() throws IOException {
++    hpackWriter.writeHeaders(headerEntries("foo", "bar"));
++    assertBytes(0x40, 3, 'f', 'o', 'o', 3, 'b', 'a', 'r');
++    assertEquals(1, hpackWriter.headerCount);
++
++    hpackWriter.writeHeaders(headerEntries("foo", "bar1"));
++    assertBytes(0x7e, 4, 'b', 'a', 'r', '1');
++    assertEquals(2, hpackWriter.headerCount);
++
++    hpackWriter.writeHeaders(headerEntries("foo", "bar1"));
++    assertBytes(0xbe);
++    assertEquals(2, hpackWriter.headerCount);
++  }
++
+   private Hpack.Reader newReader(Buffer source) {
+     return new Hpack.Reader(4096, source);
+   }
+diff --git a/okhttp/src/main/java/okhttp3/internal/http2/Header.java b/okhttp/src/main/java/okhttp3/internal/http2/Header.java
+index 638e550848..3cfd7be8d7 100644
+--- a/okhttp/src/main/java/okhttp3/internal/http2/Header.java
++++ b/okhttp/src/main/java/okhttp3/internal/http2/Header.java
+@@ -21,6 +21,7 @@
+ /** HTTP header: the name is an ASCII string, but the value can be UTF-8. */
+ public final class Header {
+   // Special header names defined in HTTP/2 spec.
++  public static final ByteString PSEUDO_PREFIX = ByteString.encodeUtf8(":");
+   public static final ByteString RESPONSE_STATUS = ByteString.encodeUtf8(":status");
+   public static final ByteString TARGET_METHOD = ByteString.encodeUtf8(":method");
+   public static final ByteString TARGET_PATH = ByteString.encodeUtf8(":path");
+diff --git a/okhttp/src/main/java/okhttp3/internal/http2/Hpack.java b/okhttp/src/main/java/okhttp3/internal/http2/Hpack.java
+index 405c2e273d..ff0f3903d5 100644
+--- a/okhttp/src/main/java/okhttp3/internal/http2/Hpack.java
++++ b/okhttp/src/main/java/okhttp3/internal/http2/Hpack.java
+@@ -152,7 +152,6 @@ private void adjustDynamicTableByteCount() {
+     }
+ 
+     private void clearDynamicTable() {
+-      headerList.clear();
+       Arrays.fill(dynamicTable, null);
+       nextHeaderIndex = dynamicTable.length - 1;
+       headerCount = 0;
+@@ -463,29 +462,56 @@ void writeHeaders(List<Header> headerBlock) throws IOException {
+         smallestHeaderTableSizeSetting = Integer.MAX_VALUE;
+         writeInt(maxDynamicTableByteCount, PREFIX_5_BITS, 0x20);
+       }
+-      // TODO: implement index tracking
++
+       for (int i = 0, size = headerBlock.size(); i < size; i++) {
+         Header header = headerBlock.get(i);
+         ByteString name = header.name.toAsciiLowercase();
+         ByteString value = header.value;
++        int headerIndex = -1;
++        int headerNameIndex = -1;
++
+         Integer staticIndex = NAME_TO_FIRST_INDEX.get(name);
+-        if (staticIndex != null) {
+-          // Literal Header Field without Indexing - Indexed Name.
+-          writeInt(staticIndex + 1, PREFIX_4_BITS, 0);
++        if (staticIndex != null) headerNameIndex = staticIndex + 1;
++
++        // Only search a subset of the static header table. Most entries have an empty value, so
++        // it's unnecessary to waste cycles looking at them.
++        for (int j = 1; j < 7; j++) {
++          if (Util.equal(STATIC_HEADER_TABLE[j], header)) {
++            headerIndex = j + 1;
++            break;
++          }
++        }
++
++        if (headerIndex == -1) {
++          for (int j = nextHeaderIndex + 1, length = dynamicTable.length; j < length; j++) {
++            if (Util.equal(dynamicTable[j], header)) {
++              headerIndex = j - nextHeaderIndex + STATIC_HEADER_TABLE.length;
++              break;
++            } else if (headerNameIndex == -1 && Util.equal(dynamicTable[j].name, name)) {
++              headerNameIndex = j - nextHeaderIndex + STATIC_HEADER_TABLE.length;
++            }
++          }
++        }
++
++        if (headerIndex != -1) {
++          // Indexed Header Field.
++          writeInt(headerIndex, PREFIX_7_BITS, 0x80);
++        } else if (headerNameIndex == -1) {
++          // Literal Header Field with Incremental Indexing - New Name.
++          out.writeByte(0x40);
++          writeByteString(name);
++          writeByteString(value);
++          insertIntoDynamicTable(header);
++        } else if (name.startsWith(Header.PSEUDO_PREFIX) && !Header.TARGET_AUTHORITY.equals(name)) {
++          // Follow Chromes lead - only include the :authority pseudo header, but exclude all other
++          // pseudo headers. Literal Header Field without Indexing - Indexed Name.
++          writeInt(headerNameIndex, PREFIX_4_BITS, 0);
+           writeByteString(value);
+         } else {
+-          int dynamicIndex = Util.indexOf(dynamicTable, header);
+-          if (dynamicIndex != -1) {
+-            // Indexed Header.
+-            writeInt(dynamicIndex - nextHeaderIndex + STATIC_HEADER_TABLE.length, PREFIX_7_BITS,
+-                0x80);
+-          } else {
+-            // Literal Header Field with Incremental Indexing - New Name
+-            out.writeByte(0x40);
+-            writeByteString(name);
+-            writeByteString(value);
+-            insertIntoDynamicTable(header);
+-          }
++          // Literal Header Field with Incremental Indexing - Indexed Name.
++          writeInt(headerNameIndex, PREFIX_6_BITS, 0x40);
++          writeByteString(value);
++          insertIntoDynamicTable(header);
+         }
+       }
+     }

@@ -1,0 +1,511 @@
+diff --git a/compiler/src/main/java/dagger/internal/codegen/GraphAnalysisProcessor.java b/compiler/src/main/java/dagger/internal/codegen/GraphAnalysisProcessor.java
+index cb2d34f19..b0cfe10bf 100644
+--- a/compiler/src/main/java/dagger/internal/codegen/GraphAnalysisProcessor.java
++++ b/compiler/src/main/java/dagger/internal/codegen/GraphAnalysisProcessor.java
+@@ -22,6 +22,7 @@
+ import dagger.internal.Linker;
+ import dagger.internal.ProblemDetector;
+ import dagger.internal.SetBinding;
++import dagger.internal.codegen.Util.CodeGenerationIncompleteException;
+ import java.io.IOException;
+ import java.io.PrintWriter;
+ import java.io.StringWriter;
+@@ -95,9 +96,14 @@
+     }
+ 
+     for (Element element : modules) {
+-      Map<String, Object> annotation = getAnnotation(Module.class, element);
+-      TypeElement moduleType = (TypeElement) element;
++      Map<String, Object> annotation = null;
++      try {
++        annotation = getAnnotation(Module.class, element);
++      } catch (CodeGenerationIncompleteException e) {
++        continue; // skip this element. An up-stream compiler error is in play.
++      }
+ 
++      TypeElement moduleType = (TypeElement) element;
+       if (annotation == null) {
+         error("Missing @Module annotation.", moduleType);
+         continue;
+diff --git a/compiler/src/main/java/dagger/internal/codegen/ModuleAdapterProcessor.java b/compiler/src/main/java/dagger/internal/codegen/ModuleAdapterProcessor.java
+index 969c37627..ff87d24aa 100644
+--- a/compiler/src/main/java/dagger/internal/codegen/ModuleAdapterProcessor.java
++++ b/compiler/src/main/java/dagger/internal/codegen/ModuleAdapterProcessor.java
+@@ -23,7 +23,10 @@
+ import dagger.internal.Linker;
+ import dagger.internal.ModuleAdapter;
+ import dagger.internal.SetBinding;
++import dagger.internal.codegen.Util.CodeGenerationIncompleteException;
+ import java.io.IOException;
++import java.io.StringWriter;
++import java.io.Writer;
+ import java.util.ArrayList;
+ import java.util.Arrays;
+ import java.util.EnumSet;
+@@ -47,6 +50,7 @@
+ import javax.lang.model.element.Modifier;
+ import javax.lang.model.element.TypeElement;
+ import javax.lang.model.element.VariableElement;
++import javax.lang.model.type.TypeKind;
+ import javax.lang.model.type.TypeMirror;
+ import javax.lang.model.util.Elements;
+ import javax.lang.model.util.Types;
+@@ -77,10 +81,13 @@
+  */
+ @SupportedAnnotationTypes({ "*" })
+ public final class ModuleAdapterProcessor extends AbstractProcessor {
+-  private final LinkedHashMap<String, List<ExecutableElement>> remainingTypes =
+-      new LinkedHashMap<String, List<ExecutableElement>>();
+   private static final String BINDINGS_MAP = JavaWriter.type(
+       Map.class, String.class.getCanonicalName(), Binding.class.getCanonicalName() + "<?>");
++  private static final List<String> INVALID_RETURN_TYPES =
++      Arrays.asList(Provider.class.getCanonicalName(), Lazy.class.getCanonicalName());
++
++  private final LinkedHashMap<String, List<ExecutableElement>> remainingTypes =
++      new LinkedHashMap<String, List<ExecutableElement>>();
+ 
+   @Override public SourceVersion getSupportedSourceVersion() {
+     return SourceVersion.latestSupported();
+@@ -92,19 +99,26 @@
+       String typeName = i.next();
+       TypeElement type = processingEnv.getElementUtils().getTypeElement(typeName);
+       List<ExecutableElement> providesTypes = remainingTypes.get(typeName);
++
+       try {
+         // Attempt to get the annotation. If types are missing, this will throw
+-        // IllegalStateException.
++        // CodeGenerationIncompleteException.
+         Map<String, Object> parsedAnnotation = getAnnotation(Module.class, type);
+-        try {
+-          generateModuleAdapter(type, parsedAnnotation, providesTypes);
+-        } catch (IOException e) {
+-          error("Code gen failed: " + e, type);
+-        }
+-        i.remove();
+-      } catch (IllegalStateException e) {
+-        // a dependent type was not defined, we'll catch it on another pass
++
++        //TODO(cgruber): Figure out an initial sizing of the StringWriter.
++        StringWriter stringWriter = new StringWriter();
++        String adapterName = adapterName(type, MODULE_ADAPTER_SUFFIX);
++        generateModuleAdapter(stringWriter, adapterName, type, parsedAnnotation, providesTypes);
++        JavaFileObject sourceFile = processingEnv.getFiler().createSourceFile(adapterName, type);
++        Writer sourceWriter = sourceFile.openWriter();
++        sourceWriter.append(stringWriter.getBuffer());
++        sourceWriter.close();
++      } catch (CodeGenerationIncompleteException e) {
++        continue; // A dependent type was not defined, we'll try to catch it on another pass.
++      } catch (IOException e) {
++        error("Code gen failed: " + e, type);
+       }
++      i.remove();
+     }
+     if (env.processingOver() && remainingTypes.size() > 0) {
+       processingEnv.getMessager().printMessage(Diagnostic.Kind.ERROR,
+@@ -163,14 +177,17 @@ private void error(String msg, Element element) {
+ 
+       // Invalidate return types.
+       TypeMirror returnType = types.erasure(providerMethodAsExecutable.getReturnType());
+-      for (String invalidTypeName : Arrays.asList(Provider.class.getCanonicalName(),
+-          Lazy.class.getCanonicalName())) {
+-        TypeElement invalidTypeElement = elementUtils.getTypeElement(invalidTypeName);
+-        if (invalidTypeElement != null && types.isSameType(returnType,
+-            types.erasure(invalidTypeElement.asType()))) {
+-          error(String.format("@Provides method must not return %s directly: %s.%s",
+-              invalidTypeElement, type.getQualifiedName(), providerMethod), providerMethod);
+-          continue provides; // Skip to next provides method.
++      if (!returnType.getKind().equals(TypeKind.ERROR)) {
++        // Validate if we have a type to validate (a type yet to be generated by other
++        // processors is not "invalid" in this way, so ignore).
++        for (String invalidTypeName : INVALID_RETURN_TYPES) {
++          TypeElement invalidTypeElement = elementUtils.getTypeElement(invalidTypeName);
++          if (invalidTypeElement != null && types.isSameType(returnType,
++              types.erasure(invalidTypeElement.asType()))) {
++            error(String.format("@Provides method must not return %s directly: %s.%s",
++                invalidTypeElement, type.getQualifiedName(), providerMethod), providerMethod);
++            continue provides; // Skip to next provides method.
++          }
+         }
+       }
+ 
+@@ -216,8 +233,8 @@ private void error(String msg, Element element) {
+    * Write a companion class for {@code type} that implements {@link
+    * ModuleAdapter} to expose its provider methods.
+    */
+-  private void generateModuleAdapter(TypeElement type, Map<String, Object> module,
+-      List<ExecutableElement> providerMethods) throws IOException {
++  private void generateModuleAdapter(Writer ioWriter, String adapterName, TypeElement type,
++      Map<String, Object> module, List<ExecutableElement> providerMethods) throws IOException {
+     if (module == null) {
+       error(type + " has @Provides methods but no @Module annotation", type);
+       return;
+@@ -231,10 +248,7 @@ private void generateModuleAdapter(TypeElement type, Map<String, Object> module,
+     boolean complete = (Boolean) module.get("complete");
+     boolean library = (Boolean) module.get("library");
+ 
+-    String adapterName = adapterName(type, MODULE_ADAPTER_SUFFIX);
+-    JavaFileObject sourceFile = processingEnv.getFiler()
+-        .createSourceFile(adapterName, type);
+-    JavaWriter writer = new JavaWriter(sourceFile.openWriter());
++    JavaWriter writer = new JavaWriter(ioWriter);
+ 
+     boolean multibindings = checkForMultibindings(providerMethods);
+     boolean providerMethodDependencies = checkForDependencies(providerMethods);
+@@ -343,8 +357,8 @@ private void generateModuleAdapter(TypeElement type, Map<String, Object> module,
+     }
+ 
+     for (ExecutableElement providerMethod : providerMethods) {
+-      generateProvidesAdapter(writer, providerMethod, methodToClassName, methodNameToNextId,
+-          library);
++      generateProvidesAdapter(
++          writer, providerMethod, methodToClassName, methodNameToNextId, library);
+     }
+ 
+     writer.endType();
+diff --git a/compiler/src/main/java/dagger/internal/codegen/Util.java b/compiler/src/main/java/dagger/internal/codegen/Util.java
+index 0826adf2f..0f8b36c24 100644
+--- a/compiler/src/main/java/dagger/internal/codegen/Util.java
++++ b/compiler/src/main/java/dagger/internal/codegen/Util.java
+@@ -137,10 +137,17 @@ public static void typeToString(final TypeMirror type, final StringBuilder resul
+         return null;
+       }
+       @Override public Void visitError(ErrorType errorType, Void v) {
+-        // There's already an error but it may not have been reported (most likely
+-        // a missing import). If we throw an UnsupportedOperationException here
+-        // we'll obscure the real error, so just continue.
+-        result.append("error");
++        // Error type found, a type may not yet have been generated, but we need the type
++        // so we can generate the correct code in anticipation of the type being available
++        // to the compiler.
++
++        // Paramterized types which don't exist are returned as an error type whose name is "<any>"
++        if ("<any>".equals(errorType.toString())) {
++          throw new CodeGenerationIncompleteException(
++              "Type reported as <any> is likely a not-yet generated parameterized type.");
++        }
++        // TODO(cgruber): Figure out a strategy for non-FQCN cases.
++        result.append(errorType.toString());
+         return null;
+       }
+       @Override protected Void defaultAction(TypeMirror typeMirror, Void v) {
+@@ -150,19 +157,30 @@ public static void typeToString(final TypeMirror type, final StringBuilder resul
+     }, null);
+   }
+ 
+-  private static final AnnotationValueVisitor<Object, Void> VALUE_EXTRACTOR
+-      = new SimpleAnnotationValueVisitor6<Object, Void>() {
+-    @Override protected Object defaultAction(Object o, Void v) {
+-      return o;
+-    }
+-    @Override public Object visitArray(List<? extends AnnotationValue> values, Void v) {
+-      Object[] result = new Object[values.size()];
+-      for (int i = 0; i < values.size(); i++) {
+-        result[i] = values.get(i).accept(this, null);
+-      }
+-      return result;
+-    }
+-  };
++  private static final AnnotationValueVisitor<Object, Void> VALUE_EXTRACTOR =
++      new SimpleAnnotationValueVisitor6<Object, Void>() {
++        @Override public Object visitString(String s, Void p) {
++          if ("<error>".equals(s)) {
++            throw new CodeGenerationIncompleteException("Unknown type returned as <error>.");
++          } else if ("<any>".equals(s)) {
++            throw new CodeGenerationIncompleteException("Unknown type returned as <any>.");
++          }
++          return s;
++        }
++        @Override public Object visitType(TypeMirror t, Void p) {
++          return t;
++        }
++        @Override protected Object defaultAction(Object o, Void v) {
++          return o;
++        }
++        @Override public Object visitArray(List<? extends AnnotationValue> values, Void v) {
++          Object[] result = new Object[values.size()];
++          for (int i = 0; i < values.size(); i++) {
++            result[i] = values.get(i).accept(this, null);
++          }
++          return result;
++        }
++      };
+ 
+   /**
+    * Returns the annotation on {@code element} formatted as a Map. This returns
+@@ -196,7 +214,6 @@ public static void typeToString(final TypeMirror type, final StringBuilder resul
+       }
+       return result;
+     }
+-
+     return null; // Annotation not found.
+   }
+ 
+@@ -327,4 +344,15 @@ static boolean isStatic(Element element) {
+     }
+     return false;
+   }
++
++  /**
++   * An exception thrown when a type is not extant (returns as an error type),
++   * usually as a result of another processor not having yet generated its types upon
++   * which a dagger-annotated type depends.
++   */
++  final static class CodeGenerationIncompleteException extends IllegalStateException {
++    public CodeGenerationIncompleteException(String s) {
++      super(s);
++    }
++  }
+ }
+diff --git a/compiler/src/main/java/dagger/internal/codegen/ValidationProcessor.java b/compiler/src/main/java/dagger/internal/codegen/ValidationProcessor.java
+index 3bbac71c2..578bdb3b9 100644
+--- a/compiler/src/main/java/dagger/internal/codegen/ValidationProcessor.java
++++ b/compiler/src/main/java/dagger/internal/codegen/ValidationProcessor.java
+@@ -18,6 +18,7 @@
+ 
+ import dagger.Module;
+ import dagger.Provides;
++import dagger.internal.codegen.Util.CodeGenerationIncompleteException;
+ import java.util.ArrayList;
+ import java.util.Arrays;
+ import java.util.LinkedHashMap;
+@@ -64,16 +65,20 @@
+     Map<Element, Element> parametersToTheirMethods = new LinkedHashMap<Element, Element>();
+     getAllElements(env, allElements, parametersToTheirMethods);
+     for (Element element : allElements) {
++      try {
+         validateProvides(element);
+-        validateScoping(element);
+-        validateQualifiers(element, parametersToTheirMethods);
++      } catch (CodeGenerationIncompleteException e) {
++        continue; // Upstream compiler issue in play. Ignore this element.
++      }
++      validateScoping(element);
++      validateQualifiers(element, parametersToTheirMethods);
+     }
+     return false;
+   }
+ 
+   private void validateProvides(Element element) {
+     if (element.getAnnotation(Provides.class) != null
+-        && element.getEnclosingElement().getAnnotation(Module.class) == null) {
++        && Util.getAnnotation(Module.class, element.getEnclosingElement()) == null) {
+       error("@Provides methods must be declared in modules: " + elementToString(element), element);
+     }
+   }
+diff --git a/compiler/src/test/java/dagger/tests/integration/validation/GeneratedTypesNotReadyTest.java b/compiler/src/test/java/dagger/tests/integration/validation/GeneratedTypesNotReadyTest.java
+new file mode 100644
+index 000000000..ad8ca1745
+--- /dev/null
++++ b/compiler/src/test/java/dagger/tests/integration/validation/GeneratedTypesNotReadyTest.java
+@@ -0,0 +1,211 @@
++/**
++ * Copyright (c) 2013 Google, Inc.
++ * Copyright (c) 2013 Square, Inc.
++ *
++ * Licensed under the Apache License, Version 2.0 (the "License");
++ * you may not use this file except in compliance with the License.
++ * You may obtain a copy of the License at
++ *
++ * http://www.apache.org/licenses/LICENSE-2.0
++ *
++ * Unless required by applicable law or agreed to in writing, software
++ * distributed under the License is distributed on an "AS IS" BASIS,
++ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++ * See the License for the specific language governing permissions and
++ * limitations under the License.
++ */
++package dagger.tests.integration.validation;
++
++import com.google.common.base.Joiner;
++import com.google.testing.compile.JavaFileObjects;
++import java.io.IOException;
++import java.io.Writer;
++import java.util.Set;
++import javax.annotation.processing.AbstractProcessor;
++import javax.annotation.processing.RoundEnvironment;
++import javax.annotation.processing.SupportedAnnotationTypes;
++import javax.lang.model.SourceVersion;
++import javax.lang.model.element.TypeElement;
++import javax.tools.JavaFileObject;
++import org.junit.Test;
++import org.junit.runner.RunWith;
++import org.junit.runners.JUnit4;
++
++import static com.google.common.collect.Iterables.concat;
++import static com.google.testing.compile.JavaSourcesSubjectFactory.javaSources;
++import static dagger.tests.integration.ProcessorTestUtils.daggerProcessors;
++import static java.util.Arrays.asList;
++import static org.truth0.Truth.ASSERT;
++
++/**
++ * Tests that the annotation processor(s) will properly handle the case where
++ * code they are processing and depending on is generated by other processors
++ * in the environment, and so the types they need may not exist yet.
++ */
++@RunWith(JUnit4.class)
++public class GeneratedTypesNotReadyTest {
++  private final JavaFileObject foo = JavaFileObjects.forSourceString("Foo", Joiner.on("\n").join(
++      "package myPackage;",
++      "public interface Foo {}"
++  ));
++  private final JavaFileObject main = JavaFileObjects.forSourceString("Main", Joiner.on("\n").join(
++      "import javax.inject.Inject;",
++      "import myPackage.Foo;",
++      "class Main {",
++      "  @Inject Foo f;",
++      "}"));
++
++  @Test public void withstandsMissingTypeReferencedInInjects() {
++    // TODO(cgruber): remove Foo (interface) from this when injects= analysis is fixed.
++    JavaFileObject module = JavaFileObjects.forSourceString("FooModule", Joiner.on("\n").join(
++        "import dagger.Module;",
++        "import dagger.Provides;",
++        "import myPackage.Foo;",
++        "@Module(injects = { Main.class, myPackage.FooImpl.class })",
++        "class FooModule {",
++        "  @Provides Foo provideFoo(myPackage.FooImpl impl) {",
++        "    return impl;",
++        "  }",
++        "}"));
++
++    ASSERT.about(javaSources()).that(asList(foo, main, module))
++        .processedWith(concat(asList(new FooImplGenerator()), daggerProcessors()))
++        .compilesWithoutError();
++  }
++
++  @Test public void withstandsMissingTypeReferencedInsideModule() {
++    JavaFileObject module = JavaFileObjects.forSourceString("FooModule", Joiner.on("\n").join(
++        "import dagger.Module;",
++        "import dagger.Provides;",
++        "import myPackage.Foo;",
++        "@Module(injects = { Main.class })",
++        "class FooModule {",
++        "  @Provides Foo provideFoo(myPackage.FooImpl impl) {",
++        "    return impl;",
++        "  }",
++        "}"));
++
++    ASSERT.about(javaSources()).that(asList(foo, module, main))
++        .processedWith(concat(daggerProcessors(), asList(new FooImplGenerator())))
++        .compilesWithoutError();
++  }
++
++  @Test public void withstandsMissingTypeReferencedByProvidesReturnType() {
++    JavaFileObject main = JavaFileObjects.forSourceString("Main", Joiner.on("\n").join(
++        "import javax.inject.Inject;",
++        "class Main {",
++        "  @Inject myPackage.FooImpl f;",
++        "}"));
++    JavaFileObject module = JavaFileObjects.forSourceString("FooModule", Joiner.on("\n").join(
++        "import dagger.Module;",
++        "import dagger.Provides;",
++        "@Module(injects = { Main.class })",
++        "class FooModule {",
++        "  @Provides myPackage.FooImpl provideFoo() {",
++        "    return new myPackage.FooImpl();",
++        "  }",
++        "}"));
++
++    ASSERT.about(javaSources()).that(asList(foo, module, main))
++        .processedWith(concat(daggerProcessors(), asList(new FooImplGenerator())))
++        .compilesWithoutError();
++  }
++
++  @Test public void failsWhenMissingGenericTypeReferencedByProvidesReturnType() {
++    JavaFileObject main = JavaFileObjects.forSourceString("Main", Joiner.on("\n").join(
++        "import javax.inject.Inject;",
++        "class Main {",
++        "  @Inject myPackage.FooImpl2<String> f;",
++        "}"));
++    JavaFileObject module = JavaFileObjects.forSourceString("FooModule", Joiner.on("\n").join(
++        "import dagger.Module;",
++        "import dagger.Provides;",
++        "@Module(injects = { Main.class })",
++        "class FooModule {",
++        "  @Provides myPackage.FooImpl2<String> provideFoo() {",
++        "    return new myPackage.FooImpl2<String>();",
++        "  }",
++        "}"));
++
++    ASSERT.about(javaSources()).that(asList(foo, module, main))
++        .processedWith(new FooImplGenerator())
++        .compilesWithoutError();
++    ASSERT.about(javaSources()).that(asList(foo, module, main))
++        .processedWith(concat(daggerProcessors(), asList(new FooImplGenerator())))
++        .failsToCompile()
++        .withErrorContaining("Could not find types required by provides methods for [FooModule]");
++  }
++
++  @Test public void withstandsMissingTypeReferencedInTransitiveJITDependency() {
++    JavaFileObject main = JavaFileObjects.forSourceString("Main", Joiner.on("\n").join(
++        "import javax.inject.Inject;",
++        "import myPackage.FooImpl;",
++        "class Main {",
++        "  @Inject FooImpl f;",
++        "}"));
++    JavaFileObject module = JavaFileObjects.forSourceString("FooModule", Joiner.on("\n").join(
++        "import dagger.Module;",
++        "import dagger.Provides;",
++        "@Module(injects = { Main.class })",
++        "class FooModule {",
++        "}"));
++
++    ASSERT.about(javaSources()).that(asList(foo, module, main))
++        .processedWith(concat(daggerProcessors(), asList(new FooImplGenerator())))
++        .compilesWithoutError();
++  }
++
++  @Test public void verifyFooImplGeneratorIsCompilingWithoutDagger() {
++    JavaFileObject module = JavaFileObjects.forSourceString("FooModule", Joiner.on("\n").join(
++        "import dagger.Module;",
++        "import dagger.Provides;",
++        "import myPackage.Foo;",
++        "@Module(injects = { Main.class })",
++        "class FooModule {",
++        "  @Provides Foo provideFoo(myPackage.FooImpl impl) {",
++        "    return impl;",
++        "  }",
++        "}"));
++    ASSERT.about(javaSources()).that(asList(foo, module, main))
++        .processedWith(new FooImplGenerator())
++        .compilesWithoutError();
++  }
++
++  @SupportedAnnotationTypes("*")
++  private final class FooImplGenerator extends AbstractProcessor {
++    boolean written = false;
++    @Override public boolean process(Set<? extends TypeElement> na1, RoundEnvironment na2) {
++      if (!written) {
++        try {
++          JavaFileObject sourceFile = processingEnv.getFiler().createSourceFile("FooImpl");
++          Writer writer = sourceFile.openWriter();
++          writer.write(Joiner.on("\n").join(
++              "package myPackage;",
++              "import javax.inject.Inject;",
++              "public final class FooImpl implements Foo {",
++              "  @Inject public FooImpl() { }",
++              "}"));
++          writer.close();
++          sourceFile = processingEnv.getFiler().createSourceFile("FooImpl2");
++          writer = sourceFile.openWriter();
++          writer.write(Joiner.on("\n").join(
++              "package myPackage;",
++              "import javax.inject.Inject;",
++              "public final class FooImpl2<T> implements Foo {",
++              "  @Inject public FooImpl2() { }",
++              "}"));
++          writer.close();
++          written = true;
++        } catch (IOException e) {
++          throw new RuntimeException(e);
++        }
++      }
++      return false;
++    }
++
++    @Override public SourceVersion getSupportedSourceVersion() {
++      return SourceVersion.latestSupported();
++    }
++  }
++
++}

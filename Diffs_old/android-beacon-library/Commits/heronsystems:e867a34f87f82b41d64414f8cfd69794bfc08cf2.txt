@@ -1,0 +1,1722 @@
+diff --git a/CHANGELOG.md b/CHANGELOG.md
+index 49b4e00e..bb174008 100644
+--- a/CHANGELOG.md
++++ b/CHANGELOG.md
+@@ -10,6 +10,12 @@ Bug Fixes:
+ 
+ - Fix failure to stop scanning when unbinding from service or when the between scan period
+   is nonzero. (#507, David G. Young)
++- Fix possible `NullPointerException` with `BackgroundPowerSaver` on devices
++  prior to Android 4.3 Jelly Bean MR 2 (API 18) (#516, Aaron Kromer)
++- Fix rare edge case causing `NoSuchElementException` when using the legacy
++  `BeaconManager#getMonitoringNotifier` and `BeaconManager#getRangingNotifier`
++  where the notifier sets were modified external to `BeaconManager` by another
++  thread (#516, Aaron Kromer)
+ 
+ ### 2.10 / 2017-04-21
+ 
+diff --git a/build.gradle b/build.gradle
+index 4ab2e3c0..d04ab77a 100644
+--- a/build.gradle
++++ b/build.gradle
+@@ -67,8 +67,12 @@ android {
+         targetSdkVersion 'O'
+         versionCode 1
+         versionName version
+-        testInstrumentationRunner "com.google.android.apps.common.testing.testrunner.GoogleInstrumentationTestRunner"
+         consumerProguardFiles 'proguard-rules.pro'
++        testInstrumentationRunner "android.support.test.runner.AndroidJUnitRunner"
++        testOptions {
++            // The test runner needs Espresso 2.2.2 which requires at least 8
++            minSdkVersion 8
++        }
+     }
+ 
+     compileOptions {
+@@ -108,6 +112,17 @@ dependencies {
+     testCompile('org.mockito:mockito-core:1.10.19') {
+         exclude group: 'org.hamcrest'
+     }
++    androidTestCompile('junit:junit:4.12') {
++        exclude group: 'org.hamcrest'
++    }
++    androidTestCompile('org.hamcrest:hamcrest-junit:2.0.0.0') {
++        exclude group: 'junit'
++    }
++    androidTestCompile('com.android.support.test.espresso:espresso-core:2.2.2', {
++        exclude group: 'com.android.support', module: 'support-annotations'
++        exclude group: 'org.hamcrest'
++    })
++    androidTestCompile 'org.apache.commons:commons-math3:3.6.1'
+ }
+ 
+ apply plugin: 'idea'
+diff --git a/src/androidTest/java/org/altbeacon/beacon/NotifierSetCopyBenchmarksTest.java b/src/androidTest/java/org/altbeacon/beacon/NotifierSetCopyBenchmarksTest.java
+new file mode 100644
+index 00000000..b93ede2e
+--- /dev/null
++++ b/src/androidTest/java/org/altbeacon/beacon/NotifierSetCopyBenchmarksTest.java
+@@ -0,0 +1,278 @@
++package org.altbeacon.beacon;
++
++import android.support.test.runner.AndroidJUnit4;
++import android.util.Log;
++
++import org.apache.commons.math3.stat.descriptive.DescriptiveStatistics;
++import org.junit.BeforeClass;
++import org.junit.Test;
++import org.junit.runner.RunWith;
++
++import java.util.Collection;
++import java.util.Collections;
++import java.util.HashSet;
++import java.util.Locale;
++import java.util.Set;
++import java.util.concurrent.CopyOnWriteArraySet;
++
++/*
++ * Set of benchmarks for copying various sized notifier sets.
++ *
++ * As with the current implementation the base sets use `CopyOnWriteArraySet`. In most cases
++ * these notifier sets will only have a single notifier in them. However, it's possible there are
++ * more so this also includes a set of three notifiers. While its very unlikely the notifiers
++ * will grow much larger two bigger sets are also included to help expose the affect of set size on
++ * the performance.
++ *
++ * Sample Test Runs
++ * ================
++ *
++ * All tests were performed with no apps running in the foreground and the devices in airplane
++ * mode. This was done to help minimize background system noise.
++ *
++ * Nexus 6 on Android 7.0
++ *
++ *   |      Type       | Size |   N   |   Min   |   Max   |  Mean   | Std. Dev |     Var     |
++ *   |-----------------|------|-------|---------|---------|---------|----------|-------------|
++ *   |         HashSet |    1 | 10000 |    4062 |   85157 |   11484 |   3429.7 | 1.17626e+07 |
++ *   | UnmodifiableSet |    1 | 10000 |    1718 |  342292 |    4864 |   4907.6 | 2.40841e+07 |
++ *   |         HashSet |    3 | 10000 |    6563 | 4019793 |   14402 |  41514.6 | 1.72346e+09 |
++ *   | UnmodifiableSet |    3 | 10000 |    1666 |  223281 |    5403 |   3091.0 | 9.55441e+06 |
++ *   |         HashSet |   10 | 10000 |    7500 | 1140937 |   16996 |  12741.5 | 1.62345e+08 |
++ *   | UnmodifiableSet |   10 | 10000 |    1666 |  313802 |    4765 |   4146.9 | 1.71966e+07 |
++ *   |         HashSet |   20 | 10000 |   11510 | 1677083 |   21395 |  18560.7 | 3.44500e+08 |
++ *   | UnmodifiableSet |   20 | 10000 |    1718 | 1690104 |    4187 |  17014.1 | 2.89478e+08 |
++ *
++ *
++ * Nexus 5 on Android 4.4.4
++ *
++ *   |      Type       | Size |   N   |   Min   |   Max   |  Mean   | Std. Dev |  Variance   |
++ *   |-----------------|------|-------|---------|---------|---------|----------|-------------|
++ *   |         HashSet |    1 | 10000 |    6354 | 7764219 |   12658 | 154235.5 | 2.37886e+10 |
++ *   | UnmodifiableSet |    1 | 10000 |    1250 |  178334 |    1360 |   1996.4 | 3.98546e+06 |
++ *   |         HashSet |    3 | 10000 |    9479 | 7745833 |   17389 | 171098.2 | 2.92746e+10 |
++ *   | UnmodifiableSet |    3 | 10000 |    1250 |  120001 |    1435 |   1320.4 | 1.74347e+06 |
++ *   |         HashSet |   10 | 10000 |   10000 | 7665208 |   30028 | 252827.8 | 6.39219e+10 |
++ *   | UnmodifiableSet |   10 | 10000 |    1302 |   97865 |    1435 |   1012.2 | 1.02459e+06 |
++ *   |         HashSet |   20 | 10000 |   16354 | 8842240 |   41301 | 333940.7 | 1.11516e+11 |
++ *   | UnmodifiableSet |   20 | 10000 |    1302 |   94479 |    1486 |   1049.3 | 1.10112e+06 |
++ *
++ *
++ * Samsung SM-G900V on Android 4.4.2
++ *
++ *   |      Type       | Size |   N   |   Min   |   Max    |  Mean   | Std. Dev |  Variance   |
++ *   |-----------------|------|-------|---------|----------|---------|----------|-------------|
++ *   |         HashSet |    1 | 10000 |    7084 |   306615 |    8703 |   9694.4 | 9.39809e+07 |
++ *   | UnmodifiableSet |    1 | 10000 |    1562 |    51615 |    1926 |    869.5 | 7.56085e+05 |
++ *   |         HashSet |    3 | 10000 |   10364 |   809427 |   12095 |   9418.6 | 8.87103e+07 |
++ *   | UnmodifiableSet |    3 | 10000 |    1562 |    82605 |    1967 |   1157.5 | 1.33973e+06 |
++ *   |         HashSet |   10 | 10000 |   11094 | 14970052 |   26345 | 155322.0 | 2.41249e+10 |
++ *   | UnmodifiableSet |   10 | 10000 |    1562 |    11563 |    1981 |    545.5 | 2.97536e+05 |
++ *   |         HashSet |   20 | 10000 |   17760 | 13884687 |   29915 | 215507.1 | 4.64433e+10 |
++ *   | UnmodifiableSet |   20 | 10000 |    1562 |   170781 |    1939 |   3229.1 | 1.04269e+07 |
++ *
++ *
++ * Summary
++ * =======
++ *
++ * In all cases usage of the `UnmodifiableSet` was fastest. This is not surprising because the
++ * current implementations are thin object wrappers around the provided set. This means they
++ * store the `CopyOnWriteArraySet` internally and delegate all non-mutation methods to it. So
++ * naturally this is faster than creating a new data structure and copying all elements into it.
++ */
++@RunWith(AndroidJUnit4.class)
++public class NotifierSetCopyBenchmarksTest {
++    private static final Set<RangeNotifier> LARGE_SET  = buildSet(20);
++
++    private static final Set<RangeNotifier> MEDIUM_SET = buildSet(10);
++
++    private static final Set<RangeNotifier> SINGLE_SET = buildSet(1);
++
++    private static final Set<RangeNotifier> SMALL_SET  = buildSet(3);
++
++    private static final String STAT_FORMAT =
++            "| %15s | %4d | %4d | %7d | %7d | %7d | %#8.1f | %.5e |";
++
++    private static final String STAT_HEADER =
++            "|      Type       | Size |   N   |   Min   |   Max   |  Mean   | Std. Dev |  Variance   |\n" +
++            "|-----------------|------|-------|---------|---------|---------|----------|-------------|";
++
++    private static final String TAG = "BenchmarkTests";
++
++    private static final int WARMUP_SIZE = 1_000;
++
++    private static final int SAMPLE_SIZE = 10_000;
++
++    @BeforeClass
++    public static void _displayStatsHeader() {
++        Log.i(TAG, "Benchmarks: NotifierSetCopyBenchmarksTest");
++        Log.i(TAG, STAT_HEADER);
++        // Let things finish loading / processing (such as package name for logging)
++        try {
++            Thread.sleep(2_000);
++        } catch (InterruptedException e) {
++            e.printStackTrace();
++        }
++    }
++
++    private static Set<RangeNotifier> buildSet(int size) {
++        final Set<RangeNotifier> set = new CopyOnWriteArraySet<>();
++        for (int i = 0; i < size; i++) {
++            set.add(
++                    new RangeNotifier() {
++                        @Override
++                        public void didRangeBeaconsInRegion(Collection<Beacon> beacons, Region region) {
++                        }
++                    }
++            );
++        }
++        return set;
++    }
++
++    @Test
++    public void copyHashSet_Size1() {
++        Set<RangeNotifier> copySet = null;
++        double[] raw = new double[SAMPLE_SIZE];
++        for (int i = 0; i < WARMUP_SIZE; i++) {
++            copySet = new HashSet<>(SINGLE_SET);
++        }
++        System.gc();
++        for (int i = 0; i < raw.length; i++) {
++            long t0 = System.nanoTime();
++            copySet = new HashSet<>(SINGLE_SET);
++            raw[i] = System.nanoTime() - t0;
++        }
++        logStats(copySet, raw);
++    }
++
++    @Test
++    public void copyHashSet_Size10() {
++        Set<RangeNotifier> copySet = null;
++        double[] raw = new double[SAMPLE_SIZE];
++        for (int i = 0; i < WARMUP_SIZE; i++) {
++            copySet = new HashSet<>(MEDIUM_SET);
++        }
++        System.gc();
++        for (int i = 0; i < raw.length; i++) {
++            long t0 = System.nanoTime();
++            copySet = new HashSet<>(MEDIUM_SET);
++            raw[i] = System.nanoTime() - t0;
++        }
++        logStats(copySet, raw);
++    }
++
++    @Test
++    public void copyHashSet_Size20() {
++        Set<RangeNotifier> copySet = null;
++        double[] raw = new double[SAMPLE_SIZE];
++        for (int i = 0; i < WARMUP_SIZE; i++) {
++            copySet = new HashSet<>(LARGE_SET);
++        }
++        System.gc();
++        for (int i = 0; i < raw.length; i++) {
++            long t0 = System.nanoTime();
++            copySet = new HashSet<>(LARGE_SET);
++            raw[i] = System.nanoTime() - t0;
++        }
++        logStats(copySet, raw);
++    }
++
++    @Test
++    public void copyHashSet_Size3() {
++        Set<RangeNotifier> copySet = null;
++        double[] raw = new double[SAMPLE_SIZE];
++        for (int i = 0; i < WARMUP_SIZE; i++) {
++            copySet = new HashSet<>(SMALL_SET);
++        }
++        System.gc();
++        for (int i = 0; i < raw.length; i++) {
++            long t0 = System.nanoTime();
++            copySet = new HashSet<>(SMALL_SET);
++            raw[i] = System.nanoTime() - t0;
++        }
++        logStats(copySet, raw);
++    }
++
++    @Test
++    public void copyUnmodifiableSet_Size1() {
++        Set<RangeNotifier> copySet = null;
++        double[] raw = new double[SAMPLE_SIZE];
++        for (int i = 0; i < WARMUP_SIZE; i++) {
++            copySet = new HashSet<>(SINGLE_SET);
++        }
++        System.gc();
++        for (int i = 0; i < raw.length; i++) {
++            long t0 = System.nanoTime();
++            copySet = Collections.unmodifiableSet(SINGLE_SET);
++            raw[i] = System.nanoTime() - t0;
++        }
++        logStats(copySet, raw);
++    }
++
++    @Test
++    public void copyUnmodifiableSet_Size10() {
++        Set<RangeNotifier> copySet = null;
++        double[] raw = new double[SAMPLE_SIZE];
++        for (int i = 0; i < WARMUP_SIZE; i++) {
++            copySet = new HashSet<>(MEDIUM_SET);
++        }
++        System.gc();
++        for (int i = 0; i < raw.length; i++) {
++            long t0 = System.nanoTime();
++            copySet = Collections.unmodifiableSet(MEDIUM_SET);
++            raw[i] = System.nanoTime() - t0;
++        }
++        logStats(copySet, raw);
++    }
++
++    @Test
++    public void copyUnmodifiableSet_Size20() {
++        Set<RangeNotifier> copySet = null;
++        double[] raw = new double[SAMPLE_SIZE];
++        for (int i = 0; i < WARMUP_SIZE; i++) {
++            copySet = new HashSet<>(LARGE_SET);
++        }
++        System.gc();
++        for (int i = 0; i < raw.length; i++) {
++            long t0 = System.nanoTime();
++            copySet = Collections.unmodifiableSet(LARGE_SET);
++            raw[i] = System.nanoTime() - t0;
++        }
++        logStats(copySet, raw);
++    }
++
++    @Test
++    public void copyUnmodifiableSet_Size3() {
++        Set<RangeNotifier> copySet = null;
++        double[] raw = new double[SAMPLE_SIZE];
++        for (int i = 0; i < WARMUP_SIZE; i++) {
++            copySet = new HashSet<>(SMALL_SET);
++        }
++        System.gc();
++        for (int i = 0; i < raw.length; i++) {
++            long t0 = System.nanoTime();
++            copySet = Collections.unmodifiableSet(SMALL_SET);
++            raw[i] = System.nanoTime() - t0;
++        }
++        logStats(copySet, raw);
++    }
++
++    private void logStats(Set<?> set, double[] raw) {
++        DescriptiveStatistics descStats = new DescriptiveStatistics(raw);
++        Log.i(
++                TAG,
++                String.format(
++                        Locale.US,
++                        STAT_FORMAT,
++                        set.getClass().getSimpleName(),
++                        set.size(),
++                        descStats.getN(),
++                        Math.round(descStats.getMin()),
++                        Math.round(descStats.getMax()),
++                        Math.round(descStats.getMean()),
++                        descStats.getStandardDeviation(),
++                        descStats.getVariance()
++                )
++        );
++    }
++}
+diff --git a/src/main/java/org/altbeacon/beacon/BeaconManager.java b/src/main/java/org/altbeacon/beacon/BeaconManager.java
+index 242f19a0..85dde8df 100644
+--- a/src/main/java/org/altbeacon/beacon/BeaconManager.java
++++ b/src/main/java/org/altbeacon/beacon/BeaconManager.java
+@@ -35,6 +35,8 @@
+ import android.os.Message;
+ import android.os.Messenger;
+ import android.os.RemoteException;
++import android.support.annotation.NonNull;
++import android.support.annotation.Nullable;
+ 
+ import org.altbeacon.beacon.logging.LogManager;
+ import org.altbeacon.beacon.logging.Loggers;
+@@ -46,6 +48,7 @@
+ import org.altbeacon.beacon.service.RegionMonitoringState;
+ import org.altbeacon.beacon.service.RunningAverageRssiFilter;
+ import org.altbeacon.beacon.service.ScanJob;
++import org.altbeacon.beacon.service.ScanJobScheduler;
+ import org.altbeacon.beacon.service.ScanState;
+ import org.altbeacon.beacon.service.SettingsData;
+ import org.altbeacon.beacon.service.StartRMData;
+@@ -55,6 +58,7 @@
+ 
+ import java.util.ArrayList;
+ import java.util.Collection;
++import java.util.Collections;
+ import java.util.Iterator;
+ import java.util.List;
+ import java.util.Map;
+@@ -115,23 +119,46 @@
+  * @author Andrew Reitz <andrew@andrewreitz.com>
+  */
+ public class BeaconManager {
++    @NonNull
+     private static final String TAG = "BeaconManager";
+-    private Context mContext;
++
++    @NonNull
++    private final Context mContext;
++
++    @Nullable
+     protected static volatile BeaconManager sInstance = null;
+-    private final ConcurrentMap<BeaconConsumer, ConsumerInfo> consumers = new ConcurrentHashMap<BeaconConsumer,ConsumerInfo>();
++
++    @NonNull
++    private final ConcurrentMap<BeaconConsumer, ConsumerInfo> consumers = new ConcurrentHashMap<>();
++
++    @Nullable
+     private Messenger serviceMessenger = null;
++
++    @NonNull
+     protected final Set<RangeNotifier> rangeNotifiers = new CopyOnWriteArraySet<>();
++
++    @Nullable
+     protected RangeNotifier dataRequestNotifier = null;
++
++    @NonNull
+     protected final Set<MonitorNotifier> monitorNotifiers = new CopyOnWriteArraySet<>();
+-    private final ArrayList<Region> rangedRegions = new ArrayList<Region>();
++
++    @NonNull
++    private final ArrayList<Region> rangedRegions = new ArrayList<>();
++
++    @NonNull
+     private final List<BeaconParser> beaconParsers = new CopyOnWriteArrayList<>();
++
++    @Nullable
+     private NonBeaconLeScanCallback mNonBeaconLeScanCallback;
++
+     private boolean mRegionStatePersistenceEnabled = true;
+     private boolean mBackgroundMode = false;
+     private boolean mBackgroundModeUninitialized = true;
+     private boolean mMainProcess = false;
+-    private Boolean mScannerInSameProcess = null;
+     private boolean mScheduledScanJobsEnabled = false;
++    @Nullable
++    private Boolean mScannerInSameProcess = null;
+ 
+     private static boolean sAndroidLScanningDisabled = false;
+     private static boolean sManifestCheckingDisabled = false;
+@@ -241,8 +268,9 @@ public void setBackgroundBetweenScanPeriod(long p) {
+      */
+     public static void setRegionExitPeriod(long regionExitPeriod){
+         sExitRegionPeriod = regionExitPeriod;
+-        if (sInstance != null) {
+-            sInstance.applySettings();
++        BeaconManager instance = sInstance;
++        if (instance != null) {
++            instance.applySettings();
+         }
+     }
+     
+@@ -259,7 +287,8 @@ public static long getRegionExitPeriod(){
+      * An accessor for the singleton instance of this class.  A context must be provided, but if you need to use it from a non-Activity
+      * or non-Service class, you can attach it to another singleton or a subclass of the Android Application class.
+      */
+-    public static BeaconManager getInstanceForApplication(Context context) {
++    @NonNull
++    public static BeaconManager getInstanceForApplication(@NonNull Context context) {
+         /*
+          * Follow double check pattern from Effective Java v2 Item 71.
+          *
+@@ -285,7 +314,7 @@ public static BeaconManager getInstanceForApplication(Context context) {
+         return instance;
+     }
+ 
+-    protected BeaconManager(Context context) {
++    protected BeaconManager(@NonNull Context context) {
+         mContext = context.getApplicationContext();
+         checkIfMainProcess();
+         if (!sManifestCheckingDisabled) {
+@@ -340,6 +369,7 @@ protected void checkIfMainProcess() {
+      *
+      * @return list of active BeaconParsers
+      */
++   @NonNull
+     public List<BeaconParser> getBeaconParsers() {
+         return beaconParsers;
+     }
+@@ -365,7 +395,7 @@ public boolean checkAvailability() throws BleNotAvailableException {
+      *
+      * @param consumer the <code>Activity</code> or <code>Service</code> that will receive the callback when the service is ready.
+      */
+-    public void bind(BeaconConsumer consumer) {
++    public void bind(@NonNull BeaconConsumer consumer) {
+         if (!isBleAvailable()) {
+             LogManager.w(TAG, "Method invocation will be ignored.");
+             return;
+@@ -406,7 +436,7 @@ public void bind(BeaconConsumer consumer) {
+      *
+      * @param consumer the <code>Activity</code> or <code>Service</code> that no longer needs to use the service.
+      */
+-    public void unbind(BeaconConsumer consumer) {
++    public void unbind(@NonNull BeaconConsumer consumer) {
+         if (!isBleAvailable()) {
+             LogManager.w(TAG, "Method invocation will be ignored.");
+             return;
+@@ -443,8 +473,10 @@ public void unbind(BeaconConsumer consumer) {
+      * @param consumer
+      * @return
+      */
+-    public boolean isBound(BeaconConsumer consumer) {
++    public boolean isBound(@NonNull BeaconConsumer consumer) {
+         synchronized(consumers) {
++            // Annotation doesn't guarantee we get a non-null, but raising an NPE here is excessive
++            //noinspection ConstantConditions
+             return consumer != null && consumers.get(consumer) != null && (serviceMessenger != null);
+         }
+     }
+@@ -456,7 +488,7 @@ public boolean isBound(BeaconConsumer consumer) {
+      */
+     public boolean isAnyConsumerBound() {
+         synchronized(consumers) {
+-            return consumers.size() > 0 && (serviceMessenger != null);
++            return consumers.isEmpty() && (serviceMessenger != null);
+         }
+     }
+ 
+@@ -537,11 +569,11 @@ public boolean isBackgroundModeUninitialized() {
+      * @deprecated replaced by (@link #addRangeNotifier)
+      */
+     @Deprecated
+-    public void setRangeNotifier(RangeNotifier notifier) {
+-        synchronized (rangeNotifiers) {
+-            rangeNotifiers.clear();
++    public void setRangeNotifier(@Nullable RangeNotifier notifier) {
++        rangeNotifiers.clear();
++        if (null != notifier) {
++            addRangeNotifier(notifier);
+         }
+-        addRangeNotifier(notifier);
+     }
+ 
+     /**
+@@ -555,11 +587,10 @@ public void setRangeNotifier(RangeNotifier notifier) {
+      * @param notifier The {@link RangeNotifier} to register.
+      * @see RangeNotifier
+      */
+-    public void addRangeNotifier(RangeNotifier notifier) {
++    public void addRangeNotifier(@NonNull RangeNotifier notifier) {
++        //noinspection ConstantConditions
+         if (notifier != null) {
+-            synchronized (rangeNotifiers) {
+-                rangeNotifiers.add(notifier);
+-            }
++            rangeNotifiers.add(notifier);
+         }
+     }
+ 
+@@ -569,19 +600,15 @@ public void addRangeNotifier(RangeNotifier notifier) {
+      * @param notifier The {@link RangeNotifier} to unregister.
+      * @see RangeNotifier
+      */
+-    public boolean removeRangeNotifier(RangeNotifier notifier) {
+-        synchronized (rangeNotifiers) {
+-            return rangeNotifiers.remove(notifier);
+-        }
++    public boolean removeRangeNotifier(@NonNull RangeNotifier notifier) {
++        return rangeNotifiers.remove(notifier);
+     }
+ 
+     /**
+      * Remove all the Range Notifiers.
+      */
+     public void removeAllRangeNotifiers() {
+-        synchronized (rangeNotifiers) {
+-            rangeNotifiers.clear();
+-        }
++        rangeNotifiers.clear();
+     }
+ 
+     /**
+@@ -599,14 +626,14 @@ public void removeAllRangeNotifiers() {
+      * @deprecated replaced by {@link #addMonitorNotifier}
+      */
+     @Deprecated
+-    public void setMonitorNotifier(MonitorNotifier notifier) {
++    public void setMonitorNotifier(@Nullable MonitorNotifier notifier) {
+         if (determineIfCalledFromSeparateScannerProcess()) {
+             return;
+         }
+-        synchronized (monitorNotifiers) {
+-            monitorNotifiers.clear();
++        monitorNotifiers.clear();
++        if (null != notifier) {
++            addMonitorNotifier(notifier);
+         }
+-        addMonitorNotifier(notifier);
+     }
+ 
+     /**
+@@ -622,14 +649,13 @@ public void setMonitorNotifier(MonitorNotifier notifier) {
+      * @see #startMonitoringBeaconsInRegion(Region)
+      * @see Region
+      */
+-    public void addMonitorNotifier(MonitorNotifier notifier) {
++    public void addMonitorNotifier(@NonNull MonitorNotifier notifier) {
+         if (determineIfCalledFromSeparateScannerProcess()) {
+             return;
+         }
++        //noinspection ConstantConditions
+         if (notifier != null) {
+-            synchronized (monitorNotifiers) {
+-                monitorNotifiers.add(notifier);
+-            }
++            monitorNotifiers.add(notifier);
+         }
+     }
+ 
+@@ -638,7 +664,7 @@ public void addMonitorNotifier(MonitorNotifier notifier) {
+      * @deprecated Misspelled. Replaced by {@link #removeMonitorNotifier}
+      */
+     @Deprecated
+-    public boolean removeMonitoreNotifier(MonitorNotifier notifier) {
++    public boolean removeMonitoreNotifier(@NonNull MonitorNotifier notifier) {
+         return removeMonitorNotifier(notifier);
+     }
+ 
+@@ -650,13 +676,11 @@ public boolean removeMonitoreNotifier(MonitorNotifier notifier) {
+      * @see #startMonitoringBeaconsInRegion(Region)
+      * @see Region
+      */
+-    public boolean removeMonitorNotifier(MonitorNotifier notifier) {
++    public boolean removeMonitorNotifier(@NonNull MonitorNotifier notifier) {
+         if (determineIfCalledFromSeparateScannerProcess()) {
+             return false;
+         }
+-        synchronized (monitorNotifiers) {
+-            return monitorNotifiers.remove(notifier);
+-        }
++        return monitorNotifiers.remove(notifier);
+     }
+ 
+     /**
+@@ -666,9 +690,7 @@ public void removeAllMonitorNotifiers() {
+         if (determineIfCalledFromSeparateScannerProcess()) {
+             return;
+         }
+-        synchronized (monitorNotifiers) {
+-            monitorNotifiers.clear();
+-        }
++        monitorNotifiers.clear();
+     }
+ 
+     /**
+@@ -715,7 +737,7 @@ public boolean isRegionStatePersistenceEnabled() {
+      * method.  If it is not a monitored region, it will be ignored.
+      * @param region
+      */
+-    public void requestStateForRegion(Region region) {
++    public void requestStateForRegion(@NonNull Region region) {
+         if (determineIfCalledFromSeparateScannerProcess()) {
+             return;
+         }
+@@ -725,10 +747,8 @@ public void requestStateForRegion(Region region) {
+         if (stateObj != null && stateObj.getInside()) {
+             state = MonitorNotifier.INSIDE;
+         }
+-        synchronized (monitorNotifiers) {
+-            for (MonitorNotifier notifier: monitorNotifiers) {
+-                notifier.didDetermineStateForRegion(state, region);
+-            }
++        for (MonitorNotifier notifier : monitorNotifiers) {
++            notifier.didDetermineStateForRegion(state, region);
+         }
+     }
+ 
+@@ -745,7 +765,7 @@ public void requestStateForRegion(Region region) {
+      * @see Region
+      */
+     @TargetApi(18)
+-    public void startRangingBeaconsInRegion(Region region) throws RemoteException {
++    public void startRangingBeaconsInRegion(@NonNull Region region) throws RemoteException {
+         if (!isBleAvailable()) {
+             LogManager.w(TAG, "Method invocation will be ignored.");
+             return;
+@@ -757,7 +777,7 @@ public void startRangingBeaconsInRegion(Region region) throws RemoteException {
+             rangedRegions.add(region);
+         }
+         if (mScheduledScanJobsEnabled) {
+-            ScanJob.applySettingsToScheduledJob(mContext, this);
++            ScanJobScheduler.getInstance().applySettingsToScheduledJob(mContext, this);
+         }
+         else {
+             if (serviceMessenger == null) {
+@@ -780,7 +800,7 @@ public void startRangingBeaconsInRegion(Region region) throws RemoteException {
+      * @see Region
+      */
+     @TargetApi(18)
+-    public void stopRangingBeaconsInRegion(Region region) throws RemoteException {
++    public void stopRangingBeaconsInRegion(@NonNull Region region) throws RemoteException {
+         if (!isBleAvailable()) {
+             LogManager.w(TAG, "Method invocation will be ignored.");
+             return;
+@@ -798,7 +818,7 @@ public void stopRangingBeaconsInRegion(Region region) throws RemoteException {
+             rangedRegions.remove(regionToRemove);
+         }
+         if (mScheduledScanJobsEnabled) {
+-            ScanJob.applySettingsToScheduledJob(mContext, this);
++            ScanJobScheduler.getInstance().applySettingsToScheduledJob(mContext, this);
+         }
+         else {
+             if (serviceMessenger == null) {
+@@ -819,29 +839,25 @@ public void applySettings() {
+         if (determineIfCalledFromSeparateScannerProcess()) {
+             return;
+         }
+-        if (isAnyConsumerBound() && !isScannerInDifferentProcess() == false) {
++        if (!isAnyConsumerBound()) {
++            LogManager.d(TAG, "Not synchronizing settings to service, as it has not started up yet");
++        } else if (isScannerInDifferentProcess()) {
+             LogManager.d(TAG, "Synchronizing settings to service");
+             syncSettingsToService();
+-        }
+-        else {
+-            if (isAnyConsumerBound() == false) {
+-                LogManager.d(TAG, "Not synchronizing settings to service, as it has not started up yet");
+-
+-            }
+-            else {
+-                LogManager.d(TAG, "Not synchronizing settings to service, as it is in the same process");
+-            }
++        } else {
++            LogManager.d(TAG, "Not synchronizing settings to service, as it is in the same process");
+         }
+     }
+ 
+     protected void syncSettingsToService() {
++        if (mScheduledScanJobsEnabled) {
++            ScanJobScheduler.getInstance().applySettingsToScheduledJob(mContext, this);
++            return;
++        }
+         if (serviceMessenger == null) {
+             LogManager.e(TAG, "The BeaconManager is not bound to the service.  Settings synchronization will fail.");
+             return;
+         }
+-        if (mScheduledScanJobsEnabled) {
+-            ScanJob.applySettingsToScheduledJob(mContext, this);
+-        }
+         else {
+             try {
+                 Message msg = Message.obtain(null, BeaconService.MSG_SYNC_SETTINGS, 0, 0);
+@@ -866,7 +882,7 @@ protected void syncSettingsToService() {
+      * @see Region
+      */
+     @TargetApi(18)
+-    public void startMonitoringBeaconsInRegion(Region region) throws RemoteException {
++    public void startMonitoringBeaconsInRegion(@NonNull Region region) throws RemoteException {
+         if (!isBleAvailable()) {
+             LogManager.w(TAG, "Method invocation will be ignored.");
+             return;
+@@ -876,7 +892,7 @@ public void startMonitoringBeaconsInRegion(Region region) throws RemoteException
+         }
+         if (mScheduledScanJobsEnabled) {
+             MonitoringStatus.getInstanceForApplication(mContext).addRegion(region, new Callback(callbackPackageName()));
+-            ScanJob.applySettingsToScheduledJob(mContext, this);
++            ScanJobScheduler.getInstance().applySettingsToScheduledJob(mContext, this);
+         }
+         else {
+             if (serviceMessenger == null) {
+@@ -905,7 +921,7 @@ public void startMonitoringBeaconsInRegion(Region region) throws RemoteException
+      * @see Region
+      */
+     @TargetApi(18)
+-    public void stopMonitoringBeaconsInRegion(Region region) throws RemoteException {
++    public void stopMonitoringBeaconsInRegion(@NonNull Region region) throws RemoteException {
+         if (!isBleAvailable()) {
+             LogManager.w(TAG, "Method invocation will be ignored.");
+             return;
+@@ -915,7 +931,7 @@ public void stopMonitoringBeaconsInRegion(Region region) throws RemoteException
+         }
+         if (mScheduledScanJobsEnabled) {
+             MonitoringStatus.getInstanceForApplication(mContext).removeRegion(region);
+-            ScanJob.applySettingsToScheduledJob(mContext, this);
++            ScanJobScheduler.getInstance().applySettingsToScheduledJob(mContext, this);
+         }
+         else {
+             if (serviceMessenger == null) {
+@@ -949,7 +965,7 @@ public void updateScanPeriods() throws RemoteException {
+         LogManager.d(TAG, "updating background flag to %s", mBackgroundMode);
+         LogManager.d(TAG, "updating scan period to %s, %s", this.getScanPeriod(), this.getBetweenScanPeriod());
+         if (mScheduledScanJobsEnabled) {
+-            ScanJob.applySettingsToScheduledJob(mContext, this);
++            ScanJobScheduler.getInstance().applySettingsToScheduledJob(mContext, this);
+         }
+         else {
+             if (serviceMessenger == null) {
+@@ -972,20 +988,33 @@ private String callbackPackageName() {
+      * @deprecated replaced by (@link #getMonitorNotifiers)
+      */
+     @Deprecated
++    @Nullable
+     public MonitorNotifier getMonitoringNotifier() {
+-        synchronized (monitorNotifiers) {
+-            if (monitorNotifiers.size() > 0) {
+-                return monitorNotifiers.iterator().next();
+-            }
+-            return null;
++        Iterator<MonitorNotifier> iterator = monitorNotifiers.iterator();
++        if (iterator.hasNext()) {
++            return iterator.next();
+         }
++        return null;
+     }
+ 
+     /**
+-     * @return the list of registered monitorNotifier
++     * Read-only access to the registered {@link MonitorNotifier} instances
++     * <p>
++     * This provides a thread-safe "read-only" view of the {@link Set} of registered monitor
++     * notifiers. Attempts to modify the returned set, or its iterator, will throw an
++     * {@link UnsupportedOperationException}. Modifications to the underlying set should be made
++     * through {@link #addMonitorNotifier(MonitorNotifier)} and
++     * {@link #removeMonitorNotifier(MonitorNotifier)}.
++     *
++     * @return a thread-safe {@linkplain Collections#unmodifiableSet(Set) unmodifiable view}
++     * providing "read-only" access to the registered {@link MonitorNotifier} instances
++     * @see #addMonitorNotifier(MonitorNotifier)
++     * @see #removeMonitorNotifier(MonitorNotifier)
++     * @see Collections#unmodifiableSet(Set)
+      */
++    @NonNull
+     public Set<MonitorNotifier> getMonitoringNotifiers(){
+-        return monitorNotifiers;
++        return Collections.unmodifiableSet(monitorNotifiers);
+     }
+ 
+     /**
+@@ -993,25 +1022,39 @@ public MonitorNotifier getMonitoringNotifier() {
+      * @deprecated replaced by (@link #getRangeNotifiers)
+      */
+     @Deprecated
++    @Nullable
+     public RangeNotifier getRangingNotifier() {
+-        synchronized (rangeNotifiers) {
+-            if (rangeNotifiers.size() > 0) {
+-                return rangeNotifiers.iterator().next();
+-            }
+-            return null;
++        Iterator<RangeNotifier> iterator = rangeNotifiers.iterator();
++        if (iterator.hasNext()) {
++            return iterator.next();
+         }
++        return null;
+     }
+ 
+     /**
+-     * @return the list of registered rangeNotifier
++     * Read-only access to the registered {@link RangeNotifier} instances
++     * <p>
++     * This provides a thread-safe "read-only" view of the {@link Set} of registered range
++     * notifiers. Attempts to modify the returned set, or its iterator, will throw an
++     * {@link UnsupportedOperationException}. Modifications to the underlying set should be made
++     * through {@link #addRangeNotifier(RangeNotifier)} and
++     * {@link #removeRangeNotifier(RangeNotifier)}.
++     *
++     * @return a thread-safe {@linkplain Collections#unmodifiableSet(Set) unmodifiable view}
++     * providing "read-only" access to the registered {@link RangeNotifier} instances
++     * @see #addRangeNotifier(RangeNotifier)
++     * @see #removeRangeNotifier(RangeNotifier)
++     * @see Collections#unmodifiableSet(Set)
+      */
++    @NonNull
+     public Set<RangeNotifier> getRangingNotifiers() {
+-        return rangeNotifiers;
++        return Collections.unmodifiableSet(rangeNotifiers);
+     }
+ 
+     /**
+      * @return the list of regions currently being monitored
+      */
++    @NonNull
+     public Collection<Region> getMonitoredRegions() {
+         return MonitoringStatus.getInstanceForApplication(mContext).regions();
+     }
+@@ -1019,9 +1062,10 @@ public RangeNotifier getRangingNotifier() {
+     /**
+      * @return the list of regions currently being ranged
+      */
++    @NonNull
+     public Collection<Region> getRangedRegions() {
+         synchronized(this.rangedRegions) {
+-            return new ArrayList<Region>(this.rangedRegions);
++            return new ArrayList<>(this.rangedRegions);
+         }
+     }
+ 
+@@ -1053,6 +1097,7 @@ public static void logDebug(String tag, String message, Throwable t) {
+         LogManager.d(t, tag, message);
+     }
+ 
++    @Nullable
+     protected static BeaconSimulator beaconSimulator;
+ 
+     protected static String distanceModelUpdateUrl = "http://data.altbeacon.org/android-distance.json";
+@@ -1061,7 +1106,7 @@ public static String getDistanceModelUpdateUrl() {
+         return distanceModelUpdateUrl;
+     }
+ 
+-    public static void setDistanceModelUpdateUrl(String url) {
++    public static void setDistanceModelUpdateUrl(@NonNull String url) {
+         warnIfScannerNotInSameProcess();
+         distanceModelUpdateUrl = url;
+     }
+@@ -1071,7 +1116,7 @@ public static void setDistanceModelUpdateUrl(String url) {
+      */
+     protected static Class rssiFilterImplClass = RunningAverageRssiFilter.class;
+ 
+-    public static void setRssiFilterImplClass(Class c) {
++    public static void setRssiFilterImplClass(@NonNull Class c) {
+         warnIfScannerNotInSameProcess();
+         rssiFilterImplClass = c;
+     }
+@@ -1105,24 +1150,27 @@ public static void setBeaconSimulator(BeaconSimulator beaconSimulator) {
+         BeaconManager.beaconSimulator = beaconSimulator;
+     }
+ 
++    @Nullable
+     public static BeaconSimulator getBeaconSimulator() {
+         return BeaconManager.beaconSimulator;
+     }
+ 
+ 
+-    protected void setDataRequestNotifier(RangeNotifier notifier) {
++    protected void setDataRequestNotifier(@Nullable RangeNotifier notifier) {
+         this.dataRequestNotifier = notifier;
+     }
+ 
++    @Nullable
+     protected RangeNotifier getDataRequestNotifier() {
+         return this.dataRequestNotifier;
+     }
+ 
++    @Nullable
+     public NonBeaconLeScanCallback getNonBeaconLeScanCallback() {
+         return mNonBeaconLeScanCallback;
+     }
+ 
+-    public void setNonBeaconLeScanCallback(NonBeaconLeScanCallback callback) {
++    public void setNonBeaconLeScanCallback(@Nullable NonBeaconLeScanCallback callback) {
+         mNonBeaconLeScanCallback = callback;
+     }
+ 
+@@ -1167,6 +1215,8 @@ private void verifyServiceDeclaration() {
+ 
+     private class ConsumerInfo {
+         public boolean isConnected = false;
++
++        @NonNull
+         public BeaconServiceConnection beaconServiceConnection;
+ 
+         public ConsumerInfo() {
+@@ -1233,8 +1283,9 @@ public static boolean isAndroidLScanningDisabled() {
+      */
+     public static void setAndroidLScanningDisabled(boolean disabled) {
+         sAndroidLScanningDisabled = disabled;
+-        if (sInstance != null) {
+-            sInstance.applySettings();
++        BeaconManager instance = sInstance;
++        if (instance != null) {
++            instance.applySettings();
+         }
+     }
+ 
+@@ -1276,7 +1327,8 @@ private boolean determineIfCalledFromSeparateScannerProcess() {
+     }
+ 
+     private static void warnIfScannerNotInSameProcess() {
+-        if (sInstance != null && sInstance.isScannerInDifferentProcess()) {
++        BeaconManager instance = sInstance;
++        if (instance != null && instance.isScannerInDifferentProcess()) {
+             LogManager.w(TAG,
+                     "Unsupported configuration change made for BeaconScanner in separate process");
+         }
+diff --git a/src/main/java/org/altbeacon/beacon/distance/ModelSpecificDistanceCalculator.java b/src/main/java/org/altbeacon/beacon/distance/ModelSpecificDistanceCalculator.java
+index 42f7db77..4688c15c 100644
+--- a/src/main/java/org/altbeacon/beacon/distance/ModelSpecificDistanceCalculator.java
++++ b/src/main/java/org/altbeacon/beacon/distance/ModelSpecificDistanceCalculator.java
+@@ -189,8 +189,12 @@ private boolean loadModelMapFromFile() {
+             buildModelMapWithLock(sb.toString());
+             return true;
+         } catch (JSONException e) {
+-            LogManager.e(TAG, "Cannot update distance models from online database at %s with JSON",
+-                    e, mRemoteUpdateUrlString, sb.toString());
++            LogManager.e(
++                    e,
++                    TAG,
++                    "Cannot update distance models from online database at %s with JSON: %s",
++                    mRemoteUpdateUrlString, sb.toString()
++            );
+             return false;
+         }
+     }
+diff --git a/src/main/java/org/altbeacon/beacon/powersave/BackgroundPowerSaver.java b/src/main/java/org/altbeacon/beacon/powersave/BackgroundPowerSaver.java
+index ff6186c9..1349ad49 100644
+--- a/src/main/java/org/altbeacon/beacon/powersave/BackgroundPowerSaver.java
++++ b/src/main/java/org/altbeacon/beacon/powersave/BackgroundPowerSaver.java
+@@ -5,36 +5,37 @@
+ import android.app.Application;
+ import android.content.Context;
+ import android.os.Bundle;
++import android.support.annotation.NonNull;
+ 
+ import org.altbeacon.beacon.BeaconManager;
+ import org.altbeacon.beacon.logging.LogManager;
+ 
+ /**
+- *
+  * Simply creating an instance of this class and holding a reference to it in your Application can
+  * improve battery life by 60% by slowing down scans when your app is in the background.
+- *
+  */
+ @TargetApi(18)
+ public class BackgroundPowerSaver implements Application.ActivityLifecycleCallbacks {
++    @NonNull
+     private static final String TAG = "BackgroundPowerSaver";
+-    private BeaconManager beaconManager;
++
++    @NonNull
++    private final BeaconManager beaconManager;
++
+     private int activeActivityCount = 0;
+ 
+     /**
+-     *
+      * Constructs a new BackgroundPowerSaver
+      *
+-     * @param context
+-     * @deprecated the countActiveActivityStrategy flag is no longer used.
+-     *
++     * @deprecated the {@code countActiveActivityStrategy} flag is no longer used. Use
++     * {@link #BackgroundPowerSaver(Context)}
+      */
++    @Deprecated
+     public BackgroundPowerSaver(Context context, boolean countActiveActivityStrategy) {
+         this(context);
+     }
+ 
+     /**
+-     *
+      * Constructs a new BackgroundPowerSaver using the default background determination strategy
+      *
+      * @param context
+@@ -42,7 +43,6 @@ public BackgroundPowerSaver(Context context, boolean countActiveActivityStrategy
+     public BackgroundPowerSaver(Context context) {
+         if (android.os.Build.VERSION.SDK_INT < 18) {
+             LogManager.w(TAG, "BackgroundPowerSaver requires API 18 or higher.");
+-            return;
+         }
+         beaconManager = BeaconManager.getInstanceForApplication(context);
+         ((Application)context.getApplicationContext()).registerActivityLifecycleCallbacks(this);
+@@ -70,7 +70,12 @@ public void onActivityResumed(Activity activity) {
+     @Override
+     public void onActivityPaused(Activity activity) {
+         activeActivityCount--;
+-        LogManager.d(TAG, "activity paused: %s active activities: %s", activity, activeActivityCount);
++        LogManager.d(
++                TAG,
++                "activity paused: %s active activities: %s",
++                activity,
++                activeActivityCount
++        );
+         if (activeActivityCount < 1) {
+             LogManager.d(TAG, "setting background mode");
+             beaconManager.setBackgroundMode(true);
+diff --git a/src/main/java/org/altbeacon/beacon/service/BeaconService.java b/src/main/java/org/altbeacon/beacon/service/BeaconService.java
+index 63f38787..3a50855a 100644
+--- a/src/main/java/org/altbeacon/beacon/service/BeaconService.java
++++ b/src/main/java/org/altbeacon/beacon/service/BeaconService.java
+@@ -39,6 +39,7 @@
+ import android.os.IBinder;
+ import android.os.Message;
+ import android.os.Messenger;
++import android.support.annotation.NonNull;
+ 
+ import org.altbeacon.beacon.Beacon;
+ import org.altbeacon.beacon.BeaconManager;
+@@ -93,7 +94,7 @@
+     private ExtraDataBeaconTracker mExtraDataBeaconTracker;
+     private ExecutorService mExecutor;
+     private final DistinctPacketDetector mDistinctPacketDetector = new DistinctPacketDetector();
+-    
++
+     /*
+      * The scan period is how long we wait between restarting the BLE advertisement scans
+      * Each time we restart we only see the unique advertisements once (e.g. unique beacons)
+@@ -476,16 +477,23 @@ private void processBeaconFromScan(Beacon beacon) {
+     }
+ 
+ 
+-    private class ScanData {
+-        public ScanData(BluetoothDevice device, int rssi, byte[] scanRecord) {
++    /**
++     * <strong>This class is not thread safe.</strong>
++     */
++    private static class ScanData {
++        ScanData(@NonNull BluetoothDevice device, int rssi, @NonNull byte[] scanRecord) {
+             this.device = device;
+             this.rssi = rssi;
+             this.scanRecord = scanRecord;
+         }
+ 
+-        int rssi;
+-        BluetoothDevice device;
+-        byte[] scanRecord;
++        final int rssi;
++
++        @NonNull
++        final BluetoothDevice device;
++
++        @NonNull
++        final byte[] scanRecord;
+     }
+ 
+     private class ScanProcessor extends AsyncTask<ScanData, Void, Void> {
+@@ -502,7 +510,7 @@ protected Void doInBackground(ScanData... params) {
+             ScanData scanData = params[0];
+             Beacon beacon = null;
+ 
+-            for (BeaconParser parser : BeaconService.this.beaconParsers) {
++            for (BeaconParser parser : beaconParsers) {
+                 beacon = parser.fromScanData(scanData.scanRecord,
+                         scanData.rssi, scanData.device);
+ 
+@@ -518,7 +526,7 @@ protected Void doInBackground(ScanData... params) {
+                 if (!mCycledScanner.getDistinctPacketsDetectedPerScan()) {
+                     if (!mDistinctPacketDetector.isPacketDistinct(scanData.device.getAddress(),
+                             scanData.scanRecord)) {
+-                        LogManager.i(TAG, "Non-distinct packets detected in a single scan.  Restarting scans unecessary.");
++                        LogManager.i(TAG, "Non-distinct packets detected in a single scan.  Restarting scans unnecessary.");
+                         mCycledScanner.setDistinctPacketsDetectedPerScan(true);
+                     }
+                 }
+diff --git a/src/main/java/org/altbeacon/beacon/service/ScanJob.java b/src/main/java/org/altbeacon/beacon/service/ScanJob.java
+index 6cad816f..3c98fe92 100644
+--- a/src/main/java/org/altbeacon/beacon/service/ScanJob.java
++++ b/src/main/java/org/altbeacon/beacon/service/ScanJob.java
+@@ -7,6 +7,7 @@
+ import android.app.job.JobService;
+ import android.bluetooth.BluetoothDevice;
+ import android.bluetooth.le.ScanFilter;
++import android.bluetooth.le.ScanResult;
+ import android.bluetooth.le.ScanSettings;
+ import android.content.ComponentName;
+ import android.content.Context;
+@@ -58,6 +59,14 @@
+ @TargetApi(Build.VERSION_CODES.LOLLIPOP)
+ public class ScanJob extends JobService {
+     private static final String TAG = ScanJob.class.getSimpleName();
++    public static final int PERIODIC_SCAN_JOB_ID = 1;
++    /*
++        Periodic scan jobs are used in general, but they cannot be started immediately.  So we have
++        a second immediate scan job to kick off when scanning gets started or settings changed.
++        Once the periodic one gets run, the immediate is cancelled.
++     */
++    public static final int IMMMEDIATE_SCAN_JOB_ID = 2;
++
+     private ScanState mScanState;
+     private Handler mStopHandler = new Handler();
+ 
+@@ -76,13 +85,27 @@
+     @Override
+     public boolean onStartJob(final JobParameters jobParameters) {
+         JobScheduler jobScheduler = (JobScheduler) this.getSystemService(Context.JOB_SCHEDULER_SERVICE);
+-        if (jobParameters.getJobId() == sPeriodicScanJobId) {
+-            LogManager.i(TAG, "Running periodic scan job: instance is "+this);
++        if (jobParameters.getJobId() == IMMMEDIATE_SCAN_JOB_ID) {
++            LogManager.i(TAG, "Running immdiate scan job: instance is "+this);
+         }
+         else {
+-            LogManager.i(TAG, "Running immediate scan job: instance is "+this);
++            LogManager.i(TAG, "Running periodic scan job: instance is "+this);
+         }
+         mExecutor = Executors.newFixedThreadPool(Runtime.getRuntime().availableProcessors() + 1);
++        NonBeaconLeScanCallback nonBeaconLeScanCallback = BeaconManager.getInstanceForApplication(this).getNonBeaconLeScanCallback();
++
++        List<ScanResult> queuedScanResults = ScanJobScheduler.getInstance().dumpBackgroundScanResultQueue();
++        LogManager.d(TAG, "Processing %d queued scan resuilts", queuedScanResults.size());
++        for (ScanResult result : queuedScanResults) {
++            try {
++                new ScanJob.ScanProcessor(nonBeaconLeScanCallback).executeOnExecutor(mExecutor,
++                        new ScanJob.ScanData(result.getDevice(), result.getRssi(), result.getScanRecord().getBytes()));
++            } catch (RejectedExecutionException e) {
++                LogManager.w(TAG, "Ignoring queued scan result because we cannot keep up.");
++            }
++        }
++        LogManager.d(TAG, "Done processing queued scan resuilts");
++
+         boolean startedScan = false;
+         if (mInitialized) {
+             LogManager.d(TAG, "Scanning already started.  Resetting for current parameters");
+@@ -146,7 +169,7 @@ private void startPassiveScanIfNeeded() {
+ 
+     @Override
+     public boolean onStopJob(JobParameters params) {
+-        if (params.getJobId() == sPeriodicScanJobId) {
++        if (params.getJobId() == PERIODIC_SCAN_JOB_ID) {
+             LogManager.i(TAG, "onStopJob called for periodic scan");
+         }
+         else {
+@@ -211,105 +234,9 @@ private void stopScanning() {
+         LogManager.d(TAG, "Scanning stopped");
+     }
+ 
+-    //TODO: Move this and the static methods below to its own utility class
+-
+-    /*
+-        Periodic scan jobs are used in general, but they cannot be started immediately.  So we have
+-        a second immediate scan job to kick off when scanning gets started or settings changed.
+-        Once the periodic one gets run, the immediate is cancelled.
+-     */
+-    private static int sImmediateScanJobId = 1; // TODO: make this configurable
+-    private static int sPeriodicScanJobId = 2; // TODO: make this configurable
+-
+-    private static void applySettingsToScheduledJob(Context context, BeaconManager beaconManager, ScanState scanState) {
+-        scanState.applyChanges(beaconManager);
+-        LogManager.d(TAG, "Applying scan job settings with background mode "+scanState.getBackgroundMode());
+-        schedule(context, scanState, false);
+-    }
+-
+-    public static void applySettingsToScheduledJob(Context context, BeaconManager beaconManager) {
+-        LogManager.d(TAG, "Applying settings to ScanJob");
+-        JobScheduler jobScheduler = (JobScheduler) context.getSystemService(Context.JOB_SCHEDULER_SERVICE);
+-        ScanState scanState = ScanState.restore(context);
+-        applySettingsToScheduledJob(context, beaconManager, scanState);
+-    }
+-
+-    public static void scheduleAfterBackgroundWakeup(Context context) {
+-        ScanState scanState = ScanState.restore(context);
+-        schedule(context, scanState, true);
+-    }
+-    /**
+-     *
+-     * @param context
+-     */
+-    public static void schedule(Context context, ScanState scanState, boolean backgroundWakeup) {
+-        long betweenScanPeriod = scanState.getScanJobIntervalMillis() - scanState.getScanJobRuntimeMillis();
+-
+-        long millisToNextJobStart = scanState.getScanJobIntervalMillis();
+-        if (backgroundWakeup) {
+-            LogManager.d(TAG, "We just woke up in the background based on a new scan result.  Start scan job immediately.");
+-            millisToNextJobStart = 0;
+-        }
+-        else {
+-            if (betweenScanPeriod > 0) {
+-                // If we pause between scans, then we need to start scanning on a normalized time
+-                millisToNextJobStart = (SystemClock.elapsedRealtime() % scanState.getScanJobIntervalMillis());
+-            }
+-            else {
+-                millisToNextJobStart = 0;
+-            }
+-
+-            if (millisToNextJobStart < 50) {
+-                // always wait a little bit to start scanning in case settings keep changing.
+-                // by user restarting settings and scanning.  50ms should be fine
+-                millisToNextJobStart = 50;
+-            }
+-        }
+-
+-        JobScheduler jobScheduler = (JobScheduler) context.getSystemService(Context.JOB_SCHEDULER_SERVICE);
+-
+-        if (backgroundWakeup || !scanState.getBackgroundMode()) {
+-            // If we are in the foreground, and we want to start a scan soon, we will schedule an
+-            // immediate job
+-            if (millisToNextJobStart < scanState.getScanJobIntervalMillis() - 50) {
+-                // If the next time we want to scan is less than 50ms from the periodic scan cycle, then]
+-                // we schedule it for that specific time.
+-                LogManager.d(TAG, "Scheduling immediate ScanJob to run in "+millisToNextJobStart+" millis");
+-                JobInfo immediateJob = new JobInfo.Builder(sImmediateScanJobId, new ComponentName(context, ScanJob.class))
+-                        .setPersisted(true) // This makes it restart after reboot
+-                        .setExtras(new PersistableBundle())
+-                        .setMinimumLatency(millisToNextJobStart)
+-                        .setOverrideDeadline(millisToNextJobStart).build();
+-                int error = jobScheduler.schedule(immediateJob);
+-                if (error < 0) {
+-                    LogManager.e(TAG, "Failed to schedule scan job.  Beacons will not be detected. Error: "+error);
+-                }
+-            }
+-        }
+-        else {
+-            LogManager.d(TAG, "Not scheduling an immediate scan because we are in background mode.   Cancelling existing immediate scan.");
+-            jobScheduler.cancel(sImmediateScanJobId);
+-        }
+ 
+-        JobInfo.Builder periodicJobBuilder = new JobInfo.Builder(sPeriodicScanJobId, new ComponentName(context, ScanJob.class))
+-                .setPersisted(true) // This makes it restart after reboot
+-                .setExtras(new PersistableBundle());
+ 
+-        if (android.os.Build.VERSION.SDK_INT >= Build.VERSION_CODES.N) {
+-            // ON Android N+ we specify a tolerance of 0ms (capped at 5% by the OS) to ensure
+-            // our scans happen within 5% of the schduled time.
+-            periodicJobBuilder.setPeriodic(scanState.getScanJobIntervalMillis(), 0l).build();
+-        }
+-        else {
+-            periodicJobBuilder.setPeriodic(scanState.getScanJobIntervalMillis()).build();
+-        }
+ 
+-        LogManager.d(TAG, "Scheduling ScanJob to run every "+scanState.getScanJobIntervalMillis()+" millis");
+-        int error = jobScheduler.schedule(periodicJobBuilder.build());
+-        if (error < 0) {
+-            LogManager.e(TAG, "Failed to schedule scan job.  Beacons will not be detected. Error: "+error);
+-        }
+-    }
+ 
+   // ***********************
+   // Code below here copied from BeaconService -- refactor to a common class
+diff --git a/src/main/java/org/altbeacon/beacon/service/ScanJobScheduler.java b/src/main/java/org/altbeacon/beacon/service/ScanJobScheduler.java
+new file mode 100644
+index 00000000..92785406
+--- /dev/null
++++ b/src/main/java/org/altbeacon/beacon/service/ScanJobScheduler.java
+@@ -0,0 +1,215 @@
++package org.altbeacon.beacon.service;
++
++import android.app.job.JobInfo;
++import android.app.job.JobScheduler;
++import android.bluetooth.le.ScanResult;
++import android.content.ComponentName;
++import android.content.Context;
++import android.os.Build;
++import android.os.PersistableBundle;
++import android.os.SystemClock;
++import android.support.annotation.NonNull;
++import android.support.annotation.Nullable;
++
++import org.altbeacon.beacon.BeaconManager;
++import org.altbeacon.beacon.logging.LogManager;
++
++import java.util.ArrayList;
++import java.util.List;
++
++/**
++ * Created by dyoung on 6/7/17.
++ */
++
++public class ScanJobScheduler {
++    private static final String TAG = ScanJobScheduler.class.getSimpleName();
++    private static final Object SINGLETON_LOCK = new Object();
++    private static final long MIN_MILLIS_BETWEEN_SCAN_JOB_SCHEDULING = 10000l;
++    @Nullable
++    private static volatile ScanJobScheduler sInstance = null;
++    @NonNull
++    private Long mScanJobScheduleTime = 0l;
++    @NonNull
++    private List<ScanResult> mBackgroundScanResultQueue = new ArrayList<>();
++
++    @NonNull
++    public static ScanJobScheduler getInstance() {
++        ScanJobScheduler instance = sInstance;
++        if (instance == null) {
++            synchronized (SINGLETON_LOCK) {
++                instance = sInstance;
++                if (instance == null) {
++                    sInstance = instance = new ScanJobScheduler();
++                }
++            }
++        }
++        return instance;
++    }
++
++    protected ScanJobScheduler() {
++    }
++
++    /**
++     * Returns queued scan results delivered in the background
++     * @return
++     */
++    public List<ScanResult> dumpBackgroundScanResultQueue() {
++        List<ScanResult> retval = mBackgroundScanResultQueue;
++        mBackgroundScanResultQueue = new ArrayList<>();
++        return retval;
++    }
++
++    private void applySettingsToScheduledJob(Context context, BeaconManager beaconManager, ScanState scanState) {
++        scanState.applyChanges(beaconManager);
++        LogManager.d(TAG, "Applying scan job settings with background mode "+scanState.getBackgroundMode());
++        schedule(context, scanState, false);
++    }
++
++    public void applySettingsToScheduledJob(Context context, BeaconManager beaconManager) {
++        LogManager.d(TAG, "Applying settings to ScanJob");
++        JobScheduler jobScheduler = (JobScheduler) context.getSystemService(Context.JOB_SCHEDULER_SERVICE);
++        ScanState scanState = ScanState.restore(context);
++        applySettingsToScheduledJob(context, beaconManager, scanState);
++    }
++
++    public void scheduleAfterBackgroundWakeup(Context context, List<ScanResult> scanResults) {
++        if (scanResults != null) {
++            mBackgroundScanResultQueue.addAll(scanResults);
++        }
++        synchronized (mScanJobScheduleTime) {
++            // We typically get a bunch of calls in a row here, separated by a few millis.  Only do this once.
++            if (System.currentTimeMillis() - mScanJobScheduleTime > MIN_MILLIS_BETWEEN_SCAN_JOB_SCHEDULING) {
++                LogManager.d(TAG, "scheduling an immediate scan job because last did "+(System.currentTimeMillis() - mScanJobScheduleTime)+"seconds ago.");
++                mScanJobScheduleTime = System.currentTimeMillis();
++            }
++            else {
++                LogManager.d(TAG, "Not scheduling an immediate scan job because we just did recently.");
++                return;
++            }
++        }
++        ScanState scanState = ScanState.restore(context);
++        schedule(context, scanState, true);
++    }
++
++    /**
++     *
++     * @param context
++     */
++    public void schedule(Context context, ScanState scanState, boolean backgroundWakeup) {
++        long betweenScanPeriod = scanState.getScanJobIntervalMillis() - scanState.getScanJobRuntimeMillis();
++
++        long millisToNextJobStart = scanState.getScanJobIntervalMillis();
++        if (backgroundWakeup) {
++            LogManager.d(TAG, "We just woke up in the background based on a new scan result.  Start scan job immediately.");
++            millisToNextJobStart = 0;
++        }
++        else {
++            if (betweenScanPeriod > 0) {
++                // If we pause between scans, then we need to start scanning on a normalized time
++                millisToNextJobStart = (SystemClock.elapsedRealtime() % scanState.getScanJobIntervalMillis());
++            }
++            else {
++                millisToNextJobStart = 0;
++            }
++
++            if (millisToNextJobStart < 50) {
++                // always wait a little bit to start scanning in case settings keep changing.
++                // by user restarting settings and scanning.  50ms should be fine
++                millisToNextJobStart = 50;
++            }
++        }
++
++        JobScheduler jobScheduler = (JobScheduler) context.getSystemService(Context.JOB_SCHEDULER_SERVICE);
++
++        if (backgroundWakeup || !scanState.getBackgroundMode()) {
++            // If we are in the foreground, and we want to start a scan soon, we will schedule an
++            // immediate job
++            if (millisToNextJobStart < scanState.getScanJobIntervalMillis() - 50) {
++                // If the next time we want to scan is less than 50ms from the periodic scan cycle, then]
++                // we schedule it for that specific time.
++                LogManager.d(TAG, "Scheduling immediate ScanJob to run in "+millisToNextJobStart+" millis");
++                JobInfo immediateJob = new JobInfo.Builder(ScanJob.IMMMEDIATE_SCAN_JOB_ID, new ComponentName(context, ScanJob.class))
++                        .setPersisted(true) // This makes it restart after reboot
++                        .setExtras(new PersistableBundle())
++                        .setMinimumLatency(millisToNextJobStart)
++                        .setOverrideDeadline(millisToNextJobStart).build();
++                int error = jobScheduler.schedule(immediateJob);
++                if (error < 0) {
++                    LogManager.e(TAG, "Failed to schedule scan job.  Beacons will not be detected. Error: "+error);
++                }
++            }
++        }
++        else {
++            LogManager.d(TAG, "Not scheduling an immediate scan because we are in background mode.   Cancelling existing immediate scan.");
++            jobScheduler.cancel(ScanJob.IMMMEDIATE_SCAN_JOB_ID);
++        }
++
++        JobInfo.Builder periodicJobBuilder = new JobInfo.Builder(ScanJob.PERIODIC_SCAN_JOB_ID, new ComponentName(context, ScanJob.class))
++                .setPersisted(true) // This makes it restart after reboot
++                .setExtras(new PersistableBundle());
++
++        if (android.os.Build.VERSION.SDK_INT >= Build.VERSION_CODES.N) {
++            // ON Android N+ we specify a tolerance of 0ms (capped at 5% by the OS) to ensure
++            // our scans happen within 5% of the schduled time.
++            periodicJobBuilder.setPeriodic(scanState.getScanJobIntervalMillis(), 0l).build();
++        }
++        else {
++            periodicJobBuilder.setPeriodic(scanState.getScanJobIntervalMillis()).build();
++        }
++        // On Android O I see this:
++        //
++        // 06-07 22:15:51.361 6455-6455/org.altbeacon.beaconreference W/JobInfo: Specified interval for 1 is +5m10s0ms. Clamped to +15m0s0ms
++        // 06-07 22:15:51.361 6455-6455/org.altbeacon.beaconreference W/JobInfo: Specified flex for 1 is 0. Clamped to +5m0s0ms
++        //
++        // This suggests logs are being clamped at a max of every 15 minutes +/- 5 minutes in the background
++        // This is the same way it worked on Android N per this post: https://stackoverflow.com/questions/38344220/job-scheduler-not-running-on-android-n
++        //
++        // In practice, I see the following runtimes on the Nexus Player with Android O
++        //
++        /*
++06-07 22:25:51.380 6455-6455/org.altbeacon.beaconreference I/ScanJob: Running periodic scan job: instance is org.altbeacon.beacon.service.ScanJob@7188bc6
++06-07 22:41:01.227 6455-6455/org.altbeacon.beaconreference I/ScanJob: Running periodic scan job: instance is org.altbeacon.beacon.service.ScanJob@382ed7b
++06-07 22:55:51.373 6455-6455/org.altbeacon.beaconreference I/ScanJob: Running periodic scan job: instance is org.altbeacon.beacon.service.ScanJob@203c928
++06-07 23:10:59.083 6455-6455/org.altbeacon.beaconreference I/ScanJob: Running periodic scan job: instance is org.altbeacon.beacon.service.ScanJob@dc96415
++06-07 23:25:51.371 6455-6455/org.altbeacon.beaconreference I/ScanJob: Running periodic scan job: instance is org.altbeacon.beacon.service.ScanJob@68bed2e
++06-07 23:40:59.142 6455-6455/org.altbeacon.beaconreference I/ScanJob: Running periodic scan job: instance is org.altbeacon.beacon.service.ScanJob@c295843
++06-07 23:55:51.369 6455-6455/org.altbeacon.beaconreference I/ScanJob: Running periodic scan job: instance is org.altbeacon.beacon.service.ScanJob@cd047e4
++06-08 00:10:59.082 6455-6455/org.altbeacon.beaconreference I/ScanJob: Running periodic scan job: instance is org.altbeacon.beacon.service.ScanJob@8009a61
++06-08 00:25:51.368 6455-6455/org.altbeacon.beaconreference I/ScanJob: Running periodic scan job: instance is org.altbeacon.beacon.service.ScanJob@f1fa2ca
++06-08 00:40:59.085 6455-6455/org.altbeacon.beaconreference I/ScanJob: Running periodic scan job: instance is org.altbeacon.beacon.service.ScanJob@88dddef
++06-08 00:55:51.374 6455-6455/org.altbeacon.beaconreference I/ScanJob: Running periodic scan job: instance is org.altbeacon.beacon.service.ScanJob@eb2b360
++06-08 01:10:51.670 6455-6455/org.altbeacon.beaconreference I/ScanJob: Running periodic scan job: instance is org.altbeacon.beacon.service.ScanJob@9bca225
++06-08 01:25:51.383 6455-6455/org.altbeacon.beaconreference I/ScanJob: Running periodic scan job: instance is org.altbeacon.beacon.service.ScanJob@871c8fe
++06-08 01:45:51.404 6455-6455/org.altbeacon.beaconreference I/ScanJob: Running periodic scan job: instance is org.altbeacon.beacon.service.ScanJob@3bf42d3
++06-08 01:56:12.354 6455-6455/org.altbeacon.beaconreference I/ScanJob: Running periodic scan job: instance is org.altbeacon.beacon.service.ScanJob@c3d4e34
++06-08 02:21:51.771 6455-6455/org.altbeacon.beaconreference I/ScanJob: Running periodic scan job: instance is org.altbeacon.beacon.service.ScanJob@1557571
++06-08 02:37:01.861 6455-6455/org.altbeacon.beaconreference I/ScanJob: Running periodic scan job: instance is org.altbeacon.beacon.service.ScanJob@e2c879a
++06-08 02:52:11.943 6455-6455/org.altbeacon.beaconreference I/ScanJob: Running periodic scan job: instance is org.altbeacon.beacon.service.ScanJob@c9f0d7f
++06-08 03:07:22.041 6455-6455/org.altbeacon.beaconreference I/ScanJob: Running periodic scan job: instance is org.altbeacon.beacon.service.ScanJob@4e0cab0
++06-08 03:23:12.696 6455-6455/org.altbeacon.beaconreference I/ScanJob: Running periodic scan job: instance is org.altbeacon.beacon.service.ScanJob@1139a7d
++06-08 03:38:22.776 6455-6455/org.altbeacon.beaconreference I/ScanJob: Running periodic scan job: instance is org.altbeacon.beacon.service.ScanJob@e06b8f6
++06-08 03:52:12.792 6455-6455/org.altbeacon.beaconreference I/ScanJob: Running periodic scan job: instance is org.altbeacon.beacon.service.ScanJob@74147eb
++06-08 04:08:32.872 6455-6455/org.altbeacon.beaconreference I/ScanJob: Running periodic scan job: instance is org.altbeacon.beacon.service.ScanJob@90d9fec
++06-08 04:21:12.856 6455-6455/org.altbeacon.beaconreference I/ScanJob: Running periodic scan job: instance is org.altbeacon.beacon.service.ScanJob@a4abd49
++06-08 04:38:42.959 6455-6455/org.altbeacon.beaconreference I/ScanJob: Running periodic scan job: instance is org.altbeacon.beacon.service.ScanJob@741d912
++06-08 04:50:12.923 6455-6455/org.altbeacon.beaconreference I/ScanJob: Running periodic scan job: instance is org.altbeacon.beacon.service.ScanJob@15bfe17
++06-08 05:08:53.047 6455-6455/org.altbeacon.beaconreference I/ScanJob: Running periodic scan job: instance is org.altbeacon.beacon.service.ScanJob@fa229e8
++06-08 05:19:13.050 6455-6455/org.altbeacon.beaconreference I/ScanJob: Running periodic scan job: instance is org.altbeacon.beacon.service.ScanJob@b0e49d5
++06-08 05:39:03.142 6455-6455/org.altbeacon.beaconreference I/ScanJob: Running periodic scan job: instance is org.altbeacon.beacon.service.ScanJob@18823ee
++06-08 05:54:13.212 6455-6455/org.altbeacon.beaconreference I/ScanJob: Running periodic scan job: instance is org.altbeacon.beacon.service.ScanJob@a72fc03
++06-08 06:10:51.850 6455-6455/org.altbeacon.beaconreference I/ScanJob: Running periodic scan job: instance is org.altbeacon.beacon.service.ScanJob@3fb84a4
++06-08 06:26:01.917 6455-6455/org.altbeacon.beaconreference I/ScanJob: Running periodic scan job: instance is org.altbeacon.beacon.service.ScanJob@53d6c21
++06-08 06:41:11.994 6455-6455/org.altbeacon.beaconreference I/ScanJob: Running periodic scan job: instance is org.altbeacon.beacon.service.ScanJob@848958a
++06-08 06:56:22.053 6455-6455/org.altbeacon.beaconreference I/ScanJob: Running periodic scan job: instance is org.altbeacon.beacon.service.ScanJob@43cdaf
++06-08 07:06:32.119 6455-6455/org.altbeacon.beaconreference I/ScanJob: Running periodic scan job: instance is org.altbeacon.beacon.service.ScanJob@5318c20
++06-08 07:29:12.356 6455-6455/org.altbeacon.beaconreference I/ScanJob: Running periodic scan job: instance is org.altbeacon.beacon.service.ScanJob@34f102d
++06-08 07:44:22.431 6455-6455/org.altbeacon.beaconreference I/ScanJob: Running periodic scan job: instance is org.altbeacon.beacon.service.ScanJob@4d2e9e6
++         */
++
++        LogManager.d(TAG, "Scheduling ScanJob to run every "+scanState.getScanJobIntervalMillis()+" millis");
++        int error = jobScheduler.schedule(periodicJobBuilder.build());
++        if (error < 0) {
++            LogManager.e(TAG, "Failed to schedule scan job.  Beacons will not be detected. Error: "+error);
++        }
++    }
++}
+diff --git a/src/main/java/org/altbeacon/beacon/service/scanner/CycledLeScannerForAndroidO.java b/src/main/java/org/altbeacon/beacon/service/scanner/CycledLeScannerForAndroidO.java
+index fda5f246..4df63c91 100644
+--- a/src/main/java/org/altbeacon/beacon/service/scanner/CycledLeScannerForAndroidO.java
++++ b/src/main/java/org/altbeacon/beacon/service/scanner/CycledLeScannerForAndroidO.java
+@@ -26,6 +26,8 @@
+ 
+     public CycledLeScannerForAndroidO(Context context, long scanPeriod, long betweenScanPeriod, boolean backgroundFlag, CycledLeScanCallback cycledLeScanCallback, BluetoothCrashResolver crashResolver) {
+         super(context, scanPeriod, betweenScanPeriod, backgroundFlag, cycledLeScanCallback, crashResolver);
++        // We stop scanning here in case we were doing a passive background scan
++        getBluetoothAdapter().getBluetoothLeScanner().stopScan(getScanCallbackIntent());
+     }
+ 
+     /**
+@@ -36,13 +38,10 @@ public void startAndroidOBackgroundScan(Set<BeaconParser> beaconParsers) {
+         List<ScanFilter> filters = new ScanFilterUtils().createScanFiltersForBeaconParsers(
+                 new ArrayList(beaconParsers));
+         try {
+-            Intent intent = new Intent(mContext, StartupBroadcastReceiver.class);
+-            intent.putExtra("o-scan", true);
+-            PendingIntent callbackIntent = PendingIntent.getBroadcast(mContext,0, intent, PendingIntent.FLAG_UPDATE_CURRENT);
+             // We cannot build with a minSdk < Android O when using Android O preview APIs
+             // so if you set an earlier minSdk to test against pre-O devices, you must comment out
+             // the next few lines
+-            int result = getBluetoothAdapter().getBluetoothLeScanner().startScan(filters, settings, callbackIntent);
++            int result = getBluetoothAdapter().getBluetoothLeScanner().startScan(filters, settings, getScanCallbackIntent());
+             if (result != 0) {
+                 LogManager.e(TAG, "Failed to start background scan on Android O.  Code: "+result);
+             }
+@@ -55,4 +54,11 @@ public void startAndroidOBackgroundScan(Set<BeaconParser> beaconParsers) {
+          }
+     }
+ 
++    // Low power scan results in the background will be delivered via Intent
++    private PendingIntent getScanCallbackIntent() {
++        Intent intent = new Intent(mContext, StartupBroadcastReceiver.class);
++        intent.putExtra("o-scan", true);
++        return PendingIntent.getBroadcast(mContext,0, intent, PendingIntent.FLAG_UPDATE_CURRENT);
++    }
++
+ }
+diff --git a/src/main/java/org/altbeacon/beacon/service/scanner/CycledLeScannerForLollipop.java b/src/main/java/org/altbeacon/beacon/service/scanner/CycledLeScannerForLollipop.java
+index 44a2fa9e..b08c0640 100644
+--- a/src/main/java/org/altbeacon/beacon/service/scanner/CycledLeScannerForLollipop.java
++++ b/src/main/java/org/altbeacon/beacon/service/scanner/CycledLeScannerForLollipop.java
+@@ -198,7 +198,7 @@ public void run() {
+                     LogManager.w(TAG, "Cannot start scan. Bluetooth may be turned off.");
+                 } catch (NullPointerException npe) {
+                     // Necessary because of https://code.google.com/p/android/issues/detail?id=160503
+-                    LogManager.e(TAG, "Cannot start scan. Unexpected NPE.", npe);
++                    LogManager.e(npe, TAG, "Cannot start scan. Unexpected NPE.");
+                 } catch (SecurityException e) {
+                     // Thrown by Samsung Knox devices if bluetooth access denied for an app
+                     LogManager.e(TAG, "Cannot start scan.  Security Exception");
+@@ -229,7 +229,7 @@ public void run() {
+                     LogManager.w(TAG, "Cannot stop scan. Bluetooth may be turned off.");
+                 } catch (NullPointerException npe) {
+                     // Necessary because of https://code.google.com/p/android/issues/detail?id=160503
+-                    LogManager.e(TAG, "Cannot stop scan. Unexpected NPE.", npe);
++                    LogManager.e(npe, TAG, "Cannot stop scan. Unexpected NPE.");
+                 } catch (SecurityException e) {
+                     // Thrown by Samsung Knox devices if bluetooth access denied for an app
+                     LogManager.e(TAG, "Cannot stop scan.  Security Exception");
+@@ -307,8 +307,39 @@ public void onBatchScanResults(List<ScanResult> results) {
+                 }
+ 
+                 @Override
+-                public void onScanFailed(int i) {
+-                    LogManager.e(TAG, "Scan Failed");
++                public void onScanFailed(int errorCode) {
++                    switch (errorCode) {
++                        case SCAN_FAILED_ALREADY_STARTED:
++                            LogManager.e(
++                                    TAG,
++                                    "Scan failed: a BLE scan with the same settings is already started by the app"
++                            );
++                            break;
++                        case SCAN_FAILED_APPLICATION_REGISTRATION_FAILED:
++                            LogManager.e(
++                                    TAG,
++                                    "Scan failed: app cannot be registered"
++                            );
++                            break;
++                        case SCAN_FAILED_FEATURE_UNSUPPORTED:
++                            LogManager.e(
++                                    TAG,
++                                    "Scan failed: power optimized scan feature is not supported"
++                            );
++                            break;
++                        case SCAN_FAILED_INTERNAL_ERROR:
++                            LogManager.e(
++                                    TAG,
++                                    "Scan failed: internal error"
++                            );
++                            break;
++                        default:
++                            LogManager.e(
++                                    TAG,
++                                    "Scan failed with unknown error (errorCode=" + errorCode + ")"
++                            );
++                            break;
++                    }
+                 }
+             };
+         }
+diff --git a/src/main/java/org/altbeacon/beacon/service/scanner/DistinctPacketDetector.java b/src/main/java/org/altbeacon/beacon/service/scanner/DistinctPacketDetector.java
+index 42978d30..daff6763 100644
+--- a/src/main/java/org/altbeacon/beacon/service/scanner/DistinctPacketDetector.java
++++ b/src/main/java/org/altbeacon/beacon/service/scanner/DistinctPacketDetector.java
+@@ -1,6 +1,6 @@
+ package org.altbeacon.beacon.service.scanner;
+ 
+-import android.util.Log;
++import android.support.annotation.NonNull;
+ 
+ import java.nio.ByteBuffer;
+ import java.util.HashSet;
+@@ -8,30 +8,33 @@
+ 
+ /**
+  * Created by dyoung on 4/8/17.
+- *
++ * <p>
+  * This class tracks whether multiple distinct BLE packets have been seen, with the purpose of
+  * determining if the Android device supports detecting multiple distinct packets in a single scan.
+  * Some older devices are not capable of this (e.g. Nexus 4, Moto G1), so detecting multiple packets
+  * requires stopping and restarting scanning on these devices.  This allows detecting if that is
+- * neessary
++ * necessary.
++ * <p>
++ * <strong>This class is not thread safe.</strong>
+  */
+ public class DistinctPacketDetector {
+     // Sanity limit for the number of packets to track, so we don't use too much memory
+     private static final int MAX_PACKETS_TO_TRACK = 1000;
+-    protected Set<ByteBuffer> mDistinctPacketsDetected = new HashSet<ByteBuffer>();
++
++    @NonNull
++    private final Set<ByteBuffer> mDistinctPacketsDetected = new HashSet<>();
+ 
+     public void clearDetections() {
+         mDistinctPacketsDetected.clear();
+     }
+ 
+-    public boolean isPacketDistinct(String originMacAddress, byte[] scanRecord) {
++    public boolean isPacketDistinct(@NonNull String originMacAddress, @NonNull byte[] scanRecord) {
+         byte[] macBytes = originMacAddress.getBytes();
+         ByteBuffer buffer = ByteBuffer.allocate(macBytes.length+scanRecord.length);
+         buffer.put(macBytes);
+         buffer.put(scanRecord);
+         buffer.rewind(); // rewind puts position back to beginning so .equals and .hashCode work
+ 
+-        boolean distinct = !mDistinctPacketsDetected.contains(buffer);
+         if (mDistinctPacketsDetected.size() == MAX_PACKETS_TO_TRACK) {
+             return mDistinctPacketsDetected.contains(buffer);
+         }
+diff --git a/src/main/java/org/altbeacon/beacon/startup/StartupBroadcastReceiver.java b/src/main/java/org/altbeacon/beacon/startup/StartupBroadcastReceiver.java
+index 9711f5dd..0a041fe0 100644
+--- a/src/main/java/org/altbeacon/beacon/startup/StartupBroadcastReceiver.java
++++ b/src/main/java/org/altbeacon/beacon/startup/StartupBroadcastReceiver.java
+@@ -1,13 +1,22 @@
+ package org.altbeacon.beacon.startup;
+ 
++import android.bluetooth.le.BluetoothLeScanner;
++import android.bluetooth.le.ScanCallback;
++import android.bluetooth.le.ScanResult;
++import android.bluetooth.le.ScanSettings;
+ import android.content.BroadcastReceiver;
+ import android.content.Context;
+ import android.content.Intent;
+ import android.os.Bundle;
++import android.os.Parcel;
++import android.os.Parcelable;
+ 
+ import org.altbeacon.beacon.logging.LogManager;
+ import org.altbeacon.beacon.BeaconManager;
+ import org.altbeacon.beacon.service.ScanJob;
++import org.altbeacon.beacon.service.ScanJobScheduler;
++
++import java.util.ArrayList;
+ 
+ public class StartupBroadcastReceiver extends BroadcastReceiver
+ {
+@@ -22,24 +31,19 @@ public void onReceive(Context context, Intent intent) {
+         }
+         BeaconManager beaconManager = BeaconManager.getInstanceForApplication(context.getApplicationContext());
+         if (beaconManager.isAnyConsumerBound() || beaconManager.getScheduledScanJobsEnabled()) {
+-            if (intent.getBooleanExtra("wakeup", false)) {
+-                LogManager.d(TAG, "got wake up intent");
+-            }
+-            else if (intent.getBooleanExtra("o-scan", false)) {
++            int bleCallbackType = intent.getIntExtra(BluetoothLeScanner.EXTRA_CALLBACK_TYPE, -1); // e.g. ScanSettings.CALLBACK_TYPE_FIRST_MATCH
++            if (bleCallbackType != -1) {
++                LogManager.d(TAG, "Passive background scan callback type: "+bleCallbackType);
+                 LogManager.d(TAG, "got Android O background scan via intent");
+-                Bundle bundle = intent.getExtras();
+-                /*
+-06-05 22:31:14.277 7696-7696/org.altbeacon.beaconreference D/StartupBroadcastReceiver: Extra key found in Android O background scan delivery intent: o-scan
+-06-05 22:31:14.278 7696-7696/org.altbeacon.beaconreference D/StartupBroadcastReceiver: Extra key found in Android O background scan delivery intent: android.bluetooth.le.extra.LIST_SCAN_RESULT
+-06-05 22:31:14.278 7696-7696/org.altbeacon.beaconreference D/StartupBroadcastReceiver: Extra key found in Android O background scan delivery intent: android.bluetooth.le.extra.CALLBACK_TYPE
+-                 */
+-
+-                for (String key : bundle.keySet()) {
+-                    LogManager.d(TAG, "Extra key found in Android O background scan delivery intent: "+key);
++                int errorCode = intent.getIntExtra(BluetoothLeScanner.EXTRA_ERROR_CODE, -1); // e.g.  ScanCallback.SCAN_FAILED_INTERNAL_ERROR
++                if (errorCode != -1) {
++                    LogManager.w(TAG, "Passive background scan failed.  Code; "+errorCode);
+                 }
+-                // TODO: figure out how to get the scan data out of the keys above so we can process
+-                // Kick off a scan
+-                ScanJob.scheduleAfterBackgroundWakeup(context);
++                ArrayList<ScanResult> scanResults = intent.getParcelableArrayListExtra(BluetoothLeScanner.EXTRA_LIST_SCAN_RESULT);
++                ScanJobScheduler.getInstance().scheduleAfterBackgroundWakeup(context, scanResults);
++            }
++            else if (intent.getBooleanExtra("wakeup", false)) {
++                LogManager.d(TAG, "got wake up intent");
+             }
+             else {
+                 LogManager.d(TAG, "Already started.  Ignoring intent: %s of type: %s", intent,

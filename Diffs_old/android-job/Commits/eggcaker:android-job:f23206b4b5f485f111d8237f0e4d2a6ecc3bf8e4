@@ -1,0 +1,260 @@
+diff --git a/CHANGELOG.md b/CHANGELOG.md
+index d06a3f4..ec7bacb 100644
+--- a/CHANGELOG.md
++++ b/CHANGELOG.md
+@@ -1,3 +1,6 @@
++## 1.2.1
++* Add option to override the default background executor, see #292
++
+ ## 1.2.0 (2017-10-05)
+ 
+ * Extract `JobManager.Config` class into `JobConfig` class to make it possible to change settings before the `JobManager` is created
+diff --git a/library/src/main/java/com/evernote/android/job/JobConfig.java b/library/src/main/java/com/evernote/android/job/JobConfig.java
+index 2b4ea8b..93ad09a 100644
+--- a/library/src/main/java/com/evernote/android/job/JobConfig.java
++++ b/library/src/main/java/com/evernote/android/job/JobConfig.java
+@@ -35,7 +35,11 @@
+ import com.evernote.android.job.util.JobPreconditions;
+ 
+ import java.util.EnumMap;
++import java.util.concurrent.ExecutorService;
++import java.util.concurrent.Executors;
++import java.util.concurrent.ThreadFactory;
+ import java.util.concurrent.TimeUnit;
++import java.util.concurrent.atomic.AtomicInteger;
+ 
+ /**
+  * A global configuration for the job library.
+@@ -57,6 +61,23 @@ private JobConfig() {
+     private static final EnumMap<JobApi, Boolean> ENABLED_APIS;
+     private static final JobCat CAT = new JobCat("JobConfig");
+ 
++    private static final ExecutorService DEFAULT_EXECUTOR_SERVICE = Executors.newCachedThreadPool(new ThreadFactory() {
++
++        private final AtomicInteger mThreadNumber = new AtomicInteger();
++
++        @Override
++        public Thread newThread(@NonNull Runnable r) {
++            Thread thread = new Thread(r, "AndroidJob-" + mThreadNumber.incrementAndGet());
++            if (thread.isDaemon()) {
++                thread.setDaemon(false);
++            }
++            if (thread.getPriority() != Thread.NORM_PRIORITY) {
++                thread.setPriority(Thread.NORM_PRIORITY);
++            }
++            return thread;
++        }
++    });
++
+     private static volatile boolean allowSmallerIntervals;
+     private static volatile boolean forceAllowApi14 = false;
+ 
+@@ -68,6 +89,7 @@ private JobConfig() {
+     private static volatile boolean forceRtc = false;
+ 
+     private static volatile Clock clock = Clock.DEFAULT;
++    private static volatile ExecutorService executorService = DEFAULT_EXECUTOR_SERVICE;
+ 
+     static {
+         ENABLED_APIS = new EnumMap<>(JobApi.class);
+@@ -276,6 +298,23 @@ public static Clock getClock() {
+         JobConfig.clock = clock;
+     }
+ 
++    /**
++     * @return The executor service for all parallel execution.
++     */
++    public static ExecutorService getExecutorService() {
++        return executorService;
++    }
++
++    /**
++     * Overrides the executor service for all parallel execution. This could be helpful for Espresso
++     * tests.
++     *
++     * @param executorService The new executor service.
++     */
++    public static void setExecutorService(@NonNull ExecutorService executorService) {
++        JobConfig.executorService = JobPreconditions.checkNotNull(executorService);
++    }
++
+     /**
+      * Resets all adjustments in the config.
+      */
+@@ -290,6 +329,7 @@ public static void reset() {
+         jobIdOffset = 0;
+         forceRtc = false;
+         clock = Clock.DEFAULT;
++        executorService = DEFAULT_EXECUTOR_SERVICE;
+         JobCat.setLogcatEnabled(true);
+         JobCat.clearLogger();
+     }
+diff --git a/library/src/main/java/com/evernote/android/job/JobExecutor.java b/library/src/main/java/com/evernote/android/job/JobExecutor.java
+index ec4c735..5d0895b 100644
+--- a/library/src/main/java/com/evernote/android/job/JobExecutor.java
++++ b/library/src/main/java/com/evernote/android/job/JobExecutor.java
+@@ -42,8 +42,6 @@
+ import java.util.Map;
+ import java.util.Set;
+ import java.util.concurrent.Callable;
+-import java.util.concurrent.ExecutorService;
+-import java.util.concurrent.Executors;
+ import java.util.concurrent.Future;
+ import java.util.concurrent.TimeUnit;
+ 
+@@ -56,15 +54,12 @@
+     private static final CatLog CAT = new JobCat("JobExecutor");
+     private static final long WAKE_LOCK_TIMEOUT = TimeUnit.MINUTES.toMillis(3);
+ 
+-    private final ExecutorService mExecutorService;
+-
+     private final SparseArray<Job> mJobs; // only cached in memory, that's fine
+     private final LruCache<Integer, Job> mFinishedJobsCache;
+ 
+     private final Set<JobRequest> mStartingRequests;
+ 
+     public JobExecutor() {
+-        mExecutorService = Executors.newCachedThreadPool(JobProxy.Common.COMMON_THREAD_FACTORY);
+         mJobs = new SparseArray<>();
+         mFinishedJobsCache = new LruCache<>(20);
+         mStartingRequests = new HashSet<>();
+@@ -85,7 +80,7 @@ public JobExecutor() {
+         CAT.i("Executing %s, context %s", request, context.getClass().getSimpleName());
+ 
+         mJobs.put(request.getJobId(), job);
+-        return mExecutorService.submit(new JobCallable(job));
++        return JobConfig.getExecutorService().submit(new JobCallable(job));
+     }
+ 
+     public synchronized Job getJob(int jobId) {
+diff --git a/library/src/main/java/com/evernote/android/job/JobProxy.java b/library/src/main/java/com/evernote/android/job/JobProxy.java
+index d471820..d596d4d 100644
+--- a/library/src/main/java/com/evernote/android/job/JobProxy.java
++++ b/library/src/main/java/com/evernote/android/job/JobProxy.java
+@@ -41,8 +41,6 @@
+ import java.util.Locale;
+ import java.util.concurrent.ExecutionException;
+ import java.util.concurrent.Future;
+-import java.util.concurrent.ThreadFactory;
+-import java.util.concurrent.atomic.AtomicInteger;
+ 
+ /**
+  * A proxy for each {@link JobApi}.
+@@ -66,23 +64,6 @@
+ 
+         private static final Object COMMON_MONITOR = new Object();
+ 
+-        public static final ThreadFactory COMMON_THREAD_FACTORY = new ThreadFactory() {
+-
+-            private final AtomicInteger mThreadNumber = new AtomicInteger();
+-
+-            @Override
+-            public Thread newThread(@NonNull Runnable r) {
+-                Thread thread = new Thread(r, "AndroidJob-" + mThreadNumber.incrementAndGet());
+-                if (thread.isDaemon()) {
+-                    thread.setDaemon(false);
+-                }
+-                if (thread.getPriority() != Thread.NORM_PRIORITY) {
+-                    thread.setPriority(Thread.NORM_PRIORITY);
+-                }
+-                return thread;
+-            }
+-        };
+-
+         // see Google Guava: https://github.com/google/guava/blob/master/guava/src/com/google/common/math/LongMath.java
+         private static long checkedAdd(long a, long b) {
+             long result = a + b;
+diff --git a/library/src/main/java/com/evernote/android/job/v14/PlatformAlarmServiceExact.java b/library/src/main/java/com/evernote/android/job/v14/PlatformAlarmServiceExact.java
+index b7593a0..3b434ea 100644
+--- a/library/src/main/java/com/evernote/android/job/v14/PlatformAlarmServiceExact.java
++++ b/library/src/main/java/com/evernote/android/job/v14/PlatformAlarmServiceExact.java
+@@ -32,6 +32,7 @@
+ import android.os.IBinder;
+ import android.support.annotation.Nullable;
+ 
++import com.evernote.android.job.JobConfig;
+ import com.evernote.android.job.JobProxy;
+ import com.evernote.android.job.util.JobCat;
+ 
+@@ -39,8 +40,6 @@
+ 
+ import java.util.HashSet;
+ import java.util.Set;
+-import java.util.concurrent.ExecutorService;
+-import java.util.concurrent.Executors;
+ 
+ /**
+  * @author rwondratschek
+@@ -60,14 +59,12 @@ public static Intent createIntent(Context context, int jobId, @Nullable Bundle t
+ 
+     private final Object mMonitor = new Object();
+ 
+-    private volatile ExecutorService mExecutorService;
+     private volatile Set<Integer> mStartIds;
+     private volatile int mLastStartId;
+ 
+     @Override
+     public void onCreate() {
+         super.onCreate();
+-        mExecutorService = Executors.newCachedThreadPool(JobProxy.Common.COMMON_THREAD_FACTORY);
+         mStartIds = new HashSet<>();
+     }
+ 
+@@ -78,7 +75,7 @@ public int onStartCommand(@Nullable final Intent intent, int flags, final int st
+             mLastStartId = startId;
+         }
+ 
+-        mExecutorService.execute(new Runnable() {
++        JobConfig.getExecutorService().execute(new Runnable() {
+             @Override
+             public void run() {
+                 try {
+@@ -95,9 +92,6 @@ public void run() {
+ 
+     @Override
+     public void onDestroy() {
+-        mExecutorService.shutdown();
+-        mExecutorService = null;
+-
+         synchronized (mMonitor) {
+             mStartIds = null;
+             mLastStartId = 0;
+diff --git a/library/src/main/java/com/evernote/android/job/v21/PlatformJobService.java b/library/src/main/java/com/evernote/android/job/v21/PlatformJobService.java
+index 2748da1..2f50433 100644
+--- a/library/src/main/java/com/evernote/android/job/v21/PlatformJobService.java
++++ b/library/src/main/java/com/evernote/android/job/v21/PlatformJobService.java
+@@ -32,6 +32,7 @@
+ import android.os.Bundle;
+ 
+ import com.evernote.android.job.Job;
++import com.evernote.android.job.JobConfig;
+ import com.evernote.android.job.JobManager;
+ import com.evernote.android.job.JobProxy;
+ import com.evernote.android.job.JobRequest;
+@@ -39,9 +40,6 @@
+ 
+ import net.vrallev.android.cat.Cat;
+ 
+-import java.util.concurrent.ExecutorService;
+-import java.util.concurrent.Executors;
+-
+ /**
+  * @author rwondratschek
+  */
+@@ -53,7 +51,6 @@
+      */
+ 
+     private static final JobCat CAT = new JobCat("PlatformJobService");
+-    private static final ExecutorService EXECUTOR_SERVICE = Executors.newCachedThreadPool(JobProxy.Common.COMMON_THREAD_FACTORY);
+ 
+     @Override
+     public boolean onStartJob(final JobParameters params) {
+@@ -82,7 +79,7 @@ public boolean onStartJob(final JobParameters params) {
+ 
+         common.markStarting(request);
+ 
+-        EXECUTOR_SERVICE.execute(new Runnable() {
++        JobConfig.getExecutorService().execute(new Runnable() {
+             @Override
+             public void run() {
+                 try {

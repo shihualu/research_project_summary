@@ -1,0 +1,2246 @@
+diff --git a/pom.xml b/pom.xml
+index d9818fc1e..4e9818dfd 100644
+--- a/pom.xml
++++ b/pom.xml
+@@ -53,7 +53,7 @@
+     <animal.sniffer.version>1.14</animal.sniffer.version>
+ 
+     <!-- Adapter Dependencies -->
+-    <rxjava.version>1.1.5</rxjava.version>
++    <rxjava.version>1.1.9</rxjava.version>
+ 
+     <!-- Converter Dependencies -->
+     <gson.version>2.7</gson.version>
+diff --git a/retrofit-adapters/README.md b/retrofit-adapters/README.md
+index 7ef38b3ff..34e18813b 100644
+--- a/retrofit-adapters/README.md
++++ b/retrofit-adapters/README.md
+@@ -4,7 +4,7 @@ Retrofit Adapters
+ Retrofit ships with a default adapter for executing `Call` instances. The child modules contained
+ herein are additional adapters for other popular execution mechanisms.
+ 
+-To use, supply an instance of your desired converter when building your `Retrofit` instance.
++To use, supply an instance of your desired adapter when building your `Retrofit` instance.
+ 
+ ```java
+ Retrofit retrofit = new Retrofit.Builder()
+diff --git a/retrofit-adapters/rxjava/src/main/java/retrofit2/adapter/rxjava/BodyOnSubscribe.java b/retrofit-adapters/rxjava/src/main/java/retrofit2/adapter/rxjava/BodyOnSubscribe.java
+new file mode 100644
+index 000000000..1ae1499eb
+--- /dev/null
++++ b/retrofit-adapters/rxjava/src/main/java/retrofit2/adapter/rxjava/BodyOnSubscribe.java
+@@ -0,0 +1,81 @@
++/*
++ * Copyright (C) 2016 Jake Wharton
++ *
++ * Licensed under the Apache License, Version 2.0 (the "License");
++ * you may not use this file except in compliance with the License.
++ * You may obtain a copy of the License at
++ *
++ *      http://www.apache.org/licenses/LICENSE-2.0
++ *
++ * Unless required by applicable law or agreed to in writing, software
++ * distributed under the License is distributed on an "AS IS" BASIS,
++ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++ * See the License for the specific language governing permissions and
++ * limitations under the License.
++ */
++package retrofit2.adapter.rxjava;
++
++import retrofit2.Response;
++import rx.Observable.OnSubscribe;
++import rx.Subscriber;
++import rx.exceptions.CompositeException;
++import rx.exceptions.Exceptions;
++import rx.plugins.RxJavaPlugins;
++
++final class BodyOnSubscribe<T> implements OnSubscribe<T> {
++  private final OnSubscribe<Response<T>> upstream;
++
++  BodyOnSubscribe(OnSubscribe<Response<T>> upstream) {
++    this.upstream = upstream;
++  }
++
++  @Override public void call(Subscriber<? super T> subscriber) {
++    upstream.call(new BodySubscriber<>(subscriber));
++  }
++
++  private static class BodySubscriber<R> extends Subscriber<Response<R>> {
++    private final Subscriber<? super R> subscriber;
++    /** Indicates whether a terminal event has been sent to {@link #subscriber}. */
++    private boolean subscriberTerminated;
++
++    BodySubscriber(Subscriber<? super R> subscriber) {
++      super(subscriber);
++      this.subscriber = subscriber;
++    }
++
++    @Override public void onNext(Response<R> response) {
++      if (response.isSuccessful()) {
++        subscriber.onNext(response.body());
++      } else {
++        subscriberTerminated = true;
++        Throwable t = new HttpException(response);
++        try {
++          subscriber.onError(t);
++        } catch (Throwable inner) {
++          Exceptions.throwIfFatal(inner);
++          CompositeException composite = new CompositeException(t, inner);
++          RxJavaPlugins.getInstance().getErrorHandler().handleError(composite);
++        }
++      }
++    }
++
++    @Override public void onError(Throwable throwable) {
++      if (!subscriberTerminated) {
++        subscriber.onError(throwable);
++      } else {
++        // This should never happen! onNext handles and forwards errors automatically.
++        Throwable broken = new AssertionError(
++            "This should never happen! Report as a Retrofit bug with the full stacktrace.");
++        //noinspection UnnecessaryInitCause Two-arg AssertionError constructor is 1.7+ only.
++        broken.initCause(throwable);
++        RxJavaPlugins.getInstance().getErrorHandler().handleError(broken);
++      }
++    }
++
++    @Override public void onCompleted() {
++      if (!subscriberTerminated) {
++        subscriber.onCompleted();
++      }
++    }
++  }
++}
+diff --git a/retrofit-adapters/rxjava/src/main/java/retrofit2/adapter/rxjava/CallOnSubscribe.java b/retrofit-adapters/rxjava/src/main/java/retrofit2/adapter/rxjava/CallOnSubscribe.java
+new file mode 100644
+index 000000000..a76a86a4f
+--- /dev/null
++++ b/retrofit-adapters/rxjava/src/main/java/retrofit2/adapter/rxjava/CallOnSubscribe.java
+@@ -0,0 +1,93 @@
++/*
++ * Copyright (C) 2016 Jake Wharton
++ *
++ * Licensed under the Apache License, Version 2.0 (the "License");
++ * you may not use this file except in compliance with the License.
++ * You may obtain a copy of the License at
++ *
++ *      http://www.apache.org/licenses/LICENSE-2.0
++ *
++ * Unless required by applicable law or agreed to in writing, software
++ * distributed under the License is distributed on an "AS IS" BASIS,
++ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++ * See the License for the specific language governing permissions and
++ * limitations under the License.
++ */
++package retrofit2.adapter.rxjava;
++
++import java.util.concurrent.atomic.AtomicBoolean;
++import retrofit2.Call;
++import retrofit2.Response;
++import rx.Observable.OnSubscribe;
++import rx.Producer;
++import rx.Subscriber;
++import rx.Subscription;
++import rx.exceptions.CompositeException;
++import rx.exceptions.Exceptions;
++import rx.plugins.RxJavaPlugins;
++
++final class CallOnSubscribe<T> implements OnSubscribe<Response<T>> {
++  private final Call<T> originalCall;
++
++  CallOnSubscribe(Call<T> originalCall) {
++    this.originalCall = originalCall;
++  }
++
++  @Override public void call(Subscriber<? super Response<T>> subscriber) {
++    // Since Call is a one-shot type, clone it for each new subscriber.
++    Call<T> call = originalCall.clone();
++    CallArbiter<T> arbiter = new CallArbiter<>(call, subscriber);
++    subscriber.add(arbiter);
++    subscriber.setProducer(arbiter);
++  }
++
++  private static final class CallArbiter<T> extends AtomicBoolean
++      implements Subscription, Producer {
++    private final Call<T> call;
++    private final Subscriber<? super Response<T>> subscriber;
++
++    CallArbiter(Call<T> call, Subscriber<? super Response<T>> subscriber) {
++      this.call = call;
++      this.subscriber = subscriber;
++    }
++
++    @Override public void unsubscribe() {
++      call.cancel();
++    }
++
++    @Override public boolean isUnsubscribed() {
++      return call.isCanceled();
++    }
++
++    @Override public void request(long amount) {
++      if (amount == 0 || !compareAndSet(false, true)) {
++        return;
++      }
++
++      boolean terminated = false;
++      try {
++        Response<T> response = call.execute();
++        if (!call.isCanceled()) {
++          subscriber.onNext(response);
++        }
++        if (!call.isCanceled()) {
++          terminated = true;
++          subscriber.onCompleted();
++        }
++      } catch (Throwable t) {
++        Exceptions.throwIfFatal(t);
++        if (terminated) {
++          RxJavaPlugins.getInstance().getErrorHandler().handleError(t);
++        } else if (!call.isCanceled()) {
++          try {
++            subscriber.onError(t);
++          } catch (Throwable inner) {
++            Exceptions.throwIfFatal(inner);
++            CompositeException composite = new CompositeException(t, inner);
++            RxJavaPlugins.getInstance().getErrorHandler().handleError(composite);
++          }
++        }
++      }
++    }
++  }
++}
+diff --git a/retrofit-adapters/rxjava/src/main/java/retrofit2/adapter/rxjava/CompletableHelper.java b/retrofit-adapters/rxjava/src/main/java/retrofit2/adapter/rxjava/CompletableHelper.java
+deleted file mode 100644
+index 78b668905..000000000
+--- a/retrofit-adapters/rxjava/src/main/java/retrofit2/adapter/rxjava/CompletableHelper.java
++++ /dev/null
+@@ -1,92 +0,0 @@
+-/*
+- * Copyright (C) 2016 Square, Inc.
+- *
+- * Licensed under the Apache License, Version 2.0 (the "License");
+- * you may not use this file except in compliance with the License.
+- * You may obtain a copy of the License at
+- *
+- *      http://www.apache.org/licenses/LICENSE-2.0
+- *
+- * Unless required by applicable law or agreed to in writing, software
+- * distributed under the License is distributed on an "AS IS" BASIS,
+- * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+- * See the License for the specific language governing permissions and
+- * limitations under the License.
+- */
+-package retrofit2.adapter.rxjava;
+-
+-import java.lang.reflect.Type;
+-import retrofit2.Call;
+-import retrofit2.CallAdapter;
+-import retrofit2.Response;
+-import rx.Completable;
+-import rx.Completable.CompletableOnSubscribe;
+-import rx.Completable.CompletableSubscriber;
+-import rx.Scheduler;
+-import rx.Subscription;
+-import rx.exceptions.Exceptions;
+-import rx.functions.Action0;
+-import rx.subscriptions.Subscriptions;
+-
+-final class CompletableHelper {
+-  static CallAdapter<Completable> createCallAdapter(Scheduler scheduler) {
+-    return new CompletableCallAdapter(scheduler);
+-  }
+-
+-  private static final class CompletableCallOnSubscribe implements CompletableOnSubscribe {
+-    private final Call originalCall;
+-
+-    CompletableCallOnSubscribe(Call originalCall) {
+-      this.originalCall = originalCall;
+-    }
+-
+-    @Override public void call(CompletableSubscriber subscriber) {
+-      // Since Call is a one-shot type, clone it for each new subscriber.
+-      final Call call = originalCall.clone();
+-
+-      // Attempt to cancel the call if it is still in-flight on unsubscription.
+-      Subscription subscription = Subscriptions.create(new Action0() {
+-        @Override public void call() {
+-          call.cancel();
+-        }
+-      });
+-      subscriber.onSubscribe(subscription);
+-
+-      try {
+-        Response response = call.execute();
+-        if (!subscription.isUnsubscribed()) {
+-          if (response.isSuccessful()) {
+-            subscriber.onCompleted();
+-          } else {
+-            subscriber.onError(new HttpException(response));
+-          }
+-        }
+-      } catch (Throwable t) {
+-        Exceptions.throwIfFatal(t);
+-        if (!subscription.isUnsubscribed()) {
+-          subscriber.onError(t);
+-        }
+-      }
+-    }
+-  }
+-
+-  static class CompletableCallAdapter implements CallAdapter<Completable> {
+-    private final Scheduler scheduler;
+-
+-    CompletableCallAdapter(Scheduler scheduler) {
+-      this.scheduler = scheduler;
+-    }
+-
+-    @Override public Type responseType() {
+-      return Void.class;
+-    }
+-
+-    @Override public Completable adapt(Call call) {
+-      Completable completable = Completable.create(new CompletableCallOnSubscribe(call));
+-      if (scheduler != null) {
+-        return completable.subscribeOn(scheduler);
+-      }
+-      return completable;
+-    }
+-  }
+-}
+diff --git a/retrofit-adapters/rxjava/src/main/java/retrofit2/adapter/rxjava/HttpException.java b/retrofit-adapters/rxjava/src/main/java/retrofit2/adapter/rxjava/HttpException.java
+index 7b5377ea5..2e501e121 100644
+--- a/retrofit-adapters/rxjava/src/main/java/retrofit2/adapter/rxjava/HttpException.java
++++ b/retrofit-adapters/rxjava/src/main/java/retrofit2/adapter/rxjava/HttpException.java
+@@ -4,12 +4,17 @@
+ 
+ /** Exception for an unexpected, non-2xx HTTP response. */
+ public final class HttpException extends Exception {
++  private static String getMessage(Response<?> response) {
++    if (response == null) throw new NullPointerException("response == null");
++    return "HTTP " + response.code() + " " + response.message();
++  }
++
+   private final int code;
+   private final String message;
+   private final transient Response<?> response;
+ 
+   public HttpException(Response<?> response) {
+-    super("HTTP " + response.code() + " " + response.message());
++    super(getMessage(response));
+     this.code = response.code();
+     this.message = response.message();
+     this.response = response;
+diff --git a/retrofit-adapters/rxjava/src/main/java/retrofit2/adapter/rxjava/OperatorMapResponseToBodyOrError.java b/retrofit-adapters/rxjava/src/main/java/retrofit2/adapter/rxjava/OperatorMapResponseToBodyOrError.java
+deleted file mode 100644
+index 321f463f9..000000000
+--- a/retrofit-adapters/rxjava/src/main/java/retrofit2/adapter/rxjava/OperatorMapResponseToBodyOrError.java
++++ /dev/null
+@@ -1,56 +0,0 @@
+-/*
+- * Copyright (C) 2016 Square, Inc.
+- *
+- * Licensed under the Apache License, Version 2.0 (the "License");
+- * you may not use this file except in compliance with the License.
+- * You may obtain a copy of the License at
+- *
+- *      http://www.apache.org/licenses/LICENSE-2.0
+- *
+- * Unless required by applicable law or agreed to in writing, software
+- * distributed under the License is distributed on an "AS IS" BASIS,
+- * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+- * See the License for the specific language governing permissions and
+- * limitations under the License.
+- */
+-package retrofit2.adapter.rxjava;
+-
+-import retrofit2.Response;
+-import rx.Observable;
+-import rx.Observable.Operator;
+-import rx.Subscriber;
+-import rx.functions.Func1;
+-
+-/**
+- * A version of {@link Observable#map(Func1)} which lets us trigger {@code onError} without having
+- * to use {@link Observable#flatMap(Func1)} which breaks producer requests from propagating.
+- */
+-final class OperatorMapResponseToBodyOrError<T> implements Operator<T, Response<T>> {
+-  private static final OperatorMapResponseToBodyOrError<Object> INSTANCE =
+-      new OperatorMapResponseToBodyOrError<>();
+-
+-  @SuppressWarnings("unchecked") // Safe because of erasure.
+-  static <R> OperatorMapResponseToBodyOrError<R> instance() {
+-    return (OperatorMapResponseToBodyOrError<R>) INSTANCE;
+-  }
+-
+-  @Override public Subscriber<? super Response<T>> call(final Subscriber<? super T> child) {
+-    return new Subscriber<Response<T>>(child) {
+-      @Override public void onNext(Response<T> response) {
+-        if (response.isSuccessful()) {
+-          child.onNext(response.body());
+-        } else {
+-          child.onError(new HttpException(response));
+-        }
+-      }
+-
+-      @Override public void onCompleted() {
+-        child.onCompleted();
+-      }
+-
+-      @Override public void onError(Throwable e) {
+-        child.onError(e);
+-      }
+-    };
+-  }
+-}
+diff --git a/retrofit-adapters/rxjava/src/main/java/retrofit2/adapter/rxjava/Result.java b/retrofit-adapters/rxjava/src/main/java/retrofit2/adapter/rxjava/Result.java
+index 8d68e9e7f..49abfae2b 100644
+--- a/retrofit-adapters/rxjava/src/main/java/retrofit2/adapter/rxjava/Result.java
++++ b/retrofit-adapters/rxjava/src/main/java/retrofit2/adapter/rxjava/Result.java
+@@ -62,4 +62,11 @@ public Throwable error() {
+   public boolean isError() {
+     return error != null;
+   }
++
++  @Override public String toString() {
++    if (error != null) {
++      return "Result{isError=true, error=\"" + error + "\"}";
++    }
++    return "Result{isError=false, response=" + response + '}';
++  }
+ }
+diff --git a/retrofit-adapters/rxjava/src/main/java/retrofit2/adapter/rxjava/ResultOnSubscribe.java b/retrofit-adapters/rxjava/src/main/java/retrofit2/adapter/rxjava/ResultOnSubscribe.java
+new file mode 100644
+index 000000000..798df5af8
+--- /dev/null
++++ b/retrofit-adapters/rxjava/src/main/java/retrofit2/adapter/rxjava/ResultOnSubscribe.java
+@@ -0,0 +1,68 @@
++/*
++ * Copyright (C) 2016 Jake Wharton
++ *
++ * Licensed under the Apache License, Version 2.0 (the "License");
++ * you may not use this file except in compliance with the License.
++ * You may obtain a copy of the License at
++ *
++ *      http://www.apache.org/licenses/LICENSE-2.0
++ *
++ * Unless required by applicable law or agreed to in writing, software
++ * distributed under the License is distributed on an "AS IS" BASIS,
++ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++ * See the License for the specific language governing permissions and
++ * limitations under the License.
++ */
++package retrofit2.adapter.rxjava;
++
++import retrofit2.Response;
++import rx.Observable.OnSubscribe;
++import rx.Subscriber;
++import rx.exceptions.CompositeException;
++import rx.exceptions.Exceptions;
++import rx.plugins.RxJavaPlugins;
++
++final class ResultOnSubscribe<T> implements OnSubscribe<Result<T>> {
++  private final OnSubscribe<Response<T>> upstream;
++
++  ResultOnSubscribe(OnSubscribe<Response<T>> upstream) {
++    this.upstream = upstream;
++  }
++
++  @Override public void call(Subscriber<? super Result<T>> subscriber) {
++    upstream.call(new ResultSubscriber<T>(subscriber));
++  }
++
++  private static class ResultSubscriber<R> extends Subscriber<Response<R>> {
++    private final Subscriber<? super Result<R>> subscriber;
++
++    ResultSubscriber(Subscriber<? super Result<R>> subscriber) {
++      super(subscriber);
++      this.subscriber = subscriber;
++    }
++
++    @Override public void onNext(Response<R> response) {
++      subscriber.onNext(Result.response(response));
++    }
++
++    @Override public void onError(Throwable throwable) {
++      try {
++        subscriber.onNext(Result.<R>error(throwable));
++      } catch (Throwable t) {
++        try {
++          subscriber.onError(t);
++        } catch (Throwable inner) {
++          Exceptions.throwIfFatal(inner);
++          CompositeException composite = new CompositeException(t, inner);
++          RxJavaPlugins.getInstance().getErrorHandler().handleError(composite);
++        }
++        return;
++      }
++      subscriber.onCompleted();
++    }
++
++    @Override public void onCompleted() {
++      subscriber.onCompleted();
++    }
++  }
++}
+diff --git a/retrofit-adapters/rxjava/src/main/java/retrofit2/adapter/rxjava/RxJavaCallAdapter.java b/retrofit-adapters/rxjava/src/main/java/retrofit2/adapter/rxjava/RxJavaCallAdapter.java
+new file mode 100644
+index 000000000..5a728aff8
+--- /dev/null
++++ b/retrofit-adapters/rxjava/src/main/java/retrofit2/adapter/rxjava/RxJavaCallAdapter.java
+@@ -0,0 +1,93 @@
++/*
++ * Copyright (C) 2016 Jake Wharton
++ *
++ * Licensed under the Apache License, Version 2.0 (the "License");
++ * you may not use this file except in compliance with the License.
++ * You may obtain a copy of the License at
++ *
++ *      http://www.apache.org/licenses/LICENSE-2.0
++ *
++ * Unless required by applicable law or agreed to in writing, software
++ * distributed under the License is distributed on an "AS IS" BASIS,
++ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++ * See the License for the specific language governing permissions and
++ * limitations under the License.
++ */
++package retrofit2.adapter.rxjava;
++
++import java.lang.reflect.Type;
++import retrofit2.Call;
++import retrofit2.CallAdapter;
++import retrofit2.Response;
++import rx.Observable;
++import rx.Observable.OnSubscribe;
++import rx.Scheduler;
++
++final class RxJavaCallAdapter implements CallAdapter<Object> {
++  private final Type responseType;
++  private final Scheduler scheduler;
++  private final boolean isResult;
++  private final boolean isBody;
++  private final boolean isSingle;
++  private final boolean isCompletable;
++
++  RxJavaCallAdapter(Type responseType, Scheduler scheduler, boolean isResult, boolean isBody,
++      boolean isSingle, boolean isCompletable) {
++    this.responseType = responseType;
++    this.scheduler = scheduler;
++    this.isResult = isResult;
++    this.isBody = isBody;
++    this.isSingle = isSingle;
++    this.isCompletable = isCompletable;
++  }
++
++  @Override public Type responseType() {
++    return responseType;
++  }
++
++  @Override public <R> Object adapt(Call<R> call) {
++    OnSubscribe<Response<R>> callFunc = new CallOnSubscribe<>(call);
++
++    OnSubscribe<?> func;
++    if (isResult) {
++      func = new ResultOnSubscribe<>(callFunc);
++    } else if (isBody) {
++      func = new BodyOnSubscribe<>(callFunc);
++    } else {
++      func = callFunc;
++    }
++    Observable<?> observable = Observable.create(func);
++
++    if (scheduler != null) {
++      observable = observable.subscribeOn(scheduler);
++    }
++
++    if (isSingle) {
++      return SingleHelper.toSingle(observable);
++    }
++    if (isCompletable) {
++      return CompletableHelper.toCompletable(observable);
++    }
++    return observable;
++  }
++
++  /**
++   * Separate static class defers classloading and bytecode verification since Completable is not an
++   * RxJava stable API yet.
++   */
++  private static final class CompletableHelper {
++    static Object toCompletable(Observable<?> observable) {
++      return observable.toCompletable();
++    }
++  }
++
++  /**
++   * Separate static class defers classloading and bytecode verification since Single is not an
++   * RxJava stable API yet.
++   */
++  private static final class SingleHelper {
++    static Object toSingle(Observable<?> observable) {
++      return observable.toSingle();
++    }
++  }
++}
+diff --git a/retrofit-adapters/rxjava/src/main/java/retrofit2/adapter/rxjava/RxJavaCallAdapterFactory.java b/retrofit-adapters/rxjava/src/main/java/retrofit2/adapter/rxjava/RxJavaCallAdapterFactory.java
+index f0feb4b21..101daebdc 100644
+--- a/retrofit-adapters/rxjava/src/main/java/retrofit2/adapter/rxjava/RxJavaCallAdapterFactory.java
++++ b/retrofit-adapters/rxjava/src/main/java/retrofit2/adapter/rxjava/RxJavaCallAdapterFactory.java
+@@ -19,31 +19,27 @@
+ import java.lang.annotation.Annotation;
+ import java.lang.reflect.ParameterizedType;
+ import java.lang.reflect.Type;
+-import java.util.concurrent.atomic.AtomicBoolean;
+-import retrofit2.Call;
+ import retrofit2.CallAdapter;
+ import retrofit2.Response;
+ import retrofit2.Retrofit;
++import rx.Completable;
+ import rx.Observable;
+-import rx.Producer;
+ import rx.Scheduler;
+-import rx.Subscriber;
+-import rx.Subscription;
+-import rx.exceptions.Exceptions;
+-import rx.functions.Func1;
++import rx.Single;
+ 
+ /**
+  * A {@linkplain CallAdapter.Factory call adapter} which uses RxJava for creating observables.
+  * <p>
+- * Adding this class to {@link Retrofit} allows you to return {@link Observable} from service
+- * methods.
++ * Adding this class to {@link Retrofit} allows you to return an {@link Observable}, {@link Single},
++ * or {@link Completable} from service methods.
+  * <pre><code>
+  * interface MyService {
+  *   &#64;GET("user/me")
+  *   Observable&lt;User&gt; getUser()
+  * }
+  * </code></pre>
+- * There are three configurations supported for the {@code Observable} type parameter:
++ * There are three configurations supported for the {@code Observable} or {@code Single} type
++ * parameter:
+  * <ul>
+  * <li>Direct body (e.g., {@code Observable<User>}) calls {@code onNext} with the deserialized body
+  * for 2XX responses and calls {@code onError} with {@link HttpException} for non-2XX responses and
+@@ -54,6 +50,10 @@
+  * <li>Result wrapped body (e.g., {@code Observable<Result<User>>}) calls {@code onNext} with a
+  * {@link Result} object for all HTTP responses and errors.</li>
+  * </ul>
++ * <p>
++ * <em>Note:</em> Support for {@link Single} and {@link Completable} is experimental and subject
++ * to backwards-incompatible changes at any time since both of these types are not considered
++ * stable by RxJava.
+  */
+ public final class RxJavaCallAdapterFactory extends CallAdapter.Factory {
+   /**
+@@ -88,30 +88,20 @@ private RxJavaCallAdapterFactory(Scheduler scheduler) {
+     if (rawType != Observable.class && !isSingle && !isCompletable) {
+       return null;
+     }
+-    if (!isCompletable && !(returnType instanceof ParameterizedType)) {
+-      String name = isSingle ? "Single" : "Observable";
+-      throw new IllegalStateException(name + " return type must be parameterized"
+-          + " as " + name + "<Foo> or " + name + "<? extends Foo>");
+-    }
+ 
+     if (isCompletable) {
+-      // Add Completable-converter wrapper from a separate class. This defers classloading such that
+-      // regular Observable operation can be leveraged without relying on this unstable RxJava API.
+-      // Note that this has to be done separately since Completable doesn't have a parametrized
+-      // type.
+-      return CompletableHelper.createCallAdapter(scheduler);
++      return new RxJavaCallAdapter(Void.class, scheduler, false, true, false, true);
+     }
+ 
+-    CallAdapter<Observable<?>> callAdapter = getCallAdapter(returnType, scheduler);
+-    if (isSingle) {
+-      // Add Single-converter wrapper from a separate class. This defers classloading such that
+-      // regular Observable operation can be leveraged without relying on this unstable RxJava API.
+-      return SingleHelper.makeSingle(callAdapter);
++    boolean isResult = false;
++    boolean isBody = false;
++    Type responseType;
++    if (!(returnType instanceof ParameterizedType)) {
++      String name = isSingle ? "Single" : "Observable";
++      throw new IllegalStateException(name + " return type must be parameterized"
++          + " as " + name + "<Foo> or " + name + "<? extends Foo>");
+     }
+-    return callAdapter;
+-  }
+ 
+-  private CallAdapter<Observable<?>> getCallAdapter(Type returnType, Scheduler scheduler) {
+     Type observableType = getParameterUpperBound(0, (ParameterizedType) returnType);
+     Class<?> rawObservableType = getRawType(observableType);
+     if (rawObservableType == Response.class) {
+@@ -119,154 +109,19 @@ private RxJavaCallAdapterFactory(Scheduler scheduler) {
+         throw new IllegalStateException("Response must be parameterized"
+             + " as Response<Foo> or Response<? extends Foo>");
+       }
+-      Type responseType = getParameterUpperBound(0, (ParameterizedType) observableType);
+-      return new ResponseCallAdapter(responseType, scheduler);
+-    }
+-
+-    if (rawObservableType == Result.class) {
++      responseType = getParameterUpperBound(0, (ParameterizedType) observableType);
++    } else if (rawObservableType == Result.class) {
+       if (!(observableType instanceof ParameterizedType)) {
+         throw new IllegalStateException("Result must be parameterized"
+             + " as Result<Foo> or Result<? extends Foo>");
+       }
+-      Type responseType = getParameterUpperBound(0, (ParameterizedType) observableType);
+-      return new ResultCallAdapter(responseType, scheduler);
+-    }
+-
+-    return new SimpleCallAdapter(observableType, scheduler);
+-  }
+-
+-  static final class CallOnSubscribe<T> implements Observable.OnSubscribe<Response<T>> {
+-    private final Call<T> originalCall;
+-
+-    CallOnSubscribe(Call<T> originalCall) {
+-      this.originalCall = originalCall;
+-    }
+-
+-    @Override public void call(final Subscriber<? super Response<T>> subscriber) {
+-      // Since Call is a one-shot type, clone it for each new subscriber.
+-      Call<T> call = originalCall.clone();
+-
+-      // Wrap the call in a helper which handles both unsubscription and backpressure.
+-      RequestArbiter<T> requestArbiter = new RequestArbiter<>(call, subscriber);
+-      subscriber.add(requestArbiter);
+-      subscriber.setProducer(requestArbiter);
+-    }
+-  }
+-
+-  static final class RequestArbiter<T> extends AtomicBoolean implements Subscription, Producer {
+-    private final Call<T> call;
+-    private final Subscriber<? super Response<T>> subscriber;
+-
+-    RequestArbiter(Call<T> call, Subscriber<? super Response<T>> subscriber) {
+-      this.call = call;
+-      this.subscriber = subscriber;
+-    }
+-
+-    @Override public void request(long n) {
+-      if (n < 0) throw new IllegalArgumentException("n < 0: " + n);
+-      if (n == 0) return; // Nothing to do when requesting 0.
+-      if (!compareAndSet(false, true)) return; // Request was already triggered.
+-
+-      try {
+-        Response<T> response = call.execute();
+-        if (!subscriber.isUnsubscribed()) {
+-          subscriber.onNext(response);
+-        }
+-      } catch (Throwable t) {
+-        Exceptions.throwIfFatal(t);
+-        if (!subscriber.isUnsubscribed()) {
+-          subscriber.onError(t);
+-        }
+-        return;
+-      }
+-
+-      if (!subscriber.isUnsubscribed()) {
+-        subscriber.onCompleted();
+-      }
++      responseType = getParameterUpperBound(0, (ParameterizedType) observableType);
++      isResult = true;
++    } else {
++      responseType = observableType;
++      isBody = true;
+     }
+ 
+-    @Override public void unsubscribe() {
+-      call.cancel();
+-    }
+-
+-    @Override public boolean isUnsubscribed() {
+-      return call.isCanceled();
+-    }
+-  }
+-
+-  static final class ResponseCallAdapter implements CallAdapter<Observable<?>> {
+-    private final Type responseType;
+-    private final Scheduler scheduler;
+-
+-    ResponseCallAdapter(Type responseType, Scheduler scheduler) {
+-      this.responseType = responseType;
+-      this.scheduler = scheduler;
+-    }
+-
+-    @Override public Type responseType() {
+-      return responseType;
+-    }
+-
+-    @Override public <R> Observable<Response<R>> adapt(Call<R> call) {
+-      Observable<Response<R>> observable = Observable.create(new CallOnSubscribe<>(call));
+-      if (scheduler != null) {
+-        return observable.subscribeOn(scheduler);
+-      }
+-      return observable;
+-    }
+-  }
+-
+-  static final class SimpleCallAdapter implements CallAdapter<Observable<?>> {
+-    private final Type responseType;
+-    private final Scheduler scheduler;
+-
+-    SimpleCallAdapter(Type responseType, Scheduler scheduler) {
+-      this.responseType = responseType;
+-      this.scheduler = scheduler;
+-    }
+-
+-    @Override public Type responseType() {
+-      return responseType;
+-    }
+-
+-    @Override public <R> Observable<R> adapt(Call<R> call) {
+-      Observable<R> observable = Observable.create(new CallOnSubscribe<>(call)) //
+-          .lift(OperatorMapResponseToBodyOrError.<R>instance());
+-      if (scheduler != null) {
+-        return observable.subscribeOn(scheduler);
+-      }
+-      return observable;
+-    }
+-  }
+-
+-  static final class ResultCallAdapter implements CallAdapter<Observable<?>> {
+-    private final Type responseType;
+-    private final Scheduler scheduler;
+-
+-    ResultCallAdapter(Type responseType, Scheduler scheduler) {
+-      this.responseType = responseType;
+-      this.scheduler = scheduler;
+-    }
+-
+-    @Override public Type responseType() {
+-      return responseType;
+-    }
+-
+-    @Override public <R> Observable<Result<R>> adapt(Call<R> call) {
+-      Observable<Result<R>> observable = Observable.create(new CallOnSubscribe<>(call)) //
+-          .map(new Func1<Response<R>, Result<R>>() {
+-            @Override public Result<R> call(Response<R> response) {
+-              return Result.response(response);
+-            }
+-          }).onErrorReturn(new Func1<Throwable, Result<R>>() {
+-            @Override public Result<R> call(Throwable throwable) {
+-              return Result.error(throwable);
+-            }
+-          });
+-      if (scheduler != null) {
+-        return observable.subscribeOn(scheduler);
+-      }
+-      return observable;
+-    }
++    return new RxJavaCallAdapter(responseType, scheduler, isResult, isBody, isSingle, false);
+   }
+ }
+diff --git a/retrofit-adapters/rxjava/src/test/java/retrofit2/adapter/rxjava/CompletableTest.java b/retrofit-adapters/rxjava/src/test/java/retrofit2/adapter/rxjava/CompletableTest.java
+index 0cdd11155..d22877347 100644
+--- a/retrofit-adapters/rxjava/src/test/java/retrofit2/adapter/rxjava/CompletableTest.java
++++ b/retrofit-adapters/rxjava/src/test/java/retrofit2/adapter/rxjava/CompletableTest.java
+@@ -16,21 +16,28 @@
+ package retrofit2.adapter.rxjava;
+ 
+ import java.io.IOException;
++import java.util.concurrent.atomic.AtomicReference;
+ import okhttp3.mockwebserver.MockResponse;
+ import okhttp3.mockwebserver.MockWebServer;
+ import org.junit.Before;
+ import org.junit.Rule;
+ import org.junit.Test;
++import org.junit.rules.TestRule;
+ import retrofit2.Retrofit;
+ import retrofit2.http.GET;
+ import rx.Completable;
++import rx.exceptions.CompositeException;
++import rx.exceptions.Exceptions;
++import rx.plugins.RxJavaErrorHandler;
++import rx.plugins.RxJavaPlugins;
+ 
+ import static okhttp3.mockwebserver.SocketPolicy.DISCONNECT_AFTER_REQUEST;
+ import static org.assertj.core.api.Assertions.assertThat;
+-import static org.junit.Assert.fail;
+ 
+ public final class CompletableTest {
+   @Rule public final MockWebServer server = new MockWebServer();
++  @Rule public final TestRule pluginsReset = new RxJavaPluginsResetRule();
++  @Rule public final RecordingSubscriber.Rule subscriberRule = new RecordingSubscriber.Rule();
+ 
+   interface Service {
+     @GET("/") Completable completable();
+@@ -48,29 +55,77 @@
+ 
+   @Test public void completableSuccess200() {
+     server.enqueue(new MockResponse().setBody("Hi"));
+-    service.completable().await();
++
++    RecordingSubscriber<Void> subscriber = subscriberRule.create();
++    service.completable().unsafeSubscribe(subscriber);
++    subscriber.assertCompleted();
+   }
+ 
+   @Test public void completableSuccess404() {
+     server.enqueue(new MockResponse().setResponseCode(404));
+ 
+-    try {
+-      service.completable().await();
+-      fail();
+-    } catch (RuntimeException e) {
+-      Throwable cause = e.getCause();
+-      assertThat(cause).isInstanceOf(HttpException.class).hasMessage("HTTP 404 Client Error");
+-    }
++    RecordingSubscriber<Void> subscriber = subscriberRule.create();
++    service.completable().unsafeSubscribe(subscriber);
++    subscriber.assertError(HttpException.class, "HTTP 404 Client Error");
+   }
+ 
+   @Test public void completableFailure() {
+     server.enqueue(new MockResponse().setSocketPolicy(DISCONNECT_AFTER_REQUEST));
+ 
+-    try {
+-      service.completable().await();
+-      fail();
+-    } catch (RuntimeException e) {
+-      assertThat(e.getCause()).isInstanceOf(IOException.class);
+-    }
++    RecordingSubscriber<Void> subscriber = subscriberRule.create();
++    service.completable().unsafeSubscribe(subscriber);
++    subscriber.assertError(IOException.class);
++  }
++
++  @Test public void bodyThrowingInOnCompletedDeliveredToPlugin() {
++    server.enqueue(new MockResponse().setBody("Hi"));
++
++    final AtomicReference<Throwable> throwableRef = new AtomicReference<>();
++    RxJavaPlugins.getInstance().registerErrorHandler(new RxJavaErrorHandler() {
++      @Override public void handleError(Throwable throwable) {
++        if (!throwableRef.compareAndSet(null, throwable)) {
++          throw Exceptions.propagate(throwable);
++        }
++      }
++    });
++
++    RecordingSubscriber<String> subscriber = subscriberRule.create();
++    final RuntimeException e = new RuntimeException();
++    service.completable().unsafeSubscribe(new ForwardingSubscriber<String>(subscriber) {
++      @Override public void onCompleted() {
++        throw e;
++      }
++    });
++
++    assertThat(throwableRef.get()).isSameAs(e);
++  }
++
++  @Test public void bodyThrowingInOnErrorDeliveredToPlugin() {
++    server.enqueue(new MockResponse().setResponseCode(404));
++
++    final AtomicReference<Throwable> throwableRef = new AtomicReference<>();
++    RxJavaPlugins.getInstance().registerErrorHandler(new RxJavaErrorHandler() {
++      @Override public void handleError(Throwable throwable) {
++        if (!throwableRef.compareAndSet(null, throwable)) {
++          throw Exceptions.propagate(throwable);
++        }
++      }
++    });
++
++    RecordingSubscriber<String> subscriber = subscriberRule.create();
++    final AtomicReference<Throwable> errorRef = new AtomicReference<>();
++    final RuntimeException e = new RuntimeException();
++    service.completable().unsafeSubscribe(new ForwardingSubscriber<String>(subscriber) {
++      @Override public void onError(Throwable throwable) {
++        if (!errorRef.compareAndSet(null, throwable)) {
++          throw Exceptions.propagate(throwable);
++        }
++        throw e;
++      }
++    });
++
++    //noinspection ThrowableResultOfMethodCallIgnored
++    CompositeException composite = (CompositeException) throwableRef.get();
++    assertThat(composite.getExceptions()).containsExactly(errorRef.get(), e);
+   }
+ }
+diff --git a/retrofit-adapters/rxjava/src/test/java/retrofit2/adapter/rxjava/CompletableSchedulerTest.java b/retrofit-adapters/rxjava/src/test/java/retrofit2/adapter/rxjava/CompletableWithSchedulerTest.java
+similarity index 83%
+rename from retrofit-adapters/rxjava/src/test/java/retrofit2/adapter/rxjava/CompletableSchedulerTest.java
+rename to retrofit-adapters/rxjava/src/test/java/retrofit2/adapter/rxjava/CompletableWithSchedulerTest.java
+index bb02e3d47..02c4778b1 100644
+--- a/retrofit-adapters/rxjava/src/test/java/retrofit2/adapter/rxjava/CompletableSchedulerTest.java
++++ b/retrofit-adapters/rxjava/src/test/java/retrofit2/adapter/rxjava/CompletableWithSchedulerTest.java
+@@ -23,11 +23,11 @@
+ import retrofit2.Retrofit;
+ import retrofit2.http.GET;
+ import rx.Completable;
+-import rx.observers.TestSubscriber;
+ import rx.schedulers.TestScheduler;
+ 
+-public final class CompletableSchedulerTest {
++public final class CompletableWithSchedulerTest {
+   @Rule public final MockWebServer server = new MockWebServer();
++  @Rule public final RecordingSubscriber.Rule subscriberRule = new RecordingSubscriber.Rule();
+ 
+   interface Service {
+     @GET("/") Completable completable();
+@@ -47,9 +47,9 @@
+   @Test public void completableUsesScheduler() {
+     server.enqueue(new MockResponse().setBody("Hi"));
+ 
+-    TestSubscriber<Void> subscriber = new TestSubscriber<>();
+-    service.completable().subscribe(subscriber);
+-    subscriber.assertNoTerminalEvent();
++    RecordingSubscriber<String> subscriber = subscriberRule.create();
++    service.completable().unsafeSubscribe(subscriber);
++    subscriber.assertNoEvents();
+ 
+     scheduler.triggerActions();
+     subscriber.assertCompleted();
+diff --git a/retrofit-adapters/rxjava/src/main/java/retrofit2/adapter/rxjava/SingleHelper.java b/retrofit-adapters/rxjava/src/test/java/retrofit2/adapter/rxjava/ForwardingSubscriber.java
+similarity index 50%
+rename from retrofit-adapters/rxjava/src/main/java/retrofit2/adapter/rxjava/SingleHelper.java
+rename to retrofit-adapters/rxjava/src/test/java/retrofit2/adapter/rxjava/ForwardingSubscriber.java
+index e0073cfae..d32d6f6ae 100644
+--- a/retrofit-adapters/rxjava/src/main/java/retrofit2/adapter/rxjava/SingleHelper.java
++++ b/retrofit-adapters/rxjava/src/test/java/retrofit2/adapter/rxjava/ForwardingSubscriber.java
+@@ -1,5 +1,5 @@
+ /*
+- * Copyright (C) 2015 Square, Inc.
++ * Copyright (C) 2016 Square, Inc.
+  *
+  * Licensed under the Apache License, Version 2.0 (the "License");
+  * you may not use this file except in compliance with the License.
+@@ -15,23 +15,24 @@
+  */
+ package retrofit2.adapter.rxjava;
+ 
+-import java.lang.reflect.Type;
+-import retrofit2.Call;
+-import retrofit2.CallAdapter;
+-import rx.Observable;
+-import rx.Single;
++import rx.Subscriber;
+ 
+-final class SingleHelper {
+-  static CallAdapter<Single<?>> makeSingle(final CallAdapter<Observable<?>> callAdapter) {
+-    return new CallAdapter<Single<?>>() {
+-      @Override public Type responseType() {
+-        return callAdapter.responseType();
+-      }
++abstract class ForwardingSubscriber<T> extends Subscriber<T> {
++  private final Subscriber<T> delegate;
+ 
+-      @Override public <R> Single<?> adapt(Call<R> call) {
+-        Observable<?> observable = callAdapter.adapt(call);
+-        return observable.toSingle();
+-      }
+-    };
++  ForwardingSubscriber(Subscriber<T> delegate) {
++    this.delegate = delegate;
++  }
++
++  @Override public void onNext(T value) {
++    delegate.onNext(value);
++  }
++
++  @Override public void onCompleted() {
++    delegate.onCompleted();
++  }
++
++  @Override public void onError(Throwable throwable) {
++    delegate.onError(throwable);
+   }
+ }
+diff --git a/retrofit-adapters/rxjava/src/test/java/retrofit2/adapter/rxjava/HttpExceptionTest.java b/retrofit-adapters/rxjava/src/test/java/retrofit2/adapter/rxjava/HttpExceptionTest.java
+new file mode 100644
+index 000000000..2e77f06c1
+--- /dev/null
++++ b/retrofit-adapters/rxjava/src/test/java/retrofit2/adapter/rxjava/HttpExceptionTest.java
+@@ -0,0 +1,41 @@
++/*
++ * Copyright (C) 2016 Square, Inc.
++ *
++ * Licensed under the Apache License, Version 2.0 (the "License");
++ * you may not use this file except in compliance with the License.
++ * You may obtain a copy of the License at
++ *
++ *      http://www.apache.org/licenses/LICENSE-2.0
++ *
++ * Unless required by applicable law or agreed to in writing, software
++ * distributed under the License is distributed on an "AS IS" BASIS,
++ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++ * See the License for the specific language governing permissions and
++ * limitations under the License.
++ */
++package retrofit2.adapter.rxjava;
++
++import org.junit.Test;
++import retrofit2.Response;
++
++import static org.assertj.core.api.Assertions.assertThat;
++import static org.junit.Assert.fail;
++
++public final class HttpExceptionTest {
++  @Test public void response() {
++    Response<String> response = Response.success("Hi");
++    HttpException exception = new HttpException(response);
++    assertThat(exception.code()).isEqualTo(200);
++    assertThat(exception.message()).isEqualTo("OK");
++    assertThat(exception.response()).isSameAs(response);
++  }
++
++  @Test public void nullResponseThrows() {
++    try {
++      new HttpException(null);
++      fail();
++    } catch (NullPointerException e) {
++      assertThat(e).hasMessage("response == null");
++    }
++  }
++}
+diff --git a/retrofit-adapters/rxjava/src/test/java/retrofit2/adapter/rxjava/ObservableTest.java b/retrofit-adapters/rxjava/src/test/java/retrofit2/adapter/rxjava/ObservableTest.java
+index f3e05adea..39265f5e9 100644
+--- a/retrofit-adapters/rxjava/src/test/java/retrofit2/adapter/rxjava/ObservableTest.java
++++ b/retrofit-adapters/rxjava/src/test/java/retrofit2/adapter/rxjava/ObservableTest.java
+@@ -16,24 +16,29 @@
+ package retrofit2.adapter.rxjava;
+ 
+ import java.io.IOException;
++import java.util.concurrent.atomic.AtomicReference;
+ import okhttp3.mockwebserver.MockResponse;
+ import okhttp3.mockwebserver.MockWebServer;
+ import org.junit.Before;
+ import org.junit.Rule;
+ import org.junit.Test;
++import org.junit.rules.TestRule;
+ import retrofit2.Response;
+ import retrofit2.Retrofit;
+ import retrofit2.http.GET;
+ import rx.Observable;
+-import rx.observables.BlockingObservable;
+-import rx.observers.TestSubscriber;
++import rx.exceptions.CompositeException;
++import rx.exceptions.Exceptions;
++import rx.plugins.RxJavaErrorHandler;
++import rx.plugins.RxJavaPlugins;
+ 
+ import static okhttp3.mockwebserver.SocketPolicy.DISCONNECT_AFTER_REQUEST;
+ import static org.assertj.core.api.Assertions.assertThat;
+-import static org.junit.Assert.fail;
+ 
+ public final class ObservableTest {
+   @Rule public final MockWebServer server = new MockWebServer();
++  @Rule public final TestRule pluginsReset = new RxJavaPluginsResetRule();
++  @Rule public final RecordingSubscriber.Rule subscriberRule = new RecordingSubscriber.Rule();
+ 
+   interface Service {
+     @GET("/") Observable<String> body();
+@@ -55,141 +60,325 @@
+   @Test public void bodySuccess200() {
+     server.enqueue(new MockResponse().setBody("Hi"));
+ 
+-    BlockingObservable<String> o = service.body().toBlocking();
+-    assertThat(o.first()).isEqualTo("Hi");
++    RecordingSubscriber<String> subscriber = subscriberRule.create();
++    service.body().unsafeSubscribe(subscriber);
++    subscriber.assertValue("Hi").assertCompleted();
+   }
+ 
+   @Test public void bodySuccess404() {
+     server.enqueue(new MockResponse().setResponseCode(404));
+ 
+-    BlockingObservable<String> o = service.body().toBlocking();
+-    try {
+-      o.first();
+-      fail();
+-    } catch (RuntimeException e) {
+-      Throwable cause = e.getCause();
+-      assertThat(cause).isInstanceOf(HttpException.class).hasMessage("HTTP 404 Client Error");
+-    }
++    RecordingSubscriber<String> subscriber = subscriberRule.create();
++    service.body().unsafeSubscribe(subscriber);
++    subscriber.assertError(HttpException.class, "HTTP 404 Client Error");
+   }
+ 
+   @Test public void bodyFailure() {
+     server.enqueue(new MockResponse().setSocketPolicy(DISCONNECT_AFTER_REQUEST));
+ 
+-    BlockingObservable<String> o = service.body().toBlocking();
+-    try {
+-      o.first();
+-      fail();
+-    } catch (RuntimeException e) {
+-      assertThat(e.getCause()).isInstanceOf(IOException.class);
+-    }
++    RecordingSubscriber<String> subscriber = subscriberRule.create();
++    service.body().unsafeSubscribe(subscriber);
++    subscriber.assertError(IOException.class);
+   }
+ 
+   @Test public void bodyRespectsBackpressure() {
+     server.enqueue(new MockResponse().setBody("Hi"));
+ 
+-    TestSubscriber<String> subscriber = new TestSubscriber<>(0);
+-    Observable<String> o = service.body();
+-
+-    o.subscribe(subscriber);
++    RecordingSubscriber<String> subscriber = subscriberRule.createWithInitialRequest(0);
++    service.body().unsafeSubscribe(subscriber);
+     assertThat(server.getRequestCount()).isEqualTo(0);
+ 
+     subscriber.requestMore(1);
+     assertThat(server.getRequestCount()).isEqualTo(1);
++    subscriber.assertAnyValue().assertCompleted();
+ 
+     subscriber.requestMore(Long.MAX_VALUE); // Subsequent requests do not trigger HTTP requests.
+     assertThat(server.getRequestCount()).isEqualTo(1);
+   }
+ 
++  @Test public void bodyThrowingInOnNextDeliveredToError() {
++    server.enqueue(new MockResponse().setBody("Hi"));
++
++    RecordingSubscriber<String> subscriber = subscriberRule.create();
++    final RuntimeException e = new RuntimeException();
++    service.body().unsafeSubscribe(new ForwardingSubscriber<String>(subscriber) {
++      @Override public void onNext(String value) {
++        throw e;
++      }
++    });
++
++    subscriber.assertError(e);
++  }
++
++  @Test public void bodyThrowingInOnCompletedDeliveredToPlugin() {
++    server.enqueue(new MockResponse().setBody("Hi"));
++
++    final AtomicReference<Throwable> throwableRef = new AtomicReference<>();
++    RxJavaPlugins.getInstance().registerErrorHandler(new RxJavaErrorHandler() {
++      @Override public void handleError(Throwable throwable) {
++        if (!throwableRef.compareAndSet(null, throwable)) {
++          throw Exceptions.propagate(throwable);
++        }
++      }
++    });
++
++    RecordingSubscriber<String> subscriber = subscriberRule.create();
++    final RuntimeException e = new RuntimeException();
++    service.body().unsafeSubscribe(new ForwardingSubscriber<String>(subscriber) {
++      @Override public void onCompleted() {
++        throw e;
++      }
++    });
++
++    subscriber.assertValue("Hi");
++    assertThat(throwableRef.get()).isSameAs(e);
++  }
++
++  @Test public void bodyThrowingInOnErrorDeliveredToPlugin() {
++    server.enqueue(new MockResponse().setResponseCode(404));
++
++    final AtomicReference<Throwable> throwableRef = new AtomicReference<>();
++    RxJavaPlugins.getInstance().registerErrorHandler(new RxJavaErrorHandler() {
++      @Override public void handleError(Throwable throwable) {
++        if (!throwableRef.compareAndSet(null, throwable)) {
++          throw Exceptions.propagate(throwable);
++        }
++      }
++    });
++
++    RecordingSubscriber<String> subscriber = subscriberRule.create();
++    final AtomicReference<Throwable> errorRef = new AtomicReference<>();
++    final RuntimeException e = new RuntimeException();
++    service.body().unsafeSubscribe(new ForwardingSubscriber<String>(subscriber) {
++      @Override public void onError(Throwable throwable) {
++        if (!errorRef.compareAndSet(null, throwable)) {
++          throw Exceptions.propagate(throwable);
++        }
++        throw e;
++      }
++    });
++
++    //noinspection ThrowableResultOfMethodCallIgnored
++    CompositeException composite = (CompositeException) throwableRef.get();
++    assertThat(composite.getExceptions()).containsExactly(errorRef.get(), e);
++  }
++
+   @Test public void responseSuccess200() {
+     server.enqueue(new MockResponse().setBody("Hi"));
+ 
+-    BlockingObservable<Response<String>> o = service.response().toBlocking();
+-    Response<String> response = o.first();
+-    assertThat(response.isSuccessful()).isTrue();
+-    assertThat(response.body()).isEqualTo("Hi");
++    RecordingSubscriber<Response<String>> subscriber = subscriberRule.create();
++    service.response().unsafeSubscribe(subscriber);
++    assertThat(subscriber.takeValue().body()).isEqualTo("Hi");
++    subscriber.assertCompleted();
+   }
+ 
+   @Test public void responseSuccess404() throws IOException {
+-    server.enqueue(new MockResponse().setResponseCode(404).setBody("Hi"));
++    server.enqueue(new MockResponse().setResponseCode(404));
+ 
+-    BlockingObservable<Response<String>> o = service.response().toBlocking();
+-    Response<String> response = o.first();
+-    assertThat(response.isSuccessful()).isFalse();
+-    assertThat(response.errorBody().string()).isEqualTo("Hi");
++    RecordingSubscriber<Response<String>> subscriber = subscriberRule.create();
++    service.response().unsafeSubscribe(subscriber);
++    assertThat(subscriber.takeValue().code()).isEqualTo(404);
++    subscriber.assertCompleted();
+   }
+ 
+   @Test public void responseFailure() {
+     server.enqueue(new MockResponse().setSocketPolicy(DISCONNECT_AFTER_REQUEST));
+ 
+-    BlockingObservable<Response<String>> o = service.response().toBlocking();
+-    try {
+-      o.first();
+-      fail();
+-    } catch (RuntimeException t) {
+-      assertThat(t.getCause()).isInstanceOf(IOException.class);
+-    }
++    RecordingSubscriber<Response<String>> subscriber = subscriberRule.create();
++    service.response().unsafeSubscribe(subscriber);
++    subscriber.assertError(IOException.class);
+   }
+ 
+   @Test public void responseRespectsBackpressure() {
+     server.enqueue(new MockResponse().setBody("Hi"));
+ 
+-    TestSubscriber<Response<String>> subscriber = new TestSubscriber<>(0);
+-    Observable<Response<String>> o = service.response();
+-
+-    o.subscribe(subscriber);
++    RecordingSubscriber<Response<String>> subscriber = subscriberRule.createWithInitialRequest(0);
++    service.response().unsafeSubscribe(subscriber);
+     assertThat(server.getRequestCount()).isEqualTo(0);
+ 
+     subscriber.requestMore(1);
+     assertThat(server.getRequestCount()).isEqualTo(1);
++    subscriber.assertAnyValue().assertCompleted();
+ 
+     subscriber.requestMore(Long.MAX_VALUE); // Subsequent requests do not trigger HTTP requests.
+     assertThat(server.getRequestCount()).isEqualTo(1);
+   }
+ 
++  @Test public void responseThrowingInOnNextDeliveredToError() {
++    server.enqueue(new MockResponse().setBody("Hi"));
++
++    RecordingSubscriber<Response<String>> subscriber = subscriberRule.create();
++    final RuntimeException e = new RuntimeException();
++    service.response().unsafeSubscribe(new ForwardingSubscriber<Response<String>>(subscriber) {
++      @Override public void onNext(Response<String> value) {
++        throw e;
++      }
++    });
++
++    subscriber.assertError(e);
++  }
++
++  @Test public void responseThrowingInOnCompletedDeliveredToPlugin() {
++    server.enqueue(new MockResponse().setBody("Hi"));
++
++    final AtomicReference<Throwable> throwableRef = new AtomicReference<>();
++    RxJavaPlugins.getInstance().registerErrorHandler(new RxJavaErrorHandler() {
++      @Override public void handleError(Throwable throwable) {
++        if (!throwableRef.compareAndSet(null, throwable)) {
++          throw Exceptions.propagate(throwable);
++        }
++      }
++    });
++
++    RecordingSubscriber<Response<String>> subscriber = subscriberRule.create();
++    final RuntimeException e = new RuntimeException();
++    service.response().unsafeSubscribe(new ForwardingSubscriber<Response<String>>(subscriber) {
++      @Override public void onCompleted() {
++        throw e;
++      }
++    });
++
++    assertThat(subscriber.takeValue().body()).isEqualTo("Hi");
++    assertThat(throwableRef.get()).isSameAs(e);
++  }
++
++  @Test public void responseThrowingInOnErrorDeliveredToPlugin() {
++    server.enqueue(new MockResponse().setSocketPolicy(DISCONNECT_AFTER_REQUEST));
++
++    final AtomicReference<Throwable> throwableRef = new AtomicReference<>();
++    RxJavaPlugins.getInstance().registerErrorHandler(new RxJavaErrorHandler() {
++      @Override public void handleError(Throwable throwable) {
++        if (!throwableRef.compareAndSet(null, throwable)) {
++          throw Exceptions.propagate(throwable);
++        }
++      }
++    });
++
++    RecordingSubscriber<Response<String>> subscriber = subscriberRule.create();
++    final AtomicReference<Throwable> errorRef = new AtomicReference<>();
++    final RuntimeException e = new RuntimeException();
++    service.response().unsafeSubscribe(new ForwardingSubscriber<Response<String>>(subscriber) {
++      @Override public void onError(Throwable throwable) {
++        if (!errorRef.compareAndSet(null, throwable)) {
++          throw Exceptions.propagate(throwable);
++        }
++        throw e;
++      }
++    });
++
++    //noinspection ThrowableResultOfMethodCallIgnored
++    CompositeException composite = (CompositeException) throwableRef.get();
++    assertThat(composite.getExceptions()).containsExactly(errorRef.get(), e);
++  }
++
+   @Test public void resultSuccess200() {
+     server.enqueue(new MockResponse().setBody("Hi"));
+ 
+-    BlockingObservable<Result<String>> o = service.result().toBlocking();
+-    Result<String> result = o.first();
+-    assertThat(result.isError()).isFalse();
+-    Response<String> response = result.response();
+-    assertThat(response.isSuccessful()).isTrue();
+-    assertThat(response.body()).isEqualTo("Hi");
++    RecordingSubscriber<Result<String>> subscriber = subscriberRule.create();
++    service.result().unsafeSubscribe(subscriber);
++    assertThat(subscriber.takeValue().response().body()).isEqualTo("Hi");
++    subscriber.assertCompleted();
+   }
+ 
+   @Test public void resultSuccess404() throws IOException {
+-    server.enqueue(new MockResponse().setResponseCode(404).setBody("Hi"));
++    server.enqueue(new MockResponse().setResponseCode(404));
+ 
+-    BlockingObservable<Result<String>> o = service.result().toBlocking();
+-    Result<String> result = o.first();
+-    assertThat(result.isError()).isFalse();
+-    Response<String> response = result.response();
+-    assertThat(response.isSuccessful()).isFalse();
+-    assertThat(response.errorBody().string()).isEqualTo("Hi");
++    RecordingSubscriber<Result<String>> subscriber = subscriberRule.create();
++    service.result().unsafeSubscribe(subscriber);
++    assertThat(subscriber.takeValue().response().code()).isEqualTo(404);
++    subscriber.assertCompleted();
+   }
+ 
+   @Test public void resultFailure() {
+     server.enqueue(new MockResponse().setSocketPolicy(DISCONNECT_AFTER_REQUEST));
+ 
+-    BlockingObservable<Result<String>> o = service.result().toBlocking();
+-    Result<String> result = o.first();
+-    assertThat(result.isError()).isTrue();
+-    assertThat(result.error()).isInstanceOf(IOException.class);
++    RecordingSubscriber<Result<String>> subscriber = subscriberRule.create();
++    service.result().unsafeSubscribe(subscriber);
++    assertThat(subscriber.takeValue().error()).isInstanceOf(IOException.class);
++    subscriber.assertCompleted();
+   }
+ 
+   @Test public void resultRespectsBackpressure() {
+     server.enqueue(new MockResponse().setBody("Hi"));
+ 
+-    TestSubscriber<Result<String>> subscriber = new TestSubscriber<>(0);
+-    Observable<Result<String>> o = service.result();
+-
+-    o.subscribe(subscriber);
++    RecordingSubscriber<Result<String>> subscriber = subscriberRule.createWithInitialRequest(0);
++    service.result().unsafeSubscribe(subscriber);
+     assertThat(server.getRequestCount()).isEqualTo(0);
+ 
+     subscriber.requestMore(1);
+     assertThat(server.getRequestCount()).isEqualTo(1);
++    subscriber.assertAnyValue().assertCompleted();
+ 
+     subscriber.requestMore(Long.MAX_VALUE); // Subsequent requests do not trigger HTTP requests.
+     assertThat(server.getRequestCount()).isEqualTo(1);
+   }
++
++  @Test public void resultThrowingInOnNextDeliveredToError() {
++    server.enqueue(new MockResponse().setBody("Hi"));
++
++    RecordingSubscriber<Result<String>> subscriber = subscriberRule.create();
++    final RuntimeException e = new RuntimeException();
++    service.result().unsafeSubscribe(new ForwardingSubscriber<Result<String>>(subscriber) {
++      @Override public void onNext(Result<String> value) {
++        throw e;
++      }
++    });
++
++    subscriber.assertError(e);
++  }
++
++  @Test public void resultThrowingInOnCompletedDeliveredToPlugin() {
++    server.enqueue(new MockResponse().setBody("Hi"));
++
++    final AtomicReference<Throwable> throwableRef = new AtomicReference<>();
++    RxJavaPlugins.getInstance().registerErrorHandler(new RxJavaErrorHandler() {
++      @Override public void handleError(Throwable throwable) {
++        if (!throwableRef.compareAndSet(null, throwable)) {
++          throw Exceptions.propagate(throwable);
++        }
++      }
++    });
++
++    RecordingSubscriber<Result<String>> subscriber = subscriberRule.create();
++    final RuntimeException e = new RuntimeException();
++    service.result().unsafeSubscribe(new ForwardingSubscriber<Result<String>>(subscriber) {
++      @Override public void onCompleted() {
++        throw e;
++      }
++    });
++
++    assertThat(subscriber.takeValue().response().body()).isEqualTo("Hi");
++    assertThat(throwableRef.get()).isSameAs(e);
++  }
++
++  @Test public void resultThrowingInOnErrorDeliveredToPlugin() {
++    server.enqueue(new MockResponse().setBody("Hi"));
++
++    final AtomicReference<Throwable> throwableRef = new AtomicReference<>();
++    RxJavaPlugins.getInstance().registerErrorHandler(new RxJavaErrorHandler() {
++      @Override public void handleError(Throwable throwable) {
++        if (!throwableRef.compareAndSet(null, throwable)) {
++          throw Exceptions.propagate(throwable);
++        }
++      }
++    });
++
++    RecordingSubscriber<Result<String>> subscriber = subscriberRule.create();
++    final RuntimeException first = new RuntimeException();
++    final RuntimeException second = new RuntimeException();
++    service.result().unsafeSubscribe(new ForwardingSubscriber<Result<String>>(subscriber) {
++      @Override public void onNext(Result<String> value) {
++        // The only way to trigger onError for a result is if onNext throws.
++        throw first;
++      }
++
++      @Override public void onError(Throwable throwable) {
++        throw second;
++      }
++    });
++
++    //noinspection ThrowableResultOfMethodCallIgnored
++    CompositeException composite = (CompositeException) throwableRef.get();
++    assertThat(composite.getExceptions()).containsExactly(first, second);
++  }
+ }
+diff --git a/retrofit-adapters/rxjava/src/test/java/retrofit2/adapter/rxjava/ObservableSchedulerTest.java b/retrofit-adapters/rxjava/src/test/java/retrofit2/adapter/rxjava/ObservableWithSchedulerTest.java
+similarity index 70%
+rename from retrofit-adapters/rxjava/src/test/java/retrofit2/adapter/rxjava/ObservableSchedulerTest.java
+rename to retrofit-adapters/rxjava/src/test/java/retrofit2/adapter/rxjava/ObservableWithSchedulerTest.java
+index e0a1c2d41..3cf00cd7a 100644
+--- a/retrofit-adapters/rxjava/src/test/java/retrofit2/adapter/rxjava/ObservableSchedulerTest.java
++++ b/retrofit-adapters/rxjava/src/test/java/retrofit2/adapter/rxjava/ObservableWithSchedulerTest.java
+@@ -24,11 +24,11 @@
+ import retrofit2.Retrofit;
+ import retrofit2.http.GET;
+ import rx.Observable;
+-import rx.observers.TestSubscriber;
+ import rx.schedulers.TestScheduler;
+ 
+-public final class ObservableSchedulerTest {
++public final class ObservableWithSchedulerTest {
+   @Rule public final MockWebServer server = new MockWebServer();
++  @Rule public final RecordingSubscriber.Rule subscriberRule = new RecordingSubscriber.Rule();
+ 
+   interface Service {
+     @GET("/") Observable<String> body();
+@@ -51,39 +51,33 @@
+   @Test public void bodyUsesScheduler() {
+     server.enqueue(new MockResponse().setBody("Hi"));
+ 
+-    TestSubscriber<String> subscriber = new TestSubscriber<>();
+-    service.body().subscribe(subscriber);
+-    subscriber.assertNoValues();
+-    subscriber.assertNoTerminalEvent();
++    RecordingSubscriber<String> subscriber = subscriberRule.create();
++    service.body().unsafeSubscribe(subscriber);
++    subscriber.assertNoEvents();
+ 
+     scheduler.triggerActions();
+-    subscriber.assertValueCount(1);
+-    subscriber.assertCompleted();
++    subscriber.assertAnyValue().assertCompleted();
+   }
+ 
+   @Test public void responseUsesScheduler() {
+     server.enqueue(new MockResponse().setBody("Hi"));
+ 
+-    TestSubscriber<Response<String>> subscriber = new TestSubscriber<>();
+-    service.response().subscribe(subscriber);
+-    subscriber.assertNoValues();
+-    subscriber.assertNoTerminalEvent();
++    RecordingSubscriber<Response<String>> subscriber = subscriberRule.create();
++    service.response().unsafeSubscribe(subscriber);
++    subscriber.assertNoEvents();
+ 
+     scheduler.triggerActions();
+-    subscriber.assertValueCount(1);
+-    subscriber.assertCompleted();
++    subscriber.assertAnyValue().assertCompleted();
+   }
+ 
+   @Test public void resultUsesScheduler() {
+     server.enqueue(new MockResponse().setBody("Hi"));
+ 
+-    TestSubscriber<Result<String>> subscriber = new TestSubscriber<>();
+-    service.result().subscribe(subscriber);
+-    subscriber.assertNoValues();
+-    subscriber.assertNoTerminalEvent();
++    RecordingSubscriber<Result<String>> subscriber = subscriberRule.create();
++    service.result().unsafeSubscribe(subscriber);
++    subscriber.assertNoEvents();
+ 
+     scheduler.triggerActions();
+-    subscriber.assertValueCount(1);
+-    subscriber.assertCompleted();
++    subscriber.assertAnyValue().assertCompleted();
+   }
+ }
+diff --git a/retrofit-adapters/rxjava/src/test/java/retrofit2/adapter/rxjava/RecordingSubscriber.java b/retrofit-adapters/rxjava/src/test/java/retrofit2/adapter/rxjava/RecordingSubscriber.java
+new file mode 100644
+index 000000000..4919ddcd5
+--- /dev/null
++++ b/retrofit-adapters/rxjava/src/test/java/retrofit2/adapter/rxjava/RecordingSubscriber.java
+@@ -0,0 +1,146 @@
++/*
++ * Copyright (C) 2016 Square, Inc.
++ *
++ * Licensed under the Apache License, Version 2.0 (the "License");
++ * you may not use this file except in compliance with the License.
++ * You may obtain a copy of the License at
++ *
++ *      http://www.apache.org/licenses/LICENSE-2.0
++ *
++ * Unless required by applicable law or agreed to in writing, software
++ * distributed under the License is distributed on an "AS IS" BASIS,
++ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++ * See the License for the specific language governing permissions and
++ * limitations under the License.
++ */
++package retrofit2.adapter.rxjava;
++
++import java.util.ArrayDeque;
++import java.util.ArrayList;
++import java.util.Deque;
++import java.util.List;
++import org.junit.rules.TestRule;
++import org.junit.runner.Description;
++import org.junit.runners.model.Statement;
++import rx.Notification;
++import rx.Subscriber;
++
++import static org.assertj.core.api.Assertions.assertThat;
++
++/** A test {@link Subscriber} and JUnit rule which guarantees all events are asserted. */
++final class RecordingSubscriber<T> extends Subscriber<T> {
++  private final long initialRequest;
++  private final Deque<Notification<T>> events = new ArrayDeque<>();
++
++  private RecordingSubscriber(long initialRequest) {
++    this.initialRequest = initialRequest;
++  }
++
++  @Override public void onStart() {
++    request(initialRequest);
++  }
++
++  @Override public void onNext(T value) {
++    events.add(Notification.createOnNext(value));
++  }
++
++  @Override public void onCompleted() {
++    events.add(Notification.<T>createOnCompleted());
++  }
++
++  @Override public void onError(Throwable e) {
++    events.add(Notification.<T>createOnError(e));
++  }
++
++  private Notification<T> takeNotification() {
++    Notification<T> notification = events.pollFirst();
++    if (notification == null) {
++      throw new AssertionError("No event found!");
++    }
++    return notification;
++  }
++
++  public T takeValue() {
++    Notification<T> notification = takeNotification();
++    assertThat(notification.isOnNext())
++        .overridingErrorMessage("Expected onNext event but was %s", notification)
++        .isTrue();
++    return notification.getValue();
++  }
++
++  public Throwable takeError() {
++    Notification<T> notification = takeNotification();
++    assertThat(notification.isOnError())
++        .overridingErrorMessage("Expected onError event but was %s", notification)
++        .isTrue();
++    return notification.getThrowable();
++  }
++
++  public RecordingSubscriber<T> assertAnyValue() {
++    takeValue();
++    return this;
++  }
++
++  public RecordingSubscriber<T> assertValue(T value) {
++    assertThat(takeValue()).isEqualTo(value);
++    return this;
++  }
++
++  public void assertCompleted() {
++    Notification<T> notification = takeNotification();
++    assertThat(notification.isOnCompleted())
++        .overridingErrorMessage("Expected onCompleted event but was %s", notification)
++        .isTrue();
++    assertNoEvents();
++  }
++
++  public void assertError(Throwable throwable) {
++    assertThat(takeError()).isEqualTo(throwable);
++  }
++
++  public void assertError(Class<? extends Throwable> errorClass) {
++    assertError(errorClass, null);
++  }
++
++  public void assertError(Class<? extends Throwable> errorClass, String message) {
++    Throwable throwable = takeError();
++    assertThat(throwable).isInstanceOf(errorClass);
++    if (message != null) {
++      assertThat(throwable).hasMessage(message);
++    }
++    assertNoEvents();
++  }
++
++  public void assertNoEvents() {
++    assertThat(events).as("Unconsumed events found!").isEmpty();
++  }
++
++  public void requestMore(long amount) {
++    request(amount);
++  }
++
++  public static final class Rule implements TestRule {
++    final List<RecordingSubscriber<?>> subscribers = new ArrayList<>();
++
++    public <T> RecordingSubscriber<T> create() {
++      return createWithInitialRequest(Long.MAX_VALUE);
++    }
++
++    public <T> RecordingSubscriber<T> createWithInitialRequest(long initialRequest) {
++      RecordingSubscriber<T> subscriber = new RecordingSubscriber<>(initialRequest);
++      subscribers.add(subscriber);
++      return subscriber;
++    }
++
++    @Override public Statement apply(final Statement base, Description description) {
++      return new Statement() {
++        @Override public void evaluate() throws Throwable {
++          base.evaluate();
++          for (RecordingSubscriber<?> subscriber : subscribers) {
++            subscriber.assertNoEvents();
++          }
++        }
++      };
++    }
++  }
++}
+diff --git a/retrofit-adapters/rxjava/src/test/java/retrofit2/adapter/rxjava/RxJavaPluginsResetRule.java b/retrofit-adapters/rxjava/src/test/java/retrofit2/adapter/rxjava/RxJavaPluginsResetRule.java
+new file mode 100644
+index 000000000..dfe336f07
+--- /dev/null
++++ b/retrofit-adapters/rxjava/src/test/java/retrofit2/adapter/rxjava/RxJavaPluginsResetRule.java
+@@ -0,0 +1,37 @@
++/*
++ * Copyright (C) 2016 Square, Inc.
++ *
++ * Licensed under the Apache License, Version 2.0 (the "License");
++ * you may not use this file except in compliance with the License.
++ * You may obtain a copy of the License at
++ *
++ *      http://www.apache.org/licenses/LICENSE-2.0
++ *
++ * Unless required by applicable law or agreed to in writing, software
++ * distributed under the License is distributed on an "AS IS" BASIS,
++ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++ * See the License for the specific language governing permissions and
++ * limitations under the License.
++ */
++package retrofit2.adapter.rxjava;
++
++import org.junit.rules.TestRule;
++import org.junit.runner.Description;
++import org.junit.runners.model.Statement;
++import rx.plugins.RxJavaPlugins;
++
++/** A JUnit @Rule which resets RxJava's plugins before and after each test. */
++final class RxJavaPluginsResetRule implements TestRule {
++  @Override public Statement apply(final Statement base, Description description) {
++    return new Statement() {
++      @Override public void evaluate() throws Throwable {
++        RxJavaPlugins.getInstance().reset();
++        try {
++          base.evaluate();
++        } finally {
++          RxJavaPlugins.getInstance().reset();
++        }
++      }
++    };
++  }
++}
+diff --git a/retrofit-adapters/rxjava/src/test/java/retrofit2/adapter/rxjava/SingleTest.java b/retrofit-adapters/rxjava/src/test/java/retrofit2/adapter/rxjava/SingleTest.java
+index 67c5a3d22..668807987 100644
+--- a/retrofit-adapters/rxjava/src/test/java/retrofit2/adapter/rxjava/SingleTest.java
++++ b/retrofit-adapters/rxjava/src/test/java/retrofit2/adapter/rxjava/SingleTest.java
+@@ -16,23 +16,30 @@
+ package retrofit2.adapter.rxjava;
+ 
+ import java.io.IOException;
++import java.util.concurrent.atomic.AtomicReference;
+ import okhttp3.mockwebserver.MockResponse;
+ import okhttp3.mockwebserver.MockWebServer;
+ import org.junit.Before;
++import org.junit.Ignore;
+ import org.junit.Rule;
+ import org.junit.Test;
++import org.junit.rules.TestRule;
+ import retrofit2.Response;
+ import retrofit2.Retrofit;
+ import retrofit2.http.GET;
+ import rx.Single;
+-import rx.singles.BlockingSingle;
++import rx.exceptions.CompositeException;
++import rx.exceptions.Exceptions;
++import rx.plugins.RxJavaErrorHandler;
++import rx.plugins.RxJavaPlugins;
+ 
+ import static okhttp3.mockwebserver.SocketPolicy.DISCONNECT_AFTER_REQUEST;
+ import static org.assertj.core.api.Assertions.assertThat;
+-import static org.junit.Assert.fail;
+ 
+ public final class SingleTest {
+   @Rule public final MockWebServer server = new MockWebServer();
++  @Rule public final TestRule pluginsReset = new RxJavaPluginsResetRule();
++  @Rule public final RecordingSubscriber.Rule subscriberRule = new RecordingSubscriber.Rule();
+ 
+   interface Service {
+     @GET("/") Single<String> body();
+@@ -54,93 +61,281 @@
+   @Test public void bodySuccess200() {
+     server.enqueue(new MockResponse().setBody("Hi"));
+ 
+-    BlockingSingle<String> o = service.body().toBlocking();
+-    assertThat(o.value()).isEqualTo("Hi");
++    RecordingSubscriber<String> subscriber = subscriberRule.create();
++    service.body().unsafeSubscribe(subscriber);
++    subscriber.assertValue("Hi").assertCompleted();
+   }
+ 
+   @Test public void bodySuccess404() {
+     server.enqueue(new MockResponse().setResponseCode(404));
+ 
+-    BlockingSingle<String> o = service.body().toBlocking();
+-    try {
+-      o.value();
+-      fail();
+-    } catch (RuntimeException e) {
+-      Throwable cause = e.getCause();
+-      assertThat(cause).isInstanceOf(HttpException.class).hasMessage("HTTP 404 Client Error");
+-    }
++    RecordingSubscriber<String> subscriber = subscriberRule.create();
++    service.body().unsafeSubscribe(subscriber);
++    subscriber.assertError(HttpException.class, "HTTP 404 Client Error");
+   }
+ 
+   @Test public void bodyFailure() {
+     server.enqueue(new MockResponse().setSocketPolicy(DISCONNECT_AFTER_REQUEST));
+ 
+-    BlockingSingle<String> o = service.body().toBlocking();
+-    try {
+-      o.value();
+-      fail();
+-    } catch (RuntimeException e) {
+-      assertThat(e.getCause()).isInstanceOf(IOException.class);
+-    }
++    RecordingSubscriber<String> subscriber = subscriberRule.create();
++    service.body().unsafeSubscribe(subscriber);
++    subscriber.assertError(IOException.class);
++  }
++
++  @Test public void bodyThrowingInOnNextDeliveredToError() {
++    server.enqueue(new MockResponse().setBody("Hi"));
++
++    RecordingSubscriber<String> subscriber = subscriberRule.create();
++    final RuntimeException e = new RuntimeException();
++    service.body().unsafeSubscribe(new ForwardingSubscriber<String>(subscriber) {
++      @Override public void onNext(String value) {
++        throw e;
++      }
++    });
++
++    subscriber.assertError(e);
++  }
++
++  @Test public void bodyThrowingInOnCompletedDeliveredToPlugin() {
++    server.enqueue(new MockResponse().setBody("Hi"));
++
++    final AtomicReference<Throwable> throwableRef = new AtomicReference<>();
++    RxJavaPlugins.getInstance().registerErrorHandler(new RxJavaErrorHandler() {
++      @Override public void handleError(Throwable throwable) {
++        if (!throwableRef.compareAndSet(null, throwable)) {
++          throw Exceptions.propagate(throwable);
++        }
++      }
++    });
++
++    RecordingSubscriber<String> subscriber = subscriberRule.create();
++    final RuntimeException e = new RuntimeException();
++    service.body().unsafeSubscribe(new ForwardingSubscriber<String>(subscriber) {
++      @Override public void onCompleted() {
++        throw e;
++      }
++    });
++
++    subscriber.assertValue("Hi");
++    assertThat(throwableRef.get()).isSameAs(e);
++  }
++
++  @Test public void bodyThrowingInOnErrorDeliveredToPlugin() {
++    server.enqueue(new MockResponse().setResponseCode(404));
++
++    final AtomicReference<Throwable> throwableRef = new AtomicReference<>();
++    RxJavaPlugins.getInstance().registerErrorHandler(new RxJavaErrorHandler() {
++      @Override public void handleError(Throwable throwable) {
++        if (!throwableRef.compareAndSet(null, throwable)) {
++          throw Exceptions.propagate(throwable);
++        }
++      }
++    });
++
++    RecordingSubscriber<String> subscriber = subscriberRule.create();
++    final AtomicReference<Throwable> errorRef = new AtomicReference<>();
++    final RuntimeException e = new RuntimeException();
++    service.body().unsafeSubscribe(new ForwardingSubscriber<String>(subscriber) {
++      @Override public void onError(Throwable throwable) {
++        if (!errorRef.compareAndSet(null, throwable)) {
++          throw Exceptions.propagate(throwable);
++        }
++        throw e;
++      }
++    });
++
++    //noinspection ThrowableResultOfMethodCallIgnored
++    CompositeException composite = (CompositeException) throwableRef.get();
++    assertThat(composite.getExceptions()).containsExactly(errorRef.get(), e);
+   }
+ 
+   @Test public void responseSuccess200() {
+     server.enqueue(new MockResponse().setBody("Hi"));
+ 
+-    BlockingSingle<Response<String>> o = service.response().toBlocking();
+-    Response<String> response = o.value();
+-    assertThat(response.isSuccessful()).isTrue();
+-    assertThat(response.body()).isEqualTo("Hi");
++    RecordingSubscriber<Response<String>> subscriber = subscriberRule.create();
++    service.response().unsafeSubscribe(subscriber);
++    assertThat(subscriber.takeValue().body()).isEqualTo("Hi");
++    subscriber.assertCompleted();
+   }
+ 
+   @Test public void responseSuccess404() throws IOException {
+-    server.enqueue(new MockResponse().setResponseCode(404).setBody("Hi"));
++    server.enqueue(new MockResponse().setResponseCode(404));
+ 
+-    BlockingSingle<Response<String>> o = service.response().toBlocking();
+-    Response<String> response = o.value();
+-    assertThat(response.isSuccessful()).isFalse();
+-    assertThat(response.errorBody().string()).isEqualTo("Hi");
++    RecordingSubscriber<Response<String>> subscriber = subscriberRule.create();
++    service.response().unsafeSubscribe(subscriber);
++    assertThat(subscriber.takeValue().code()).isEqualTo(404);
++    subscriber.assertCompleted();
+   }
+ 
+   @Test public void responseFailure() {
+     server.enqueue(new MockResponse().setSocketPolicy(DISCONNECT_AFTER_REQUEST));
+ 
+-    BlockingSingle<Response<String>> o = service.response().toBlocking();
+-    try {
+-      o.value();
+-      fail();
+-    } catch (RuntimeException t) {
+-      assertThat(t.getCause()).isInstanceOf(IOException.class);
+-    }
++    RecordingSubscriber<Response<String>> subscriber = subscriberRule.create();
++    service.response().unsafeSubscribe(subscriber);
++    subscriber.assertError(IOException.class);
++  }
++
++  @Test public void responseThrowingInOnNextDeliveredToError() {
++    server.enqueue(new MockResponse().setBody("Hi"));
++
++    RecordingSubscriber<Response<String>> subscriber = subscriberRule.create();
++    final RuntimeException e = new RuntimeException();
++    service.response().unsafeSubscribe(new ForwardingSubscriber<Response<String>>(subscriber) {
++      @Override public void onNext(Response<String> value) {
++        throw e;
++      }
++    });
++
++    subscriber.assertError(e);
++  }
++
++  @Test public void responseThrowingInOnCompletedDeliveredToPlugin() {
++    server.enqueue(new MockResponse().setBody("Hi"));
++
++    final AtomicReference<Throwable> throwableRef = new AtomicReference<>();
++    RxJavaPlugins.getInstance().registerErrorHandler(new RxJavaErrorHandler() {
++      @Override public void handleError(Throwable throwable) {
++        if (!throwableRef.compareAndSet(null, throwable)) {
++          throw Exceptions.propagate(throwable);
++        }
++      }
++    });
++
++    RecordingSubscriber<Response<String>> subscriber = subscriberRule.create();
++    final RuntimeException e = new RuntimeException();
++    service.response().unsafeSubscribe(new ForwardingSubscriber<Response<String>>(subscriber) {
++      @Override public void onCompleted() {
++        throw e;
++      }
++    });
++
++    assertThat(subscriber.takeValue().body()).isEqualTo("Hi");
++    assertThat(throwableRef.get()).isSameAs(e);
++  }
++
++  @Test public void responseThrowingInOnErrorDeliveredToPlugin() {
++    server.enqueue(new MockResponse().setSocketPolicy(DISCONNECT_AFTER_REQUEST));
++
++    final AtomicReference<Throwable> throwableRef = new AtomicReference<>();
++    RxJavaPlugins.getInstance().registerErrorHandler(new RxJavaErrorHandler() {
++      @Override public void handleError(Throwable throwable) {
++        if (!throwableRef.compareAndSet(null, throwable)) {
++          throw Exceptions.propagate(throwable);
++        }
++      }
++    });
++
++    RecordingSubscriber<Response<String>> subscriber = subscriberRule.create();
++    final AtomicReference<Throwable> errorRef = new AtomicReference<>();
++    final RuntimeException e = new RuntimeException();
++    service.response().unsafeSubscribe(new ForwardingSubscriber<Response<String>>(subscriber) {
++      @Override public void onError(Throwable throwable) {
++        if (!errorRef.compareAndSet(null, throwable)) {
++          throw Exceptions.propagate(throwable);
++        }
++        throw e;
++      }
++    });
++
++    //noinspection ThrowableResultOfMethodCallIgnored
++    CompositeException composite = (CompositeException) throwableRef.get();
++    assertThat(composite.getExceptions()).containsExactly(errorRef.get(), e);
+   }
+ 
+   @Test public void resultSuccess200() {
+     server.enqueue(new MockResponse().setBody("Hi"));
+ 
+-    BlockingSingle<Result<String>> o = service.result().toBlocking();
+-    Result<String> result = o.value();
+-    assertThat(result.isError()).isFalse();
+-    Response<String> response = result.response();
+-    assertThat(response.isSuccessful()).isTrue();
+-    assertThat(response.body()).isEqualTo("Hi");
++    RecordingSubscriber<Result<String>> subscriber = subscriberRule.create();
++    service.result().unsafeSubscribe(subscriber);
++    assertThat(subscriber.takeValue().response().body()).isEqualTo("Hi");
++    subscriber.assertCompleted();
+   }
+ 
+   @Test public void resultSuccess404() throws IOException {
+-    server.enqueue(new MockResponse().setResponseCode(404).setBody("Hi"));
++    server.enqueue(new MockResponse().setResponseCode(404));
+ 
+-    BlockingSingle<Result<String>> o = service.result().toBlocking();
+-    Result<String> result = o.value();
+-    assertThat(result.isError()).isFalse();
+-    Response<String> response = result.response();
+-    assertThat(response.isSuccessful()).isFalse();
+-    assertThat(response.errorBody().string()).isEqualTo("Hi");
++    RecordingSubscriber<Result<String>> subscriber = subscriberRule.create();
++    service.result().unsafeSubscribe(subscriber);
++    assertThat(subscriber.takeValue().response().code()).isEqualTo(404);
++    subscriber.assertCompleted();
+   }
+ 
+   @Test public void resultFailure() {
+     server.enqueue(new MockResponse().setSocketPolicy(DISCONNECT_AFTER_REQUEST));
+ 
+-    BlockingSingle<Result<String>> o = service.result().toBlocking();
+-    Result<String> result = o.value();
+-    assertThat(result.isError()).isTrue();
+-    assertThat(result.error()).isInstanceOf(IOException.class);
++    RecordingSubscriber<Result<String>> subscriber = subscriberRule.create();
++    service.result().unsafeSubscribe(subscriber);
++    assertThat(subscriber.takeValue().error()).isInstanceOf(IOException.class);
++    subscriber.assertCompleted();
++  }
++
++  @Test public void resultThrowingInOnNextDeliveredToError() {
++    server.enqueue(new MockResponse().setBody("Hi"));
++
++    RecordingSubscriber<Result<String>> subscriber = subscriberRule.create();
++    final RuntimeException e = new RuntimeException();
++    service.result().unsafeSubscribe(new ForwardingSubscriber<Result<String>>(subscriber) {
++      @Override public void onNext(Result<String> value) {
++        throw e;
++      }
++    });
++
++    subscriber.assertError(e);
++  }
++
++  @Test public void resultThrowingInOnCompletedDeliveredToPlugin() {
++    server.enqueue(new MockResponse().setBody("Hi"));
++
++    final AtomicReference<Throwable> throwableRef = new AtomicReference<>();
++    RxJavaPlugins.getInstance().registerErrorHandler(new RxJavaErrorHandler() {
++      @Override public void handleError(Throwable throwable) {
++        if (!throwableRef.compareAndSet(null, throwable)) {
++          throw Exceptions.propagate(throwable);
++        }
++      }
++    });
++
++    RecordingSubscriber<Result<String>> subscriber = subscriberRule.create();
++    final RuntimeException e = new RuntimeException();
++    service.result().unsafeSubscribe(new ForwardingSubscriber<Result<String>>(subscriber) {
++      @Override public void onCompleted() {
++        throw e;
++      }
++    });
++
++    assertThat(subscriber.takeValue().response().body()).isEqualTo("Hi");
++    assertThat(throwableRef.get()).isSameAs(e);
++  }
++
++  @Ignore("Single's contract is onNext|onError so we have no way of triggering this case")
++  @Test public void resultThrowingInOnErrorDeliveredToPlugin() throws Throwable {
++    server.enqueue(new MockResponse().setBody("Hi"));
++
++    final AtomicReference<Throwable> throwableRef = new AtomicReference<>();
++    RxJavaPlugins.getInstance().registerErrorHandler(new RxJavaErrorHandler() {
++      @Override public void handleError(Throwable throwable) {
++        if (!throwableRef.compareAndSet(null, throwable)) {
++          throw Exceptions.propagate(throwable);
++        }
++      }
++    });
++
++    RecordingSubscriber<Result<String>> subscriber = subscriberRule.create();
++    final RuntimeException first = new RuntimeException("First");
++    final RuntimeException second = new RuntimeException("Second");
++    service.result().unsafeSubscribe(new ForwardingSubscriber<Result<String>>(subscriber) {
++      @Override public void onNext(Result<String> value) {
++        // The only way to trigger onError for a result is if onNext throws.
++        throw first;
++      }
++
++      @Override public void onError(Throwable throwable) {
++        throw second;
++      }
++    });
++
++    //noinspection ThrowableResultOfMethodCallIgnored
++    CompositeException composite = (CompositeException) throwableRef.get();
++    assertThat(composite.getExceptions()).containsExactly(first, second);
+   }
+ }
+diff --git a/retrofit-adapters/rxjava/src/test/java/retrofit2/adapter/rxjava/SingleSchedulerTest.java b/retrofit-adapters/rxjava/src/test/java/retrofit2/adapter/rxjava/SingleWithSchedulerTest.java
+similarity index 72%
+rename from retrofit-adapters/rxjava/src/test/java/retrofit2/adapter/rxjava/SingleSchedulerTest.java
+rename to retrofit-adapters/rxjava/src/test/java/retrofit2/adapter/rxjava/SingleWithSchedulerTest.java
+index 671370e02..5188c0ed9 100644
+--- a/retrofit-adapters/rxjava/src/test/java/retrofit2/adapter/rxjava/SingleSchedulerTest.java
++++ b/retrofit-adapters/rxjava/src/test/java/retrofit2/adapter/rxjava/SingleWithSchedulerTest.java
+@@ -24,11 +24,11 @@
+ import retrofit2.Retrofit;
+ import retrofit2.http.GET;
+ import rx.Single;
+-import rx.observers.TestSubscriber;
+ import rx.schedulers.TestScheduler;
+ 
+-public final class SingleSchedulerTest {
++public final class SingleWithSchedulerTest {
+   @Rule public final MockWebServer server = new MockWebServer();
++  @Rule public final RecordingSubscriber.Rule subscriberRule = new RecordingSubscriber.Rule();
+ 
+   interface Service {
+     @GET("/") Single<String> body();
+@@ -51,36 +51,33 @@
+   @Test public void bodyUsesScheduler() {
+     server.enqueue(new MockResponse().setBody("Hi"));
+ 
+-    TestSubscriber<String> subscriber = new TestSubscriber<>();
+-    service.body().subscribe(subscriber);
+-    subscriber.assertNoValues();
+-    subscriber.assertNoTerminalEvent();
++    RecordingSubscriber<String> subscriber = subscriberRule.create();
++    service.body().unsafeSubscribe(subscriber);
++    subscriber.assertNoEvents();
+ 
+     scheduler.triggerActions();
+-    subscriber.assertValueCount(1);
++    subscriber.assertAnyValue().assertCompleted();
+   }
+ 
+   @Test public void responseUsesScheduler() {
+     server.enqueue(new MockResponse().setBody("Hi"));
+ 
+-    TestSubscriber<Response<String>> subscriber = new TestSubscriber<>();
+-    service.response().subscribe(subscriber);
+-    subscriber.assertNoValues();
+-    subscriber.assertNoTerminalEvent();
++    RecordingSubscriber<Response<String>> subscriber = subscriberRule.create();
++    service.response().unsafeSubscribe(subscriber);
++    subscriber.assertNoEvents();
+ 
+     scheduler.triggerActions();
+-    subscriber.assertValueCount(1);
++    subscriber.assertAnyValue().assertCompleted();
+   }
+ 
+   @Test public void resultUsesScheduler() {
+     server.enqueue(new MockResponse().setBody("Hi"));
+ 
+-    TestSubscriber<Result<String>> subscriber = new TestSubscriber<>();
+-    service.result().subscribe(subscriber);
+-    subscriber.assertNoValues();
+-    subscriber.assertNoTerminalEvent();
++    RecordingSubscriber<Result<String>> subscriber = subscriberRule.create();
++    service.result().unsafeSubscribe(subscriber);
++    subscriber.assertNoEvents();
+ 
+     scheduler.triggerActions();
+-    subscriber.assertValueCount(1);
++    subscriber.assertAnyValue().assertCompleted();
+   }
+ }
+diff --git a/retrofit/src/main/java/retrofit2/Response.java b/retrofit/src/main/java/retrofit2/Response.java
+index 939363b3d..a0efab014 100644
+--- a/retrofit/src/main/java/retrofit2/Response.java
++++ b/retrofit/src/main/java/retrofit2/Response.java
+@@ -126,4 +126,8 @@ public T body() {
+   public ResponseBody errorBody() {
+     return errorBody;
+   }
++
++  @Override public String toString() {
++    return rawResponse.toString();
++  }
+ }

@@ -1,0 +1,201 @@
+diff --git a/retrofit-converters/jaxb/src/main/java/retrofit2/converter/jaxb/JaxbResponseConverter.java b/retrofit-converters/jaxb/src/main/java/retrofit2/converter/jaxb/JaxbResponseConverter.java
+index 1b0666b52..469b863d1 100644
+--- a/retrofit-converters/jaxb/src/main/java/retrofit2/converter/jaxb/JaxbResponseConverter.java
++++ b/retrofit-converters/jaxb/src/main/java/retrofit2/converter/jaxb/JaxbResponseConverter.java
+@@ -33,6 +33,10 @@
+   JaxbResponseConverter(JAXBContext context, Class<T> type) {
+     this.context = context;
+     this.type = type;
++
++    // Prevent XML External Entity attacks (XXE).
++    xmlInputFactory.setProperty(XMLInputFactory.IS_SUPPORTING_EXTERNAL_ENTITIES, false);
++    xmlInputFactory.setProperty(XMLInputFactory.SUPPORT_DTD, false);
+   }
+ 
+   @Override public T convert(ResponseBody value) throws IOException {
+diff --git a/retrofit-converters/jaxb/src/test/java/retrofit2/converter/jaxb/JaxbConverterFactoryTest.java b/retrofit-converters/jaxb/src/test/java/retrofit2/converter/jaxb/JaxbConverterFactoryTest.java
+index 1067f8af5..186d506fb 100644
+--- a/retrofit-converters/jaxb/src/test/java/retrofit2/converter/jaxb/JaxbConverterFactoryTest.java
++++ b/retrofit-converters/jaxb/src/test/java/retrofit2/converter/jaxb/JaxbConverterFactoryTest.java
+@@ -146,4 +146,55 @@
+     Response<Contact> response = call.execute();
+     assertThat(response.body().name).isEqualTo("Jenny");
+   }
++
++  @Test public void externalEntity() throws Exception {
++    server.enqueue(new MockResponse()
++        .setBody(""
++            + "<?xml version=\"1.0\" ?>"
++            + "<!DOCTYPE contact["
++            + "  <!ENTITY secret SYSTEM \"" + server.url("/secret.txt") + "\">"
++            + "]>"
++            + "<contact>"
++            + "<name>&secret;</name>"
++            + "</contact>"));
++    server.enqueue(new MockResponse()
++        .setBody("hello"));
++
++    Call<Contact> call = service.getXml();
++    try {
++      Response<Contact> response = call.execute();
++      response.body();
++      fail();
++    } catch (RuntimeException expected) {
++      assertThat(expected).hasMessageContaining("ParseError");
++    }
++
++    assertThat(server.getRequestCount()).isEqualTo(1);
++  }
++
++  @Test public void externalDtd() throws Exception {
++    server.enqueue(new MockResponse()
++        .setBody(""
++            + "<?xml version=\"1.0\" ?>"
++            + "<!DOCTYPE contact SYSTEM \"" + server.url("/contact.dtd") + "\">"
++            + "<contact>"
++            + "<name>&secret;</name>"
++            + "</contact>"));
++    server.enqueue(new MockResponse()
++        .setBody(""
++            + "<!ELEMENT contact (name)>\n"
++            + "<!ELEMENT name (#PCDATA)>\n"
++            + "<!ENTITY secret \"hello\">"));
++
++    Call<Contact> call = service.getXml();
++    try {
++      Response<Contact> response = call.execute();
++      response.body();
++      fail();
++    } catch (RuntimeException expected) {
++      assertThat(expected).hasMessageContaining("ParseError");
++    }
++
++    assertThat(server.getRequestCount()).isEqualTo(1);
++  }
+ }
+diff --git a/retrofit-mock/src/main/java/retrofit2/mock/Calls.java b/retrofit-mock/src/main/java/retrofit2/mock/Calls.java
+index 42947a95f..f0e9affbe 100644
+--- a/retrofit-mock/src/main/java/retrofit2/mock/Calls.java
++++ b/retrofit-mock/src/main/java/retrofit2/mock/Calls.java
+@@ -42,7 +42,20 @@
+     return new FakeCall<>(response, null);
+   }
+ 
++  /** Creates a failed {@link Call} from {@code failure}. */
+   public static <T> Call<T> failure(IOException failure) {
++    // TODO delete this overload in Retrofit 3.0.
++    return new FakeCall<>(null, failure);
++  }
++
++  /**
++   * Creates a failed {@link Call} from {@code failure}.
++   * <p>
++   * Note: When invoking {@link Call#execute() execute()} on the returned {@link Call}, if
++   * {@code failure} is a {@link RuntimeException}, {@link Error}, or {@link IOException} subtype
++   * it is thrown directly. Otherwise it is "sneaky thrown" despite not being declared.
++   */
++  public static <T> Call<T> failure(Throwable failure) {
+     return new FakeCall<>(null, failure);
+   }
+ 
+@@ -52,11 +65,11 @@ private Calls() {
+ 
+   static final class FakeCall<T> implements Call<T> {
+     private final Response<T> response;
+-    private final IOException error;
++    private final Throwable error;
+     private final AtomicBoolean canceled = new AtomicBoolean();
+     private final AtomicBoolean executed = new AtomicBoolean();
+ 
+-    FakeCall(@Nullable Response<T> response, @Nullable IOException error) {
++    FakeCall(@Nullable Response<T> response, @Nullable Throwable error) {
+       if ((response == null) == (error == null)) {
+         throw new AssertionError("Only one of response or error can be set.");
+       }
+@@ -74,7 +87,12 @@ private Calls() {
+       if (response != null) {
+         return response;
+       }
+-      throw error;
++      throw FakeCall.<Error>sneakyThrow2(error);
++    }
++
++    @SuppressWarnings("unchecked") // Intentionally abusing this feature.
++    private static <T extends Throwable> T sneakyThrow2(Throwable t) throws T {
++      throw (T) t;
+     }
+ 
+     @SuppressWarnings("ConstantConditions") // Guarding public API nullability.
+@@ -131,10 +149,8 @@ private Calls() {
+       if (delegate == null) {
+         try {
+           delegate = callable.call();
+-        } catch (IOException e) {
+-          delegate = failure(e);
+         } catch (Exception e) {
+-          throw new IllegalStateException("Callable threw unrecoverable exception", e);
++          delegate = failure(e);
+         }
+         this.delegate = delegate;
+       }
+diff --git a/retrofit-mock/src/test/java/retrofit2/mock/CallsTest.java b/retrofit-mock/src/test/java/retrofit2/mock/CallsTest.java
+index f32f4c4ee..bf67cad9a 100644
+--- a/retrofit-mock/src/test/java/retrofit2/mock/CallsTest.java
++++ b/retrofit-mock/src/test/java/retrofit2/mock/CallsTest.java
+@@ -15,13 +15,16 @@
+  */
+ package retrofit2.mock;
+ 
++import java.io.FileNotFoundException;
+ import java.io.IOException;
++import java.security.cert.CertificateException;
+ import java.util.concurrent.Callable;
+ import java.util.concurrent.atomic.AtomicReference;
+ import org.junit.Test;
+ import retrofit2.Call;
+ import retrofit2.Callback;
+ import retrofit2.Response;
++import retrofit2.Retrofit;
+ 
+ import static org.assertj.core.api.Assertions.assertThat;
+ import static org.junit.Assert.assertEquals;
+@@ -155,6 +158,19 @@
+     assertTrue(taco.isExecuted());
+   }
+ 
++  @Test public void failureExecuteCheckedException() {
++    CertificateException failure = new CertificateException("Hey");
++    Call<Object> taco = Calls.failure(failure);
++    assertFalse(taco.isExecuted());
++    try {
++      taco.execute();
++      fail();
++    } catch (Throwable e) {
++      assertSame(failure, e);
++    }
++    assertTrue(taco.isExecuted());
++  }
++
+   @Test public void failureEnqueue() {
+     IOException failure = new IOException("Hey");
+     Call<Object> taco = Calls.failure(failure);
+@@ -260,4 +276,19 @@
+     });
+     assertSame(failure, failureRef.get());
+   }
++
++  @Test public void deferredThrowUncheckedExceptionEnqueue() {
++    final RuntimeException failure = new RuntimeException("Hey");
++    final AtomicReference<Throwable> failureRef = new AtomicReference<>();
++    Calls.failure(failure).enqueue(new Callback<Object>() {
++      @Override public void onResponse(Call<Object> call, Response<Object> response) {
++        fail();
++      }
++
++      @Override public void onFailure(Call<Object> call, Throwable t) {
++        failureRef.set(t);
++      }
++    });
++    assertSame(failure, failureRef.get());
++  }
+ }

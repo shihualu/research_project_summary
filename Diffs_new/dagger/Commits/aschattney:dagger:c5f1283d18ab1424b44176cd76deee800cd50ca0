@@ -1,0 +1,298 @@
+diff --git a/compiler/src/main/java/dagger/internal/codegen/AbstractComponentWriter.java b/compiler/src/main/java/dagger/internal/codegen/AbstractComponentWriter.java
+index 2f4f57451..d73610196 100644
+--- a/compiler/src/main/java/dagger/internal/codegen/AbstractComponentWriter.java
++++ b/compiler/src/main/java/dagger/internal/codegen/AbstractComponentWriter.java
+@@ -1102,15 +1102,13 @@ private void initializeFrameworkTypes() {
+             CodeBlock.of(
+                 "($T) $L",
+                 binding.bindingType().frameworkClass(),
+-                getMemberSelect(
+-                        Iterables.getOnlyElement(binding.explicitDependencies()).bindingKey())
+-                    .getExpressionFor(name));
++                getMemberSelect(Iterables.getOnlyElement(binding.explicitDependencies()).bindingKey()).getExpressionFor(name)
++            );
+         return Optional.of(
+             CodeBlocks.concat(
+                 ImmutableList.of(
+                     initializeDeferredDependencies(binding),
+-                    initializeMember(
+-                        bindingKey, decorateForScope(delegatingCodeBlock, binding.scope())))));
++                    initializeDelegateMember(bindingKey, decorateForScope(delegatingCodeBlock, binding.scope())))));
+       case SINGLETON_INSTANCE:
+         if (!binding.scope().isPresent()) {
+           return Optional.empty();
+@@ -1224,6 +1222,43 @@ private CodeBlock initializeMember(BindingKey bindingKey, CodeBlock initializati
+     return CodeBlocks.concat(initializations.build());
+   }
+ 
++  private CodeBlock initializeDelegateMember(BindingKey bindingKey, CodeBlock initializationCodeBlock) {
++    final String delegateFieldName = delegateFieldNames.get(bindingKey.key());
++    ImmutableList.Builder<CodeBlock> initializations = ImmutableList.builder();
++
++    CodeBlock memberSelect = getMemberSelectExpression(bindingKey);
++    CodeBlock delegateFactoryVariable = delegateFactoryVariableExpression(bindingKey);
++    if (getInitializationState(bindingKey).equals(DELEGATED)) {
++        initializations.add(
++                CodeBlock.of(
++                        "$1T $2L = ($1T) $3L;", DELEGATE_FACTORY, delegateFactoryVariable, memberSelect));
++    }
++    if (!getInitializationState(bindingKey).equals(DELEGATED) && delegateFieldName != null) {
++        final TypeName interfaceTypeName = ClassName.get(bindingKey.key().type());
++        final CodeBlock.Builder codeBuilder = CodeBlock.builder();
++        codeBuilder.beginControlFlow("if (builder.$L != null)", delegateFieldName);
++        codeBuilder.add("$1L = new javax.inject.Provider<$2T>() {\n" +
++              "   public $2T get() {\n" +
++              "     return builder.$3L.get();\n" +
++              "   }\n" +
++              "};\n", memberSelect, interfaceTypeName, delegateFieldName);
++      codeBuilder.nextControlFlow("else");
++      codeBuilder.add(CodeBlock.of("this.$L = $L;", memberSelect, initializationCodeBlock));
++      codeBuilder.endControlFlow();
++      initializations.add(codeBuilder.build());
++    }else {
++      initializations.add(
++              CodeBlock.of("this.$L = $L;", memberSelect, initializationCodeBlock));
++    }
++    if (getInitializationState(bindingKey).equals(DELEGATED)) {
++      initializations.add(
++              CodeBlock.of("$L.setDelegatedProvider($L);", delegateFactoryVariable, memberSelect));
++    }
++    setInitializationState(bindingKey, INITIALIZED);
++
++    return CodeBlocks.concat(initializations.build());
++  }
++
+   private CodeBlock delegateFactoryVariableExpression(BindingKey key) {
+     return CodeBlock.of("$LDelegate", getMemberSelectExpression(key).toString().replace('.', '_'));
+   }
+@@ -1256,7 +1291,7 @@ private CodeBlock initializeFactoryForContributionBinding(ContributionBinding bi
+           // We can easily include the raw type (no generics) + annotation type (no values),
+           // using .class & String.format -- but that wouldn't be the whole story.
+           // What should we do?
+-/*<<<<<<< HEAD:compiler/src/main/java/dagger/internal/codegen/AbstractComponentWriter.java
++/*
+ 
+           CodeBlock.Builder getMethodBodyBuilder = CodeBlock.builder();
+           getMethodBodyBuilder.add(getCodeBlock(binding, callFactoryMethod));
+@@ -1318,7 +1353,6 @@ private CodeBlock initializeFactoryForContributionBinding(ContributionBinding bi
+               factoryName,
+               getComponentContributionExpression(
+                   ComponentRequirement.forDependency(dependencyType.asType())));
+-//>>>>>>> upstream/master:java/dagger/internal/codegen/AbstractComponentWriter.java
+         }
+ 
+       case SUBCOMPONENT_BUILDER:
+@@ -1373,7 +1407,7 @@ private CodeBlock initializeFactoryForContributionBinding(ContributionBinding bi
+           }
+           arguments.addAll(getDependencyArguments(binding));
+ 
+-          if (delegateFieldName != null && bindingSupportsTestDelegate(binding)) {
++          if (delegateFieldName != null && Util.bindingSupportsTestDelegate(binding)) {
+             if (mockFieldName != null) {
+               arguments.add(0, CodeBlock.of("builder.$L", mockFieldName));
+             }
+diff --git a/compiler/src/main/java/dagger/internal/codegen/Binding.java b/compiler/src/main/java/dagger/internal/codegen/Binding.java
+index bb1e073ec..cb22467a3 100644
+--- a/compiler/src/main/java/dagger/internal/codegen/Binding.java
++++ b/compiler/src/main/java/dagger/internal/codegen/Binding.java
+@@ -92,6 +92,8 @@
+         : Sets.union(implicitDependencies, explicitDependencies());
+   }
+ 
++  protected abstract boolean shouldGenerateDelegate();
++
+   private final Supplier<ImmutableList<FrameworkDependency>> frameworkDependencies =
+       memoize(
+           () ->
+diff --git a/compiler/src/main/java/dagger/internal/codegen/BindingGraph.java b/compiler/src/main/java/dagger/internal/codegen/BindingGraph.java
+index efd5b4499..b8f6ad24a 100644
+--- a/compiler/src/main/java/dagger/internal/codegen/BindingGraph.java
++++ b/compiler/src/main/java/dagger/internal/codegen/BindingGraph.java
+@@ -879,9 +879,7 @@ private boolean isResolvedInParent(BindingKey bindingKey, ContributionBinding bi
+       private ImmutableSet<ContributionBinding> getLocalExplicitBindings(Key key) {
+         return new ImmutableSet.Builder<ContributionBinding>()
+             .addAll(explicitBindings.get(key))
+-            .addAll(
+-                createDelegateBindings(
+-                    delegateDeclarations.get(keyFactory.convertToDelegateKey(key))))
++            .addAll(createDelegateBindings(delegateDeclarations.get(keyFactory.convertToDelegateKey(key))))
+             .build();
+       }
+ 
+diff --git a/compiler/src/main/java/dagger/internal/codegen/ContributionBinding.java b/compiler/src/main/java/dagger/internal/codegen/ContributionBinding.java
+index 4aefcc80d..b8bd4fa0f 100644
+--- a/compiler/src/main/java/dagger/internal/codegen/ContributionBinding.java
++++ b/compiler/src/main/java/dagger/internal/codegen/ContributionBinding.java
+@@ -73,6 +73,11 @@
+     return unwrapOptionalEquivalence(wrappedMapKey());
+   }
+ 
++  @Override
++  public boolean shouldGenerateDelegate() {
++    return !ignoreStubGeneration();
++  }
++
+   /**
+    * The kind of contribution this binding represents. Defines which elements can specify this kind
+    * of contribution.
+diff --git a/compiler/src/main/java/dagger/internal/codegen/MembersInjectionBinding.java b/compiler/src/main/java/dagger/internal/codegen/MembersInjectionBinding.java
+index 507519966..09c847e51 100644
+--- a/compiler/src/main/java/dagger/internal/codegen/MembersInjectionBinding.java
++++ b/compiler/src/main/java/dagger/internal/codegen/MembersInjectionBinding.java
+@@ -32,6 +32,8 @@
+ import com.google.common.collect.ImmutableSortedSet;
+ import com.google.common.collect.LinkedHashMultimap;
+ import com.google.common.collect.SetMultimap;
++
++import java.lang.reflect.Member;
+ import java.util.ArrayList;
+ import java.util.Comparator;
+ import java.util.HashSet;
+@@ -200,6 +202,7 @@ MembersInjectionBinding forInjectedType(
+       return new AutoValue_MembersInjectionBinding(
+           key,
+           dependencies,
++          false,
+           typeElement,
+           hasNonDefaultTypeParameters(typeElement, key.type(), types)
+               ? Optional.of(
+diff --git a/compiler/src/main/java/dagger/internal/codegen/ProvisionBinding.java b/compiler/src/main/java/dagger/internal/codegen/ProvisionBinding.java
+index 2878b7ed2..c982138c0 100644
+--- a/compiler/src/main/java/dagger/internal/codegen/ProvisionBinding.java
++++ b/compiler/src/main/java/dagger/internal/codegen/ProvisionBinding.java
+@@ -37,7 +37,7 @@
+ import com.google.errorprone.annotations.CanIgnoreReturnValue;
+ import dagger.internal.codegen.ComponentDescriptor.BuilderRequirementMethod;
+ import java.util.Optional;
+-import dagger.AllowStubGeneration;
++import dagger.Replaceable;
+ 
+ import javax.annotation.CheckReturnValue;
+ import javax.inject.Inject;
+@@ -78,6 +78,11 @@ public BindingType bindingType() {
+     return BindingType.PROVISION;
+   }
+ 
++  @Override
++  public boolean shouldGenerateDelegate() {
++    return Util.bindingSupportsTestDelegate(this) && bindingKind() != Kind.SYNTHETIC_DELEGATE_BINDING;
++  }
++
+   @Override
+   abstract Optional<ProvisionBinding> unresolved();
+ 
+@@ -158,7 +163,7 @@ ProvisionBinding forInjectConstructor(
+       Optional<DependencyRequest> membersInjectionRequest =
+           membersInjectionRequest(enclosingCxtorType);
+ 
+-      final boolean ignoreStubGeneration = constructorElement.getAnnotation(AllowStubGeneration.class) == null;
++      final boolean ignoreStubGeneration = constructorElement.getAnnotation(Replaceable.class) == null;
+       ProvisionBinding.Builder builder =
+           ProvisionBinding.builder()
+               .contributionType(ContributionType.UNIQUE)
+@@ -210,7 +215,7 @@ ProvisionBinding forProvidesMethod(
+           dependencyRequestFactory.forRequiredResolvedVariables(
+               providesMethod.getParameters(),
+               resolvedMethod.getParameterTypes());
+-      final boolean ignoreStubGeneration = genericParameter || providesMethod.getAnnotation(AllowStubGeneration.class) == null;
++      final boolean ignoreStubGeneration = genericParameter || providesMethod.getAnnotation(Replaceable.class) == null;
+       return ProvisionBinding.builder()
+           .contributionType(ContributionType.fromBindingMethod(providesMethod))
+           .bindingElement(providesMethod)
+@@ -290,7 +295,7 @@ ProvisionBinding forBuilderBinding(BuilderRequirementMethod method) {
+       checkArgument(builderMethod.getKind().equals(METHOD));
+       checkArgument(builderMethod.getParameters().size() == 1);
+       VariableElement parameterElement = Iterables.getOnlyElement(builderMethod.getParameters());
+-      final boolean ignoreStubGeneration = builderMethod.getAnnotation(AllowStubGeneration.class) == null;
++      final boolean ignoreStubGeneration = builderMethod.getAnnotation(Replaceable.class) == null;
+       return ProvisionBinding.builder()
+           .contributionType(ContributionType.UNIQUE)
+           .bindingElement(builderMethod)
+@@ -309,7 +314,7 @@ ProvisionBinding forSubcomponentBuilderMethod(
+       checkArgument(subcomponentBuilderMethod.getParameters().isEmpty());
+       DeclaredType declaredContainer = asDeclared(contributedBy.asType());
+       final DependencyRequest request = dependencyRequestFactory.plantDependency(application);
+-      final boolean ignoreStubGeneration = subcomponentBuilderMethod.getAnnotation(AllowStubGeneration.class) == null;
++      final boolean ignoreStubGeneration = subcomponentBuilderMethod.getAnnotation(Replaceable.class) == null;
+       return ProvisionBinding.builder()
+           .contributionType(ContributionType.UNIQUE)
+           .ignoreStubGeneration(ignoreStubGeneration)
+@@ -347,12 +352,19 @@ ProvisionBinding missingDelegate(DelegateDeclaration delegateDeclaration) {
+     }
+ 
+     private ProvisionBinding.Builder delegateBuilder(DelegateDeclaration delegateDeclaration) {
++      boolean ignoreStubGeneration = true;
++      final Optional<ExecutableElement> element = delegateDeclaration.bindingElement();
++      if (element.isPresent()) {
++        ignoreStubGeneration = element.get().getAnnotation(Replaceable.class) == null;
++      }
+       return ProvisionBinding.builder()
+           .contributionType(delegateDeclaration.contributionType())
+           .bindingElement(delegateDeclaration.bindingElement().get())
+           .contributingModule(delegateDeclaration.contributingModule().get())
+           .key(keyFactory.forDelegateBinding(delegateDeclaration, Provider.class))
+           .explicitDependencies(delegateDeclaration.delegateRequest())
++          .ignoreStubGeneration(ignoreStubGeneration)
++          .generateTestDelegate(!ignoreStubGeneration && appConfigProvider.get().debug())
+           .wrappedMapKey(delegateDeclaration.wrappedMapKey())
+           .bindingKind(Kind.SYNTHETIC_DELEGATE_BINDING)
+           .scope(Scope.uniqueScopeOf(delegateDeclaration.bindingElement().get()));
+diff --git a/compiler/src/main/java/dagger/internal/codegen/StubGenerator.java b/compiler/src/main/java/dagger/internal/codegen/StubGenerator.java
+index 60c7f21eb..5fdea873f 100644
+--- a/compiler/src/main/java/dagger/internal/codegen/StubGenerator.java
++++ b/compiler/src/main/java/dagger/internal/codegen/StubGenerator.java
+@@ -2,9 +2,7 @@
+ 
+ import java.io.IOException;
+ import java.util.Optional;
+-
+ import com.squareup.javapoet.*;
+-
+ import javax.annotation.processing.Filer;
+ import javax.lang.model.element.Element;
+ import javax.lang.model.element.Modifier;
+@@ -13,7 +11,6 @@
+ import java.util.*;
+ import static dagger.internal.codegen.SourceFiles.generateBindingFieldsForDependencies;
+ import static dagger.internal.codegen.TypeNames.*;
+-import static dagger.internal.codegen.Util.bindingSupportsTestDelegate;
+ 
+ 
+ public class StubGenerator extends SourceFileGenerator<ProvisionBinding> {
+@@ -41,7 +38,7 @@ ClassName nameGeneratedType(ProvisionBinding input) {
+     @Override
+     Optional<TypeSpec.Builder> write(ClassName generatedTypeName, ProvisionBinding input) {
+         final String o = generatedTypeName.packageName() + "." + generatedTypeName.simpleName();
+-        if (generated.contains(o) || !bindingSupportsTestDelegate(input)) {
++        if (generated.contains(o) || !input.shouldGenerateDelegate()) {
+             return Optional.empty();
+         }
+         generated.add(o);
+diff --git a/compiler/src/main/java/dagger/internal/codegen/Util.java b/compiler/src/main/java/dagger/internal/codegen/Util.java
+index ddb533f6b..294cebbd5 100644
+--- a/compiler/src/main/java/dagger/internal/codegen/Util.java
++++ b/compiler/src/main/java/dagger/internal/codegen/Util.java
+@@ -641,7 +641,8 @@ public static boolean bindingCanBeProvidedInTest(ContributionBinding binding) {
+         final ImmutableList<ContributionBinding.Kind> kinds = ImmutableList.of(
+                 ContributionBinding.Kind.PROVISION,
+                 ContributionBinding.Kind.INJECTION,
+-                ContributionBinding.Kind.BUILDER_BINDING
++                ContributionBinding.Kind.BUILDER_BINDING,
++                ContributionBinding.Kind.SYNTHETIC_DELEGATE_BINDING
+         );
+         final ContributionBinding.Kind kind = binding.bindingKind();
+         return kinds.contains(kind);
+diff --git a/core/src/main/java/dagger/AllowStubGeneration.java b/core/src/main/java/dagger/Replaceable.java
+similarity index 91%
+rename from core/src/main/java/dagger/AllowStubGeneration.java
+rename to core/src/main/java/dagger/Replaceable.java
+index bdf518cd0..3494d6b65 100644
+--- a/core/src/main/java/dagger/AllowStubGeneration.java
++++ b/core/src/main/java/dagger/Replaceable.java
+@@ -12,5 +12,5 @@
+ @Retention(RUNTIME)
+ @Target({METHOD, CONSTRUCTOR})
+ @Documented
+-public @interface AllowStubGeneration {
++public @interface Replaceable {
+ }

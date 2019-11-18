@@ -1,0 +1,287 @@
+diff --git a/java/dagger/internal/codegen/BindingGraphFactory.java b/java/dagger/internal/codegen/BindingGraphFactory.java
+index 6263e8717..92db37599 100644
+--- a/java/dagger/internal/codegen/BindingGraphFactory.java
++++ b/java/dagger/internal/codegen/BindingGraphFactory.java
+@@ -26,6 +26,7 @@
+ import static dagger.internal.codegen.ComponentRequirement.Kind.BOUND_INSTANCE;
+ import static dagger.internal.codegen.DaggerStreams.toImmutableSet;
+ import static dagger.internal.codegen.RequestKinds.getRequestKind;
++import static dagger.internal.codegen.SourceFiles.generatedMonitoringModuleName;
+ import static dagger.internal.codegen.Util.reentrantComputeIfAbsent;
+ import static dagger.model.BindingKind.DELEGATE;
+ import static dagger.model.BindingKind.INJECTION;
+@@ -46,12 +47,14 @@
+ import dagger.MembersInjector;
+ import dagger.Reusable;
+ import dagger.internal.codegen.ComponentDescriptor.BuilderRequirementMethod;
++import dagger.internal.codegen.ComponentDescriptor.Kind;
+ import dagger.model.DependencyRequest;
+ import dagger.model.Key;
+ import dagger.model.RequestKind;
+ import dagger.model.Scope;
+ import dagger.producers.Produced;
+ import dagger.producers.Producer;
++import dagger.producers.internal.ProductionExecutorModule;
+ import java.util.ArrayDeque;
+ import java.util.Collection;
+ import java.util.Deque;
+@@ -77,6 +80,7 @@
+   private final KeyFactory keyFactory;
+   private final BindingFactory bindingFactory;
+   private final CompilerOptions compilerOptions;
++  private final ModuleDescriptor.Factory moduleDescriptorFactory;
+ 
+   @Inject
+   BindingGraphFactory(
+@@ -84,11 +88,13 @@
+       InjectBindingRegistry injectBindingRegistry,
+       KeyFactory keyFactory,
+       BindingFactory bindingFactory,
++      ModuleDescriptor.Factory moduleDescriptorFactory,
+       CompilerOptions compilerOptions) {
+     this.elements = elements;
+     this.injectBindingRegistry = injectBindingRegistry;
+     this.keyFactory = keyFactory;
+     this.bindingFactory = bindingFactory;
++    this.moduleDescriptorFactory = moduleDescriptorFactory;
+     this.compilerOptions = compilerOptions;
+   }
+ 
+@@ -149,7 +155,7 @@ private BindingGraph create(
+     ImmutableSet.Builder<SubcomponentDeclaration> subcomponentDeclarations = ImmutableSet.builder();
+ 
+     // Collect transitive module bindings and multibinding declarations.
+-    for (ModuleDescriptor moduleDescriptor : componentDescriptor.modules()) {
++    for (ModuleDescriptor moduleDescriptor : modules(componentDescriptor, parentResolver)) {
+       explicitBindingsBuilder.addAll(moduleDescriptor.bindings());
+       multibindingDeclarations.addAll(moduleDescriptor.multibindingDeclarations());
+       subcomponentDeclarations.addAll(moduleDescriptor.subcomponentDeclarations());
+@@ -207,6 +213,45 @@ private BindingGraph create(
+         requestResolver.getFactoryMethod());
+   }
+ 
++  /**
++   * Returns all the modules that should be installed in the component. For production components
++   * and production subcomponents that have a parent that is not a production component or
++   * subcomponent, also includes the production monitoring module for the component and the
++   * production executor module.
++   */
++  private ImmutableSet<ModuleDescriptor> modules(
++      ComponentDescriptor componentDescriptor, Optional<Resolver> parentResolver) {
++    if (componentDescriptor.kind().equals(Kind.PRODUCTION_COMPONENT)
++        || (componentDescriptor.kind().equals(Kind.PRODUCTION_SUBCOMPONENT)
++            && parentResolver.isPresent()
++            && !parentResolver.get().componentDescriptor.kind().isProducer())) {
++      ImmutableSet.Builder<ModuleDescriptor> modules = new ImmutableSet.Builder<>();
++      modules.addAll(componentDescriptor.modules());
++      modules.add(descriptorForMonitoringModule(componentDescriptor.typeElement()));
++      modules.add(descriptorForProductionExecutorModule());
++      return modules.build();
++    }
++    return componentDescriptor.modules();
++  }
++
++  /**
++   * Returns a descriptor for a generated module that handles monitoring for production components.
++   * This module is generated in the {@link MonitoringModuleProcessingStep}.
++   *
++   * @throws TypeNotPresentException if the module has not been generated yet. This will cause the
++   *     processor to retry in a later processing round.
++   */
++  private ModuleDescriptor descriptorForMonitoringModule(TypeElement componentDefinitionType) {
++    return moduleDescriptorFactory.create(
++        elements.checkTypePresent(
++            generatedMonitoringModuleName(componentDefinitionType).toString()));
++  }
++
++  /** Returns a descriptor {@link ProductionExecutorModule}. */
++  private ModuleDescriptor descriptorForProductionExecutorModule() {
++    return moduleDescriptorFactory.create(elements.getTypeElement(ProductionExecutorModule.class));
++  }
++
+   /** Indexes {@code bindingDeclarations} by {@link BindingDeclaration#key()}. */
+   private static <T extends BindingDeclaration>
+       ImmutableSetMultimap<Key, T> indexBindingDeclarationsByKey(Iterable<T> declarations) {
+diff --git a/java/dagger/internal/codegen/ComponentDescriptor.java b/java/dagger/internal/codegen/ComponentDescriptor.java
+index eb4699916..ee1533f19 100644
+--- a/java/dagger/internal/codegen/ComponentDescriptor.java
++++ b/java/dagger/internal/codegen/ComponentDescriptor.java
+@@ -17,6 +17,7 @@
+ package dagger.internal.codegen;
+ 
+ import static com.google.auto.common.MoreElements.isAnnotationPresent;
++import static com.google.auto.common.MoreTypes.asTypeElement;
+ import static com.google.common.base.Preconditions.checkArgument;
+ import static com.google.common.base.Preconditions.checkNotNull;
+ import static com.google.common.base.Verify.verify;
+@@ -48,7 +49,6 @@
+ import com.google.common.collect.ImmutableMap;
+ import com.google.common.collect.ImmutableSet;
+ import com.google.common.collect.Sets;
+-import com.squareup.javapoet.ClassName;
+ import dagger.BindsInstance;
+ import dagger.Component;
+ import dagger.Lazy;
+@@ -59,7 +59,6 @@
+ import dagger.producers.CancellationPolicy;
+ import dagger.producers.ProductionComponent;
+ import dagger.producers.ProductionSubcomponent;
+-import dagger.producers.internal.ProductionExecutorModule;
+ import java.lang.annotation.Annotation;
+ import java.util.EnumSet;
+ import java.util.LinkedHashSet;
+@@ -491,11 +490,10 @@ ComponentDescriptor forComponent(TypeElement componentType) {
+             "%s must be annotated with @Component or @ProductionComponent.",
+             componentType);
+       }
+-      return create(componentType, kind.get(), Optional.empty());
++      return create(componentType, kind.get());
+     }
+ 
+-    private ComponentDescriptor create(
+-        TypeElement componentDefinitionType, Kind kind, Optional<Kind> parentKind) {
++    private ComponentDescriptor create(TypeElement componentDefinitionType, Kind kind) {
+       AnnotationMirror componentMirror =
+           getAnnotationMirror(componentDefinitionType, kind.annotationType()).get();
+       DeclaredType declaredComponentType = MoreTypes.asDeclared(componentDefinitionType.asType());
+@@ -519,28 +517,18 @@ private ComponentDescriptor create(
+         }
+       }
+ 
+-      ImmutableSet.Builder<ModuleDescriptor> modulesBuilder = ImmutableSet.builder();
+-      for (TypeMirror componentModulesType : getComponentModules(componentMirror)) {
+-        modulesBuilder.add(
+-            moduleDescriptorFactory.create(MoreTypes.asTypeElement(componentModulesType)));
+-      }
+-      if (kind.equals(Kind.PRODUCTION_COMPONENT)
+-          || (kind.equals(Kind.PRODUCTION_SUBCOMPONENT)
+-              && parentKind.isPresent()
+-              && (parentKind.get().equals(Kind.COMPONENT)
+-                  || parentKind.get().equals(Kind.SUBCOMPONENT)))) {
+-        modulesBuilder.add(descriptorForMonitoringModule(componentDefinitionType));
+-        modulesBuilder.add(descriptorForProductionExecutorModule());
+-      }
+-      ImmutableSet<ModuleDescriptor> modules = modulesBuilder.build();
++      ImmutableSet<ModuleDescriptor> modules =
++          getComponentModules(componentMirror).stream()
++              .map(moduleType -> moduleDescriptorFactory.create(asTypeElement(moduleType)))
++              .collect(toImmutableSet());
++
+       ImmutableSet<ModuleDescriptor> transitiveModules = transitiveModules(modules);
+       ImmutableSet.Builder<ComponentDescriptor> subcomponentsFromModules = ImmutableSet.builder();
+       for (ModuleDescriptor module : transitiveModules) {
+         for (SubcomponentDeclaration subcomponentDeclaration : module.subcomponentDeclarations()) {
+           TypeElement subcomponent = subcomponentDeclaration.subcomponentType();
+           subcomponentsFromModules.add(
+-              create(
+-                  subcomponent, Kind.forAnnotatedElement(subcomponent).get(), Optional.of(kind)));
++              create(subcomponent, Kind.forAnnotatedElement(subcomponent).get()));
+         }
+       }
+       ImmutableSet<ExecutableElement> unimplementedMethods =
+@@ -566,8 +554,7 @@ private ComponentDescriptor create(
+                 componentMethodDescriptor,
+                 create(
+                     MoreElements.asType(MoreTypes.asElement(resolvedMethod.getReturnType())),
+-                    componentMethodDescriptor.kind().componentKind(),
+-                    Optional.of(kind)));
++                    componentMethodDescriptor.kind().componentKind()));
+             break;
+           case SUBCOMPONENT_BUILDER:
+           case PRODUCTION_SUBCOMPONENT_BUILDER:
+@@ -576,8 +563,7 @@ private ComponentDescriptor create(
+                 create(
+                     MoreElements.asType(
+                         MoreTypes.asElement(resolvedMethod.getReturnType()).getEnclosingElement()),
+-                    componentMethodDescriptor.kind().componentKind(),
+-                    Optional.of(kind)));
++                    componentMethodDescriptor.kind().componentKind()));
+             break;
+           default: // nothing special to do for other methods.
+         }
+@@ -684,7 +670,7 @@ private ComponentMethodDescriptor getDescriptorForComponentMethod(
+       if (!builderType.isPresent()) {
+         return Optional.empty();
+       }
+-      TypeElement element = MoreTypes.asTypeElement(builderType.get());
++      TypeElement element = asTypeElement(builderType.get());
+       ImmutableSet<ExecutableElement> methods = elements.getUnimplementedMethods(element);
+       ImmutableSet.Builder<BuilderRequirementMethod> requirementMethods = ImmutableSet.builder();
+       ExecutableElement buildMethod = null;
+@@ -721,32 +707,11 @@ private ComponentRequirement requirementForBuilderMethod(
+       }
+ 
+       TypeMirror type = getOnlyElement(resolvedType.getParameterTypes());
+-      return ConfigurationAnnotations.getModuleAnnotation(MoreTypes.asTypeElement(type)).isPresent()
++      return ConfigurationAnnotations.getModuleAnnotation(asTypeElement(type)).isPresent()
+           ? ComponentRequirement.forModule(type)
+           : ComponentRequirement.forDependency(type);
+     }
+ 
+-    /**
+-     * Returns a descriptor for a generated module that handles monitoring for production
+-     * components. This module is generated in the {@link MonitoringModuleProcessingStep}.
+-     *
+-     * @throws TypeNotPresentException if the module has not been generated yet. This will cause the
+-     *     processor to retry in a later processing round.
+-     */
+-    private ModuleDescriptor descriptorForMonitoringModule(TypeElement componentDefinitionType) {
+-      ClassName monitoringModuleName =
+-          SourceFiles.generatedMonitoringModuleName(componentDefinitionType);
+-      TypeElement monitoringModule = elements.checkTypePresent(monitoringModuleName.toString());
+-      return moduleDescriptorFactory.create(monitoringModule);
+-    }
+-
+-    /** Returns a descriptor {@link ProductionExecutorModule}. */
+-    private ModuleDescriptor descriptorForProductionExecutorModule() {
+-      TypeElement productionExecutorModule =
+-          elements.getTypeElement(ProductionExecutorModule.class);
+-      return moduleDescriptorFactory.create(productionExecutorModule);
+-    }
+-
+     private ImmutableSet<ModuleDescriptor> transitiveModules(
+         Iterable<ModuleDescriptor> topLevelModules) {
+       Set<ModuleDescriptor> transitiveModules = new LinkedHashSet<>();
+diff --git a/java/dagger/internal/codegen/KytheBindingGraphFactory.java b/java/dagger/internal/codegen/KytheBindingGraphFactory.java
+index 91c9a4c49..c3a6a238f 100644
+--- a/java/dagger/internal/codegen/KytheBindingGraphFactory.java
++++ b/java/dagger/internal/codegen/KytheBindingGraphFactory.java
+@@ -63,6 +63,7 @@
+   }
+ 
+   /** Creates the {@link CompilerOptions} for use during {@link BindingGraph} construction. */
++  // TODO(dpb): Use Dagger to inject this!
+   static CompilerOptions createCompilerOptions() {
+     return CompilerOptions.builder()
+         .usesProducers(true)
+@@ -80,6 +81,7 @@ static CompilerOptions createCompilerOptions() {
+         .validate();
+   }
+ 
++  // TODO(dpb): Use Dagger to inject this!
+   private static ComponentDescriptor.Factory createComponentDescriptorFactory(
+       DaggerElements elements, DaggerTypes types, CompilerOptions compilerOptions) {
+     KeyFactory keyFactory = new KeyFactory(types, elements);
+@@ -108,6 +110,7 @@ static CompilerOptions createCompilerOptions() {
+         elements, types, dependencyRequestFactory, moduleDescriptorFactory, compilerOptions);
+   }
+ 
++  // TODO(dpb): Use Dagger to inject this!
+   private static BindingGraphFactory createBindingGraphFactory(
+       DaggerTypes types, DaggerElements elements, CompilerOptions compilerOptions) {
+     KeyFactory keyFactory = new KeyFactory(types, elements);
+@@ -134,6 +137,14 @@ private static BindingGraphFactory createBindingGraphFactory(
+         injectBindingRegistry,
+         keyFactory,
+         bindingFactory,
++        new ModuleDescriptor.Factory(
++            elements,
++            bindingFactory,
++            new MultibindingDeclaration.Factory(types, keyFactory),
++            new DelegateDeclaration.Factory(
++                types, keyFactory, new DependencyRequestFactory(keyFactory, types)),
++            new SubcomponentDeclaration.Factory(keyFactory),
++            new OptionalBindingDeclaration.Factory(keyFactory)),
+         compilerOptions);
+   }
+ 

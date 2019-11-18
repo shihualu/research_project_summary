@@ -1,0 +1,151 @@
+diff --git a/CHANGELOG.md b/CHANGELOG.md
+index 235dc5d..e856bff 100644
+--- a/CHANGELOG.md
++++ b/CHANGELOG.md
+@@ -12,6 +12,7 @@
+ * Add helper job class `DailyJob` to make it easier to run jobs once a day, see #223
+ * Add option in `JobConfig` to add a logger
+ * Add option in `JobConfig` for a job ID offset to avoid clashes with other jobs in the `JobScheduler`
++* Switch to elapsed real time with the `AlarmManager` to have a consistent behavior with the `JobScheduler`, see #237
+ 
+ ## 1.1.12
+ 
+diff --git a/library/src/androidTest/java/com/evernote/android/job/PlatformTest.java b/library/src/androidTest/java/com/evernote/android/job/PlatformTest.java
+index 41990b1..7749d0b 100644
+--- a/library/src/androidTest/java/com/evernote/android/job/PlatformTest.java
++++ b/library/src/androidTest/java/com/evernote/android/job/PlatformTest.java
+@@ -76,7 +76,17 @@ public void testApi26() throws Exception {
+     }
+ 
+     @Test
+-    public void testExact() throws Exception {
++    public void testExactRealTime() throws Exception {
++        testJobExact();
++    }
++
++    @Test
++    public void testExactRtc() throws Exception {
++        JobConfig.setForceRtc(true);
++        testJobExact();
++    }
++
++    private void testJobExact() throws Exception {
+         mJob = new TestJob(PlatformAlarmServiceExact.class);
+ 
+         new JobRequest.Builder("tag")
+diff --git a/library/src/main/java/com/evernote/android/job/JobConfig.java b/library/src/main/java/com/evernote/android/job/JobConfig.java
+index af6b702..9ce66c9 100644
+--- a/library/src/main/java/com/evernote/android/job/JobConfig.java
++++ b/library/src/main/java/com/evernote/android/job/JobConfig.java
+@@ -62,6 +62,8 @@ private JobConfig() {
+ 
+     private static volatile int jobIdOffset = 0;
+ 
++    private static volatile boolean forceRtc = false;
++
+     static {
+         ENABLED_APIS = new EnumMap<>(JobApi.class);
+         for (JobApi api : JobApi.values()) {
+@@ -238,6 +240,24 @@ public static void setJobIdOffset(int jobIdOffset) {
+         JobConfig.jobIdOffset = jobIdOffset;
+     }
+ 
++    /**
++     * @return Whether the alarm time should use System.currentTimeMillis() (wall clock time in UTC). The
++     *                 default value is {@code false} and will use the alarm time in SystemClock.elapsedRealtime()
++     *                 (time since boot, including sleep).
++     */
++    public static boolean isForceRtc() {
++        return forceRtc;
++    }
++
++    /**
++     * @param forceRtc Force using the alarm time in System.currentTimeMillis() (wall clock time in UTC). The
++     *                 default value is {@code false} and will use the alarm time in SystemClock.elapsedRealtime()
++     *                 (time since boot, including sleep).
++     */
++    public static void setForceRtc(boolean forceRtc) {
++        JobConfig.forceRtc = forceRtc;
++    }
++
+     /**
+      * Resets all adjustments in the config.
+      */
+@@ -250,6 +270,7 @@ public static void reset() {
+         jobReschedulePause = DEFAULT_JOB_RESCHEDULE_PAUSE;
+         skipJobReschedule = false;
+         jobIdOffset = 0;
++        forceRtc = false;
+         JobCat.setLogcatEnabled(true);
+         JobCat.clearLogger();
+     }
+diff --git a/library/src/main/java/com/evernote/android/job/v14/JobProxy14.java b/library/src/main/java/com/evernote/android/job/v14/JobProxy14.java
+index 58baa30..c55d791 100644
+--- a/library/src/main/java/com/evernote/android/job/v14/JobProxy14.java
++++ b/library/src/main/java/com/evernote/android/job/v14/JobProxy14.java
+@@ -34,6 +34,7 @@
+ import android.os.SystemClock;
+ import android.support.annotation.Nullable;
+ 
++import com.evernote.android.job.JobConfig;
+ import com.evernote.android.job.JobProxy;
+ import com.evernote.android.job.JobRequest;
+ import com.evernote.android.job.util.JobCat;
+@@ -90,18 +91,18 @@ public void plantOneOff(JobRequest request) {
+     }
+ 
+     protected void plantOneOffInexact(JobRequest request, AlarmManager alarmManager, PendingIntent pendingIntent) {
+-        alarmManager.set(AlarmManager.ELAPSED_REALTIME, Common.getAverageDelayMs(request), pendingIntent);
++        alarmManager.set(getType(false), getTriggerAtMillis(request), pendingIntent);
+         logScheduled(request);
+     }
+ 
+     protected void plantOneOffExact(JobRequest request, AlarmManager alarmManager, PendingIntent pendingIntent) {
+-        long triggerAtMillis = SystemClock.elapsedRealtime() + Common.getAverageDelayMs(request);
++        long triggerAtMillis = getTriggerAtMillis(request);
+         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.M) {
+-            alarmManager.setExactAndAllowWhileIdle(AlarmManager.ELAPSED_REALTIME_WAKEUP, triggerAtMillis, pendingIntent);
++            alarmManager.setExactAndAllowWhileIdle(getType(true), triggerAtMillis, pendingIntent);
+         } else if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.KITKAT) {
+-            alarmManager.setExact(AlarmManager.ELAPSED_REALTIME_WAKEUP, triggerAtMillis, pendingIntent);
++            alarmManager.setExact(getType(true), triggerAtMillis, pendingIntent);
+         } else {
+-            alarmManager.set(AlarmManager.ELAPSED_REALTIME_WAKEUP, triggerAtMillis, pendingIntent);
++            alarmManager.set(getType(true), triggerAtMillis, pendingIntent);
+         }
+         logScheduled(request);
+     }
+@@ -114,9 +115,21 @@ protected void plantOneOffFlexSupport(JobRequest request, AlarmManager alarmMana
+                 JobUtil.timeToString(request.getIntervalMs()), JobUtil.timeToString(request.getFlexMs()));
+     }
+ 
+-//    protected long getTriggerAtMillis(JobRequest request) {
+-//        return System.currentTimeMillis() + Common.getAverageDelayMs(request);
+-//    }
++    protected long getTriggerAtMillis(JobRequest request) {
++        if (JobConfig.isForceRtc()) {
++            return System.currentTimeMillis() + Common.getAverageDelayMs(request);
++        } else {
++            return SystemClock.elapsedRealtime() + Common.getAverageDelayMs(request);
++        }
++    }
++
++    protected int getType(boolean wakeup) {
++        if (wakeup) {
++            return JobConfig.isForceRtc() ? AlarmManager.RTC_WAKEUP : AlarmManager.ELAPSED_REALTIME_WAKEUP;
++        } else {
++            return JobConfig.isForceRtc() ? AlarmManager.RTC : AlarmManager.ELAPSED_REALTIME;
++        }
++    }
+ 
+     private void logScheduled(JobRequest request) {
+         mCat.d("Scheduled alarm, %s, delay %s, exact %b, reschedule count %d", request,
+@@ -128,7 +141,7 @@ public void plantPeriodic(JobRequest request) {
+         PendingIntent pendingIntent = getPendingIntent(request, true);
+         AlarmManager alarmManager = getAlarmManager();
+         if (alarmManager != null) {
+-            alarmManager.setRepeating(AlarmManager.ELAPSED_REALTIME_WAKEUP, request.getIntervalMs(), request.getIntervalMs(), pendingIntent);
++            alarmManager.setRepeating(getType(true), getTriggerAtMillis(request), request.getIntervalMs(), pendingIntent);
+         }
+ 
+         mCat.d("Scheduled repeating alarm, %s, interval %s", request, JobUtil.timeToString(request.getIntervalMs()));

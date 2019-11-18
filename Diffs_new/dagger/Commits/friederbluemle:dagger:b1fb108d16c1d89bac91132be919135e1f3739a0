@@ -1,0 +1,825 @@
+diff --git a/java/dagger/internal/codegen/BUILD b/java/dagger/internal/codegen/BUILD
+index 558ee7d4d..881c7f292 100644
+--- a/java/dagger/internal/codegen/BUILD
++++ b/java/dagger/internal/codegen/BUILD
+@@ -231,10 +231,8 @@ java_library(
+         "BindingMethodImplementation.java",
+         "ComponentBindingExpressions.java",
+         "ComponentBuilder.java",
+-        "ComponentGenerator.java",
+         "ComponentInstanceBindingExpression.java",
+         "ComponentMethodBindingExpression.java",
+-        "ComponentModelBuilder.java",
+         "ComponentProvisionBindingExpression.java",
+         "ComponentRequirementBindingExpression.java",
+         "ComponentRequirementField.java",
+@@ -310,7 +308,9 @@ java_library(
+         "BindingGraphPluginsModule.java",
+         "BindingMethodValidatorsModule.java",
+         "CanReleaseReferencesProcessingStep.java",
++        "ComponentGenerator.java",
+         "ComponentHjarProcessingStep.java",
++        "ComponentModelBuilder.java",
+         "ComponentProcessingStep.java",
+         "ComponentProcessor.java",
+         "DiagnosticReporterFactory.java",
+diff --git a/java/dagger/internal/codegen/ComponentBuilder.java b/java/dagger/internal/codegen/ComponentBuilder.java
+index a9f6aff16..d4ad5fd5f 100644
+--- a/java/dagger/internal/codegen/ComponentBuilder.java
++++ b/java/dagger/internal/codegen/ComponentBuilder.java
+@@ -101,6 +101,7 @@ private static boolean hasBuilder(ComponentDescriptor component) {
+     private final TypeSpec.Builder builder;
+     private final GeneratedComponentModel generatedComponentModel;
+     private final ClassName builderName;
++    private final SubcomponentNames subcomponentNames;
+     private final Elements elements;
+     private final Types types;
+ 
+@@ -121,6 +122,7 @@ private static boolean hasBuilder(ComponentDescriptor component) {
+         builder = classBuilder(builderName);
+       }
+       this.graph = graph;
++      this.subcomponentNames = subcomponentNames;
+       this.elements = elements;
+       this.types = types;
+     }
+@@ -132,7 +134,7 @@ ComponentBuilder create() {
+         } else {
+           builder.addModifiers(PRIVATE);
+         }
+-        addSupertype(builder, builderSpec().get().builderDefinitionType());
++        setSupertype();
+       } else {
+         builder.addModifiers(PUBLIC).addMethod(constructorBuilder().addModifiers(PRIVATE).build());
+       }
+@@ -155,6 +157,27 @@ ComponentBuilder create() {
+       return new ComponentBuilder(builder.build(), builderName, builderFields);
+     }
+ 
++    /** Set the superclass being extended or interface being implemented for this builder. */
++    private void setSupertype() {
++      if (generatedComponentModel.supermodel().isPresent()) {
++        // If there's a superclass, extend the Builder defined there.
++        GeneratedComponentModel subcomponentSupermodel = generatedComponentModel.supermodel().get();
++        if (subcomponentSupermodel.isNested()) {
++          // If the subcomponent superclass is nested we're overriding the builder that was
++          // defined as a peer of the superclass.
++          builder.superclass(
++              subcomponentSupermodel
++                  .name()
++                  .peerClass(subcomponentNames.get(graph.componentDescriptor()) + "Builder"));
++        } else {
++          // Otherwise we're extending the builder defined inside the subcomponent definition.
++          builder.superclass(subcomponentSupermodel.name().nestedClass("Builder"));
++        }
++      } else {
++        addSupertype(builder, builderSpec().get().builderDefinitionType());
++      }
++    }
++
+     /**
+      * Computes fields for each of the {@linkplain BindingGraph#componentRequirements component
+      * requirements}. Regardless of builder spec, there is always one field per requirement.
+diff --git a/java/dagger/internal/codegen/ComponentGenerator.java b/java/dagger/internal/codegen/ComponentGenerator.java
+index 4420d6332..1dc14b933 100644
+--- a/java/dagger/internal/codegen/ComponentGenerator.java
++++ b/java/dagger/internal/codegen/ComponentGenerator.java
+@@ -36,6 +36,7 @@
+   private final DaggerElements elements;
+   private final KeyFactory keyFactory;
+   private final CompilerOptions compilerOptions;
++  private final BindingGraphFactory bindingGraphFactory;
+ 
+   @Inject
+   ComponentGenerator(
+@@ -44,12 +45,14 @@
+       SourceVersion sourceVersion,
+       DaggerTypes types,
+       KeyFactory keyFactory,
+-      CompilerOptions compilerOptions) {
++      CompilerOptions compilerOptions,
++      BindingGraphFactory bindingGraphFactory) {
+     super(filer, elements, sourceVersion);
+     this.types = types;
+     this.elements = elements;
+     this.keyFactory = keyFactory;
+     this.compilerOptions = compilerOptions;
++    this.bindingGraphFactory = bindingGraphFactory;
+   }
+ 
+   @Override
+@@ -71,7 +74,13 @@ static ClassName componentName(TypeElement componentDefinitionType) {
+   Optional<TypeSpec.Builder> write(ClassName componentName, BindingGraph input) {
+     return Optional.of(
+         ComponentModelBuilder.buildComponentModel(
+-                types, elements, keyFactory, compilerOptions, componentName, input)
++                types,
++                elements,
++                keyFactory,
++                compilerOptions,
++                componentName,
++                input,
++                bindingGraphFactory)
+             .generate());
+   }
+ }
+diff --git a/java/dagger/internal/codegen/ComponentModelBuilder.java b/java/dagger/internal/codegen/ComponentModelBuilder.java
+index be99cfe8b..eaeb5b6a3 100644
+--- a/java/dagger/internal/codegen/ComponentModelBuilder.java
++++ b/java/dagger/internal/codegen/ComponentModelBuilder.java
+@@ -52,7 +52,6 @@
+ import java.util.Optional;
+ import javax.lang.model.element.ExecutableElement;
+ import javax.lang.model.type.DeclaredType;
+-import javax.lang.model.util.Elements;
+ 
+ /** Builds the model for an implementation of a component or subcomponent. */
+ abstract class ComponentModelBuilder {
+@@ -62,7 +61,8 @@ static GeneratedComponentModel buildComponentModel(
+       KeyFactory keyFactory,
+       CompilerOptions compilerOptions,
+       ClassName name,
+-      BindingGraph graph) {
++      BindingGraph graph,
++      BindingGraphFactory bindingGraphFactory) {
+     GeneratedComponentModel generatedComponentModel;
+     if (graph.componentDescriptor().kind().isTopLevel()) {
+       generatedComponentModel = GeneratedComponentModel.forComponent(name);
+@@ -90,28 +90,35 @@ static GeneratedComponentModel buildComponentModel(
+           compilerOptions.aheadOfTimeSubcomponents(),
+           "Calling 'buildComponentModel()' on %s when not generating ahead-of-time subcomponents.",
+           graph.componentDescriptor().componentDefinitionType());
+-      return new BaseSubcomponentModelBuilder(
++      return new AbstractSubcomponentModelBuilder(
++              Optional.empty(), /* parent */
+               types,
+               elements,
++              keyFactory,
+               graph,
+               generatedComponentModel,
+               subcomponentNames,
+               optionalFactories,
+               bindingExpressions,
+               componentRequirementFields,
+-              builder)
++              builder,
++              bindingGraphFactory,
++              compilerOptions)
+           .build();
+     } else {
+       return new RootComponentModelBuilder(
+               types,
+               elements,
++              keyFactory,
+               graph,
+               generatedComponentModel,
+               subcomponentNames,
+               optionalFactories,
+               bindingExpressions,
+               componentRequirementFields,
+-              builder)
++              builder,
++              bindingGraphFactory,
++              compilerOptions)
+           .build();
+     }
+   }
+@@ -138,8 +145,74 @@ private GeneratedComponentModel buildSubcomponentModel(BindingGraph childGraph)
+         .build();
+   }
+ 
+-  private final Elements elements;
++  private GeneratedComponentModel buildAbstractInnerSubcomponentModel(BindingGraph childGraph) {
++    ClassName childName =
++        generatedComponentModel
++            .name()
++            .nestedClass(subcomponentNames.get(childGraph.componentDescriptor()) + "Impl");
++    GeneratedComponentModel supermodel =
++        getSubcomponentSupermodel(childGraph.componentDescriptor());
++    GeneratedComponentModel childModel =
++        GeneratedComponentModel.forAbstractSubcomponent(childName, supermodel);
++    Optional<ComponentBuilder> childBuilder =
++        ComponentBuilder.create(childModel, childGraph, subcomponentNames, elements, types);
++    ComponentRequirementFields childComponentRequirementFields =
++        componentRequirementFields.forChildComponent(childGraph, childModel, childBuilder);
++    ComponentBindingExpressions childBindingExpressions =
++        bindingExpressions.forChildComponent(
++            childGraph, childModel, childComponentRequirementFields);
++    return new AbstractSubcomponentModelBuilder(
++            Optional.of(this),
++            types,
++            elements,
++            keyFactory,
++            childGraph,
++            childModel,
++            subcomponentNames,
++            optionalFactories,
++            childBindingExpressions,
++            childComponentRequirementFields,
++            childBuilder,
++            bindingGraphFactory,
++            compilerOptions)
++        .build();
++  }
++
++  private GeneratedComponentModel getSubcomponentSupermodel(ComponentDescriptor subcomponent) {
++    // If the current model is for a subcomponent that has a defined supermodel, that supermodel
++    // should contain a reference to a model for `subcomponent`
++    if (generatedComponentModel.supermodel().isPresent()) {
++      Optional<GeneratedComponentModel> supermodel =
++          generatedComponentModel.supermodel().get().subcomponentModel(subcomponent);
++      checkState(
++          supermodel.isPresent(),
++          "Attempting to generate an implementation of a subcomponent [%s] whose parent is a "
++              + "subcomponent [%s], but whose supermodel is not present on the parent's "
++              + "supermodel.",
++          subcomponent.componentDefinitionType(),
++          graph.componentType());
++      return supermodel.get();
++    }
++
++    // Otherwise, the enclosing component is top-level, so we must generate the supermodel for the
++    // subcomponent. We do so by building the model for the abstract base class for the
++    // subcomponent. This is done by truncating the binding graph at the subcomponent.
++    BindingGraph truncatedBindingGraph = bindingGraphFactory.create(subcomponent);
++    return buildComponentModel(
++        // TODO(ronshapiro): extract a factory class here so that we don't need to pass around
++        // types, elements, keyFactory, etc...
++        types,
++        elements,
++        keyFactory,
++        compilerOptions,
++        ComponentGenerator.componentName(truncatedBindingGraph.componentType()),
++        truncatedBindingGraph,
++        bindingGraphFactory);
++  }
++
++  private final DaggerElements elements;
+   private final DaggerTypes types;
++  private final KeyFactory keyFactory;
+   private final BindingGraph graph;
+   private final SubcomponentNames subcomponentNames;
+   private final ComponentBindingExpressions bindingExpressions;
+@@ -147,20 +220,26 @@ private GeneratedComponentModel buildSubcomponentModel(BindingGraph childGraph)
+   private final GeneratedComponentModel generatedComponentModel;
+   private final OptionalFactories optionalFactories;
+   private final Optional<ComponentBuilder> builder;
++  private final BindingGraphFactory bindingGraphFactory;
++  private final CompilerOptions compilerOptions;
+   private boolean done;
+ 
+   private ComponentModelBuilder(
+       DaggerTypes types,
+-      Elements elements,
++      DaggerElements elements,
++      KeyFactory keyFactory,
+       BindingGraph graph,
+       GeneratedComponentModel generatedComponentModel,
+       SubcomponentNames subcomponentNames,
+       OptionalFactories optionalFactories,
+       ComponentBindingExpressions bindingExpressions,
+       ComponentRequirementFields componentRequirementFields,
+-      Optional<ComponentBuilder> builder) {
++      Optional<ComponentBuilder> builder,
++      BindingGraphFactory bindingGraphFactory,
++      CompilerOptions compilerOptions) {
+     this.types = types;
+     this.elements = elements;
++    this.keyFactory = keyFactory;
+     this.graph = graph;
+     this.subcomponentNames = subcomponentNames;
+     this.generatedComponentModel = generatedComponentModel;
+@@ -168,6 +247,8 @@ private ComponentModelBuilder(
+     this.bindingExpressions = bindingExpressions;
+     this.componentRequirementFields = componentRequirementFields;
+     this.builder = builder;
++    this.bindingGraphFactory = bindingGraphFactory;
++    this.compilerOptions = compilerOptions;
+   }
+ 
+   /**
+@@ -180,7 +261,7 @@ protected final GeneratedComponentModel build() {
+         !done,
+         "ComponentModelBuilder has already built the GeneratedComponentModel for [%s].",
+         generatedComponentModel.name());
+-    generatedComponentModel.addSupertype(graph.componentType());
++    setSupertype();
+     builder.map(ComponentBuilder::typeSpec).ifPresent(this::addBuilderClass);
+ 
+     getLocalAndInheritedMethods(
+@@ -196,6 +277,15 @@ protected final GeneratedComponentModel build() {
+     return generatedComponentModel;
+   }
+ 
++  /** Set the supertype for this generated class. */
++  private void setSupertype() {
++    if (generatedComponentModel.supermodel().isPresent()) {
++      generatedComponentModel.addSuperclass(generatedComponentModel.supermodel().get().name());
++    } else {
++      generatedComponentModel.addSupertype(graph.componentType());
++    }
++  }
++
+   /**
+    * Adds {@code builder} as a nested builder class. Root components and subcomponents will nest
+    * this in different classes.
+@@ -205,7 +295,7 @@ protected final GeneratedComponentModel build() {
+   /** Adds component factory methods. */
+   protected abstract void addFactoryMethods();
+ 
+-  private void addInterfaceMethods() {
++  protected void addInterfaceMethods() {
+     /* Each component method may have been declared by several supertypes. We want to implement only
+      * one method for each distinct signature.*/
+     ImmutableListMultimap<MethodSignature, ComponentMethodDescriptor> componentMethodsBySignature =
+@@ -223,9 +313,13 @@ private MethodSignature getMethodSignature(ComponentMethodDescriptor method) {
+         method, MoreTypes.asDeclared(graph.componentType().asType()), types);
+   }
+ 
+-  protected void addSubcomponents() {
++  private void addSubcomponents() {
+     for (BindingGraph subgraph : graph.subgraphs()) {
+-      generatedComponentModel.addSubcomponent(buildSubcomponentModel(subgraph));
++      generatedComponentModel.addSubcomponent(
++          subgraph.componentDescriptor(),
++          generatedComponentModel.isAbstract()
++              ? buildAbstractInnerSubcomponentModel(subgraph)
++              : buildSubcomponentModel(subgraph));
+     }
+   }
+ 
+@@ -242,6 +336,16 @@ private void addConstructor() {
+             .addModifiers(generatedComponentModel.isAbstract() ? PROTECTED : PRIVATE)
+             .addParameters(constructorParameters);
+ 
++    if (generatedComponentModel.supermodel().isPresent()) {
++      constructor.addStatement(
++          CodeBlock.of(
++              "super($L)",
++              constructorParameters
++                  .stream()
++                  .map(param -> CodeBlock.of("$N", param))
++                  .collect(toParametersCodeBlock())));
++    }
++
+     ImmutableList<ParameterSpec> initializeParameters = initializeParameters();
+     CodeBlock initializeParametersCodeBlock =
+         constructorParameters
+@@ -294,24 +398,30 @@ private void addConstructor() {
+   private static final class RootComponentModelBuilder extends ComponentModelBuilder {
+     RootComponentModelBuilder(
+         DaggerTypes types,
+-        Elements elements,
++        DaggerElements elements,
++        KeyFactory keyFactory,
+         BindingGraph graph,
+         GeneratedComponentModel generatedComponentModel,
+         SubcomponentNames subcomponentNames,
+         OptionalFactories optionalFactories,
+         ComponentBindingExpressions bindingExpressions,
+         ComponentRequirementFields componentRequirementFields,
+-        Optional<ComponentBuilder> builder) {
++        Optional<ComponentBuilder> builder,
++        BindingGraphFactory bindingGraphFactory,
++        CompilerOptions compilerOptions) {
+       super(
+           types,
+           elements,
++          keyFactory,
+           graph,
+           generatedComponentModel,
+           subcomponentNames,
+           optionalFactories,
+           bindingExpressions,
+           componentRequirementFields,
+-          builder);
++          builder,
++          bindingGraphFactory,
++          compilerOptions);
+     }
+ 
+     @Override
+@@ -358,7 +468,10 @@ private boolean canInstantiateAllRequirements() {
+     }
+   }
+ 
+-  /** Builds the model for a nested subcomponent. */
++  /**
++   * Builds the model for a nested subcomponent. This is used when ahead-of-time components are not
++   * enabled (current default mode).
++   */
+   private static final class SubComponentModelBuilder extends ComponentModelBuilder {
+     private final ComponentModelBuilder parent;
+ 
+@@ -372,13 +485,16 @@ private boolean canInstantiateAllRequirements() {
+       super(
+           parent.types,
+           parent.elements,
++          parent.keyFactory,
+           graph,
+           generatedComponentModel,
+           parent.subcomponentNames,
+           parent.optionalFactories,
+           bindingExpressions,
+           componentRequirementFields,
+-          builder);
++          builder,
++          parent.bindingGraphFactory,
++          parent.compilerOptions);
+       this.parent = parent;
+     }
+ 
+@@ -413,36 +529,50 @@ private DeclaredType parentType() {
+     }
+   }
+ 
+-  /** Builds the model for a top-level abstract base implementation of a subcomponent. */
+-  private static final class BaseSubcomponentModelBuilder extends ComponentModelBuilder {
++  /** Builds the model for abstract implementations of a subcomponent. */
++  private static final class AbstractSubcomponentModelBuilder extends ComponentModelBuilder {
++    private final Optional<ComponentModelBuilder> parent;
+     private final GeneratedComponentModel generatedComponentModel;
+ 
+-    BaseSubcomponentModelBuilder(
++    AbstractSubcomponentModelBuilder(
++        Optional<ComponentModelBuilder> parent,
+         DaggerTypes types,
+-        Elements elements,
++        DaggerElements elements,
++        KeyFactory keyFactory,
+         BindingGraph graph,
+         GeneratedComponentModel generatedComponentModel,
+         SubcomponentNames subcomponentNames,
+         OptionalFactories optionalFactories,
+         ComponentBindingExpressions bindingExpressions,
+         ComponentRequirementFields componentRequirementFields,
+-        Optional<ComponentBuilder> builder) {
++        Optional<ComponentBuilder> builder,
++        BindingGraphFactory bindingGraphFactory,
++        CompilerOptions compilerOptions) {
+       super(
+           types,
+           elements,
++          keyFactory,
+           graph,
+           generatedComponentModel,
+           subcomponentNames,
+           optionalFactories,
+           bindingExpressions,
+           componentRequirementFields,
+-          builder);
++          builder,
++          bindingGraphFactory,
++          compilerOptions);
++      this.parent = parent;
+       this.generatedComponentModel = generatedComponentModel;
+     }
+ 
+     @Override
+     protected void addBuilderClass(TypeSpec builder) {
+-      generatedComponentModel.addType(SUBCOMPONENT, builder);
++      if (parent.isPresent()) {
++        // If an inner implementation of a subcomponent the builder is a peer class.
++        parent.get().generatedComponentModel.addType(SUBCOMPONENT, builder);
++      } else {
++        generatedComponentModel.addType(SUBCOMPONENT, builder);
++      }
+     }
+ 
+     @Override
+@@ -451,8 +581,12 @@ protected void addFactoryMethods() {
+     }
+ 
+     @Override
+-    protected void addSubcomponents() {
+-      // TODO(b/72748365): Implement abstract inner subcomponents.
++    protected void addInterfaceMethods() {
++      if (!generatedComponentModel.supermodel().isPresent()) {
++        super.addInterfaceMethods();
++      }
++      // TODO(b/72748365): Contribute to modifiable portions of subcomponent implementation for
++      // inner abstract subcomponents.
+     }
+   }
+ 
+diff --git a/java/dagger/internal/codegen/GeneratedComponentModel.java b/java/dagger/internal/codegen/GeneratedComponentModel.java
+index 01d986b06..33f92aca1 100644
+--- a/java/dagger/internal/codegen/GeneratedComponentModel.java
++++ b/java/dagger/internal/codegen/GeneratedComponentModel.java
+@@ -16,6 +16,7 @@
+ 
+ package dagger.internal.codegen;
+ 
++import static com.google.common.base.Preconditions.checkState;
+ import static com.squareup.javapoet.TypeSpec.classBuilder;
+ import static dagger.internal.codegen.Accessibility.isTypeAccessibleFrom;
+ import static javax.lang.model.element.Modifier.ABSTRACT;
+@@ -35,7 +36,10 @@
+ import dagger.internal.ReferenceReleasingProviderManager;
+ import java.util.ArrayList;
+ import java.util.Arrays;
++import java.util.HashMap;
+ import java.util.List;
++import java.util.Map;
++import java.util.Optional;
+ import javax.lang.model.element.Modifier;
+ import javax.lang.model.element.Name;
+ import javax.lang.model.element.NestingKind;
+@@ -112,6 +116,8 @@
+   private final ClassName name;
+   private final NestingKind nestingKind;
+   private final boolean isAbstract;
++  private final Optional<GeneratedComponentModel> supermodel;
++  private final Map<TypeElement, GeneratedComponentModel> subcomponentModels = new HashMap<>();
+   private final TypeSpec.Builder component;
+   private final UniqueNameSet componentFieldNames = new UniqueNameSet();
+   private final UniqueNameSet componentMethodNames = new UniqueNameSet();
+@@ -124,23 +130,50 @@
+       MultimapBuilder.enumKeys(TypeSpecKind.class).arrayListValues().build();
+   private final List<Supplier<TypeSpec>> switchingProviderSupplier = new ArrayList<>();
+ 
+-  private GeneratedComponentModel(ClassName name, NestingKind nestingKind, Modifier... modifiers) {
++  private GeneratedComponentModel(
++      ClassName name,
++      NestingKind nestingKind,
++      Optional<GeneratedComponentModel> supermodel,
++      Modifier... modifiers) {
+     this.name = name;
+     this.nestingKind = nestingKind;
+     this.isAbstract = Arrays.asList(modifiers).contains(ABSTRACT);
++    this.supermodel = supermodel;
+     this.component = classBuilder(name).addModifiers(modifiers);
+   }
+ 
++  /** Create a model for a root component. */
+   static GeneratedComponentModel forComponent(ClassName name) {
+-    return new GeneratedComponentModel(name, NestingKind.TOP_LEVEL, PUBLIC, FINAL);
++    return new GeneratedComponentModel(
++        name, NestingKind.TOP_LEVEL, Optional.empty(), /* supermodel */ PUBLIC, FINAL);
+   }
+ 
++  /**
++   * Create a model for a subcomponent. This is for concrete subcomponents implementations when not
++   * generating ahead-of-time subcomponents.
++   */
+   static GeneratedComponentModel forSubcomponent(ClassName name) {
+-    return new GeneratedComponentModel(name, NestingKind.MEMBER, PRIVATE, FINAL);
++    return new GeneratedComponentModel(
++        name, NestingKind.MEMBER, Optional.empty(), /* supermodel */ PRIVATE, FINAL);
+   }
+ 
++  /**
++   * Create a model for the top-level abstract subcomponent implementation when generating
++   * ahead-of-time subcomponents.
++   */
+   static GeneratedComponentModel forBaseSubcomponent(ClassName name) {
+-    return new GeneratedComponentModel(name, NestingKind.TOP_LEVEL, PUBLIC, ABSTRACT);
++    return new GeneratedComponentModel(
++        name, NestingKind.TOP_LEVEL, Optional.empty(), /* supermodel */ PUBLIC, ABSTRACT);
++  }
++
++  /**
++   * Create a model for an inner abstract implementation of a subcomponent. This is applicable when
++   * generating ahead-of-time subcomponents.
++   */
++  static GeneratedComponentModel forAbstractSubcomponent(
++      ClassName name, GeneratedComponentModel supermodel) {
++    return new GeneratedComponentModel(
++        name, NestingKind.MEMBER, Optional.of(supermodel), PUBLIC, ABSTRACT);
+   }
+ 
+   /** Returns the name of the component. */
+@@ -158,6 +191,16 @@ boolean isAbstract() {
+     return isAbstract;
+   }
+ 
++  /** Returns the model of this model's superclass. */
++  Optional<GeneratedComponentModel> supermodel() {
++    return supermodel;
++  }
++
++  /** Returns the model of the child subcomponent. */
++  Optional<GeneratedComponentModel> subcomponentModel(ComponentDescriptor subcomponent) {
++    return Optional.ofNullable(subcomponentModels.get(subcomponent.componentDefinitionType()));
++  }
++
+   /** Returns {@code true} if {@code type} is accessible from the generated component. */
+   boolean isTypeAccessible(TypeMirror type) {
+     return isTypeAccessibleFrom(type, name.packageName());
+@@ -168,6 +211,15 @@ void addSupertype(TypeElement supertype) {
+     TypeSpecs.addSupertype(component, supertype);
+   }
+ 
++  /** Adds the given super class to the subcomponent. */
++  void addSuperclass(ClassName className) {
++    checkState(
++        supermodel.isPresent(),
++        "Setting the supertype for model [%s] as a class when model has no supermodel.",
++        name);
++    component.superclass(className);
++  }
++
+   // TODO(dpb): Consider taking FieldSpec, and returning identical FieldSpec with unique name?
+   /** Adds the given field to the component. */
+   void addField(FieldSpecKind fieldKind, FieldSpec fieldSpec) {
+@@ -200,8 +252,10 @@ void addTypes(TypeSpecKind typeKind, Iterable<TypeSpec> typeSpecs) {
+     typeSpecsMap.putAll(typeKind, typeSpecs);
+   }
+ 
+-  void addSubcomponent(GeneratedComponentModel subcomponentModel) {
+-    // TODO(user): Hold a reference to each subcomponent model.
++  /** Adds the type generated from the given subcomponent model. */
++  void addSubcomponent(
++      ComponentDescriptor subcomponent, GeneratedComponentModel subcomponentModel) {
++    subcomponentModels.put(subcomponent.componentDefinitionType(), subcomponentModel);
+     addType(TypeSpecKind.SUBCOMPONENT, subcomponentModel.generate().build());
+   }
+ 
+diff --git a/javatests/dagger/internal/codegen/AheadOfTimeSubcomponentsTest.java b/javatests/dagger/internal/codegen/AheadOfTimeSubcomponentsTest.java
+index ac1b7cdbf..79f9fa59d 100644
+--- a/javatests/dagger/internal/codegen/AheadOfTimeSubcomponentsTest.java
++++ b/javatests/dagger/internal/codegen/AheadOfTimeSubcomponentsTest.java
+@@ -216,6 +216,19 @@ public void subcomponent_BuilderAndGeneratedInstanceBinding() {
+             "  public Grandchild.Builder grandchild() {",
+             "    return null;",
+             "  }",
++            "",
++            "  protected abstract class GrandchildBuilder extends DaggerGrandchild.Builder {",
++            "    @Override",
++            "    public GrandchildBuilder module(GrandchildModule module) {",
++            "      return this;",
++            "    }",
++            "  }",
++            "",
++            "  public abstract class GrandchildImpl extends DaggerGrandchild {",
++            "    protected GrandchildImpl(GrandchildBuilder builder) {",
++            "      super(builder);",
++            "    }",
++            "  }",
+             "}");
+     Compilation compilation =
+         daggerCompiler()
+@@ -229,4 +242,163 @@ public void subcomponent_BuilderAndGeneratedInstanceBinding() {
+         .generatedSourceFile("test.DaggerChild")
+         .hasSourceEquivalentTo(generatedChild);
+   }
++
++  @Test
++  public void simpleDeepComponentHierarchy() {
++    JavaFileObject greatGrandchild =
++        JavaFileObjects.forSourceLines(
++            "test.GreatGrandchild",
++            "package test;",
++            "",
++            "import dagger.Subcomponent;",
++            "",
++            "@Subcomponent(modules = GreatGrandchildModule.class)",
++            "interface GreatGrandchild {",
++            "  Integer i();",
++            "",
++            "  @Subcomponent.Builder",
++            "  interface Builder {",
++            "    Builder module(GreatGrandchildModule module);",
++            "",
++            "    GreatGrandchild build();",
++            "  }",
++            "}");
++
++    JavaFileObject greatGrandchildModule =
++        JavaFileObjects.forSourceLines(
++            "test.GreatGrandchildModule",
++            "package test;",
++            "",
++            "import dagger.Module;",
++            "import dagger.Provides;",
++            "",
++            "@Module",
++            "class GreatGrandchildModule {",
++            "  @Provides static Integer provideInteger() { return 0; }",
++            "}");
++
++    JavaFileObject generatedGreatGrandchild =
++        JavaFileObjects.forSourceLines(
++            "test.DaggerGreatGrandchild",
++            "package test;",
++            "",
++            IMPORT_GENERATED_ANNOTATION,
++            "",
++            GENERATED_ANNOTATION,
++            "public abstract class DaggerGreatGrandchild implements GreatGrandchild {",
++            "  protected DaggerGreatGrandchild(Builder builder) {}",
++            "",
++            "  @Override",
++            "  public Integer i() {",
++            "    return GreatGrandchildModule_ProvideIntegerFactory.proxyProvideInteger();",
++            "  }",
++            "",
++            "  protected abstract static class Builder implements GreatGrandchild.Builder {",
++            "",
++            "    @Override",
++            "    public Builder module(GreatGrandchildModule module) {",
++            "      return this;",
++            "    }",
++            "  }",
++            "}");
++
++    JavaFileObject grandchild =
++        JavaFileObjects.forSourceLines(
++            "test.Grandchild",
++            "package test;",
++            "",
++            "import dagger.Subcomponent;",
++            "",
++            "@Subcomponent",
++            "interface Grandchild {",
++            "  GreatGrandchild.Builder greatGrandchild();",
++            "}");
++
++    JavaFileObject generatedGrandchild =
++        JavaFileObjects.forSourceLines(
++            "test.DaggerGrandchild",
++            "package test;",
++            IMPORT_GENERATED_ANNOTATION,
++            "",
++            GENERATED_ANNOTATION,
++            "public abstract class DaggerGrandchild implements Grandchild {",
++            "  protected DaggerGrandchild() {}",
++            "",
++            "  @Override",
++            "  public GreatGrandchild.Builder greatGrandchild() {",
++            "    return null;",
++            "  }",
++            "",
++            "  protected abstract class GreatGrandchildBuilder extends",
++            "      DaggerGreatGrandchild.Builder {",
++            "    @Override",
++            "    public GreatGrandchildBuilder module(GreatGrandchildModule module) {",
++            "      return this;",
++            "    }",
++            "  }",
++            "",
++            "  public abstract class GreatGrandchildImpl extends DaggerGreatGrandchild {",
++            "    protected GreatGrandchildImpl(GreatGrandchildBuilder builder) {",
++            "      super(builder);",
++            "    }",
++            "  }",
++            "}");
++
++    JavaFileObject child =
++        JavaFileObjects.forSourceLines(
++            "test.Child",
++            "package test;",
++            "",
++            "import dagger.Subcomponent;",
++            "",
++            "@Subcomponent",
++            "interface Child {",
++            "  Grandchild grandchild();",
++            "}");
++
++    JavaFileObject generatedChild =
++        JavaFileObjects.forSourceLines(
++            "test.DaggerChild",
++            "package test;",
++            IMPORT_GENERATED_ANNOTATION,
++            "",
++            GENERATED_ANNOTATION,
++            "public abstract class DaggerChild implements Child {",
++            "  protected DaggerChild() {}",
++            "",
++            "  public abstract class GrandchildImpl extends DaggerGrandchild {",
++            "    protected GrandchildImpl() {",
++            "      super();",
++            "    }",
++            "",
++            "    protected abstract class GreatGrandchildBuilder",
++            "        extends DaggerGrandchild.GreatGrandchildBuilder {",
++            "      @Override",
++            "      public GreatGrandchildBuilder module(GreatGrandchildModule module) {",
++            "        return this;",
++            "      }",
++            "    }",
++            "",
++            "    public abstract class GreatGrandchildImpl extends",
++            "        DaggerGrandchild.GreatGrandchildImpl {",
++            "      protected GreatGrandchildImpl(GreatGrandchildBuilder builder) {",
++            "        super(builder);",
++            "      }",
++            "    }",
++            "}");
++    Compilation compilation =
++        daggerCompiler()
++            .withOptions(AHEAD_OF_TIME_SUBCOMPONENTS_MODE.javacopts())
++            .compile(child, grandchild, greatGrandchild, greatGrandchildModule);
++    assertThat(compilation).succeededWithoutWarnings();
++    assertThat(compilation)
++        .generatedSourceFile("test.DaggerGreatGrandchild")
++        .hasSourceEquivalentTo(generatedGreatGrandchild);
++    assertThat(compilation)
++        .generatedSourceFile("test.DaggerGrandchild")
++        .hasSourceEquivalentTo(generatedGrandchild);
++    assertThat(compilation)
++        .generatedSourceFile("test.DaggerChild")
++        .hasSourceEquivalentTo(generatedChild);
++  }
+ }

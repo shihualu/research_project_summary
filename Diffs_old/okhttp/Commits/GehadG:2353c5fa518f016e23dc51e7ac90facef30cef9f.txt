@@ -1,0 +1,1290 @@
+diff --git a/okhttp/src/main/java/okhttp3/internal/ws/RealWebSocket.java b/okhttp/src/main/java/okhttp3/internal/ws/RealWebSocket.java
+deleted file mode 100644
+index 092dc5775e..0000000000
+--- a/okhttp/src/main/java/okhttp3/internal/ws/RealWebSocket.java
++++ /dev/null
+@@ -1,615 +0,0 @@
+-/*
+- * Copyright (C) 2016 Square, Inc.
+- *
+- * Licensed under the Apache License, Version 2.0 (the "License");
+- * you may not use this file except in compliance with the License.
+- * You may obtain a copy of the License at
+- *
+- *      http://www.apache.org/licenses/LICENSE-2.0
+- *
+- * Unless required by applicable law or agreed to in writing, software
+- * distributed under the License is distributed on an "AS IS" BASIS,
+- * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+- * See the License for the specific language governing permissions and
+- * limitations under the License.
+- */
+-package okhttp3.internal.ws;
+-
+-import java.io.Closeable;
+-import java.io.IOException;
+-import java.net.ProtocolException;
+-import java.net.SocketTimeoutException;
+-import java.util.ArrayDeque;
+-import java.util.Collections;
+-import java.util.List;
+-import java.util.Random;
+-import java.util.concurrent.ScheduledExecutorService;
+-import java.util.concurrent.ScheduledFuture;
+-import java.util.concurrent.ScheduledThreadPoolExecutor;
+-import java.util.concurrent.TimeUnit;
+-import javax.annotation.Nullable;
+-import okhttp3.Call;
+-import okhttp3.Callback;
+-import okhttp3.EventListener;
+-import okhttp3.OkHttpClient;
+-import okhttp3.Protocol;
+-import okhttp3.Request;
+-import okhttp3.Response;
+-import okhttp3.WebSocket;
+-import okhttp3.WebSocketListener;
+-import okhttp3.internal.Internal;
+-import okhttp3.internal.Util;
+-import okhttp3.internal.connection.StreamAllocation;
+-import okio.BufferedSink;
+-import okio.BufferedSource;
+-import okio.ByteString;
+-import okio.Okio;
+-
+-import static java.util.concurrent.TimeUnit.MILLISECONDS;
+-import static okhttp3.internal.Util.closeQuietly;
+-import static okhttp3.internal.ws.WebSocketProtocol.CLOSE_CLIENT_GOING_AWAY;
+-import static okhttp3.internal.ws.WebSocketProtocol.CLOSE_MESSAGE_MAX;
+-import static okhttp3.internal.ws.WebSocketProtocol.OPCODE_BINARY;
+-import static okhttp3.internal.ws.WebSocketProtocol.OPCODE_TEXT;
+-import static okhttp3.internal.ws.WebSocketProtocol.validateCloseCode;
+-
+-public final class RealWebSocket implements WebSocket, WebSocketReader.FrameCallback {
+-  private static final List<Protocol> ONLY_HTTP1 = Collections.singletonList(Protocol.HTTP_1_1);
+-
+-  /**
+-   * The maximum number of bytes to enqueue. Rather than enqueueing beyond this limit we tear down
+-   * the web socket! It's possible that we're writing faster than the peer can read.
+-   */
+-  private static final long MAX_QUEUE_SIZE = 16 * 1024 * 1024; // 16 MiB.
+-
+-  /**
+-   * The maximum amount of time after the client calls {@link #close} to wait for a graceful
+-   * shutdown. If the server doesn't respond the websocket will be canceled.
+-   */
+-  private static final long CANCEL_AFTER_CLOSE_MILLIS = 60 * 1000;
+-
+-  /** The application's original request unadulterated by web socket headers. */
+-  private final Request originalRequest;
+-
+-  final WebSocketListener listener;
+-  private final Random random;
+-  private final long pingIntervalMillis;
+-  private final String key;
+-
+-  /** Non-null for client web sockets. These can be canceled. */
+-  private Call call;
+-
+-  /** This runnable processes the outgoing queues. Call {@link #runWriter()} to after enqueueing. */
+-  private final Runnable writerRunnable;
+-
+-  /** Null until this web socket is connected. Only accessed by the reader thread. */
+-  private WebSocketReader reader;
+-
+-  // All mutable web socket state is guarded by this.
+-
+-  /** Null until this web socket is connected. Note that messages may be enqueued before that. */
+-  private WebSocketWriter writer;
+-
+-  /** Null until this web socket is connected. Used for writes, pings, and close timeouts. */
+-  private ScheduledExecutorService executor;
+-
+-  /**
+-   * The streams held by this web socket. This is non-null until all incoming messages have been
+-   * read and all outgoing messages have been written. It is closed when both reader and writer are
+-   * exhausted, or if there is any failure.
+-   */
+-  private Streams streams;
+-
+-  /** Outgoing pongs in the order they should be written. */
+-  private final ArrayDeque<ByteString> pongQueue = new ArrayDeque<>();
+-
+-  /** Outgoing messages and close frames in the order they should be written. */
+-  private final ArrayDeque<Object> messageAndCloseQueue = new ArrayDeque<>();
+-
+-  /** The total size in bytes of enqueued but not yet transmitted messages. */
+-  private long queueSize;
+-
+-  /** True if we've enqueued a close frame. No further message frames will be enqueued. */
+-  private boolean enqueuedClose;
+-
+-  /**
+-   * When executed this will cancel this websocket. This future itself should be canceled if that is
+-   * unnecessary because the web socket is already closed or canceled.
+-   */
+-  private ScheduledFuture<?> cancelFuture;
+-
+-  /** The close code from the peer, or -1 if this web socket has not yet read a close frame. */
+-  private int receivedCloseCode = -1;
+-
+-  /** The close reason from the peer, or null if this web socket has not yet read a close frame. */
+-  private String receivedCloseReason;
+-
+-  /** True if this web socket failed and the listener has been notified. */
+-  private boolean failed;
+-
+-  /** Total number of pings sent by this web socket. */
+-  private int sentPingCount;
+-
+-  /** Total number of pings received by this web socket. */
+-  private int receivedPingCount;
+-
+-  /** Total number of pongs received by this web socket. */
+-  private int receivedPongCount;
+-
+-  /** True if we have sent a ping that is still awaiting a reply. */
+-  private boolean awaitingPong;
+-
+-  public RealWebSocket(Request request, WebSocketListener listener, Random random,
+-      long pingIntervalMillis) {
+-    if (!"GET".equals(request.method())) {
+-      throw new IllegalArgumentException("Request must be GET: " + request.method());
+-    }
+-    this.originalRequest = request;
+-    this.listener = listener;
+-    this.random = random;
+-    this.pingIntervalMillis = pingIntervalMillis;
+-
+-    byte[] nonce = new byte[16];
+-    random.nextBytes(nonce);
+-    this.key = ByteString.of(nonce).base64();
+-
+-    this.writerRunnable = new Runnable() {
+-      @Override public void run() {
+-        try {
+-          while (writeOneFrame()) {
+-          }
+-        } catch (IOException e) {
+-          failWebSocket(e, null);
+-        }
+-      }
+-    };
+-  }
+-
+-  @Override public Request request() {
+-    return originalRequest;
+-  }
+-
+-  @Override public synchronized long queueSize() {
+-    return queueSize;
+-  }
+-
+-  @Override public void cancel() {
+-    call.cancel();
+-  }
+-
+-  public void connect(OkHttpClient client) {
+-    client = client.newBuilder()
+-        .eventListener(EventListener.NONE)
+-        .protocols(ONLY_HTTP1)
+-        .build();
+-    final Request request = originalRequest.newBuilder()
+-        .header("Upgrade", "websocket")
+-        .header("Connection", "Upgrade")
+-        .header("Sec-WebSocket-Key", key)
+-        .header("Sec-WebSocket-Version", "13")
+-        .build();
+-    call = Internal.instance.newWebSocketCall(client, request);
+-    call.enqueue(new Callback() {
+-      @Override public void onResponse(Call call, Response response) {
+-        try {
+-          checkResponse(response);
+-        } catch (ProtocolException e) {
+-          failWebSocket(e, response);
+-          closeQuietly(response);
+-          return;
+-        }
+-
+-        // Promote the HTTP streams into web socket streams.
+-        StreamAllocation streamAllocation = Internal.instance.streamAllocation(call);
+-        streamAllocation.noNewStreams(); // Prevent connection pooling!
+-        Streams streams = streamAllocation.connection().newWebSocketStreams(streamAllocation);
+-
+-        // Process all web socket messages.
+-        try {
+-          listener.onOpen(RealWebSocket.this, response);
+-          String name = "OkHttp WebSocket " + request.url().redact();
+-          initReaderAndWriter(name, streams);
+-          streamAllocation.connection().socket().setSoTimeout(0);
+-          loopReader();
+-        } catch (Exception e) {
+-          failWebSocket(e, null);
+-        }
+-      }
+-
+-      @Override public void onFailure(Call call, IOException e) {
+-        failWebSocket(e, null);
+-      }
+-    });
+-  }
+-
+-  void checkResponse(Response response) throws ProtocolException {
+-    if (response.code() != 101) {
+-      throw new ProtocolException("Expected HTTP 101 response but was '"
+-          + response.code() + " " + response.message() + "'");
+-    }
+-
+-    String headerConnection = response.header("Connection");
+-    if (!"Upgrade".equalsIgnoreCase(headerConnection)) {
+-      throw new ProtocolException("Expected 'Connection' header value 'Upgrade' but was '"
+-          + headerConnection + "'");
+-    }
+-
+-    String headerUpgrade = response.header("Upgrade");
+-    if (!"websocket".equalsIgnoreCase(headerUpgrade)) {
+-      throw new ProtocolException(
+-          "Expected 'Upgrade' header value 'websocket' but was '" + headerUpgrade + "'");
+-    }
+-
+-    String headerAccept = response.header("Sec-WebSocket-Accept");
+-    String acceptExpected = ByteString.encodeUtf8(key + WebSocketProtocol.ACCEPT_MAGIC)
+-        .sha1().base64();
+-    if (!acceptExpected.equals(headerAccept)) {
+-      throw new ProtocolException("Expected 'Sec-WebSocket-Accept' header value '"
+-          + acceptExpected + "' but was '" + headerAccept + "'");
+-    }
+-  }
+-
+-  public void initReaderAndWriter(String name, Streams streams) throws IOException {
+-    synchronized (this) {
+-      this.streams = streams;
+-      this.writer = new WebSocketWriter(streams.client, streams.sink, random);
+-      this.executor = new ScheduledThreadPoolExecutor(1, Util.threadFactory(name, false));
+-      if (pingIntervalMillis != 0) {
+-        executor.scheduleAtFixedRate(
+-            new PingRunnable(), pingIntervalMillis, pingIntervalMillis, MILLISECONDS);
+-      }
+-      if (!messageAndCloseQueue.isEmpty()) {
+-        runWriter(); // Send messages that were enqueued before we were connected.
+-      }
+-    }
+-
+-    reader = new WebSocketReader(streams.client, streams.source, this);
+-  }
+-
+-  /** Receive frames until there are no more. Invoked only by the reader thread. */
+-  public void loopReader() throws IOException {
+-    while (receivedCloseCode == -1) {
+-      // This method call results in one or more onRead* methods being called on this thread.
+-      reader.processNextFrame();
+-    }
+-  }
+-
+-  /**
+-   * For testing: receive a single frame and return true if there are more frames to read. Invoked
+-   * only by the reader thread.
+-   */
+-  boolean processNextFrame() throws IOException {
+-    try {
+-      reader.processNextFrame();
+-      return receivedCloseCode == -1;
+-    } catch (Exception e) {
+-      failWebSocket(e, null);
+-      return false;
+-    }
+-  }
+-
+-  /**
+-   * For testing: wait until the web socket's executor has terminated.
+-   */
+-  void awaitTermination(int timeout, TimeUnit timeUnit) throws InterruptedException {
+-    executor.awaitTermination(timeout, timeUnit);
+-  }
+-
+-  /**
+-   * For testing: force this web socket to release its threads.
+-   */
+-  void tearDown() throws InterruptedException {
+-    if (cancelFuture != null) {
+-      cancelFuture.cancel(false);
+-    }
+-    executor.shutdown();
+-    executor.awaitTermination(10, TimeUnit.SECONDS);
+-  }
+-
+-  synchronized int sentPingCount() {
+-    return sentPingCount;
+-  }
+-
+-  synchronized int receivedPingCount() {
+-    return receivedPingCount;
+-  }
+-
+-  synchronized int receivedPongCount() {
+-    return receivedPongCount;
+-  }
+-
+-  @Override public void onReadMessage(String text) throws IOException {
+-    listener.onMessage(this, text);
+-  }
+-
+-  @Override public void onReadMessage(ByteString bytes) throws IOException {
+-    listener.onMessage(this, bytes);
+-  }
+-
+-  @Override public synchronized void onReadPing(ByteString payload) {
+-    // Don't respond to pings after we've failed or sent the close frame.
+-    if (failed || (enqueuedClose && messageAndCloseQueue.isEmpty())) return;
+-
+-    pongQueue.add(payload);
+-    runWriter();
+-    receivedPingCount++;
+-  }
+-
+-  @Override public synchronized void onReadPong(ByteString buffer) {
+-    // This API doesn't expose pings.
+-    receivedPongCount++;
+-    awaitingPong = false;
+-  }
+-
+-  @Override public void onReadClose(int code, String reason) {
+-    if (code == -1) throw new IllegalArgumentException();
+-
+-    Streams toClose = null;
+-    synchronized (this) {
+-      if (receivedCloseCode != -1) throw new IllegalStateException("already closed");
+-      receivedCloseCode = code;
+-      receivedCloseReason = reason;
+-      if (enqueuedClose && messageAndCloseQueue.isEmpty()) {
+-        toClose = this.streams;
+-        this.streams = null;
+-        if (cancelFuture != null) cancelFuture.cancel(false);
+-        this.executor.shutdown();
+-      }
+-    }
+-
+-    try {
+-      listener.onClosing(this, code, reason);
+-
+-      if (toClose != null) {
+-        listener.onClosed(this, code, reason);
+-      }
+-    } finally {
+-      closeQuietly(toClose);
+-    }
+-  }
+-
+-  // Writer methods to enqueue frames. They'll be sent asynchronously by the writer thread.
+-
+-  @Override public boolean send(String text) {
+-    if (text == null) throw new NullPointerException("text == null");
+-    return send(ByteString.encodeUtf8(text), OPCODE_TEXT);
+-  }
+-
+-  @Override public boolean send(ByteString bytes) {
+-    if (bytes == null) throw new NullPointerException("bytes == null");
+-    return send(bytes, OPCODE_BINARY);
+-  }
+-
+-  private synchronized boolean send(ByteString data, int formatOpcode) {
+-    // Don't send new frames after we've failed or enqueued a close frame.
+-    if (failed || enqueuedClose) return false;
+-
+-    // If this frame overflows the buffer, reject it and close the web socket.
+-    if (queueSize + data.size() > MAX_QUEUE_SIZE) {
+-      close(CLOSE_CLIENT_GOING_AWAY, null);
+-      return false;
+-    }
+-
+-    // Enqueue the message frame.
+-    queueSize += data.size();
+-    messageAndCloseQueue.add(new Message(formatOpcode, data));
+-    runWriter();
+-    return true;
+-  }
+-
+-  synchronized boolean pong(ByteString payload) {
+-    // Don't send pongs after we've failed or sent the close frame.
+-    if (failed || (enqueuedClose && messageAndCloseQueue.isEmpty())) return false;
+-
+-    pongQueue.add(payload);
+-    runWriter();
+-    return true;
+-  }
+-
+-  @Override public boolean close(int code, String reason) {
+-    return close(code, reason, CANCEL_AFTER_CLOSE_MILLIS);
+-  }
+-
+-  synchronized boolean close(int code, String reason, long cancelAfterCloseMillis) {
+-    validateCloseCode(code);
+-
+-    ByteString reasonBytes = null;
+-    if (reason != null) {
+-      reasonBytes = ByteString.encodeUtf8(reason);
+-      if (reasonBytes.size() > CLOSE_MESSAGE_MAX) {
+-        throw new IllegalArgumentException("reason.size() > " + CLOSE_MESSAGE_MAX + ": " + reason);
+-      }
+-    }
+-
+-    if (failed || enqueuedClose) return false;
+-
+-    // Immediately prevent further frames from being enqueued.
+-    enqueuedClose = true;
+-
+-    // Enqueue the close frame.
+-    messageAndCloseQueue.add(new Close(code, reasonBytes, cancelAfterCloseMillis));
+-    runWriter();
+-    return true;
+-  }
+-
+-  private void runWriter() {
+-    assert (Thread.holdsLock(this));
+-
+-    if (executor != null) {
+-      executor.execute(writerRunnable);
+-    }
+-  }
+-
+-  /**
+-   * Attempts to remove a single frame from a queue and send it. This prefers to write urgent pongs
+-   * before less urgent messages and close frames. For example it's possible that a caller will
+-   * enqueue messages followed by pongs, but this sends pongs followed by messages. Pongs are always
+-   * written in the order they were enqueued.
+-   *
+-   * <p>If a frame cannot be sent - because there are none enqueued or because the web socket is not
+-   * connected - this does nothing and returns false. Otherwise this returns true and the caller
+-   * should immediately invoke this method again until it returns false.
+-   *
+-   * <p>This method may only be invoked by the writer thread. There may be only thread invoking this
+-   * method at a time.
+-   */
+-  boolean writeOneFrame() throws IOException {
+-    WebSocketWriter writer;
+-    ByteString pong;
+-    Object messageOrClose = null;
+-    int receivedCloseCode = -1;
+-    String receivedCloseReason = null;
+-    Streams streamsToClose = null;
+-
+-    synchronized (RealWebSocket.this) {
+-      if (failed) {
+-        return false; // Failed web socket.
+-      }
+-
+-      writer = this.writer;
+-      pong = pongQueue.poll();
+-      if (pong == null) {
+-        messageOrClose = messageAndCloseQueue.poll();
+-        if (messageOrClose instanceof Close) {
+-          receivedCloseCode = this.receivedCloseCode;
+-          receivedCloseReason = this.receivedCloseReason;
+-          if (receivedCloseCode != -1) {
+-            streamsToClose = this.streams;
+-            this.streams = null;
+-            this.executor.shutdown();
+-          } else {
+-            // When we request a graceful close also schedule a cancel of the websocket.
+-            cancelFuture = executor.schedule(new CancelRunnable(),
+-                ((Close) messageOrClose).cancelAfterCloseMillis, MILLISECONDS);
+-          }
+-        } else if (messageOrClose == null) {
+-          return false; // The queue is exhausted.
+-        }
+-      }
+-    }
+-
+-    try {
+-      if (pong != null) {
+-        writer.writePong(pong);
+-
+-      } else if (messageOrClose instanceof Message) {
+-        ByteString data = ((Message) messageOrClose).data;
+-        BufferedSink sink = Okio.buffer(writer.newMessageSink(
+-            ((Message) messageOrClose).formatOpcode, data.size()));
+-        sink.write(data);
+-        sink.close();
+-        synchronized (this) {
+-          queueSize -= data.size();
+-        }
+-
+-      } else if (messageOrClose instanceof Close) {
+-        Close close = (Close) messageOrClose;
+-        writer.writeClose(close.code, close.reason);
+-
+-        // We closed the writer: now both reader and writer are closed.
+-        if (streamsToClose != null) {
+-          listener.onClosed(this, receivedCloseCode, receivedCloseReason);
+-        }
+-
+-      } else {
+-        throw new AssertionError();
+-      }
+-
+-      return true;
+-    } finally {
+-      closeQuietly(streamsToClose);
+-    }
+-  }
+-
+-  private final class PingRunnable implements Runnable {
+-    PingRunnable() {
+-    }
+-
+-    @Override public void run() {
+-      writePingFrame();
+-    }
+-  }
+-
+-  void writePingFrame() {
+-    WebSocketWriter writer;
+-    int failedPing;
+-    synchronized (this) {
+-      if (failed) return;
+-      writer = this.writer;
+-      failedPing = awaitingPong ? sentPingCount : -1;
+-      sentPingCount++;
+-      awaitingPong = true;
+-    }
+-
+-    if (failedPing != -1) {
+-      failWebSocket(new SocketTimeoutException("sent ping but didn't receive pong within "
+-          + pingIntervalMillis + "ms (after " + (failedPing - 1) + " successful ping/pongs)"),
+-          null);
+-      return;
+-    }
+-
+-    try {
+-      writer.writePing(ByteString.EMPTY);
+-    } catch (IOException e) {
+-      failWebSocket(e, null);
+-    }
+-  }
+-
+-  public void failWebSocket(Exception e, @Nullable Response response) {
+-    Streams streamsToClose;
+-    synchronized (this) {
+-      if (failed) return; // Already failed.
+-      failed = true;
+-      streamsToClose = this.streams;
+-      this.streams = null;
+-      if (cancelFuture != null) cancelFuture.cancel(false);
+-      if (executor != null) executor.shutdown();
+-    }
+-
+-    try {
+-      listener.onFailure(this, e, response);
+-    } finally {
+-      closeQuietly(streamsToClose);
+-    }
+-  }
+-
+-  static final class Message {
+-    final int formatOpcode;
+-    final ByteString data;
+-
+-    Message(int formatOpcode, ByteString data) {
+-      this.formatOpcode = formatOpcode;
+-      this.data = data;
+-    }
+-  }
+-
+-  static final class Close {
+-    final int code;
+-    final ByteString reason;
+-    final long cancelAfterCloseMillis;
+-
+-    Close(int code, ByteString reason, long cancelAfterCloseMillis) {
+-      this.code = code;
+-      this.reason = reason;
+-      this.cancelAfterCloseMillis = cancelAfterCloseMillis;
+-    }
+-  }
+-
+-  public abstract static class Streams implements Closeable {
+-    public final boolean client;
+-    public final BufferedSource source;
+-    public final BufferedSink sink;
+-
+-    public Streams(boolean client, BufferedSource source, BufferedSink sink) {
+-      this.client = client;
+-      this.source = source;
+-      this.sink = sink;
+-    }
+-  }
+-
+-  final class CancelRunnable implements Runnable {
+-    @Override public void run() {
+-      cancel();
+-    }
+-  }
+-}
+diff --git a/okhttp/src/main/java/okhttp3/internal/ws/WebSocketProtocol.java b/okhttp/src/main/java/okhttp3/internal/ws/WebSocketProtocol.java
+deleted file mode 100644
+index 489979845e..0000000000
+--- a/okhttp/src/main/java/okhttp3/internal/ws/WebSocketProtocol.java
++++ /dev/null
+@@ -1,129 +0,0 @@
+-/*
+- * Copyright (C) 2014 Square, Inc.
+- *
+- * Licensed under the Apache License, Version 2.0 (the "License");
+- * you may not use this file except in compliance with the License.
+- * You may obtain a copy of the License at
+- *
+- *      http://www.apache.org/licenses/LICENSE-2.0
+- *
+- * Unless required by applicable law or agreed to in writing, software
+- * distributed under the License is distributed on an "AS IS" BASIS,
+- * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+- * See the License for the specific language governing permissions and
+- * limitations under the License.
+- */
+-package okhttp3.internal.ws;
+-
+-import okio.Buffer;
+-import okio.ByteString;
+-
+-public final class WebSocketProtocol {
+-  /** Magic value which must be appended to the key in a response header. */
+-  static final String ACCEPT_MAGIC = "258EAFA5-E914-47DA-95CA-C5AB0DC85B11";
+-
+-  /*
+-  Each frame starts with two bytes of data.
+-
+-   0 1 2 3 4 5 6 7    0 1 2 3 4 5 6 7
+-  +-+-+-+-+-------+  +-+-------------+
+-  |F|R|R|R| OP    |  |M| LENGTH      |
+-  |I|S|S|S| CODE  |  |A|             |
+-  |N|V|V|V|       |  |S|             |
+-  | |1|2|3|       |  |K|             |
+-  +-+-+-+-+-------+  +-+-------------+
+-  */
+-
+-  /** Byte 0 flag for whether this is the final fragment in a message. */
+-  static final int B0_FLAG_FIN = 0b10000000;
+-  /** Byte 0 reserved flag 1. Must be 0 unless negotiated otherwise. */
+-  static final int B0_FLAG_RSV1 = 0b01000000;
+-  /** Byte 0 reserved flag 2. Must be 0 unless negotiated otherwise. */
+-  static final int B0_FLAG_RSV2 = 0b00100000;
+-  /** Byte 0 reserved flag 3. Must be 0 unless negotiated otherwise. */
+-  static final int B0_FLAG_RSV3 = 0b00010000;
+-  /** Byte 0 mask for the frame opcode. */
+-  static final int B0_MASK_OPCODE = 0b00001111;
+-  /** Flag in the opcode which indicates a control frame. */
+-  static final int OPCODE_FLAG_CONTROL = 0b00001000;
+-
+-  /**
+-   * Byte 1 flag for whether the payload data is masked. <p> If this flag is set, the next four
+-   * bytes represent the mask key. These bytes appear after any additional bytes specified by {@link
+-   * #B1_MASK_LENGTH}.
+-   */
+-  static final int B1_FLAG_MASK = 0b10000000;
+-  /**
+-   * Byte 1 mask for the payload length. <p> If this value is {@link #PAYLOAD_SHORT}, the next two
+-   * bytes represent the length. If this value is {@link #PAYLOAD_LONG}, the next eight bytes
+-   * represent the length.
+-   */
+-  static final int B1_MASK_LENGTH = 0b01111111;
+-
+-  static final int OPCODE_CONTINUATION = 0x0;
+-  static final int OPCODE_TEXT = 0x1;
+-  static final int OPCODE_BINARY = 0x2;
+-
+-  static final int OPCODE_CONTROL_CLOSE = 0x8;
+-  static final int OPCODE_CONTROL_PING = 0x9;
+-  static final int OPCODE_CONTROL_PONG = 0xa;
+-
+-  /**
+-   * Maximum length of frame payload. Larger payloads, if supported by the frame type, can use the
+-   * special values {@link #PAYLOAD_SHORT} or {@link #PAYLOAD_LONG}.
+-   */
+-  static final long PAYLOAD_BYTE_MAX = 125L;
+-  /** Maximum length of close message in bytes. */
+-  static final long CLOSE_MESSAGE_MAX = PAYLOAD_BYTE_MAX - 2;
+-  /**
+-   * Value for {@link #B1_MASK_LENGTH} which indicates the next two bytes are the unsigned length.
+-   */
+-  static final int PAYLOAD_SHORT = 126;
+-  /** Maximum length of a frame payload to be denoted as {@link #PAYLOAD_SHORT}. */
+-  static final long PAYLOAD_SHORT_MAX = 0xffffL;
+-  /**
+-   * Value for {@link #B1_MASK_LENGTH} which indicates the next eight bytes are the unsigned
+-   * length.
+-   */
+-  static final int PAYLOAD_LONG = 127;
+-
+-  /** Used when an unchecked exception was thrown in a listener. */
+-  static final int CLOSE_CLIENT_GOING_AWAY = 1001;
+-  /** Used when an empty close frame was received (i.e., without a status code). */
+-  static final int CLOSE_NO_STATUS_CODE = 1005;
+-
+-  static void toggleMask(Buffer.UnsafeCursor cursor, byte[] key) {
+-    int keyIndex = 0;
+-    int keyLength = key.length;
+-    do {
+-      byte[] buffer = cursor.data;
+-      for (int i = cursor.start, end = cursor.end; i < end; i++, keyIndex++) {
+-        keyIndex %= keyLength; // Reassign to prevent overflow breaking counter.
+-        buffer[i] = (byte) (buffer[i] ^ key[keyIndex]);
+-      }
+-    } while (cursor.next() != -1);
+-  }
+-
+-  static String closeCodeExceptionMessage(int code) {
+-    if (code < 1000 || code >= 5000) {
+-      return "Code must be in range [1000,5000): " + code;
+-    } else if ((code >= 1004 && code <= 1006) || (code >= 1012 && code <= 2999)) {
+-      return "Code " + code + " is reserved and may not be used.";
+-    } else {
+-      return null;
+-    }
+-  }
+-
+-  static void validateCloseCode(int code) {
+-    String message = closeCodeExceptionMessage(code);
+-    if (message != null) throw new IllegalArgumentException(message);
+-  }
+-
+-  public static String acceptHeader(String key) {
+-    return ByteString.encodeUtf8(key + WebSocketProtocol.ACCEPT_MAGIC).sha1().base64();
+-  }
+-
+-  private WebSocketProtocol() {
+-    throw new AssertionError("No instances.");
+-  }
+-}
+diff --git a/okhttp/src/main/java/okhttp3/internal/ws/WebSocketReader.java b/okhttp/src/main/java/okhttp3/internal/ws/WebSocketReader.java
+deleted file mode 100644
+index 6d5d22e67d..0000000000
+--- a/okhttp/src/main/java/okhttp3/internal/ws/WebSocketReader.java
++++ /dev/null
+@@ -1,264 +0,0 @@
+-/*
+- * Copyright (C) 2014 Square, Inc.
+- *
+- * Licensed under the Apache License, Version 2.0 (the "License");
+- * you may not use this file except in compliance with the License.
+- * You may obtain a copy of the License at
+- *
+- *      http://www.apache.org/licenses/LICENSE-2.0
+- *
+- * Unless required by applicable law or agreed to in writing, software
+- * distributed under the License is distributed on an "AS IS" BASIS,
+- * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+- * See the License for the specific language governing permissions and
+- * limitations under the License.
+- */
+-package okhttp3.internal.ws;
+-
+-import java.io.IOException;
+-import java.net.ProtocolException;
+-import java.util.concurrent.TimeUnit;
+-import okio.Buffer;
+-import okio.BufferedSource;
+-import okio.ByteString;
+-
+-import static java.lang.Integer.toHexString;
+-import static okhttp3.internal.ws.WebSocketProtocol.B0_FLAG_FIN;
+-import static okhttp3.internal.ws.WebSocketProtocol.B0_FLAG_RSV1;
+-import static okhttp3.internal.ws.WebSocketProtocol.B0_FLAG_RSV2;
+-import static okhttp3.internal.ws.WebSocketProtocol.B0_FLAG_RSV3;
+-import static okhttp3.internal.ws.WebSocketProtocol.B0_MASK_OPCODE;
+-import static okhttp3.internal.ws.WebSocketProtocol.B1_FLAG_MASK;
+-import static okhttp3.internal.ws.WebSocketProtocol.B1_MASK_LENGTH;
+-import static okhttp3.internal.ws.WebSocketProtocol.CLOSE_NO_STATUS_CODE;
+-import static okhttp3.internal.ws.WebSocketProtocol.OPCODE_BINARY;
+-import static okhttp3.internal.ws.WebSocketProtocol.OPCODE_CONTINUATION;
+-import static okhttp3.internal.ws.WebSocketProtocol.OPCODE_CONTROL_CLOSE;
+-import static okhttp3.internal.ws.WebSocketProtocol.OPCODE_CONTROL_PING;
+-import static okhttp3.internal.ws.WebSocketProtocol.OPCODE_CONTROL_PONG;
+-import static okhttp3.internal.ws.WebSocketProtocol.OPCODE_FLAG_CONTROL;
+-import static okhttp3.internal.ws.WebSocketProtocol.OPCODE_TEXT;
+-import static okhttp3.internal.ws.WebSocketProtocol.PAYLOAD_BYTE_MAX;
+-import static okhttp3.internal.ws.WebSocketProtocol.PAYLOAD_LONG;
+-import static okhttp3.internal.ws.WebSocketProtocol.PAYLOAD_SHORT;
+-import static okhttp3.internal.ws.WebSocketProtocol.toggleMask;
+-
+-/**
+- * An <a href="http://tools.ietf.org/html/rfc6455">RFC 6455</a>-compatible WebSocket frame reader.
+- *
+- * <p>This class is not thread safe.
+- */
+-final class WebSocketReader {
+-  public interface FrameCallback {
+-    void onReadMessage(String text) throws IOException;
+-    void onReadMessage(ByteString bytes) throws IOException;
+-    void onReadPing(ByteString buffer);
+-    void onReadPong(ByteString buffer);
+-    void onReadClose(int code, String reason);
+-  }
+-
+-  final boolean isClient;
+-  final BufferedSource source;
+-  final FrameCallback frameCallback;
+-
+-  boolean closed;
+-
+-  // Stateful data about the current frame.
+-  int opcode;
+-  long frameLength;
+-  boolean isFinalFrame;
+-  boolean isControlFrame;
+-
+-  private final Buffer controlFrameBuffer = new Buffer();
+-  private final Buffer messageFrameBuffer = new Buffer();
+-
+-  private final byte[] maskKey;
+-  private final Buffer.UnsafeCursor maskCursor;
+-
+-  WebSocketReader(boolean isClient, BufferedSource source, FrameCallback frameCallback) {
+-    if (source == null) throw new NullPointerException("source == null");
+-    if (frameCallback == null) throw new NullPointerException("frameCallback == null");
+-    this.isClient = isClient;
+-    this.source = source;
+-    this.frameCallback = frameCallback;
+-
+-    // Masks are only a concern for server writers.
+-    maskKey = isClient ? null : new byte[4];
+-    maskCursor = isClient ? null : new Buffer.UnsafeCursor();
+-  }
+-
+-  /**
+-   * Process the next protocol frame.
+-   *
+-   * <ul>
+-   *     <li>If it is a control frame this will result in a single call to {@link FrameCallback}.
+-   *     <li>If it is a message frame this will result in a single call to {@link
+-   *         FrameCallback#onReadMessage}. If the message spans multiple frames, each interleaved
+-   *         control frame will result in a corresponding call to {@link FrameCallback}.
+-   * </ul>
+-   */
+-  void processNextFrame() throws IOException {
+-    readHeader();
+-    if (isControlFrame) {
+-      readControlFrame();
+-    } else {
+-      readMessageFrame();
+-    }
+-  }
+-
+-  private void readHeader() throws IOException {
+-    if (closed) throw new IOException("closed");
+-
+-    // Disable the timeout to read the first byte of a new frame.
+-    int b0;
+-    long timeoutBefore = source.timeout().timeoutNanos();
+-    source.timeout().clearTimeout();
+-    try {
+-      b0 = source.readByte() & 0xff;
+-    } finally {
+-      source.timeout().timeout(timeoutBefore, TimeUnit.NANOSECONDS);
+-    }
+-
+-    opcode = b0 & B0_MASK_OPCODE;
+-    isFinalFrame = (b0 & B0_FLAG_FIN) != 0;
+-    isControlFrame = (b0 & OPCODE_FLAG_CONTROL) != 0;
+-
+-    // Control frames must be final frames (cannot contain continuations).
+-    if (isControlFrame && !isFinalFrame) {
+-      throw new ProtocolException("Control frames must be final.");
+-    }
+-
+-    boolean reservedFlag1 = (b0 & B0_FLAG_RSV1) != 0;
+-    boolean reservedFlag2 = (b0 & B0_FLAG_RSV2) != 0;
+-    boolean reservedFlag3 = (b0 & B0_FLAG_RSV3) != 0;
+-    if (reservedFlag1 || reservedFlag2 || reservedFlag3) {
+-      // Reserved flags are for extensions which we currently do not support.
+-      throw new ProtocolException("Reserved flags are unsupported.");
+-    }
+-
+-    int b1 = source.readByte() & 0xff;
+-
+-    boolean isMasked = (b1 & B1_FLAG_MASK) != 0;
+-    if (isMasked == isClient) {
+-      // Masked payloads must be read on the server. Unmasked payloads must be read on the client.
+-      throw new ProtocolException(isClient
+-          ? "Server-sent frames must not be masked."
+-          : "Client-sent frames must be masked.");
+-    }
+-
+-    // Get frame length, optionally reading from follow-up bytes if indicated by special values.
+-    frameLength = b1 & B1_MASK_LENGTH;
+-    if (frameLength == PAYLOAD_SHORT) {
+-      frameLength = source.readShort() & 0xffffL; // Value is unsigned.
+-    } else if (frameLength == PAYLOAD_LONG) {
+-      frameLength = source.readLong();
+-      if (frameLength < 0) {
+-        throw new ProtocolException(
+-            "Frame length 0x" + Long.toHexString(frameLength) + " > 0x7FFFFFFFFFFFFFFF");
+-      }
+-    }
+-
+-    if (isControlFrame && frameLength > PAYLOAD_BYTE_MAX) {
+-      throw new ProtocolException("Control frame must be less than " + PAYLOAD_BYTE_MAX + "B.");
+-    }
+-
+-    if (isMasked) {
+-      // Read the masking key as bytes so that they can be used directly for unmasking.
+-      source.readFully(maskKey);
+-    }
+-  }
+-
+-  private void readControlFrame() throws IOException {
+-    if (frameLength > 0) {
+-      source.readFully(controlFrameBuffer, frameLength);
+-
+-      if (!isClient) {
+-        controlFrameBuffer.readAndWriteUnsafe(maskCursor);
+-        maskCursor.seek(0);
+-        toggleMask(maskCursor, maskKey);
+-        maskCursor.close();
+-      }
+-    }
+-
+-    switch (opcode) {
+-      case OPCODE_CONTROL_PING:
+-        frameCallback.onReadPing(controlFrameBuffer.readByteString());
+-        break;
+-      case OPCODE_CONTROL_PONG:
+-        frameCallback.onReadPong(controlFrameBuffer.readByteString());
+-        break;
+-      case OPCODE_CONTROL_CLOSE:
+-        int code = CLOSE_NO_STATUS_CODE;
+-        String reason = "";
+-        long bufferSize = controlFrameBuffer.size();
+-        if (bufferSize == 1) {
+-          throw new ProtocolException("Malformed close payload length of 1.");
+-        } else if (bufferSize != 0) {
+-          code = controlFrameBuffer.readShort();
+-          reason = controlFrameBuffer.readUtf8();
+-          String codeExceptionMessage = WebSocketProtocol.closeCodeExceptionMessage(code);
+-          if (codeExceptionMessage != null) throw new ProtocolException(codeExceptionMessage);
+-        }
+-        frameCallback.onReadClose(code, reason);
+-        closed = true;
+-        break;
+-      default:
+-        throw new ProtocolException("Unknown control opcode: " + toHexString(opcode));
+-    }
+-  }
+-
+-  private void readMessageFrame() throws IOException {
+-    int opcode = this.opcode;
+-    if (opcode != OPCODE_TEXT && opcode != OPCODE_BINARY) {
+-      throw new ProtocolException("Unknown opcode: " + toHexString(opcode));
+-    }
+-
+-    readMessage();
+-
+-    if (opcode == OPCODE_TEXT) {
+-      frameCallback.onReadMessage(messageFrameBuffer.readUtf8());
+-    } else {
+-      frameCallback.onReadMessage(messageFrameBuffer.readByteString());
+-    }
+-  }
+-
+-  /** Read headers and process any control frames until we reach a non-control frame. */
+-  private void readUntilNonControlFrame() throws IOException {
+-    while (!closed) {
+-      readHeader();
+-      if (!isControlFrame) {
+-        break;
+-      }
+-      readControlFrame();
+-    }
+-  }
+-
+-  /**
+-   * Reads a message body into across one or more frames. Control frames that occur between
+-   * fragments will be processed. If the message payload is masked this will unmask as it's being
+-   * processed.
+-   */
+-  private void readMessage() throws IOException {
+-    while (true) {
+-      if (closed) throw new IOException("closed");
+-
+-      if (frameLength > 0) {
+-        source.readFully(messageFrameBuffer, frameLength);
+-
+-        if (!isClient) {
+-          messageFrameBuffer.readAndWriteUnsafe(maskCursor);
+-          maskCursor.seek(messageFrameBuffer.size() - frameLength);
+-          toggleMask(maskCursor, maskKey);
+-          maskCursor.close();
+-        }
+-      }
+-
+-      if (isFinalFrame) break; // We are exhausted and have no continuations.
+-
+-      readUntilNonControlFrame();
+-      if (opcode != OPCODE_CONTINUATION) {
+-        throw new ProtocolException("Expected continuation opcode. Got: " + toHexString(opcode));
+-      }
+-    }
+-  }
+-}
+diff --git a/okhttp/src/main/java/okhttp3/internal/ws/WebSocketWriter.java b/okhttp/src/main/java/okhttp3/internal/ws/WebSocketWriter.java
+deleted file mode 100644
+index baffe06b19..0000000000
+--- a/okhttp/src/main/java/okhttp3/internal/ws/WebSocketWriter.java
++++ /dev/null
+@@ -1,258 +0,0 @@
+-/*
+- * Copyright (C) 2014 Square, Inc.
+- *
+- * Licensed under the Apache License, Version 2.0 (the "License");
+- * you may not use this file except in compliance with the License.
+- * You may obtain a copy of the License at
+- *
+- *      http://www.apache.org/licenses/LICENSE-2.0
+- *
+- * Unless required by applicable law or agreed to in writing, software
+- * distributed under the License is distributed on an "AS IS" BASIS,
+- * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+- * See the License for the specific language governing permissions and
+- * limitations under the License.
+- */
+-package okhttp3.internal.ws;
+-
+-import java.io.IOException;
+-import java.util.Random;
+-import okio.Buffer;
+-import okio.BufferedSink;
+-import okio.ByteString;
+-import okio.Sink;
+-import okio.Timeout;
+-
+-import static okhttp3.internal.ws.WebSocketProtocol.B0_FLAG_FIN;
+-import static okhttp3.internal.ws.WebSocketProtocol.B1_FLAG_MASK;
+-import static okhttp3.internal.ws.WebSocketProtocol.OPCODE_CONTINUATION;
+-import static okhttp3.internal.ws.WebSocketProtocol.OPCODE_CONTROL_CLOSE;
+-import static okhttp3.internal.ws.WebSocketProtocol.OPCODE_CONTROL_PING;
+-import static okhttp3.internal.ws.WebSocketProtocol.OPCODE_CONTROL_PONG;
+-import static okhttp3.internal.ws.WebSocketProtocol.PAYLOAD_BYTE_MAX;
+-import static okhttp3.internal.ws.WebSocketProtocol.PAYLOAD_LONG;
+-import static okhttp3.internal.ws.WebSocketProtocol.PAYLOAD_SHORT;
+-import static okhttp3.internal.ws.WebSocketProtocol.PAYLOAD_SHORT_MAX;
+-import static okhttp3.internal.ws.WebSocketProtocol.toggleMask;
+-import static okhttp3.internal.ws.WebSocketProtocol.validateCloseCode;
+-
+-/**
+- * An <a href="http://tools.ietf.org/html/rfc6455">RFC 6455</a>-compatible WebSocket frame writer.
+- *
+- * <p>This class is not thread safe.
+- */
+-final class WebSocketWriter {
+-  final boolean isClient;
+-  final Random random;
+-
+-  final BufferedSink sink;
+-  /** The {@link Buffer} of {@link #sink}. Write to this and then flush/emit {@link #sink}. */
+-  final Buffer sinkBuffer;
+-  boolean writerClosed;
+-
+-  final Buffer buffer = new Buffer();
+-  final FrameSink frameSink = new FrameSink();
+-
+-  boolean activeWriter;
+-
+-  private final byte[] maskKey;
+-  private final Buffer.UnsafeCursor maskCursor;
+-
+-  WebSocketWriter(boolean isClient, BufferedSink sink, Random random) {
+-    if (sink == null) throw new NullPointerException("sink == null");
+-    if (random == null) throw new NullPointerException("random == null");
+-    this.isClient = isClient;
+-    this.sink = sink;
+-    this.sinkBuffer = sink.buffer();
+-    this.random = random;
+-
+-    // Masks are only a concern for client writers.
+-    maskKey = isClient ? new byte[4] : null;
+-    maskCursor = isClient ? new Buffer.UnsafeCursor() : null;
+-  }
+-
+-  /** Send a ping with the supplied {@code payload}. */
+-  void writePing(ByteString payload) throws IOException {
+-    writeControlFrame(OPCODE_CONTROL_PING, payload);
+-  }
+-
+-  /** Send a pong with the supplied {@code payload}. */
+-  void writePong(ByteString payload) throws IOException {
+-    writeControlFrame(OPCODE_CONTROL_PONG, payload);
+-  }
+-
+-  /**
+-   * Send a close frame with optional code and reason.
+-   *
+-   * @param code Status code as defined by <a
+-   * href="http://tools.ietf.org/html/rfc6455#section-7.4">Section 7.4 of RFC 6455</a> or {@code 0}.
+-   * @param reason Reason for shutting down or {@code null}.
+-   */
+-  void writeClose(int code, ByteString reason) throws IOException {
+-    ByteString payload = ByteString.EMPTY;
+-    if (code != 0 || reason != null) {
+-      if (code != 0) {
+-        validateCloseCode(code);
+-      }
+-      Buffer buffer = new Buffer();
+-      buffer.writeShort(code);
+-      if (reason != null) {
+-        buffer.write(reason);
+-      }
+-      payload = buffer.readByteString();
+-    }
+-
+-    try {
+-      writeControlFrame(OPCODE_CONTROL_CLOSE, payload);
+-    } finally {
+-      writerClosed = true;
+-    }
+-  }
+-
+-  private void writeControlFrame(int opcode, ByteString payload) throws IOException {
+-    if (writerClosed) throw new IOException("closed");
+-
+-    int length = payload.size();
+-    if (length > PAYLOAD_BYTE_MAX) {
+-      throw new IllegalArgumentException(
+-          "Payload size must be less than or equal to " + PAYLOAD_BYTE_MAX);
+-    }
+-
+-    int b0 = B0_FLAG_FIN | opcode;
+-    sinkBuffer.writeByte(b0);
+-
+-    int b1 = length;
+-    if (isClient) {
+-      b1 |= B1_FLAG_MASK;
+-      sinkBuffer.writeByte(b1);
+-
+-      random.nextBytes(maskKey);
+-      sinkBuffer.write(maskKey);
+-
+-      if (length > 0) {
+-        long payloadStart = sinkBuffer.size();
+-        sinkBuffer.write(payload);
+-
+-        sinkBuffer.readAndWriteUnsafe(maskCursor);
+-        maskCursor.seek(payloadStart);
+-        toggleMask(maskCursor, maskKey);
+-        maskCursor.close();
+-      }
+-    } else {
+-      sinkBuffer.writeByte(b1);
+-      sinkBuffer.write(payload);
+-    }
+-
+-    sink.flush();
+-  }
+-
+-  /**
+-   * Stream a message payload as a series of frames. This allows control frames to be interleaved
+-   * between parts of the message.
+-   */
+-  Sink newMessageSink(int formatOpcode, long contentLength) {
+-    if (activeWriter) {
+-      throw new IllegalStateException("Another message writer is active. Did you call close()?");
+-    }
+-    activeWriter = true;
+-
+-    // Reset FrameSink state for a new writer.
+-    frameSink.formatOpcode = formatOpcode;
+-    frameSink.contentLength = contentLength;
+-    frameSink.isFirstFrame = true;
+-    frameSink.closed = false;
+-
+-    return frameSink;
+-  }
+-
+-  void writeMessageFrame(int formatOpcode, long byteCount, boolean isFirstFrame,
+-      boolean isFinal) throws IOException {
+-    if (writerClosed) throw new IOException("closed");
+-
+-    int b0 = isFirstFrame ? formatOpcode : OPCODE_CONTINUATION;
+-    if (isFinal) {
+-      b0 |= B0_FLAG_FIN;
+-    }
+-    sinkBuffer.writeByte(b0);
+-
+-    int b1 = 0;
+-    if (isClient) {
+-      b1 |= B1_FLAG_MASK;
+-    }
+-    if (byteCount <= PAYLOAD_BYTE_MAX) {
+-      b1 |= (int) byteCount;
+-      sinkBuffer.writeByte(b1);
+-    } else if (byteCount <= PAYLOAD_SHORT_MAX) {
+-      b1 |= PAYLOAD_SHORT;
+-      sinkBuffer.writeByte(b1);
+-      sinkBuffer.writeShort((int) byteCount);
+-    } else {
+-      b1 |= PAYLOAD_LONG;
+-      sinkBuffer.writeByte(b1);
+-      sinkBuffer.writeLong(byteCount);
+-    }
+-
+-    if (isClient) {
+-      random.nextBytes(maskKey);
+-      sinkBuffer.write(maskKey);
+-
+-      if (byteCount > 0) {
+-        long bufferStart = sinkBuffer.size();
+-        sinkBuffer.write(buffer, byteCount);
+-
+-        sinkBuffer.readAndWriteUnsafe(maskCursor);
+-        maskCursor.seek(bufferStart);
+-        toggleMask(maskCursor, maskKey);
+-        maskCursor.close();
+-      }
+-    } else {
+-      sinkBuffer.write(buffer, byteCount);
+-    }
+-
+-    sink.emit();
+-  }
+-
+-  final class FrameSink implements Sink {
+-    int formatOpcode;
+-    long contentLength;
+-    boolean isFirstFrame;
+-    boolean closed;
+-
+-    @Override public void write(Buffer source, long byteCount) throws IOException {
+-      if (closed) throw new IOException("closed");
+-
+-      buffer.write(source, byteCount);
+-
+-      // Determine if this is a buffered write which we can defer until close() flushes.
+-      boolean deferWrite = isFirstFrame
+-          && contentLength != -1
+-          && buffer.size() > contentLength - 8192 /* segment size */;
+-
+-      long emitCount = buffer.completeSegmentByteCount();
+-      if (emitCount > 0 && !deferWrite) {
+-        writeMessageFrame(formatOpcode, emitCount, isFirstFrame, false /* final */);
+-        isFirstFrame = false;
+-      }
+-    }
+-
+-    @Override public void flush() throws IOException {
+-      if (closed) throw new IOException("closed");
+-
+-      writeMessageFrame(formatOpcode, buffer.size(), isFirstFrame, false /* final */);
+-      isFirstFrame = false;
+-    }
+-
+-    @Override public Timeout timeout() {
+-      return sink.timeout();
+-    }
+-
+-    @SuppressWarnings("PointlessBitwiseExpression")
+-    @Override public void close() throws IOException {
+-      if (closed) throw new IOException("closed");
+-
+-      writeMessageFrame(formatOpcode, buffer.size(), isFirstFrame, true /* final */);
+-      closed = true;
+-      activeWriter = false;
+-    }
+-  }
+-}

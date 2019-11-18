@@ -1,0 +1,349 @@
+diff --git a/mockwebserver/src/main/java/okhttp3/mockwebserver/MockWebServer.kt b/mockwebserver/src/main/java/okhttp3/mockwebserver/MockWebServer.kt
+index a8ef919334..328d8251b9 100644
+--- a/mockwebserver/src/main/java/okhttp3/mockwebserver/MockWebServer.kt
++++ b/mockwebserver/src/main/java/okhttp3/mockwebserver/MockWebServer.kt
+@@ -331,7 +331,8 @@ class MockWebServer : ExternalResource(), Closeable {
+    * @return the head of the request queue
+    */
+   @Throws(InterruptedException::class)
+-  fun takeRequest(timeout: Long, unit: TimeUnit): RecordedRequest? = requestQueue.poll(timeout, unit)
++  fun takeRequest(timeout: Long, unit: TimeUnit): RecordedRequest? =
++      requestQueue.poll(timeout, unit)
+ 
+   @JvmName("-deprecated_requestCount")
+   @Deprecated(
+@@ -593,11 +594,18 @@ class MockWebServer : ExternalResource(), Closeable {
+       source: BufferedSource,
+       sink: BufferedSink
+     ): Boolean {
+-      val request = readRequest(socket, source, sink, sequenceNumber) ?: return false
++      if (source.exhausted()) {
++        return false // No more requests on this socket.
++      }
+ 
++      val request = readRequest(socket, source, sink, sequenceNumber)
+       atomicRequestCount.incrementAndGet()
+       requestQueue.add(request)
+ 
++      if (request.failure != null) {
++        return false // Nothing to respond to.
++      }
++
+       val response = dispatcher.dispatch(request)
+       if (response.socketPolicy === DISCONNECT_AFTER_REQUEST) {
+         socket.close()
+@@ -674,78 +682,80 @@ class MockWebServer : ExternalResource(), Closeable {
+     source: BufferedSource,
+     sink: BufferedSink,
+     sequenceNumber: Int
+-  ): RecordedRequest? {
+-    val request: String
+-    try {
+-      request = source.readUtf8LineStrict()
+-    } catch (streamIsClosed: IOException) {
+-      return null // no request because we closed the stream
+-    }
+-
+-    if (request.isEmpty()) {
+-      return null // no request because the stream is exhausted
+-    }
++  ): RecordedRequest {
++    var request = ""
+     val headers = Headers.Builder()
+     var contentLength = -1L
+     var chunked = false
+     var expectContinue = false
+-    while (true) {
+-      val header = source.readUtf8LineStrict()
+-      if (header.isEmpty()) {
+-        break
+-      }
+-      addHeaderLenient(headers, header)
+-      val lowercaseHeader = header.toLowerCase(Locale.US)
+-      if (contentLength == -1L && lowercaseHeader.startsWith("content-length:")) {
+-        contentLength = header.substring(15).trim().toLong()
+-      }
+-      if (lowercaseHeader.startsWith("transfer-encoding:") && lowercaseHeader.substring(
+-              18).trim() == "chunked") {
+-        chunked = true
++    val requestBody = TruncatingBuffer(bodyLimit)
++    val chunkSizes = mutableListOf<Int>()
++    var failure: IOException? = null
++
++    try {
++      request = source.readUtf8LineStrict()
++      if (request.isEmpty()) {
++        throw ProtocolException("no request because the stream is exhausted")
+       }
+-      if (lowercaseHeader.startsWith("expect:") && lowercaseHeader.substring(
+-              7).trim().equals("100-continue", ignoreCase = true)) {
+-        expectContinue = true
++
++      while (true) {
++        val header = source.readUtf8LineStrict()
++        if (header.isEmpty()) {
++          break
++        }
++        addHeaderLenient(headers, header)
++        val lowercaseHeader = header.toLowerCase(Locale.US)
++        if (contentLength == -1L && lowercaseHeader.startsWith("content-length:")) {
++          contentLength = header.substring(15).trim().toLong()
++        }
++        if (lowercaseHeader.startsWith("transfer-encoding:") && lowercaseHeader.substring(
++                18).trim() == "chunked") {
++          chunked = true
++        }
++        if (lowercaseHeader.startsWith("expect:") && lowercaseHeader.substring(
++                7).trim().equals("100-continue", ignoreCase = true)) {
++          expectContinue = true
++        }
+       }
+-    }
+ 
+-    val socketPolicy = dispatcher.peek().socketPolicy
+-    if (expectContinue && socketPolicy === EXPECT_CONTINUE || socketPolicy === CONTINUE_ALWAYS) {
+-      sink.writeUtf8("HTTP/1.1 100 Continue\r\n")
+-      sink.writeUtf8("Content-Length: 0\r\n")
+-      sink.writeUtf8("\r\n")
+-      sink.flush()
+-    }
++      val socketPolicy = dispatcher.peek().socketPolicy
++      if (expectContinue && socketPolicy === EXPECT_CONTINUE || socketPolicy === CONTINUE_ALWAYS) {
++        sink.writeUtf8("HTTP/1.1 100 Continue\r\n")
++        sink.writeUtf8("Content-Length: 0\r\n")
++        sink.writeUtf8("\r\n")
++        sink.flush()
++      }
+ 
+-    var hasBody = false
+-    val requestBody = TruncatingBuffer(bodyLimit)
+-    val chunkSizes = mutableListOf<Int>()
+-    val policy = dispatcher.peek()
+-    if (contentLength != -1L) {
+-      hasBody = contentLength > 0L
+-      throttledTransfer(policy, socket, source, requestBody.buffer(), contentLength, true)
+-    } else if (chunked) {
+-      hasBody = true
+-      while (true) {
+-        val chunkSize = source.readUtf8LineStrict().trim().toInt(16)
+-        if (chunkSize == 0) {
++      var hasBody = false
++      val policy = dispatcher.peek()
++      if (contentLength != -1L) {
++        hasBody = contentLength > 0L
++        throttledTransfer(policy, socket, source, requestBody.buffer(), contentLength, true)
++      } else if (chunked) {
++        hasBody = true
++        while (true) {
++          val chunkSize = source.readUtf8LineStrict().trim().toInt(16)
++          if (chunkSize == 0) {
++            readEmptyLine(source)
++            break
++          }
++          chunkSizes.add(chunkSize)
++          throttledTransfer(policy, socket, source,
++              requestBody.buffer(), chunkSize.toLong(), true)
+           readEmptyLine(source)
+-          break
+         }
+-        chunkSizes.add(chunkSize)
+-        throttledTransfer(policy, socket, source,
+-            requestBody.buffer(), chunkSize.toLong(), true)
+-        readEmptyLine(source)
+       }
+-    }
+ 
+-    val method = request.substringBefore(' ')
+-    require(!hasBody || HttpMethod.permitsRequestBody(method)) {
+-      "Request must not have a body: $request"
++      val method = request.substringBefore(' ')
++      require(!hasBody || HttpMethod.permitsRequestBody(method)) {
++        "Request must not have a body: $request"
++      }
++    } catch (e: IOException) {
++      failure = e
+     }
+ 
+     return RecordedRequest(request, headers.build(), chunkSizes, requestBody.receivedByteCount,
+-        requestBody.buffer, sequenceNumber, socket)
++        requestBody.buffer, sequenceNumber, socket, failure)
+   }
+ 
+   @Throws(IOException::class)
+@@ -1013,17 +1023,21 @@ class MockWebServer : ExternalResource(), Closeable {
+       }
+ 
+       val body = Buffer()
++      val requestLine = "$method $path HTTP/1.1"
++      var exception: IOException? = null
+       if (readBody && !peek.isDuplex) {
+-        val contentLengthString = headers["content-length"]
+-        val byteCount = contentLengthString?.toLong() ?: Long.MAX_VALUE
+-        throttledTransfer(peek, socket, stream.getSource().buffer(),
+-            body, byteCount, true)
++        try {
++          val contentLengthString = headers["content-length"]
++          val byteCount = contentLengthString?.toLong() ?: Long.MAX_VALUE
++          throttledTransfer(peek, socket, stream.getSource().buffer(),
++              body, byteCount, true)
++        } catch (e: IOException) {
++          exception = e
++        }
+       }
+ 
+-      val requestLine = "$method $path HTTP/1.1"
+-      val chunkSizes = emptyList<Int>() // No chunked encoding for HTTP/2.
+-      return RecordedRequest(requestLine, headers, chunkSizes, body.size, body,
+-          sequenceNumber.getAndIncrement(), socket)
++      return RecordedRequest(requestLine, headers, emptyList(), body.size, body,
++          sequenceNumber.getAndIncrement(), socket, exception)
+     }
+ 
+     @Throws(IOException::class)
+diff --git a/mockwebserver/src/main/java/okhttp3/mockwebserver/RecordedRequest.kt b/mockwebserver/src/main/java/okhttp3/mockwebserver/RecordedRequest.kt
+index 9b34b23203..1db64aa94a 100644
+--- a/mockwebserver/src/main/java/okhttp3/mockwebserver/RecordedRequest.kt
++++ b/mockwebserver/src/main/java/okhttp3/mockwebserver/RecordedRequest.kt
+@@ -29,7 +29,7 @@ import java.net.Socket
+ import javax.net.ssl.SSLSocket
+ 
+ /** An HTTP request that came into the mock web server. */
+-class RecordedRequest(
++class RecordedRequest @JvmOverloads constructor(
+   val requestLine: String,
+ 
+   /** All headers. */
+@@ -52,7 +52,13 @@ class RecordedRequest(
+    * multiple requests, each request is assigned its own sequence number.
+    */
+   val sequenceNumber: Int,
+-  socket: Socket
++  socket: Socket,
++
++  /**
++   * The failure MockWebServer recorded when attempting to decode this request. If, for example,
++   * the inbound request was truncated, this exception will be non-null.
++   */
++  val failure: IOException? = null
+ ) {
+   val method: String?
+   val path: String?
+diff --git a/okhttp-testing-support/src/main/java/okhttp3/OkHttpClientTestRule.kt b/okhttp-testing-support/src/main/java/okhttp3/OkHttpClientTestRule.kt
+index 933d986a1e..b4de378151 100644
+--- a/okhttp-testing-support/src/main/java/okhttp3/OkHttpClientTestRule.kt
++++ b/okhttp-testing-support/src/main/java/okhttp3/OkHttpClientTestRule.kt
+@@ -68,8 +68,8 @@ class OkHttpClientTestRule : TestRule {
+ 
+   private fun ensureAllTaskQueuesIdle() {
+     for (queue in TaskRunner.INSTANCE.activeQueues()) {
+-      assertThat(queue.awaitIdle(TimeUnit.MILLISECONDS.toNanos(500L)))
+-          .withFailMessage("Queue still active after 500ms")
++      assertThat(queue.awaitIdle(TimeUnit.MILLISECONDS.toNanos(1000L)))
++          .withFailMessage("Queue still active after 1000ms")
+           .isTrue()
+     }
+   }
+diff --git a/okhttp/src/main/java/okhttp3/internal/http2/Http2Stream.kt b/okhttp/src/main/java/okhttp3/internal/http2/Http2Stream.kt
+index 243535415d..7dad0e67f2 100644
+--- a/okhttp/src/main/java/okhttp3/internal/http2/Http2Stream.kt
++++ b/okhttp/src/main/java/okhttp3/internal/http2/Http2Stream.kt
+@@ -534,6 +534,7 @@ class Http2Stream internal constructor(
+     @Throws(IOException::class)
+     private fun emitFrame(outFinishedOnLastFrame: Boolean) {
+       val toWrite: Long
++      val outFinished: Boolean
+       synchronized(this@Http2Stream) {
+         writeTimeout.enter()
+         try {
+@@ -550,11 +551,11 @@ class Http2Stream internal constructor(
+         checkOutNotClosed() // Kick out if the stream was reset or closed while waiting.
+         toWrite = minOf(writeBytesMaximum - writeBytesTotal, sendBuffer.size)
+         writeBytesTotal += toWrite
++        outFinished = outFinishedOnLastFrame && toWrite == sendBuffer.size && errorCode == null
+       }
+ 
+       writeTimeout.enter()
+       try {
+-        val outFinished = outFinishedOnLastFrame && toWrite == sendBuffer.size
+         connection.writeData(id, outFinished, sendBuffer, toWrite)
+       } finally {
+         writeTimeout.exitAndThrowIfTimedOut()
+@@ -578,8 +579,11 @@ class Http2Stream internal constructor(
+     @Throws(IOException::class)
+     override fun close() {
+       assert(!Thread.holdsLock(this@Http2Stream))
++
++      val outFinished: Boolean
+       synchronized(this@Http2Stream) {
+         if (closed) return
++        outFinished = errorCode == null
+       }
+       if (!sink.finished) {
+         // We have 0 or more frames of data, and 0 or more frames of trailers. We need to send at
+@@ -592,7 +596,7 @@ class Http2Stream internal constructor(
+             while (sendBuffer.size > 0L) {
+               emitFrame(false)
+             }
+-            connection.writeHeaders(id, true, trailers!!.toHeaderList())
++            connection.writeHeaders(id, outFinished, trailers!!.toHeaderList())
+           }
+ 
+           hasData -> {
+@@ -601,7 +605,7 @@ class Http2Stream internal constructor(
+             }
+           }
+ 
+-          else -> {
++          outFinished -> {
+             connection.writeData(id, true, null, 0L)
+           }
+         }
+diff --git a/okhttp/src/test/java/okhttp3/internal/http2/HttpOverHttp2Test.java b/okhttp/src/test/java/okhttp3/internal/http2/HttpOverHttp2Test.java
+index 7a05f6b43d..43e665019d 100644
+--- a/okhttp/src/test/java/okhttp3/internal/http2/HttpOverHttp2Test.java
++++ b/okhttp/src/test/java/okhttp3/internal/http2/HttpOverHttp2Test.java
+@@ -30,8 +30,10 @@
+ import java.util.concurrent.LinkedBlockingQueue;
+ import java.util.concurrent.SynchronousQueue;
+ import java.util.concurrent.TimeUnit;
++import java.util.concurrent.atomic.AtomicReference;
+ import java.util.logging.Level;
+ import java.util.logging.Logger;
++import javax.annotation.Nullable;
+ import okhttp3.Cache;
+ import okhttp3.Call;
+ import okhttp3.Callback;
+@@ -1620,4 +1622,33 @@ public void shutdownAfterLateCoalescing() throws Exception {
+ 
+     latch.await();
+   }
++
++  @Test public void cancelWhileWritingRequestBodySendsCancelToServer() throws Exception {
++    server.enqueue(new MockResponse());
++
++    AtomicReference<Call> callReference = new AtomicReference<>();
++    Call call = client.newCall(new Request.Builder()
++        .url(server.url("/"))
++        .post(new RequestBody() {
++          @Override public @Nullable MediaType contentType() {
++            return MediaType.get("text/plain; charset=utf-8");
++          }
++
++          @Override public void writeTo(BufferedSink sink) {
++            callReference.get().cancel();
++          }
++        })
++        .build());
++    callReference.set(call);
++
++    try {
++      call.execute();
++      fail();
++    } catch (IOException expected) {
++      assertThat(call.isCanceled()).isTrue();
++    }
++
++    RecordedRequest recordedRequest = server.takeRequest();
++    assertThat(recordedRequest.getFailure()).hasMessage("stream was reset: CANCEL");
++  }
+ }

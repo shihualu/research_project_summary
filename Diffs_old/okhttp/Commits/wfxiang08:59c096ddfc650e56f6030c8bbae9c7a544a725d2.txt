@@ -1,0 +1,505 @@
+diff --git a/okhttp-tests/src/test/java/okhttp3/CallTest.java b/okhttp-tests/src/test/java/okhttp3/CallTest.java
+index 9182395b73..3769707bec 100644
+--- a/okhttp-tests/src/test/java/okhttp3/CallTest.java
++++ b/okhttp-tests/src/test/java/okhttp3/CallTest.java
+@@ -45,7 +45,9 @@
+ import java.util.concurrent.TimeUnit;
+ import java.util.concurrent.atomic.AtomicBoolean;
+ import java.util.concurrent.atomic.AtomicReference;
++import java.util.logging.Level;
+ import java.util.logging.Logger;
++import java.util.logging.SimpleFormatter;
+ import javax.net.ServerSocketFactory;
+ import javax.net.ssl.SSLHandshakeException;
+ import javax.net.ssl.SSLPeerUnverifiedException;
+@@ -79,6 +81,7 @@
+ import org.junit.rules.Timeout;
+ 
+ import static java.net.CookiePolicy.ACCEPT_ORIGINAL_SERVER;
++import static okhttp3.TestUtil.awaitGarbageCollection;
+ import static okhttp3.TestUtil.defaultClient;
+ import static org.junit.Assert.assertEquals;
+ import static org.junit.Assert.assertFalse;
+@@ -342,6 +345,7 @@ private void postBodyRetransmittedAfterAuthorizationFail(String body) throws Exc
+ 
+     Response response = client.newCall(request).execute();
+     assertEquals(200, response.code());
++    response.body().close();
+ 
+     RecordedRequest recordedRequest1 = server.takeRequest();
+     assertEquals("POST", recordedRequest1.getMethod());
+@@ -2569,6 +2573,78 @@ private RequestBody requestBody(final boolean chunked, final long size, final in
+         .assertBody("");
+   }
+ 
++  @Test public void leakedResponseBodyLogsStackTrace() throws Exception {
++    server.enqueue(new MockResponse()
++        .setBody("This gets leaked."));
++
++    client = new OkHttpClient.Builder()
++        .connectionPool(new ConnectionPool(0, 10, TimeUnit.MILLISECONDS))
++        .build();
++
++    Request request = new Request.Builder()
++        .url(server.url("/"))
++        .build();
++
++    Level original = logger.getLevel();
++    logger.setLevel(Level.FINE);
++    logHandler.setFormatter(new SimpleFormatter());
++    try {
++      client.newCall(request).execute(); // Ignore the response so it gets leaked then GC'd.
++      awaitGarbageCollection();
++
++      String message = logHandler.take();
++      assertTrue(message.contains("WARNING: A connection to " + server.url("/") + " was leaked."
++          + " Did you forget to close a response body?"));
++      assertTrue(message.contains("okhttp3.RealCall.execute("));
++      assertTrue(message.contains("okhttp3.CallTest.leakedResponseBodyLogsStackTrace("));
++    } finally {
++      logger.setLevel(original);
++    }
++  }
++
++  @Test public void asyncLeakedResponseBodyLogsStackTrace() throws Exception {
++    server.enqueue(new MockResponse()
++        .setBody("This gets leaked."));
++
++    client = new OkHttpClient.Builder()
++        .connectionPool(new ConnectionPool(0, 10, TimeUnit.MILLISECONDS))
++        .build();
++
++    Request request = new Request.Builder()
++        .url(server.url("/"))
++        .build();
++
++    Level original = logger.getLevel();
++    logger.setLevel(Level.FINE);
++    logHandler.setFormatter(new SimpleFormatter());
++    try {
++      final CountDownLatch latch = new CountDownLatch(1);
++      client.newCall(request).enqueue(new Callback() {
++        @Override public void onFailure(Call call, IOException e) {
++          fail();
++        }
++
++        @Override public void onResponse(Call call, Response response) throws IOException {
++          // Ignore the response so it gets leaked then GC'd.
++          latch.countDown();
++        }
++      });
++      latch.await();
++      // There's some flakiness when triggering a GC for objects in a separate thread. Adding a
++      // small delay appears to ensure the objects will get GC'd.
++      Thread.sleep(200);
++      awaitGarbageCollection();
++
++      String message = logHandler.take();
++      assertTrue(message.contains("WARNING: A connection to " + server.url("/") + " was leaked."
++          + " Did you forget to close a response body?"));
++      assertTrue(message.contains("okhttp3.RealCall.enqueue("));
++      assertTrue(message.contains("okhttp3.CallTest.asyncLeakedResponseBodyLogsStackTrace("));
++    } finally {
++      logger.setLevel(original);
++    }
++  }
++
+   private void makeFailingCall() {
+     RequestBody requestBody = new RequestBody() {
+       @Override public MediaType contentType() {
+diff --git a/okhttp-tests/src/test/java/okhttp3/ConnectionPoolTest.java b/okhttp-tests/src/test/java/okhttp3/ConnectionPoolTest.java
+index 12622ad80a..80346ba443 100644
+--- a/okhttp-tests/src/test/java/okhttp3/ConnectionPoolTest.java
++++ b/okhttp-tests/src/test/java/okhttp3/ConnectionPoolTest.java
+@@ -28,6 +28,7 @@
+ import okhttp3.internal.connection.StreamAllocation;
+ import org.junit.Test;
+ 
++import static okhttp3.TestUtil.awaitGarbageCollection;
+ import static org.junit.Assert.assertEquals;
+ import static org.junit.Assert.assertFalse;
+ import static org.junit.Assert.assertTrue;
+@@ -82,7 +83,7 @@
+ 
+     RealConnection c1 = newConnection(pool, routeA1, 50L);
+     synchronized (pool) {
+-      StreamAllocation streamAllocation = new StreamAllocation(pool, addressA);
++      StreamAllocation streamAllocation = new StreamAllocation(pool, addressA, null);
+       streamAllocation.acquire(c1);
+     }
+ 
+@@ -175,22 +176,11 @@
+   /** Use a helper method so there's no hidden reference remaining on the stack. */
+   private void allocateAndLeakAllocation(ConnectionPool pool, RealConnection connection) {
+     synchronized (pool) {
+-      StreamAllocation leak = new StreamAllocation(pool, connection.route().address());
++      StreamAllocation leak = new StreamAllocation(pool, connection.route().address(), null);
+       leak.acquire(connection);
+     }
+   }
+ 
+-  /**
+-   * See FinalizationTester for discussion on how to best trigger GC in tests.
+-   * https://android.googlesource.com/platform/libcore/+/master/support/src/test/java/libcore/
+-   * java/lang/ref/FinalizationTester.java
+-   */
+-  private void awaitGarbageCollection() throws InterruptedException {
+-    Runtime.getRuntime().gc();
+-    Thread.sleep(100);
+-    System.runFinalization();
+-  }
+-
+   private RealConnection newConnection(ConnectionPool pool, Route route, long idleAtNanos) {
+     RealConnection connection = new RealConnection(route);
+     connection.idleAtNanos = idleAtNanos;
+diff --git a/okhttp-tests/src/test/java/okhttp3/TestLogHandler.java b/okhttp-tests/src/test/java/okhttp3/TestLogHandler.java
+index 10f3cbb9d2..d3745e1a0d 100644
+--- a/okhttp-tests/src/test/java/okhttp3/TestLogHandler.java
++++ b/okhttp-tests/src/test/java/okhttp3/TestLogHandler.java
+@@ -19,6 +19,7 @@
+ import java.util.List;
+ import java.util.logging.Handler;
+ import java.util.logging.LogRecord;
++import java.util.logging.SimpleFormatter;
+ 
+ /**
+  * A log handler that records which log messages were published so that a calling test can make
+@@ -28,7 +29,11 @@
+   private final List<String> logs = new ArrayList<>();
+ 
+   @Override public synchronized void publish(LogRecord logRecord) {
+-    logs.add(logRecord.getLevel() + ": " + logRecord.getMessage());
++    if (getFormatter() == null) {
++      logs.add(logRecord.getLevel() + ": " + logRecord.getMessage());
++    } else {
++      logs.add(getFormatter().format(logRecord));
++    }
+     notifyAll();
+   }
+ 
+diff --git a/okhttp-tests/src/test/java/okhttp3/TestUtil.java b/okhttp-tests/src/test/java/okhttp3/TestUtil.java
+index 193043dabb..6f44cc5ba5 100644
+--- a/okhttp-tests/src/test/java/okhttp3/TestUtil.java
++++ b/okhttp-tests/src/test/java/okhttp3/TestUtil.java
+@@ -43,4 +43,15 @@ public static String repeat(char c, int count) {
+     Arrays.fill(array, c);
+     return new String(array);
+   }
++
++  /**
++   * See FinalizationTester for discussion on how to best trigger GC in tests.
++   * https://android.googlesource.com/platform/libcore/+/master/support/src/test/java/libcore/
++   * java/lang/ref/FinalizationTester.java
++   */
++  public static void awaitGarbageCollection() throws InterruptedException {
++    Runtime.getRuntime().gc();
++    Thread.sleep(100);
++    System.runFinalization();
++  }
+ }
+diff --git a/okhttp-tests/src/test/java/okhttp3/URLConnectionTest.java b/okhttp-tests/src/test/java/okhttp3/URLConnectionTest.java
+index 4a32ab7b51..2e71146771 100644
+--- a/okhttp-tests/src/test/java/okhttp3/URLConnectionTest.java
++++ b/okhttp-tests/src/test/java/okhttp3/URLConnectionTest.java
+@@ -1549,6 +1549,7 @@ private void postBodyRetransmittedAfterAuthorizationFail(String body) throws Exc
+     outputStream.write(body.getBytes("UTF-8"));
+     outputStream.close();
+     assertEquals(200, connection.getResponseCode());
++    connection.getInputStream().close();
+ 
+     RecordedRequest recordedRequest1 = server.takeRequest();
+     assertEquals("POST", recordedRequest1.getMethod());
+@@ -2399,6 +2400,7 @@ private void enqueueClientRequestTimeoutResponses() {
+ 
+     assertEquals(408, connection.getResponseCode());
+     assertEquals(1, server.getRequestCount());
++    connection.getErrorStream().close();
+   }
+ 
+   @Test public void readTimeouts() throws IOException {
+diff --git a/okhttp/src/main/java/okhttp3/ConnectionPool.java b/okhttp/src/main/java/okhttp3/ConnectionPool.java
+index 19ed7cab10..dcbc0b441e 100644
+--- a/okhttp/src/main/java/okhttp3/ConnectionPool.java
++++ b/okhttp/src/main/java/okhttp3/ConnectionPool.java
+@@ -33,7 +33,6 @@
+ import okhttp3.internal.platform.Platform;
+ 
+ import static okhttp3.internal.Util.closeQuietly;
+-import static okhttp3.internal.platform.Platform.WARN;
+ 
+ /**
+  * Manages reuse of HTTP and HTTP/2 connections for reduced network latency. HTTP requests that
+@@ -246,8 +245,12 @@ private int pruneAndGetAllocationCount(RealConnection connection, long now) {
+       }
+ 
+       // We've discovered a leaked allocation. This is an application bug.
+-      Platform.get().log(WARN, "A connection to " + connection.route().address().url()
+-          + " was leaked. Did you forget to close a response body?", null);
++      StreamAllocation.StreamAllocationReference streamAllocRef =
++          (StreamAllocation.StreamAllocationReference) reference;
++      String message = "A connection to " + connection.route().address().url()
++          + " was leaked. Did you forget to close a response body?";
++      Platform.get().logCloseableLeak(message, streamAllocRef.callStackTrace);
++
+       references.remove(i);
+       connection.noNewStreams = true;
+ 
+diff --git a/okhttp/src/main/java/okhttp3/RealCall.java b/okhttp/src/main/java/okhttp3/RealCall.java
+index 8fa20c8dd3..7545b508b3 100644
+--- a/okhttp/src/main/java/okhttp3/RealCall.java
++++ b/okhttp/src/main/java/okhttp3/RealCall.java
+@@ -55,6 +55,7 @@ protected RealCall(OkHttpClient client, Request originalRequest) {
+       if (executed) throw new IllegalStateException("Already Executed");
+       executed = true;
+     }
++    captureCallStackTrace();
+     try {
+       client.dispatcher().executed(this);
+       Response result = getResponseWithInterceptorChain();
+@@ -65,6 +66,11 @@ protected RealCall(OkHttpClient client, Request originalRequest) {
+     }
+   }
+ 
++  private void captureCallStackTrace() {
++    Object callStackTrace = Platform.get().getStackTraceForCloseable("response.body().close()");
++    retryAndFollowUpInterceptor.setCallStackTrace(callStackTrace);
++  }
++
+   synchronized void setForWebSocket() {
+     if (executed) throw new IllegalStateException("Already Executed");
+     this.retryAndFollowUpInterceptor.setForWebSocket(true);
+@@ -75,6 +81,7 @@ synchronized void setForWebSocket() {
+       if (executed) throw new IllegalStateException("Already Executed");
+       executed = true;
+     }
++    captureCallStackTrace();
+     client.dispatcher().enqueue(new AsyncCall(responseCallback));
+   }
+ 
+diff --git a/okhttp/src/main/java/okhttp3/internal/connection/StreamAllocation.java b/okhttp/src/main/java/okhttp3/internal/connection/StreamAllocation.java
+index 29ccb2ea5e..73b2506f62 100644
+--- a/okhttp/src/main/java/okhttp3/internal/connection/StreamAllocation.java
++++ b/okhttp/src/main/java/okhttp3/internal/connection/StreamAllocation.java
+@@ -73,6 +73,7 @@
+   public final Address address;
+   private Route route;
+   private final ConnectionPool connectionPool;
++  private final Object callStackTrace;
+ 
+   // State guarded by connectionPool.
+   private final RouteSelector routeSelector;
+@@ -82,10 +83,11 @@
+   private boolean canceled;
+   private HttpCodec codec;
+ 
+-  public StreamAllocation(ConnectionPool connectionPool, Address address) {
++  public StreamAllocation(ConnectionPool connectionPool, Address address, Object callStackTrace) {
+     this.connectionPool = connectionPool;
+     this.address = address;
+     this.routeSelector = new RouteSelector(address, routeDatabase());
++    this.callStackTrace = callStackTrace;
+   }
+ 
+   public HttpCodec newStream(OkHttpClient client, boolean doExtensiveHealthChecks) {
+@@ -318,7 +320,7 @@ public void streamFailed(IOException e) {
+    */
+   public void acquire(RealConnection connection) {
+     assert (Thread.holdsLock(connectionPool));
+-    connection.allocations.add(new WeakReference<>(this));
++    connection.allocations.add(new StreamAllocationReference(this, callStackTrace));
+   }
+ 
+   /** Remove this allocation from the connection's list of allocations. */
+@@ -340,4 +342,17 @@ public boolean hasMoreRoutes() {
+   @Override public String toString() {
+     return address.toString();
+   }
++
++  public static final class StreamAllocationReference extends WeakReference<StreamAllocation> {
++    /**
++     * Captures the stack trace at the time the Call is executed or enqueued. This is helpful for
++     * identifying the origin of connection leaks.
++     */
++    public final Object callStackTrace;
++
++    StreamAllocationReference(StreamAllocation referent, Object callStackTrace) {
++      super(referent);
++      this.callStackTrace = callStackTrace;
++    }
++  }
+ }
+diff --git a/okhttp/src/main/java/okhttp3/internal/http/RetryAndFollowUpInterceptor.java b/okhttp/src/main/java/okhttp3/internal/http/RetryAndFollowUpInterceptor.java
+index 21a1f35050..4122740e0a 100644
+--- a/okhttp/src/main/java/okhttp3/internal/http/RetryAndFollowUpInterceptor.java
++++ b/okhttp/src/main/java/okhttp3/internal/http/RetryAndFollowUpInterceptor.java
+@@ -64,6 +64,7 @@
+   private final OkHttpClient client;
+   private StreamAllocation streamAllocation;
+   private boolean forWebSocket;
++  private Object callStackTrace;
+   private volatile boolean canceled;
+ 
+   public RetryAndFollowUpInterceptor(OkHttpClient client) {
+@@ -97,6 +98,10 @@ public boolean isForWebSocket() {
+     return forWebSocket;
+   }
+ 
++  public void setCallStackTrace(Object callStackTrace) {
++    this.callStackTrace = callStackTrace;
++  }
++
+   public StreamAllocation streamAllocation() {
+     return streamAllocation;
+   }
+@@ -105,7 +110,7 @@ public StreamAllocation streamAllocation() {
+     Request request = chain.request();
+ 
+     streamAllocation = new StreamAllocation(
+-        client.connectionPool(), createAddress(request.url()));
++        client.connectionPool(), createAddress(request.url()), callStackTrace);
+ 
+     int followUpCount = 0;
+     Response priorResponse = null;
+@@ -164,13 +169,14 @@ public StreamAllocation streamAllocation() {
+       }
+ 
+       if (followUp.body() instanceof UnrepeatableRequestBody) {
++        streamAllocation.release();
+         throw new HttpRetryException("Cannot retry streamed HTTP body", response.code());
+       }
+ 
+       if (!sameConnection(response, followUp.url())) {
+         streamAllocation.release();
+         streamAllocation = new StreamAllocation(
+-            client.connectionPool(), createAddress(followUp.url()));
++            client.connectionPool(), createAddress(followUp.url()), callStackTrace);
+       } else if (streamAllocation.codec() != null) {
+         throw new IllegalStateException("Closing the body of " + response
+             + " didn't close its backing stream. Bad interceptor?");
+diff --git a/okhttp/src/main/java/okhttp3/internal/platform/AndroidPlatform.java b/okhttp/src/main/java/okhttp3/internal/platform/AndroidPlatform.java
+index bccdc0b589..fc646ead5f 100644
+--- a/okhttp/src/main/java/okhttp3/internal/platform/AndroidPlatform.java
++++ b/okhttp/src/main/java/okhttp3/internal/platform/AndroidPlatform.java
+@@ -45,6 +45,8 @@
+   private final OptionalMethod<Socket> getAlpnSelectedProtocol;
+   private final OptionalMethod<Socket> setAlpnProtocols;
+ 
++  private final CloseGuard closeGuard = CloseGuard.get();
++
+   public AndroidPlatform(Class<?> sslParametersClass, OptionalMethod<Socket> setUseSessionTickets,
+       OptionalMethod<Socket> setHostname, OptionalMethod<Socket> getAlpnSelectedProtocol,
+       OptionalMethod<Socket> setAlpnProtocols) {
+@@ -132,6 +134,18 @@ public AndroidPlatform(Class<?> sslParametersClass, OptionalMethod<Socket> setUs
+     }
+   }
+ 
++  @Override public Object getStackTraceForCloseable(String closer) {
++    return closeGuard.createAndOpen(closer);
++  }
++
++  @Override public void logCloseableLeak(String message, Object stackTrace) {
++    boolean reported = closeGuard.warnIfOpen(stackTrace);
++    if (!reported) {
++      // Unable to report via CloseGuard. As a last-ditch effort, send it to the logger.
++      log(WARN, message, null);
++    }
++  }
++
+   @Override public boolean isCleartextTrafficPermitted(String hostname) {
+     try {
+       Class<?> networkPolicyClass = Class.forName("android.security.NetworkSecurityPolicy");
+@@ -226,4 +240,63 @@ public static Platform buildIfSupported() {
+       }
+     }
+   }
++
++  /**
++   * Provides access to the internal dalvik.system.CloseGuard class. Android uses this in
++   * combination with android.os.StrictMode to report on leaked java.io.Closeable's. Available since
++   * Android API 11.
++   */
++  static final class CloseGuard {
++    private final Method getMethod;
++    private final Method openMethod;
++    private final Method warnIfOpenMethod;
++
++    CloseGuard(Method getMethod, Method openMethod, Method warnIfOpenMethod) {
++      this.getMethod = getMethod;
++      this.openMethod = openMethod;
++      this.warnIfOpenMethod = warnIfOpenMethod;
++    }
++
++    Object createAndOpen(String closer) {
++      if (getMethod != null) {
++        try {
++          Object closeGuardInstance = getMethod.invoke(null);
++          openMethod.invoke(closeGuardInstance, closer);
++          return closeGuardInstance;
++        } catch (Exception ignored) {
++        }
++      }
++      return null;
++    }
++
++    boolean warnIfOpen(Object closeGuardInstance) {
++      boolean reported = false;
++      if (closeGuardInstance != null) {
++        try {
++          warnIfOpenMethod.invoke(closeGuardInstance);
++          reported = true;
++        } catch (Exception ignored) {
++        }
++      }
++      return reported;
++    }
++
++    static CloseGuard get() {
++      Method getMethod;
++      Method openMethod;
++      Method warnIfOpenMethod;
++
++      try {
++        Class<?> closeGuardClass = Class.forName("dalvik.system.CloseGuard");
++        getMethod = closeGuardClass.getMethod("get");
++        openMethod = closeGuardClass.getMethod("open", String.class);
++        warnIfOpenMethod = closeGuardClass.getMethod("warnIfOpen");
++      } catch (Exception ignored) {
++        getMethod = null;
++        openMethod = null;
++        warnIfOpenMethod = null;
++      }
++      return new CloseGuard(getMethod, openMethod, warnIfOpenMethod);
++    }
++  }
+ }
+diff --git a/okhttp/src/main/java/okhttp3/internal/platform/Platform.java b/okhttp/src/main/java/okhttp3/internal/platform/Platform.java
+index 477ff23e9a..83c36fdd0f 100644
+--- a/okhttp/src/main/java/okhttp3/internal/platform/Platform.java
++++ b/okhttp/src/main/java/okhttp3/internal/platform/Platform.java
+@@ -133,6 +133,26 @@ public boolean isCleartextTrafficPermitted(String hostname) {
+     return true;
+   }
+ 
++  /**
++   * Returns an object that holds a stack trace created at the moment this method is executed. This
++   * should be used specifically for {@link java.io.Closeable} objects and in conjunction with
++   * {@link #logCloseableLeak(String, Object)}.
++   */
++  public Object getStackTraceForCloseable(String closer) {
++    if (logger.isLoggable(Level.FINE)) {
++      return new Throwable(closer); // These are expensive to allocate.
++    }
++    return null;
++  }
++
++  public void logCloseableLeak(String message, Object stackTrace) {
++    if (stackTrace == null) {
++      message += " To see where this was allocated, set the OkHttpClient logger level to FINE: "
++          + "Logger.getLogger(OkHttpClient.class.getName()).setLevel(Level.FINE);";
++    }
++    log(WARN, message, (Throwable) stackTrace);
++  }
++
+   public static List<String> alpnProtocolNames(List<Protocol> protocols) {
+     List<String> names = new ArrayList<>(protocols.size());
+     for (int i = 0, size = protocols.size(); i < size; i++) {

@@ -1,0 +1,194 @@
+diff --git a/RELEASENOTES.md b/RELEASENOTES.md
+index 5743d9944c..a84f4ff0b7 100644
+--- a/RELEASENOTES.md
++++ b/RELEASENOTES.md
+@@ -72,6 +72,10 @@
+   ([#6161](https://github.com/google/ExoPlayer/issues/6161)).
+ * Add demo app to show how to use the Android 10 `SurfaceControl` API with
+   ExoPlayer ([#677](https://github.com/google/ExoPlayer/issues/677)).
++* Add automatic `WakeLock` handling to `SimpleExoPlayer` through calling
++  `setEnableWakeLock`, which requires the
++  `android.Manifest.permission#WAKE_LOCK` permission
++  ([#5846](https://github.com/google/ExoPlayer/issues/5846)).
+ * Add `Player.onPlaybackSuppressionReasonChanged` to allow listeners to
+   detect playbacks suppressions (e.g. audio focus loss) directly
+   ([#6203](https://github.com/google/ExoPlayer/issues/6203)).
+diff --git a/library/core/src/main/java/com/google/android/exoplayer2/SimpleExoPlayer.java b/library/core/src/main/java/com/google/android/exoplayer2/SimpleExoPlayer.java
+index 43a5ebab99..418aa366e6 100644
+--- a/library/core/src/main/java/com/google/android/exoplayer2/SimpleExoPlayer.java
++++ b/library/core/src/main/java/com/google/android/exoplayer2/SimpleExoPlayer.java
+@@ -323,6 +323,7 @@ public SimpleExoPlayer build() {
+   private final AnalyticsCollector analyticsCollector;
+ 
+   private final AudioFocusManager audioFocusManager;
++  private final WakeLockManager wakeLockManager;
+ 
+   @Nullable private Format videoFormat;
+   @Nullable private Format audioFormat;
+@@ -453,6 +454,7 @@ protected SimpleExoPlayer(
+       ((DefaultDrmSessionManager) drmSessionManager).addListener(eventHandler, analyticsCollector);
+     }
+     audioFocusManager = new AudioFocusManager(context, componentListener);
++    wakeLockManager = new WakeLockManager(context);
+   }
+ 
+   @Override
+@@ -1226,6 +1228,7 @@ public void stop(boolean reset) {
+   public void release() {
+     verifyApplicationThread();
+     audioFocusManager.handleStop();
++    wakeLockManager.setStayAwake(false);
+     player.release();
+     removeSurfaceCallbacks();
+     if (surface != null) {
+@@ -1348,6 +1351,22 @@ public long getContentBufferedPosition() {
+     return player.getContentBufferedPosition();
+   }
+ 
++  /**
++   * Sets whether to enable the acquiring and releasing of a {@link
++   * android.os.PowerManager.WakeLock}.
++   *
++   * <p>By default, automatic wake lock handling is not enabled. Enabling this on will acquire the
++   * WakeLock if necessary. Disabling this will release the WakeLock if it is held.
++   *
++   * @param handleWakeLock True if the player should handle a {@link
++   *     android.os.PowerManager.WakeLock}, false otherwise. This is for use with a foreground
++   *     {@link android.app.Service}, for allowing audio playback with the screen off. Please note
++   *     that enabling this requires the {@link android.Manifest.permission#WAKE_LOCK} permission.
++   */
++  public void setHandleWakeLock(boolean handleWakeLock) {
++    wakeLockManager.setEnabled(handleWakeLock);
++  }
++
+   // Internal methods.
+ 
+   private void removeSurfaceCallbacks() {
+@@ -1667,5 +1686,19 @@ public void onLoadingChanged(boolean isLoading) {
+         }
+       }
+     }
++
++    @Override
++    public void onPlayerStateChanged(boolean playWhenReady, @State int playbackState) {
++      switch (playbackState) {
++        case Player.STATE_READY:
++        case Player.STATE_BUFFERING:
++          wakeLockManager.setStayAwake(playWhenReady);
++          break;
++        case Player.STATE_ENDED:
++        case Player.STATE_IDLE:
++          wakeLockManager.setStayAwake(false);
++          break;
++      }
++    }
+   }
+ }
+diff --git a/library/core/src/main/java/com/google/android/exoplayer2/WakeLockManager.java b/library/core/src/main/java/com/google/android/exoplayer2/WakeLockManager.java
+new file mode 100644
+index 0000000000..58c3748f39
+--- /dev/null
++++ b/library/core/src/main/java/com/google/android/exoplayer2/WakeLockManager.java
+@@ -0,0 +1,102 @@
++/*
++ * Copyright (C) 2019 The Android Open Source Project
++ *
++ * Licensed under the Apache License, Version 2.0 (the "License");
++ * you may not use this file except in compliance with the License.
++ * You may obtain a copy of the License at
++ *
++ *      http://www.apache.org/licenses/LICENSE-2.0
++ *
++ * Unless required by applicable law or agreed to in writing, software
++ * distributed under the License is distributed on an "AS IS" BASIS,
++ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++ * See the License for the specific language governing permissions and
++ * limitations under the License.
++ */
++package com.google.android.exoplayer2;
++
++import android.annotation.SuppressLint;
++import android.content.Context;
++import android.os.PowerManager;
++import android.os.PowerManager.WakeLock;
++import androidx.annotation.Nullable;
++import com.google.android.exoplayer2.util.Log;
++
++/**
++ * Handles a {@link WakeLock}.
++ *
++ * <p>The handling of wake locks requires the {@link android.Manifest.permission#WAKE_LOCK}
++ * permission.
++ */
++public final class WakeLockManager {
++
++  private static final String TAG = "WakeLockManager";
++  private static final String WAKE_LOCK_TAG = "ExoPlayer:WakeLockManager";
++
++  @Nullable private final PowerManager powerManager;
++  @Nullable private WakeLock wakeLock;
++  private boolean enabled;
++  private boolean stayAwake;
++
++  public WakeLockManager(Context context) {
++    powerManager = (PowerManager) context.getSystemService(Context.POWER_SERVICE);
++  }
++
++  /**
++   * Sets whether to enable the acquiring and releasing of the {@link WakeLock}.
++   *
++   * <p>By default, wake lock handling is not enabled. Enabling this will acquire the wake lock if
++   * necessary. Disabling this will release the wake lock if it is held.
++   *
++   * @param enabled True if the player should handle a {@link WakeLock}, false otherwise. Please
++   *     note that enabling this requires the {@link android.Manifest.permission#WAKE_LOCK}
++   *     permission.
++   */
++  public void setEnabled(boolean enabled) {
++    if (enabled) {
++      if (wakeLock == null) {
++        if (powerManager == null) {
++          Log.w(TAG, "PowerManager was null, therefore the WakeLock was not created.");
++          return;
++        }
++        wakeLock = powerManager.newWakeLock(PowerManager.PARTIAL_WAKE_LOCK, WAKE_LOCK_TAG);
++      }
++    }
++
++    this.enabled = enabled;
++    updateWakeLock();
++  }
++
++  /**
++   * Sets whether to acquire or release the {@link WakeLock}.
++   *
++   * <p>Please note this method requires wake lock handling to be enabled through setEnabled(boolean
++   * enable) to actually have an impact on the {@link WakeLock}.
++   *
++   * @param stayAwake True if the player should acquire the {@link WakeLock}. False if the player
++   *     should release.
++   */
++  public void setStayAwake(boolean stayAwake) {
++    this.stayAwake = stayAwake;
++    updateWakeLock();
++  }
++
++  // WakelockTimeout suppressed because the time the wake lock is needed for is unknown (could be
++  // listening to radio with screen off for multiple hours), therefore we can not determine a
++  // reasonable timeout that would not affect the user.
++  @SuppressLint("WakelockTimeout")
++  private void updateWakeLock() {
++    // Needed for the library nullness check. If enabled is true, the wakelock will not be null.
++    if (wakeLock != null) {
++      if (enabled) {
++        if (stayAwake && !wakeLock.isHeld()) {
++          wakeLock.acquire();
++        } else if (!stayAwake && wakeLock.isHeld()) {
++          wakeLock.release();
++        }
++      } else if (wakeLock.isHeld()) {
++        wakeLock.release();
++      }
++    }
++  }
++}

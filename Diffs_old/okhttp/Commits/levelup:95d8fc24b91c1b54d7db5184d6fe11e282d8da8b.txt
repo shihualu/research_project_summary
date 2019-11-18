@@ -1,0 +1,115 @@
+diff --git a/mockwebserver/src/main/java/com/squareup/okhttp/mockwebserver/MockWebServer.java b/mockwebserver/src/main/java/com/squareup/okhttp/mockwebserver/MockWebServer.java
+index 235c8b07ee..d036d53c50 100644
+--- a/mockwebserver/src/main/java/com/squareup/okhttp/mockwebserver/MockWebServer.java
++++ b/mockwebserver/src/main/java/com/squareup/okhttp/mockwebserver/MockWebServer.java
+@@ -633,6 +633,7 @@ public void run() {
+   private class SpdySocketHandler implements IncomingStreamHandler {
+     private final Socket socket;
+     private final Transport transport;
++    private final AtomicInteger sequenceNumber = new AtomicInteger();
+ 
+     private SpdySocketHandler(Socket socket, Transport transport) {
+       this.socket = socket;
+@@ -684,7 +685,7 @@ private RecordedRequest readRequest(SpdyStream stream) throws IOException {
+       String requestLine = method + ' ' + path + ' ' + version;
+       List<Integer> chunkSizes = Collections.emptyList(); // No chunked encoding for SPDY.
+       return new RecordedRequest(requestLine, httpHeaders, chunkSizes, bodyOut.size(),
+-          bodyOut.toByteArray(), 0, socket);
++          bodyOut.toByteArray(), sequenceNumber.getAndIncrement(), socket);
+     }
+ 
+     private void writeResponse(SpdyStream stream, MockResponse response) throws IOException {
+diff --git a/okhttp-protocols/src/main/java/com/squareup/okhttp/internal/spdy/SpdyConnection.java b/okhttp-protocols/src/main/java/com/squareup/okhttp/internal/spdy/SpdyConnection.java
+index f6c5533376..b19bd44c0a 100644
+--- a/okhttp-protocols/src/main/java/com/squareup/okhttp/internal/spdy/SpdyConnection.java
++++ b/okhttp-protocols/src/main/java/com/squareup/okhttp/internal/spdy/SpdyConnection.java
+@@ -122,15 +122,18 @@ synchronized SpdyStream removeStream(int streamId) {
+   }
+ 
+   private synchronized void setIdle(boolean value) {
+-    idleStartTimeNs = value ? System.nanoTime() : 0L;
++    idleStartTimeNs = value ? System.nanoTime() : Long.MAX_VALUE;
+   }
+ 
+   /** Returns true if this connection is idle. */
+   public synchronized boolean isIdle() {
+-    return idleStartTimeNs != 0L;
++    return idleStartTimeNs != Long.MAX_VALUE;
+   }
+ 
+-  /** Returns the time in ns when this connection became idle or 0L if connection is not idle. */
++  /**
++   * Returns the time in ns when this connection became idle or Long.MAX_VALUE
++   * if connection is not idle.
++   */
+   public synchronized long getIdleStartTimeNs() {
+     return idleStartTimeNs;
+   }
+diff --git a/okhttp/src/main/java/com/squareup/okhttp/Connection.java b/okhttp/src/main/java/com/squareup/okhttp/Connection.java
+index 6be5656705..a6b798da9d 100644
+--- a/okhttp/src/main/java/com/squareup/okhttp/Connection.java
++++ b/okhttp/src/main/java/com/squareup/okhttp/Connection.java
+@@ -244,7 +244,7 @@ public boolean isIdle() {
+    * {@code keepAliveDurationNs}.
+    */
+   public boolean isExpired(long keepAliveDurationNs) {
+-    return isIdle() && System.nanoTime() - getIdleStartTimeNs() > keepAliveDurationNs;
++    return getIdleStartTimeNs() < System.nanoTime() - keepAliveDurationNs;
+   }
+ 
+   /**
+diff --git a/okhttp/src/main/java/com/squareup/okhttp/internal/http/HttpEngine.java b/okhttp/src/main/java/com/squareup/okhttp/internal/http/HttpEngine.java
+index 142def4665..df5af0c47a 100644
+--- a/okhttp/src/main/java/com/squareup/okhttp/internal/http/HttpEngine.java
++++ b/okhttp/src/main/java/com/squareup/okhttp/internal/http/HttpEngine.java
+@@ -649,10 +649,17 @@ public final void readResponse() throws IOException {
+       if (cachedResponseHeaders.validate(responseHeaders)) {
+         release(false);
+         ResponseHeaders combinedHeaders = cachedResponseHeaders.combine(responseHeaders);
+-        setResponse(combinedHeaders, cachedResponseBody);
++        this.responseHeaders = combinedHeaders;
++
++        // Update the cache after applying the combined headers but before initializing the content
++        // stream, otherwise the Content-Encoding header (if present) will be stripped from the
++        // combined headers and not end up in the cache file if transparent gzip compression is
++        // turned on.
+         OkResponseCache responseCache = client.getOkResponseCache();
+         responseCache.trackConditionalCacheHit();
+         responseCache.update(cacheResponse, policy.getHttpConnectionToCache());
++
++        initContentStream(cachedResponseBody);
+         return;
+       } else {
+         Util.closeQuietly(cachedResponseBody);
+diff --git a/okhttp/src/test/java/com/squareup/okhttp/internal/http/HttpOverSpdyTest.java b/okhttp/src/test/java/com/squareup/okhttp/internal/http/HttpOverSpdyTest.java
+index ca240f1311..7720c5b615 100644
+--- a/okhttp/src/test/java/com/squareup/okhttp/internal/http/HttpOverSpdyTest.java
++++ b/okhttp/src/test/java/com/squareup/okhttp/internal/http/HttpOverSpdyTest.java
+@@ -142,7 +142,7 @@ public boolean verify(String hostname, SSLSession session) {
+     assertEquals("DEF", readAscii(connection1.getInputStream(), 3));
+     assertEquals("JKL", readAscii(connection2.getInputStream(), 3));
+     assertEquals(0, server.takeRequest().getSequenceNumber());
+-    assertEquals(0, server.takeRequest().getSequenceNumber());
++    assertEquals(1, server.takeRequest().getSequenceNumber());
+   }
+ 
+   @Test public void gzippedResponseBody() throws Exception {
+diff --git a/okhttp/src/test/java/com/squareup/okhttp/internal/http/HttpResponseCacheTest.java b/okhttp/src/test/java/com/squareup/okhttp/internal/http/HttpResponseCacheTest.java
+index aa3948b192..cbbeb987a2 100644
+--- a/okhttp/src/test/java/com/squareup/okhttp/internal/http/HttpResponseCacheTest.java
++++ b/okhttp/src/test/java/com/squareup/okhttp/internal/http/HttpResponseCacheTest.java
+@@ -946,8 +946,14 @@ private void assertNonIdentityEncodingCached(MockResponse response) throws Excep
+     server.enqueue(
+         response.setBody(gzip("ABCABCABC".getBytes("UTF-8"))).addHeader("Content-Encoding: gzip"));
+     server.enqueue(new MockResponse().setResponseCode(HttpURLConnection.HTTP_NOT_MODIFIED));
++    server.enqueue(new MockResponse().setResponseCode(HttpURLConnection.HTTP_NOT_MODIFIED));
+ 
+     server.play();
++
++    // At least three request/response pairs are required because after the first request is cached
++    // a different execution path might be taken. Thus modifications to the cache applied during
++    // the second request might not be visible until another request is performed.
++    assertEquals("ABCABCABC", readAscii(openConnection(server.getUrl("/"))));
+     assertEquals("ABCABCABC", readAscii(openConnection(server.getUrl("/"))));
+     assertEquals("ABCABCABC", readAscii(openConnection(server.getUrl("/"))));
+   }

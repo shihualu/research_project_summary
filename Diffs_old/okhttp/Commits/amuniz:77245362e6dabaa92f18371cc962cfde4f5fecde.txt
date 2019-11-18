@@ -1,0 +1,216 @@
+diff --git a/okhttp-tests/src/test/java/okhttp3/internal/http2/HpackTest.java b/okhttp-tests/src/test/java/okhttp3/internal/http2/HpackTest.java
+index ab4c7adb29..99d54a4fdb 100644
+--- a/okhttp-tests/src/test/java/okhttp3/internal/http2/HpackTest.java
++++ b/okhttp-tests/src/test/java/okhttp3/internal/http2/HpackTest.java
+@@ -36,7 +36,7 @@
+ 
+   @Before public void reset() {
+     hpackReader = newReader(bytesIn);
+-    hpackWriter = new Hpack.Writer(bytesOut);
++    hpackWriter = new Hpack.Writer(4096, false, bytesOut);
+   }
+ 
+   /**
+@@ -111,7 +111,7 @@
+     // Set to only support 110 bytes (enough for 2 headers).
+     // Use a new Writer because we don't support change the dynamic table
+     // size after Writer constructed.
+-    Hpack.Writer writer = new Hpack.Writer(110, bytesOut);
++    Hpack.Writer writer = new Hpack.Writer(110, false, bytesOut);
+     writer.writeHeaders(headerBlock);
+ 
+     assertEquals(bytesIn, bytesOut);
+@@ -906,6 +906,25 @@ private void checkReadThirdRequestWithHuffman() {
+     assertEquals(16384, hpackWriter.maxDynamicTableByteCount);
+   }
+ 
++  @Test public void huffmanEncode() throws IOException {
++    hpackWriter = new Hpack.Writer(4096, true, bytesOut);
++    hpackWriter.writeHeaders(headerEntries("foo", "bar"));
++
++    ByteString expected = new Buffer()
++        .writeByte(0x40) // Literal header, new name.
++        .writeByte(0x82) // String literal is Huffman encoded (len = 2).
++        .writeByte(0x94) // 'foo' Huffman encoded.
++        .writeByte(0xE7)
++        .writeByte(3) // String literal not Huffman encoded (len = 3).
++        .writeByte('b')
++        .writeByte('a')
++        .writeByte('r')
++        .readByteString();
++
++    ByteString actual = bytesOut.readByteString();
++    assertEquals(expected, actual);
++  }
++
+   private Hpack.Reader newReader(Buffer source) {
+     return new Hpack.Reader(4096, source);
+   }
+diff --git a/okhttp-tests/src/test/java/okhttp3/internal/http2/HuffmanTest.java b/okhttp-tests/src/test/java/okhttp3/internal/http2/HuffmanTest.java
+index 17d81535b0..53642c0ea0 100644
+--- a/okhttp-tests/src/test/java/okhttp3/internal/http2/HuffmanTest.java
++++ b/okhttp-tests/src/test/java/okhttp3/internal/http2/HuffmanTest.java
+@@ -15,11 +15,11 @@
+  */
+ package okhttp3.internal.http2;
+ 
+-import java.io.ByteArrayOutputStream;
+-import java.io.DataOutputStream;
+ import java.io.IOException;
+ import java.util.Arrays;
+ import java.util.Random;
++import okio.Buffer;
++import okio.ByteString;
+ import org.junit.Test;
+ 
+ import static org.junit.Assert.assertEquals;
+@@ -30,23 +30,21 @@
+   @Test public void roundTripForRequestAndResponse() throws IOException {
+     String s = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789";
+     for (int i = 0; i < s.length(); i++) {
+-      assertRoundTrip(s.substring(0, i).getBytes());
++      assertRoundTrip(ByteString.encodeUtf8(s.substring(0, i)));
+     }
+ 
+     Random random = new Random(123456789L);
+     byte[] buf = new byte[4096];
+     random.nextBytes(buf);
+-    assertRoundTrip(buf);
++    assertRoundTrip(ByteString.of(buf));
+   }
+ 
+-  private void assertRoundTrip(byte[] buf) throws IOException {
+-    ByteArrayOutputStream baos = new ByteArrayOutputStream();
+-    DataOutputStream dos = new DataOutputStream(baos);
++  private void assertRoundTrip(ByteString data) throws IOException {
++    Buffer buffer = new Buffer();
++    Huffman.get().encode(data, buffer);
++    assertEquals(buffer.size(), Huffman.get().encodedLength(data));
+ 
+-    Huffman.get().encode(buf, dos);
+-    assertEquals(baos.size(), Huffman.get().encodedLength(buf));
+-
+-    byte[] decodedBytes = Huffman.get().decode(baos.toByteArray());
+-    assertTrue(Arrays.equals(buf, decodedBytes));
++    byte[] decodedBytes = Huffman.get().decode(buffer.readByteArray());
++    assertTrue(Arrays.equals(data.toByteArray(), decodedBytes));
+   }
+ }
+diff --git a/okhttp/src/main/java/okhttp3/internal/http2/Hpack.java b/okhttp/src/main/java/okhttp3/internal/http2/Hpack.java
+index 3ee89bbd23..405c2e273d 100644
+--- a/okhttp/src/main/java/okhttp3/internal/http2/Hpack.java
++++ b/okhttp/src/main/java/okhttp3/internal/http2/Hpack.java
+@@ -370,6 +370,7 @@ ByteString readByteString() throws IOException {
+     private static final int SETTINGS_HEADER_TABLE_SIZE_LIMIT = 16384;
+ 
+     private final Buffer out;
++    private final boolean useCompression;
+ 
+     /**
+      * In the scenario where the dynamic table size changes multiple times between transmission of
+@@ -389,12 +390,13 @@ ByteString readByteString() throws IOException {
+     int dynamicTableByteCount = 0;
+ 
+     Writer(Buffer out) {
+-      this(SETTINGS_HEADER_TABLE_SIZE, out);
++      this(SETTINGS_HEADER_TABLE_SIZE, true, out);
+     }
+ 
+-    Writer(int headerTableSizeSetting, Buffer out) {
++    Writer(int headerTableSizeSetting, boolean useCompression, Buffer out) {
+       this.headerTableSizeSetting = headerTableSizeSetting;
+       this.maxDynamicTableByteCount = headerTableSizeSetting;
++      this.useCompression = useCompression;
+       this.out = out;
+     }
+ 
+@@ -510,8 +512,16 @@ void writeInt(int value, int prefixMask, int bits) {
+     }
+ 
+     void writeByteString(ByteString data) throws IOException {
+-      writeInt(data.size(), PREFIX_7_BITS, 0);
+-      out.write(data);
++      if (useCompression && Huffman.get().encodedLength(data) < data.size()) {
++        Buffer huffmanBuffer = new Buffer();
++        Huffman.get().encode(data, huffmanBuffer);
++        ByteString huffmanBytes = huffmanBuffer.readByteString();
++        writeInt(huffmanBytes.size(), PREFIX_7_BITS, 0x80);
++        out.write(huffmanBytes);
++      } else {
++        writeInt(data.size(), PREFIX_7_BITS, 0);
++        out.write(data);
++      }
+     }
+ 
+     void setHeaderTableSizeSetting(int headerTableSizeSetting) {
+diff --git a/okhttp/src/main/java/okhttp3/internal/http2/Http2Writer.java b/okhttp/src/main/java/okhttp3/internal/http2/Http2Writer.java
+index 493fa86574..e23d8c9996 100644
+--- a/okhttp/src/main/java/okhttp3/internal/http2/Http2Writer.java
++++ b/okhttp/src/main/java/okhttp3/internal/http2/Http2Writer.java
+@@ -76,7 +76,7 @@ public synchronized void connectionPreface() throws IOException {
+   public synchronized void applyAndAckSettings(Settings peerSettings) throws IOException {
+     if (closed) throw new IOException("closed");
+     this.maxFrameSize = peerSettings.getMaxFrameSize(maxFrameSize);
+-    if (peerSettings.getHeaderTableSize() > -1) {
++    if (peerSettings.getHeaderTableSize() != -1) {
+       hpackWriter.setHeaderTableSizeSetting(peerSettings.getHeaderTableSize());
+     }
+     int length = 0;
+diff --git a/okhttp/src/main/java/okhttp3/internal/http2/Huffman.java b/okhttp/src/main/java/okhttp3/internal/http2/Huffman.java
+index 4e516279fc..32582e9f40 100644
+--- a/okhttp/src/main/java/okhttp3/internal/http2/Huffman.java
++++ b/okhttp/src/main/java/okhttp3/internal/http2/Huffman.java
+@@ -17,7 +17,8 @@
+ 
+ import java.io.ByteArrayOutputStream;
+ import java.io.IOException;
+-import java.io.OutputStream;
++import okio.BufferedSink;
++import okio.ByteString;
+ 
+ /**
+  * This class was originally composed from the following classes in <a
+@@ -87,12 +88,12 @@ private Huffman() {
+     buildTree();
+   }
+ 
+-  void encode(byte[] data, OutputStream out) throws IOException {
++  void encode(ByteString data, BufferedSink sink) throws IOException {
+     long current = 0;
+     int n = 0;
+ 
+-    for (int i = 0; i < data.length; i++) {
+-      int b = data[i] & 0xFF;
++    for (int i = 0; i < data.size(); i++) {
++      int b = data.getByte(i) & 0xFF;
+       int code = CODES[b];
+       int nbits = CODE_LENGTHS[b];
+ 
+@@ -102,22 +103,22 @@ void encode(byte[] data, OutputStream out) throws IOException {
+ 
+       while (n >= 8) {
+         n -= 8;
+-        out.write(((int) (current >> n)));
++        sink.writeByte(((int) (current >> n)));
+       }
+     }
+ 
+     if (n > 0) {
+       current <<= (8 - n);
+       current |= (0xFF >>> n);
+-      out.write((int) current);
++      sink.writeByte((int) current);
+     }
+   }
+ 
+-  int encodedLength(byte[] bytes) {
++  int encodedLength(ByteString bytes) {
+     long len = 0;
+ 
+-    for (int i = 0; i < bytes.length; i++) {
+-      int b = bytes[i] & 0xFF;
++    for (int i = 0; i < bytes.size(); i++) {
++      int b = bytes.getByte(i) & 0xFF;
+       len += CODE_LENGTHS[b];
+     }
+ 

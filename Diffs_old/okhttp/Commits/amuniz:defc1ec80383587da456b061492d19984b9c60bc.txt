@@ -1,0 +1,207 @@
+diff --git a/mockwebserver/src/main/java/okhttp3/mockwebserver/MockWebServer.java b/mockwebserver/src/main/java/okhttp3/mockwebserver/MockWebServer.java
+index 6e482dd461..17ea30300d 100644
+--- a/mockwebserver/src/main/java/okhttp3/mockwebserver/MockWebServer.java
++++ b/mockwebserver/src/main/java/okhttp3/mockwebserver/MockWebServer.java
+@@ -862,12 +862,17 @@ private FramedSocketHandler(Socket socket, Protocol protocol) {
+       RecordedRequest request = readRequest(stream);
+       requestCount.incrementAndGet();
+       requestQueue.add(request);
++
+       MockResponse response;
+       try {
+         response = dispatcher.dispatch(request);
+       } catch (InterruptedException e) {
+         throw new AssertionError(e);
+       }
++      if (response.getSocketPolicy() == DISCONNECT_AFTER_REQUEST) {
++        socket.close();
++        return;
++      }
+       writeResponse(stream, response);
+       if (logger.isLoggable(Level.INFO)) {
+         logger.info(MockWebServer.this + " received request: " + request
+diff --git a/okhttp-tests/src/test/java/okhttp3/CallTest.java b/okhttp-tests/src/test/java/okhttp3/CallTest.java
+index 5b7e450d1a..6ecdcb421a 100644
+--- a/okhttp-tests/src/test/java/okhttp3/CallTest.java
++++ b/okhttp-tests/src/test/java/okhttp3/CallTest.java
+@@ -94,7 +94,7 @@
+ import static org.junit.Assert.fail;
+ 
+ public final class CallTest {
+-  @Rule public final TestRule timeout = new Timeout(30_000);
++  @Rule public final TestRule timeout = new Timeout(30_000, TimeUnit.MILLISECONDS);
+   @Rule public final MockWebServer server = new MockWebServer();
+   @Rule public final MockWebServer server2 = new MockWebServer();
+   @Rule public final InMemoryFileSystem fileSystem = new InMemoryFileSystem();
+@@ -1000,6 +1000,11 @@ private void postBodyRetransmittedAfterAuthorizationFail(String body) throws Exc
+     executeSynchronously("/").assertBody("retry success");
+   }
+ 
++  @Test public void recoverWhenRetryOnConnectionFailureIsTrue_HTTP2() throws Exception {
++    enableProtocol(Protocol.HTTP_2);
++    recoverWhenRetryOnConnectionFailureIsTrue();
++  }
++
+   @Test public void noRecoverWhenRetryOnConnectionFailureIsFalse() throws Exception {
+     server.enqueue(new MockResponse().setBody("seed connection pool"));
+     server.enqueue(new MockResponse().setSocketPolicy(SocketPolicy.DISCONNECT_AFTER_REQUEST));
+@@ -1015,8 +1020,14 @@ private void postBodyRetransmittedAfterAuthorizationFail(String body) throws Exc
+     // If this succeeds, too many requests were made.
+     executeSynchronously("/")
+         .assertFailure(IOException.class)
+-        .assertFailureMatches("unexpected end of stream on Connection.*"
+-            + server.getHostName() + ":" + server.getPort() + ".*");
++        .assertFailureMatches("stream was reset: CANCEL",
++            "unexpected end of stream on Connection.*"
++                + server.getHostName() + ":" + server.getPort() + ".*");
++  }
++
++  @Test public void recoverWhenRetryOnConnectionFailureIsFalse_HTTP2() throws Exception {
++    enableProtocol(Protocol.HTTP_2);
++    noRecoverWhenRetryOnConnectionFailureIsFalse();
+   }
+ 
+   @Test public void recoverFromTlsHandshakeFailure() throws Exception {
+@@ -1233,6 +1244,11 @@ private void postBodyRetransmittedAfterAuthorizationFail(String body) throws Exc
+     assertEquals(0, post2.getSequenceNumber());
+   }
+ 
++  @Test public void postBodyRetransmittedOnFailureRecovery_HTTP2() throws Exception {
++    enableProtocol(Protocol.HTTP_2);
++    postBodyRetransmittedOnFailureRecovery();
++  }
++
+   @Test public void cacheHit() throws Exception {
+     server.enqueue(new MockResponse()
+         .addHeader("ETag: v1")
+diff --git a/okhttp-tests/src/test/java/okhttp3/RecordedResponse.java b/okhttp-tests/src/test/java/okhttp3/RecordedResponse.java
+index 460ab66846..b11854a277 100644
+--- a/okhttp-tests/src/test/java/okhttp3/RecordedResponse.java
++++ b/okhttp-tests/src/test/java/okhttp3/RecordedResponse.java
+@@ -154,10 +154,12 @@ public RecordedResponse assertFailure(String... messages) {
+     return this;
+   }
+ 
+-  public RecordedResponse assertFailureMatches(String pattern) {
++  public RecordedResponse assertFailureMatches(String... patterns) {
+     assertNotNull(failure);
+-    assertTrue(failure.getMessage(), failure.getMessage().matches(pattern));
+-    return this;
++    for (String pattern : patterns) {
++      if (failure.getMessage().matches(pattern)) return this;
++    }
++    throw new AssertionError(failure.getMessage());
+   }
+ 
+   public RecordedResponse assertSentRequestAtMillis(long minimum, long maximum) {
+diff --git a/okhttp-tests/src/test/java/okhttp3/internal/http2/HttpOverHttp2Test.java b/okhttp-tests/src/test/java/okhttp3/internal/http2/HttpOverHttp2Test.java
+index b6dcd10ec2..fe1bc01e22 100644
+--- a/okhttp-tests/src/test/java/okhttp3/internal/http2/HttpOverHttp2Test.java
++++ b/okhttp-tests/src/test/java/okhttp3/internal/http2/HttpOverHttp2Test.java
+@@ -42,6 +42,7 @@
+ import okhttp3.Request;
+ import okhttp3.RequestBody;
+ import okhttp3.Response;
++import okhttp3.TestUtil;
+ import okhttp3.internal.DoubleInetAddressDns;
+ import okhttp3.internal.RecordingOkAuthenticator;
+ import okhttp3.internal.SingleInetAddressDns;
+@@ -337,8 +338,7 @@
+     in.close();
+   }
+ 
+-  @Ignore // See https://github.com/square/okhttp/issues/578
+-  @Test(timeout = 3000) public void readResponseHeaderTimeout() throws Exception {
++  @Test public void readResponseHeaderTimeout() throws Exception {
+     server.enqueue(new MockResponse().setSocketPolicy(SocketPolicy.NO_RESPONSE));
+     server.enqueue(new MockResponse().setBody("A"));
+ 
+@@ -346,11 +346,27 @@
+         .readTimeout(1000, MILLISECONDS)
+         .build();
+ 
+-    Call call = client.newCall(new Request.Builder()
++    // Make a call expecting a timeout reading the response headers.
++    Call call1 = client.newCall(new Request.Builder()
+         .url(server.url("/"))
+         .build());
+-    Response response = call.execute();
+-    assertEquals("A", response.body().string());
++    try {
++      call1.execute();
++      fail("Should have timed out!");
++    } catch (SocketTimeoutException expected) {
++      assertEquals("timeout", expected.getMessage());
++    }
++
++    // Confirm that a subsequent request on the same connection is not impacted.
++    Call call2 = client.newCall(new Request.Builder()
++        .url(server.url("/"))
++        .build());
++    Response response2 = call2.execute();
++    assertEquals("A", response2.body().string());
++
++    // Confirm that the connection was reused.
++    assertEquals(0, server.takeRequest().getSequenceNumber());
++    assertEquals(1, server.takeRequest().getSequenceNumber());
+   }
+ 
+   /**
+@@ -383,27 +399,39 @@
+    * time.
+    */
+   @Test public void readTimeoutOnSlowConnection() throws Exception {
+-    char[] body = new char[2048]; // 2KiB to read.
+-    Arrays.fill(body, 'y');
++    String body = TestUtil.repeat('y', 2048);
+     server.enqueue(new MockResponse()
+-        .setBody(new String(body))
++        .setBody(body)
+         .throttleBody(1024, 1, SECONDS)); // Slow connection 1KiB/second.
++    server.enqueue(new MockResponse()
++        .setBody(body));
+ 
+     client = client.newBuilder()
+         .readTimeout(500, MILLISECONDS) // Half a second to read something.
+         .build();
+ 
+-    Call call = client.newCall(new Request.Builder()
++    // Make a call expecting a timeout reading the response body.
++    Call call1 = client.newCall(new Request.Builder()
+         .url(server.url("/"))
+         .build());
+-    Response response = call.execute();
+-
++    Response response1 = call1.execute();
+     try {
+-      response.body().string();
++      response1.body().string();
+       fail("Should have timed out!");
+     } catch (SocketTimeoutException expected) {
+       assertEquals("timeout", expected.getMessage());
+     }
++
++    // Confirm that a subsequent request on the same connection is not impacted.
++    Call call2 = client.newCall(new Request.Builder()
++        .url(server.url("/"))
++        .build());
++    Response response2 = call2.execute();
++    assertEquals(body, response2.body().string());
++
++    // Confirm that the connection was reused.
++    assertEquals(0, server.takeRequest().getSequenceNumber());
++    assertEquals(1, server.takeRequest().getSequenceNumber());
+   }
+ 
+   @Test public void connectionTimeout() throws Exception {
+@@ -435,6 +463,10 @@
+       fail();
+     } catch (IOException expected) {
+     }
++
++    // Confirm that the connection was reused.
++    assertEquals(0, server.takeRequest().getSequenceNumber());
++    assertEquals(1, server.takeRequest().getSequenceNumber());
+   }
+ 
+   @Test public void responsesAreCached() throws IOException {

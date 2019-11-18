@@ -1,0 +1,117 @@
+diff --git a/library/src/main/java/com/google/android/exoplayer/extractor/ts/H264Reader.java b/library/src/main/java/com/google/android/exoplayer/extractor/ts/H264Reader.java
+index 86c31d7c8b..e20781adb5 100644
+--- a/library/src/main/java/com/google/android/exoplayer/extractor/ts/H264Reader.java
++++ b/library/src/main/java/com/google/android/exoplayer/extractor/ts/H264Reader.java
+@@ -68,11 +68,11 @@
+   // Scratch variables to avoid allocations.
+   private final ParsableByteArray seiWrapper;
+ 
+-  public H264Reader(TrackOutput output, SeiReader seiReader, boolean idrKeyframesOnly) {
++  public H264Reader(TrackOutput output, SeiReader seiReader, boolean allowNonIdrKeyframes) {
+     super(output);
+     this.seiReader = seiReader;
+     prefixFlags = new boolean[3];
+-    ifrParserBuffer = (idrKeyframesOnly) ? null : new IfrParserBuffer();
++    ifrParserBuffer = allowNonIdrKeyframes ? new IfrParserBuffer() : null;
+     sps = new NalUnitTargetBuffer(NAL_UNIT_TYPE_SPS, 128);
+     pps = new NalUnitTargetBuffer(NAL_UNIT_TYPE_PPS, 128);
+     sei = new NalUnitTargetBuffer(NAL_UNIT_TYPE_SEI, 128);
+diff --git a/library/src/main/java/com/google/android/exoplayer/extractor/ts/TsExtractor.java b/library/src/main/java/com/google/android/exoplayer/extractor/ts/TsExtractor.java
+index b8591b7e6d..675c626272 100644
+--- a/library/src/main/java/com/google/android/exoplayer/extractor/ts/TsExtractor.java
++++ b/library/src/main/java/com/google/android/exoplayer/extractor/ts/TsExtractor.java
+@@ -36,6 +36,10 @@
+  */
+ public final class TsExtractor implements Extractor {
+ 
++  public static final int WORKAROUND_ALLOW_NON_IDR_KEYFRAMES = 1;
++  public static final int WORKAROUND_IGNORE_AAC_STREAM = 2;
++  public static final int WORKAROUND_IGNORE_H264_STREAM = 4;
++
+   private static final String TAG = "TsExtractor";
+ 
+   private static final int TS_PACKET_SIZE = 188;
+@@ -60,7 +64,7 @@
+   private static final long HEVC_FORMAT_IDENTIFIER = Util.getIntegerCodeForString("HEVC");
+ 
+   private final PtsTimestampAdjuster ptsTimestampAdjuster;
+-  private final boolean idrKeyframesOnly;
++  private final int workaroundFlags;
+   private final ParsableByteArray tsPacketBuffer;
+   private final ParsableBitArray tsScratch;
+   /* package */ final SparseArray<TsPayloadReader> tsPayloadReaders; // Indexed by pid
+@@ -75,12 +79,12 @@ public TsExtractor() {
+   }
+ 
+   public TsExtractor(PtsTimestampAdjuster ptsTimestampAdjuster) {
+-    this(ptsTimestampAdjuster, true);
++    this(ptsTimestampAdjuster, 0);
+   }
+ 
+-  public TsExtractor(PtsTimestampAdjuster ptsTimestampAdjuster, boolean idrKeyframesOnly) {
++  public TsExtractor(PtsTimestampAdjuster ptsTimestampAdjuster, int workaroundFlags) {
+     this.ptsTimestampAdjuster = ptsTimestampAdjuster;
+-    this.idrKeyframesOnly = idrKeyframesOnly;
++    this.workaroundFlags = workaroundFlags;
+     tsPacketBuffer = new ParsableByteArray(TS_PACKET_SIZE);
+     tsScratch = new ParsableBitArray(new byte[3]);
+     tsPayloadReaders = new SparseArray<>();
+@@ -337,8 +341,8 @@ public void consume(ParsableByteArray data, boolean payloadUnitStartIndicator,
+             pesPayloadReader = new MpegAudioReader(output.track(TS_STREAM_TYPE_MPA_LSF));
+             break;
+           case TS_STREAM_TYPE_AAC:
+-            pesPayloadReader = new AdtsReader(output.track(TS_STREAM_TYPE_AAC),
+-                new DummyTrackOutput());
++            pesPayloadReader = (workaroundFlags & WORKAROUND_IGNORE_AAC_STREAM) != 0 ? null
++                : new AdtsReader(output.track(TS_STREAM_TYPE_AAC), new DummyTrackOutput());
+             break;
+           case TS_STREAM_TYPE_AC3:
+             pesPayloadReader = new Ac3Reader(output.track(TS_STREAM_TYPE_AC3), false);
+@@ -354,8 +358,10 @@ public void consume(ParsableByteArray data, boolean payloadUnitStartIndicator,
+             pesPayloadReader = new H262Reader(output.track(TS_STREAM_TYPE_H262));
+             break;
+           case TS_STREAM_TYPE_H264:
+-            pesPayloadReader = new H264Reader(output.track(TS_STREAM_TYPE_H264),
+-                new SeiReader(output.track(TS_STREAM_TYPE_EIA608)), idrKeyframesOnly);
++            pesPayloadReader = (workaroundFlags & WORKAROUND_IGNORE_H264_STREAM) != 0 ? null
++                : new H264Reader(output.track(TS_STREAM_TYPE_H264),
++                    new SeiReader(output.track(TS_STREAM_TYPE_EIA608)),
++                    (workaroundFlags & WORKAROUND_ALLOW_NON_IDR_KEYFRAMES) != 0);
+             break;
+           case TS_STREAM_TYPE_H265:
+             pesPayloadReader = new H265Reader(output.track(TS_STREAM_TYPE_H265),
+diff --git a/library/src/main/java/com/google/android/exoplayer/hls/HlsChunkSource.java b/library/src/main/java/com/google/android/exoplayer/hls/HlsChunkSource.java
+index 803f8fbd79..39288400ff 100644
+--- a/library/src/main/java/com/google/android/exoplayer/hls/HlsChunkSource.java
++++ b/library/src/main/java/com/google/android/exoplayer/hls/HlsChunkSource.java
+@@ -39,6 +39,7 @@
+ 
+ import android.net.Uri;
+ import android.os.SystemClock;
++import android.text.TextUtils;
+ import android.util.Log;
+ 
+ import java.io.ByteArrayInputStream;
+@@ -498,8 +499,21 @@ public void getChunkOperation(TsChunk previousTsChunk, long playbackPositionUs,
+         // The master source has yet to instantiate an adjuster for the discontinuity sequence.
+         return;
+       }
++      int workaroundFlags = 0;
++      String codecs = format.codecs;
++      if (!TextUtils.isEmpty(codecs)) {
++        // Sometimes AAC and H264 streams are declared in TS chunks even though they don't really
++        // exist. If we know from the codec attribute that they don't exist, then we can explicitly
++        // ignore them even if they're declared.
++        if (MimeTypes.getAudioMediaMimeType(codecs) != MimeTypes.AUDIO_AAC) {
++          workaroundFlags |= TsExtractor.WORKAROUND_IGNORE_AAC_STREAM;
++        }
++        if (MimeTypes.getVideoMediaMimeType(codecs) != MimeTypes.VIDEO_H264) {
++          workaroundFlags |= TsExtractor.WORKAROUND_IGNORE_H264_STREAM;
++        }
++      }
++      Extractor extractor = new TsExtractor(timestampAdjuster, workaroundFlags);
+       ExposedTrack selectedTrack = tracks.get(selectedTrackIndex);
+-      Extractor extractor = new TsExtractor(timestampAdjuster);
+       extractorWrapper = new HlsExtractorWrapper(trigger, format, startTimeUs, extractor,
+           switchingVariantSpliced, selectedTrack.adaptiveMaxWidth, selectedTrack.adaptiveMaxHeight);
+     } else {

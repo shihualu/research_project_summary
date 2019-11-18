@@ -1,0 +1,519 @@
+diff --git a/compiler/src/it/functional-tests/src/main/java/test/cycle/Cycles.java b/compiler/src/it/functional-tests/src/main/java/test/cycle/Cycles.java
+index 7c9292ef2..7cfd10a08 100644
+--- a/compiler/src/it/functional-tests/src/main/java/test/cycle/Cycles.java
++++ b/compiler/src/it/functional-tests/src/main/java/test/cycle/Cycles.java
+@@ -17,9 +17,15 @@
+ 
+ import dagger.Component;
+ import dagger.Lazy;
++import dagger.Module;
++import dagger.Provides;
+ import dagger.Subcomponent;
++import java.util.Map;
+ import javax.inject.Inject;
+ import javax.inject.Provider;
++import test.TestStringKey;
++
++import static dagger.Provides.Type.MAP;
+ 
+ /**
+  * Cycle classes used for testing cyclic dependencies.
+@@ -91,6 +97,47 @@ private Cycles() {}
+     }
+   }
+ 
++  static class X {
++    public final Y y;
++
++    @Inject
++    X(Y y) {
++      this.y = y;
++    }
++  }
++
++  static class Y {
++    public final Map<String, Provider<X>> mapOfProvidersOfX;
++    public final Map<String, Provider<Y>> mapOfProvidersOfY;
++
++    @Inject
++    Y(Map<String, Provider<X>> mapOfProvidersOfX, Map<String, Provider<Y>> mapOfProvidersOfY) {
++      this.mapOfProvidersOfX = mapOfProvidersOfX;
++      this.mapOfProvidersOfY = mapOfProvidersOfY;
++    }
++  }
++
++  @Module
++  static class CycleMapModule {
++    @Provides(type = MAP)
++    @TestStringKey("X")
++    static X x(X x) {
++      return x;
++    }
++
++    @Provides(type = MAP)
++    @TestStringKey("Y")
++    static Y y(Y y) {
++      return y;
++    }
++  }
++
++  @SuppressWarnings("dependency-cycle")
++  @Component(modules = CycleMapModule.class)
++  interface CycleMapComponent {
++    Y y();
++  }
++
+   @SuppressWarnings("dependency-cycle")
+   @Component
+   interface CycleComponent {
+diff --git a/compiler/src/it/functional-tests/src/test/java/test/cycle/CycleTest.java b/compiler/src/it/functional-tests/src/test/java/test/cycle/CycleTest.java
+index b580dc524..d3bc2cbad 100644
+--- a/compiler/src/it/functional-tests/src/test/java/test/cycle/CycleTest.java
++++ b/compiler/src/it/functional-tests/src/test/java/test/cycle/CycleTest.java
+@@ -22,6 +22,7 @@
+ import test.cycle.Cycles.C;
+ import test.cycle.Cycles.ChildCycleComponent;
+ import test.cycle.Cycles.CycleComponent;
++import test.cycle.Cycles.CycleMapComponent;
+ import test.cycle.Cycles.S;
+ import test.cycle.Cycles.SelfCycleComponent;
+ 
+@@ -70,4 +71,21 @@ public void subcomponentIndirectionCycle() {
+     assertThat(a.b.c.aProvider.get()).isNotNull();
+     assertThat(a.e.d.b.c.aProvider.get()).isNotNull();
+   }
++  
++  @Test
++  public void providerMapIndirectionCycle() {
++    CycleMapComponent cycleMapComponent = DaggerCycles_CycleMapComponent.create();
++    assertThat(cycleMapComponent.y()).isNotNull();
++    assertThat(cycleMapComponent.y().mapOfProvidersOfX).containsKey("X");
++    assertThat(cycleMapComponent.y().mapOfProvidersOfX.get("X")).isNotNull();
++    assertThat(cycleMapComponent.y().mapOfProvidersOfX.get("X").get()).isNotNull();
++    assertThat(cycleMapComponent.y().mapOfProvidersOfX.get("X").get().y).isNotNull();
++    assertThat(cycleMapComponent.y().mapOfProvidersOfX).hasSize(1);
++    assertThat(cycleMapComponent.y().mapOfProvidersOfY).containsKey("Y");
++    assertThat(cycleMapComponent.y().mapOfProvidersOfY.get("Y")).isNotNull();
++    assertThat(cycleMapComponent.y().mapOfProvidersOfY.get("Y").get()).isNotNull();
++    assertThat(cycleMapComponent.y().mapOfProvidersOfY.get("Y").get().mapOfProvidersOfX).hasSize(1);
++    assertThat(cycleMapComponent.y().mapOfProvidersOfY.get("Y").get().mapOfProvidersOfY).hasSize(1);
++    assertThat(cycleMapComponent.y().mapOfProvidersOfY).hasSize(1);
++  }
+ }
+diff --git a/compiler/src/main/java/dagger/internal/codegen/BindingGraphValidator.java b/compiler/src/main/java/dagger/internal/codegen/BindingGraphValidator.java
+index ebc6c580f..3ddf36c45 100644
+--- a/compiler/src/main/java/dagger/internal/codegen/BindingGraphValidator.java
++++ b/compiler/src/main/java/dagger/internal/codegen/BindingGraphValidator.java
+@@ -35,6 +35,7 @@
+ import com.google.common.collect.Ordering;
+ import com.google.common.collect.Sets;
+ import dagger.Component;
++import dagger.Lazy;
+ import dagger.internal.codegen.ComponentDescriptor.BuilderSpec;
+ import dagger.internal.codegen.ComponentDescriptor.ComponentMethodDescriptor;
+ import dagger.internal.codegen.ContributionBinding.BindingType;
+@@ -44,10 +45,12 @@
+ import java.util.Collection;
+ import java.util.Deque;
+ import java.util.Formatter;
++import java.util.HashSet;
+ import java.util.Iterator;
+-import java.util.List;
++import java.util.LinkedHashSet;
+ import java.util.Map;
+ import java.util.Set;
++import javax.inject.Provider;
+ import javax.inject.Singleton;
+ import javax.lang.model.element.AnnotationMirror;
+ import javax.lang.model.element.Element;
+@@ -60,12 +63,16 @@
+ import javax.lang.model.util.SimpleTypeVisitor6;
+ import javax.lang.model.util.Types;
+ import javax.tools.Diagnostic;
+-import javax.tools.Diagnostic.Kind;
+ 
+ import static com.google.auto.common.MoreElements.getAnnotationMirror;
++import static com.google.auto.common.MoreTypes.asDeclared;
+ import static com.google.auto.common.MoreTypes.isTypeOf;
++import static com.google.common.base.Predicates.equalTo;
++import static com.google.common.base.Predicates.not;
+ import static com.google.common.base.Verify.verify;
+ import static com.google.common.collect.Iterables.getOnlyElement;
++import static com.google.common.collect.Iterables.indexOf;
++import static com.google.common.collect.Iterables.skip;
+ import static dagger.internal.codegen.ConfigurationAnnotations.getComponentDependencies;
+ import static dagger.internal.codegen.ContributionBinding.indexMapBindingsByMapKey;
+ import static dagger.internal.codegen.ErrorMessages.INDENT;
+@@ -78,6 +85,13 @@
+ import static dagger.internal.codegen.ErrorMessages.duplicateMapKeysError;
+ import static dagger.internal.codegen.ErrorMessages.stripCommonTypePrefixes;
+ import static dagger.internal.codegen.InjectionAnnotations.getScopeAnnotation;
++import static dagger.internal.codegen.Util.getKeyTypeOfMap;
++import static dagger.internal.codegen.Util.getProvidedValueTypeOfMap;
++import static dagger.internal.codegen.Util.getValueTypeOfMap;
++import static dagger.internal.codegen.Util.isMapWithNonProvidedValues;
++import static dagger.internal.codegen.Util.isMapWithProvidedValues;
++import static javax.tools.Diagnostic.Kind.ERROR;
++import static javax.tools.Diagnostic.Kind.WARNING;
+ 
+ public class BindingGraphValidator {
+ 
+@@ -141,9 +155,12 @@ void validateSubgraph() {
+            subject.componentDescriptor().componentMethods()) {
+         Optional<DependencyRequest> entryPoint = componentMethod.dependencyRequest();
+         if (entryPoint.isPresent()) {
+-          traverseRequest(entryPoint.get(), new ArrayDeque<ResolvedRequest>(),
+-              Sets.<BindingKey>newHashSet(), subject,
+-              Sets.<DependencyRequest>newHashSet());
++          traverseRequest(
++              entryPoint.get(),
++              new ArrayDeque<ResolvedRequest>(),
++              new LinkedHashSet<BindingKey>(),
++              subject,
++              new HashSet<DependencyRequest>());
+         }
+       }
+ 
+@@ -155,17 +172,35 @@ void validateSubgraph() {
+       }
+     }
+ 
++    /**
++     * Traverse the resolved dependency requests, validating resolved bindings, and reporting any
++     * cycles found.
++     *
++     * @param request the current dependency request
++     * @param bindingPath the dependency request path from the parent of {@code request} at the head
++     *     up to the root dependency request from the component method at the tail
++     * @param keysInPath the binding keys corresponding to the dependency requests in
++     *     {@code bindingPath}, but in reverse order: the first element is the binding key from the
++     *     component method
++     * @param resolvedRequests the requests that have already been resolved, so we can avoid
++     *     traversing that part of the graph again
++     */
++    // TODO(dpb): It might be simpler to invert bindingPath's order.
+     private void traverseRequest(
+         DependencyRequest request,
+         Deque<ResolvedRequest> bindingPath,
+-        Set<BindingKey> keysInPath,
++        LinkedHashSet<BindingKey> keysInPath,
+         BindingGraph graph,
+         Set<DependencyRequest> resolvedRequests) {
+       verify(bindingPath.size() == keysInPath.size(),
+           "mismatched path vs keys -- (%s vs %s)", bindingPath, keysInPath);
+       BindingKey requestKey = request.bindingKey();
+       if (keysInPath.contains(requestKey)) {
+-        reportCycle(request, bindingPath);
++        reportCycle(
++            // Invert bindingPath to match keysInPath's order
++            ImmutableList.copyOf(bindingPath).reverse(),
++            request,
++            indexOf(keysInPath, equalTo(requestKey)));
+         return;
+       }
+ 
+@@ -776,68 +811,111 @@ private void reportDuplicateMapKeys(
+       reportBuilder.addError(builder.toString(), path.getLast().request().requestElement());
+     }
+ 
+-    private void reportCycle(DependencyRequest request, Deque<ResolvedRequest> bindingPath) {
+-      ImmutableList<DependencyRequest> pathElements = ImmutableList.<DependencyRequest>builder()
+-          .add(request)
+-          .addAll(Iterables.transform(bindingPath, REQUEST_FROM_RESOLVED_REQUEST))
+-          .build();
+-      ImmutableList<DependencyRequest> cycleElements =
+-          findCycle(pathElements, request.bindingKey());
+-      ImmutableList<String> printableDependencyPath =
+-          FluentIterable.from(pathElements)
+-              .transform(dependencyRequestFormatter)
+-              .filter(Predicates.not(Predicates.equalTo("")))
+-              .toList()
+-              .reverse();
+-      DependencyRequest rootRequest = bindingPath.getLast().request();
+-      TypeElement componentType =
+-          MoreElements.asType(rootRequest.requestElement().getEnclosingElement());
+-      Kind kind = cycleHasProviderOrLazy(cycleElements) ? Kind.WARNING : Kind.ERROR;
+-      Element requestElement = rootRequest.requestElement();
+-      if (kind == Kind.WARNING
+-              && (suppressCycleWarnings(requestElement)
+-                  || suppressCycleWarnings(requestElement.getEnclosingElement())
+-                  || suppressCycleWarnings(cycleElements))) {
++    /**
++     * Reports a cycle in the binding path.
++     *
++     * @param bindingPath the binding path, starting with the component provision dependency, and
++     *     ending with the binding that depends on {@code request}
++     * @param request the request that would have been added to the binding path if its
++     *     {@linkplain DependencyRequest#bindingKey() binding key} wasn't already in it
++     * @param indexOfDuplicatedKey the index of the dependency request in {@code bindingPath} whose
++     *     {@linkplain DependencyRequest#bindingKey() binding key} matches {@code request}'s
++     */
++    private void reportCycle(
++        Iterable<ResolvedRequest> bindingPath,
++        DependencyRequest request,
++        int indexOfDuplicatedKey) {
++      ImmutableList<DependencyRequest> requestPath =
++          FluentIterable.from(bindingPath)
++              .transform(REQUEST_FROM_RESOLVED_REQUEST)
++              .append(request)
++              .toList();
++      Element rootRequestElement = requestPath.get(0).requestElement();
++      ImmutableList<DependencyRequest> cycle =
++          requestPath.subList(indexOfDuplicatedKey, requestPath.size());
++      Diagnostic.Kind kind = cycleHasProviderOrLazy(cycle) ? WARNING : ERROR;
++      if (kind == WARNING
++          && (suppressCycleWarnings(rootRequestElement)
++              || suppressCycleWarnings(rootRequestElement.getEnclosingElement())
++              || suppressCycleWarnings(cycle))) {
+         return;
+       }
+-      // TODO(cgruber): Restructure to provide a hint for the start and end of the cycle.
++      // TODO(cgruber): Provide a hint for the start and end of the cycle.
++      TypeElement componentType = MoreElements.asType(rootRequestElement.getEnclosingElement());
+       reportBuilder.addItem(
+-          String.format(ErrorMessages.CONTAINS_DEPENDENCY_CYCLE_FORMAT,
++          String.format(
++              ErrorMessages.CONTAINS_DEPENDENCY_CYCLE_FORMAT,
+               componentType.getQualifiedName(),
+-              rootRequest.requestElement().getSimpleName(),
++              rootRequestElement.getSimpleName(),
+               Joiner.on("\n")
+-                  .join(printableDependencyPath.subList(1, printableDependencyPath.size()))),
++                  .join(
++                      FluentIterable.from(requestPath)
++                          .transform(dependencyRequestFormatter)
++                          .filter(not(equalTo("")))
++                          .skip(1))),
+           kind,
+-          rootRequest.requestElement());
++          rootRequestElement);
+     }
+ 
+-    private ImmutableList<DependencyRequest> findCycle(
+-        List<DependencyRequest> pathElements, BindingKey cycleStartingKey) {
+-      ImmutableList.Builder<DependencyRequest> cyclePath = ImmutableList.builder();
+-      boolean cycle = false;
+-      for (DependencyRequest dependencyRequest : pathElements) {
+-        if (dependencyRequest.bindingKey().equals(cycleStartingKey)) {
+-          cycle = !cycle;
+-          if (!cycle) {
+-            return cyclePath.build();
+-          }
+-        }
+-        if (cycle) {
+-          cyclePath.add(dependencyRequest);
+-        }
+-      }
+-      return cyclePath.build();
+-    }
++    /**
++     * Returns {@code true} if any step of a dependency cycle after the first is a {@link Provider}
++     * or {@link Lazy} or a {@code Map<K, Provider<V>>}.
++     *
++     * <p>If an implicit {@link Provider} dependency on {@code Map<K, Provider<V>>} is immediately
++     * preceded by a dependency on {@code Map<K, V>}, which means that the map's {@link Provider}s'
++     * {@link Provider#get() get()} methods are called during provision and so the cycle is not
++     * really broken.
++     */
++    private boolean cycleHasProviderOrLazy(ImmutableList<DependencyRequest> cycle) {
++      DependencyRequest lastDependencyRequest = cycle.get(0);
++      for (DependencyRequest dependencyRequest : skip(cycle, 1)) {
++        switch (dependencyRequest.kind()) {
++          case PROVIDER:
++            if (!isImplicitProviderMapForValueMap(dependencyRequest, lastDependencyRequest)) {
++              return true;
++            }
++            break;
+ 
+-    private boolean cycleHasProviderOrLazy(ImmutableList<DependencyRequest> pathElements) {
+-      for (DependencyRequest dependencyRequest : pathElements) {
+-        if (dependencyRequest.kind() == DependencyRequest.Kind.PROVIDER
+-            || dependencyRequest.kind() == DependencyRequest.Kind.LAZY) {
+-          return true;
++          case LAZY:
++            return true;
++
++          case INSTANCE:
++            if (isMapWithProvidedValues(dependencyRequest.key().type())) {
++              return true;
++            } else {
++              break;
++            }
++
++          default:
++            break;
+         }
++        lastDependencyRequest = dependencyRequest;
+       }
+       return false;
+     }
++
++    /**
++     * Returns {@code true} if {@code maybeValueMapRequest}'s key type is {@code Map<K, V>} and
++     * {@code maybeProviderMapRequest}'s key type is {@code Map<K, Provider<V>>}, and both keys have
++     * the same qualifier.
++     */
++    private boolean isImplicitProviderMapForValueMap(
++        DependencyRequest maybeProviderMapRequest, DependencyRequest maybeValueMapRequest) {
++      TypeMirror maybeProviderMapRequestType = maybeProviderMapRequest.key().type();
++      TypeMirror maybeValueMapRequestType = maybeValueMapRequest.key().type();
++      return maybeProviderMapRequest
++              .key()
++              .wrappedQualifier()
++              .equals(maybeValueMapRequest.key().wrappedQualifier())
++          && isMapWithProvidedValues(maybeProviderMapRequestType)
++          && isMapWithNonProvidedValues(maybeValueMapRequestType)
++          && types.isSameType(
++              getKeyTypeOfMap(asDeclared(maybeProviderMapRequestType)),
++              getKeyTypeOfMap(asDeclared(maybeValueMapRequestType)))
++          && types.isSameType(
++              getProvidedValueTypeOfMap(asDeclared(maybeProviderMapRequestType)),
++              getValueTypeOfMap(asDeclared(maybeValueMapRequestType)));
++    }
+   }
+   
+   private boolean suppressCycleWarnings(Element requestElement) {
+diff --git a/compiler/src/main/java/dagger/internal/codegen/Util.java b/compiler/src/main/java/dagger/internal/codegen/Util.java
+index 7742067c0..faa0459c4 100644
+--- a/compiler/src/main/java/dagger/internal/codegen/Util.java
++++ b/compiler/src/main/java/dagger/internal/codegen/Util.java
+@@ -16,9 +16,6 @@
+  */
+ package dagger.internal.codegen;
+ 
+-import static com.google.auto.common.MoreElements.getLocalAndInheritedMethods;
+-
+-import com.google.auto.common.MoreElements;
+ import com.google.auto.common.MoreTypes;
+ import com.google.common.base.Equivalence;
+ import com.google.common.base.Equivalence.Wrapper;
+@@ -36,6 +33,7 @@
+ import javax.lang.model.type.TypeMirror;
+ import javax.lang.model.util.Elements;
+ 
++import static com.google.auto.common.MoreElements.getLocalAndInheritedMethods;
+ import static com.google.auto.common.MoreTypes.asDeclared;
+ import static com.google.common.base.Preconditions.checkState;
+ import static javax.lang.model.element.ElementKind.CONSTRUCTOR;
+@@ -51,19 +49,19 @@
+    * Returns the {@code V} type for a {@link Map} type like Map<K, Provider<V>>} if the map
+    * includes such a construction
+    */
+-  public static TypeMirror getProvidedValueTypeOfMap(DeclaredType mapType) {
++  public static DeclaredType getProvidedValueTypeOfMap(DeclaredType mapType) {
+     checkState(MoreTypes.isTypeOf(Map.class, mapType), "%s is not a Map.", mapType);
+-    return MoreTypes.asDeclared(mapType.getTypeArguments().get(1)).getTypeArguments().get(0);
++    return asDeclared(asDeclared(mapType.getTypeArguments().get(1)).getTypeArguments().get(0));
+   }
+ 
+   // TODO(cgruber): Consider an object that holds and exposes the various parts of a Map type.
+   /**
+    * returns the value type for a {@link Map} type like Map<K, V>}.
+    */
+-  public static TypeMirror getValueTypeOfMap(DeclaredType mapType) {
++  public static DeclaredType getValueTypeOfMap(DeclaredType mapType) {
+     checkState(MoreTypes.isTypeOf(Map.class, mapType), "%s is not a Map.", mapType);
+     List<? extends TypeMirror> mapArgs = mapType.getTypeArguments();
+-    return mapArgs.get(1);
++    return asDeclared(mapArgs.get(1));
+   }
+ 
+   /**
+@@ -84,6 +82,15 @@ public static boolean isMapWithNonProvidedValues(TypeMirror type) {
+         && !MoreTypes.isTypeOf(Provider.class, asDeclared(type).getTypeArguments().get(1));
+   }
+ 
++  /**
++   * Returns true if {@code type} is a {@link Map} whose value type is a {@link Provider}.
++   */
++  public static boolean isMapWithProvidedValues(TypeMirror type) {
++    return MoreTypes.isType(type)
++        && MoreTypes.isTypeOf(Map.class, type)
++        && MoreTypes.isTypeOf(Provider.class, asDeclared(type).getTypeArguments().get(1));
++  }
++
+   /**
+    * Wraps an {@link Optional} of a type in an {@code Optional} of a {@link Wrapper} for that type.
+    */
+diff --git a/compiler/src/test/java/dagger/internal/codegen/GraphValidationTest.java b/compiler/src/test/java/dagger/internal/codegen/GraphValidationTest.java
+index 2aef82a49..5356c2722 100644
+--- a/compiler/src/test/java/dagger/internal/codegen/GraphValidationTest.java
++++ b/compiler/src/test/java/dagger/internal/codegen/GraphValidationTest.java
+@@ -243,6 +243,77 @@
+         .onLine(27);
+   }
+ 
++  @Test
++  public void cyclicDependencyNotBrokenByMapBinding() {
++    JavaFileObject component =
++        JavaFileObjects.forSourceLines(
++            "test.Outer",
++            "package test;",
++            "",
++            "import dagger.Component;",
++            "import dagger.MapKey;",
++            "import dagger.Module;",
++            "import dagger.Provides;",
++            "import java.util.Map;",
++            "import javax.inject.Inject;",
++            "",
++            "final class Outer {",
++            "  static class A {",
++            "    @Inject A(Map<String, C> cMap) {}",
++            "  }",
++            "",
++            "  static class B {",
++            "    @Inject B(A aParam) {}",
++            "  }",
++            "",
++            "  static class C {",
++            "    @Inject C(B bParam) {}",
++            "  }",
++            "",
++            "  @Component(modules = CModule.class)",
++            "  interface CComponent {",
++            "    C getC();",
++            "  }",
++            "",
++            "  @Module",
++            "  static class CModule {",
++            "    @Provides(type = Provides.Type.MAP)",
++            "    @StringKey(\"C\")",
++            "    static C c(C c) {",
++            "      return c;",
++            "    }",
++            "  }",
++            "",
++            "  @MapKey",
++            "  @interface StringKey {",
++            "    String value();",
++            "  }",
++            "}");
++
++    String expectedError =
++        Joiner.on('\n')
++            .join(
++                "test.Outer.CComponent.getC() contains a dependency cycle:",
++                "      test.Outer.C.<init>(test.Outer.B bParam)",
++                "          [parameter: test.Outer.B bParam]",
++                "      test.Outer.B.<init>(test.Outer.A aParam)",
++                "          [parameter: test.Outer.A aParam]",
++                "      test.Outer.A.<init>(java.util.Map<java.lang.String,test.Outer.C> cMap)",
++                "          [parameter: java.util.Map<java.lang.String,test.Outer.C> cMap]",
++                "      test.Outer.A.<init>(java.util.Map<java.lang.String,test.Outer.C> cMap)",
++                "          [parameter: java.util.Map<java.lang.String,test.Outer.C> cMap]",
++                "      test.Outer.CModule.c(test.Outer.C c)",
++                "          [parameter: test.Outer.C c]");
++
++    assertAbout(javaSource())
++        .that(component)
++        .processedWith(new ComponentProcessor())
++        .failsToCompile()
++        .withErrorContaining(expectedError)
++        .in(component)
++        .onLine(25);
++  }
++
+   @Test
+   public void falsePositiveCyclicDependencyIndirectionDetected() {
+     JavaFileObject component =

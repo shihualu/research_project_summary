@@ -1,0 +1,475 @@
+diff --git a/okhttp-tests/src/test/java/okhttp3/EventListenerTest.java b/okhttp-tests/src/test/java/okhttp3/EventListenerTest.java
+index f74c423f89..4ab093b4b1 100644
+--- a/okhttp-tests/src/test/java/okhttp3/EventListenerTest.java
++++ b/okhttp-tests/src/test/java/okhttp3/EventListenerTest.java
+@@ -66,6 +66,9 @@
+         .dns(singleDns)
+         .eventListener(listener)
+         .build();
++
++    listener.forbidLock(client.connectionPool());
++    listener.forbidLock(client.dispatcher());
+   }
+ 
+   @After public void tearDown() throws Exception {
+@@ -75,40 +78,42 @@
+   }
+ 
+   @Test public void successfulCallEventSequence() throws IOException {
+-    server.enqueue(new MockResponse());
++    server.enqueue(new MockResponse()
++        .setBody("abc"));
+ 
+     Call call = client.newCall(new Request.Builder()
+         .url(server.url("/"))
+         .build());
+     Response response = call.execute();
+     assertEquals(200, response.code());
++    assertEquals("abc", response.body().string());
+     response.body().close();
+ 
+-    List<String> expectedEvents = Arrays.asList("FetchStart",
+-        "DnsStart", "DnsEnd", "ConnectStart", "ConnectEnd",
+-        "ConnectionAcquired", "RequestHeadersStart", "RequestHeadersEnd",
+-        "ResponseHeadersStart", "ResponseHeadersEnd", "ResponseBodyStart",
+-        "ResponseBodyEnd", "ConnectionReleased", "FetchEnd");
++    List<String> expectedEvents = Arrays.asList("FetchStart", "DnsStart", "DnsEnd",
++        "ConnectionAcquired", "ConnectStart", "ConnectEnd", "RequestHeadersStart",
++        "RequestHeadersEnd", "ResponseHeadersStart", "ResponseHeadersEnd", "ResponseBodyStart",
++        "FetchEnd", "ResponseBodyEnd", "ConnectionReleased");
+     assertEquals(expectedEvents, listener.recordedEventTypes());
+   }
+ 
+   @Test public void successfulHttpsCallEventSequence() throws IOException {
+     enableTlsWithTunnel(false);
+-    server.enqueue(new MockResponse());
++    server.enqueue(new MockResponse()
++        .setBody("abc"));
+ 
+     Call call = client.newCall(new Request.Builder()
+         .url(server.url("/"))
+         .build());
+     Response response = call.execute();
+     assertEquals(200, response.code());
++    assertEquals("abc", response.body().string());
+     response.body().close();
+ 
+-    List<String> expectedEvents = Arrays.asList("FetchStart",
+-        "DnsStart", "DnsEnd", "ConnectStart", "SecureConnectStart",
+-        "SecureConnectEnd", "ConnectEnd",
+-        "ConnectionAcquired", "RequestHeadersStart", "RequestHeadersEnd",
+-        "ResponseHeadersStart", "ResponseHeadersEnd", "ResponseBodyStart",
+-        "ResponseBodyEnd", "ConnectionReleased", "FetchEnd");
++    List<String> expectedEvents = Arrays.asList("FetchStart", "DnsStart", "DnsEnd",
++        "ConnectionAcquired", "ConnectStart", "SecureConnectStart", "SecureConnectEnd",
++        "ConnectEnd", "RequestHeadersStart", "RequestHeadersEnd", "ResponseHeadersStart",
++        "ResponseHeadersEnd", "ResponseBodyStart", "FetchEnd", "ResponseBodyEnd",
++        "ConnectionReleased");
+     assertEquals(expectedEvents, listener.recordedEventTypes());
+   }
+ 
+diff --git a/okhttp-tests/src/test/java/okhttp3/RecordingEventListener.java b/okhttp-tests/src/test/java/okhttp3/RecordingEventListener.java
+index c4dfa7b8e4..2dab17b057 100644
+--- a/okhttp-tests/src/test/java/okhttp3/RecordingEventListener.java
++++ b/okhttp-tests/src/test/java/okhttp3/RecordingEventListener.java
+@@ -25,11 +25,19 @@
+ import java.util.List;
+ import javax.annotation.Nullable;
+ 
++import static org.junit.Assert.assertFalse;
+ import static org.junit.Assert.assertTrue;
+ 
+ final class RecordingEventListener extends EventListener {
+   final Deque<CallEvent> eventSequence = new ArrayDeque<>();
+ 
++  final List<Object> forbiddenLocks = new ArrayList<>();
++
++  /** Confirm that the thread does not hold a lock on {@code lock} during the callback. */
++  public void forbidLock(Object lock) {
++    forbiddenLocks.add(lock);
++  }
++
+   /**
+    * Removes recorded events up to (and including) an event is found whose class equals
+    * {@code eventClass} and returns it.
+@@ -56,6 +64,10 @@ void clearAllEvents() {
+   }
+ 
+   private void logEvent(CallEvent e) {
++    for (Object lock : forbiddenLocks) {
++      assertFalse(lock.toString(), Thread.holdsLock(lock));
++    }
++
+     CallEvent startEvent = e.closes();
+ 
+     if (startEvent != null) {
+diff --git a/okhttp/src/main/java/okhttp3/EventListener.java b/okhttp/src/main/java/okhttp3/EventListener.java
+index f4d8940f9a..e0c90df96a 100644
+--- a/okhttp/src/main/java/okhttp3/EventListener.java
++++ b/okhttp/src/main/java/okhttp3/EventListener.java
+@@ -21,6 +21,31 @@
+ import java.util.List;
+ import javax.annotation.Nullable;
+ 
++/**
++ * EventListener for analytic events for an OkHttpClient instance.
++ *
++ * <p>All start/connect/acquire events will eventually receive a matching end/release event,
++ * either successful (non-null parameters), or failed (non-null throwable).  The first common
++ * parameters of each event pair are used to link the event in case of concurrent or repeated
++ * events e.g. dnsStart(call, domainName) -> dnsEnd(call, domainName, inetAddressList, throwable).
++ *
++ * <p>Nesting is as follows
++ * <ul>
++ * <li>call -> (dns -> connect -> secure connect)* -> request events</li>
++ * <li>call -> (connection acquire/release)*</li>
++ * </ul>
++ *
++ * <p>Request events are ordered: requestHeaders -> requestBody -> responseHeaders -> responseBody
++ *
++ * <p>Since connections may be reused, the dns and connect events may not be present for a call,
++ * or may be repeated in case of failure retries, even concurrently in case of happy eyeballs type
++ * scenarios. A redirect cross domain, or to use https may cause additional connection and request
++ * events.
++ *
++ * <p>All events must fast, without external locking, cannot throw exceptions,
++ * attempt to mutate the event parameters, or be reentrant back into the client.
++ * Any IO - writing to files or network should be done asynchronously.
++ */
+ public abstract class EventListener {
+   public static final EventListener NONE = new EventListener() {
+   };
+@@ -172,7 +197,7 @@ public void requestHeadersStart(Call call) {
+    *
+    * <p>{@code throwable} will be non-null in the case of a failed attempt to send the headers.
+    */
+-  public void requestHeadersEnd(Call call, Throwable throwable) {
++  public void requestHeadersEnd(Call call, @Nullable Throwable throwable) {
+   }
+ 
+   /**
+@@ -197,7 +222,7 @@ public void requestBodyStart(Call call) {
+    *
+    * <p>{@code throwable} will be non-null in the case of a failed attempt to send the body.
+    */
+-  public void requestBodyEnd(Call call, Throwable throwable) {
++  public void requestBodyEnd(Call call, @Nullable Throwable throwable) {
+   }
+ 
+   /**
+@@ -221,7 +246,7 @@ public void responseHeadersStart(Call call) {
+    *
+    * <p>{@code throwable} will be non-null in the case of a failed attempt to receive the headers.
+    */
+-  public void responseHeadersEnd(Call call, Throwable throwable) {
++  public void responseHeadersEnd(Call call, @Nullable Throwable throwable) {
+   }
+ 
+   /**
+@@ -248,7 +273,7 @@ public void responseBodyStart(Call call) {
+    *
+    * <p>{@code throwable} will be non-null in the case of a failed attempt to send the body.
+    */
+-  public void responseBodyEnd(Call call, Throwable throwable) {
++  public void responseBodyEnd(Call call, @Nullable Throwable throwable) {
+   }
+ 
+   /**
+@@ -261,7 +286,7 @@ public void responseBodyEnd(Call call, Throwable throwable) {
+    *
+    * <p>{@code throwable} will be non-null in the case of a failed attempt to execute the call.
+    */
+-  public void fetchEnd(Call call, Throwable throwable) {
++  public void fetchEnd(Call call, @Nullable Throwable throwable) {
+   }
+ 
+   public interface Factory {
+diff --git a/okhttp/src/main/java/okhttp3/OkHttpClient.java b/okhttp/src/main/java/okhttp3/OkHttpClient.java
+index ce8289e0f2..70c9fc0a7d 100644
+--- a/okhttp/src/main/java/okhttp3/OkHttpClient.java
++++ b/okhttp/src/main/java/okhttp3/OkHttpClient.java
+@@ -879,12 +879,24 @@ public Builder addNetworkInterceptor(Interceptor interceptor) {
+       return this;
+     }
+ 
++    /**
++     * Configure a single client scoped listener that will receive all analytic events
++     * for this client.
++     *
++     * @see EventListener for semantics and restrictions on listener implementations.
++     */
+     public Builder eventListener(EventListener eventListener) {
+       if (eventListener == null) throw new NullPointerException("eventListener == null");
+       this.eventListenerFactory = EventListener.factory(eventListener);
+       return this;
+     }
+ 
++    /**
++     * Configure a factory to provide per-call scoped listeners that will receive analytic events
++     * for this client.
++     *
++     * @see EventListener for semantics and restrictions on listener implementations.
++     */
+     public Builder eventListenerFactory(EventListener.Factory eventListenerFactory) {
+       if (eventListenerFactory == null) {
+         throw new NullPointerException("eventListenerFactory == null");
+diff --git a/okhttp/src/main/java/okhttp3/internal/connection/StreamAllocation.java b/okhttp/src/main/java/okhttp3/internal/connection/StreamAllocation.java
+index cb7b77c5d9..0920121c27 100644
+--- a/okhttp/src/main/java/okhttp3/internal/connection/StreamAllocation.java
++++ b/okhttp/src/main/java/okhttp3/internal/connection/StreamAllocation.java
+@@ -22,6 +22,7 @@
+ import java.util.List;
+ import okhttp3.Address;
+ import okhttp3.Call;
++import okhttp3.Connection;
+ import okhttp3.ConnectionPool;
+ import okhttp3.EventListener;
+ import okhttp3.Interceptor;
+@@ -108,16 +109,10 @@ public HttpCodec newStream(
+     boolean connectionRetryEnabled = client.retryOnConnectionFailure();
+ 
+     try {
+-      RealConnection existingConnection = connection;
+-
+       RealConnection resultConnection = findHealthyConnection(connectTimeout, readTimeout,
+           writeTimeout, connectionRetryEnabled, doExtensiveHealthChecks);
+       HttpCodec resultCodec = resultConnection.newCodec(client, chain, this);
+ 
+-      if (existingConnection != connection) {
+-        eventListener.connectionAcquired(call, connection);
+-      }
+-
+       synchronized (connectionPool) {
+         codec = resultCodec;
+         return resultCodec;
+@@ -162,7 +157,9 @@ private RealConnection findHealthyConnection(int connectTimeout, int readTimeout
+    */
+   private RealConnection findConnection(int connectTimeout, int readTimeout, int writeTimeout,
+       boolean connectionRetryEnabled) throws IOException {
+-    Route selectedRoute;
++    boolean foundPooledConnection = false;
++    RealConnection result = null;
++    Route selectedRoute = null;
+     synchronized (connectionPool) {
+       if (released) throw new IllegalStateException("released");
+       if (codec != null) throw new IllegalStateException("codec != null");
+@@ -177,10 +174,17 @@ private RealConnection findConnection(int connectTimeout, int readTimeout, int w
+       // Attempt to get a connection from the pool.
+       Internal.instance.get(connectionPool, address, this, null);
+       if (connection != null) {
+-        return connection;
++        foundPooledConnection = true;
++        result = connection;
++      } else {
++        selectedRoute = route;
+       }
++    }
+ 
+-      selectedRoute = route;
++    // If we found a pooled connection, we're done.
++    if (foundPooledConnection) {
++      eventListener.connectionAcquired(call, result);
++      return result;
+     }
+ 
+     // If we need a route selection, make one. This is a blocking operation.
+@@ -190,7 +194,6 @@ private RealConnection findConnection(int connectTimeout, int readTimeout, int w
+       routeSelection = routeSelector.next();
+     }
+ 
+-    RealConnection result;
+     synchronized (connectionPool) {
+       if (canceled) throw new IOException("Canceled");
+ 
+@@ -202,22 +205,34 @@ private RealConnection findConnection(int connectTimeout, int readTimeout, int w
+           Route route = routes.get(i);
+           Internal.instance.get(connectionPool, address, this, route);
+           if (connection != null) {
++            foundPooledConnection = true;
++            result = connection;
+             this.route = route;
+-            return connection;
++            break;
+           }
+         }
+       }
+ 
+-      if (selectedRoute == null) {
+-        selectedRoute = routeSelection.next();
++      if (!foundPooledConnection) {
++        if (selectedRoute == null) {
++          selectedRoute = routeSelection.next();
++        }
++
++        // Create a connection and assign it to this allocation immediately. This makes it possible
++        // for an asynchronous cancel() to interrupt the handshake we're about to do.
++        route = selectedRoute;
++        refusedStreamCount = 0;
++        result = new RealConnection(connectionPool, selectedRoute);
++        acquire(result);
+       }
++    }
+ 
+-      // Create a connection and assign it to this allocation immediately. This makes it possible
+-      // for an asynchronous cancel() to interrupt the handshake we're about to do.
+-      route = selectedRoute;
+-      refusedStreamCount = 0;
+-      result = new RealConnection(connectionPool, selectedRoute);
+-      acquire(result);
++    // We have a connection. Either a connected one from the pool, or one we need to connect.
++    eventListener.connectionAcquired(call, result);
++
++    // If we found a pooled connection on the 2nd time around, we're done.
++    if (foundPooledConnection) {
++      return result;
+     }
+ 
+     // Do TCP + TLS handshakes. This is a blocking operation.
+@@ -244,6 +259,7 @@ private RealConnection findConnection(int connectTimeout, int readTimeout, int w
+ 
+   public void streamFinished(boolean noNewStreams, HttpCodec codec) {
+     Socket socket;
++    Connection releasedConnection;
+     synchronized (connectionPool) {
+       if (codec == null || codec != this.codec) {
+         throw new IllegalStateException("expected " + this.codec + " but was " + codec);
+@@ -251,9 +267,14 @@ public void streamFinished(boolean noNewStreams, HttpCodec codec) {
+       if (!noNewStreams) {
+         connection.successCount++;
+       }
++      releasedConnection = connection;
+       socket = deallocate(noNewStreams, false, true);
++      if (connection != null) releasedConnection = null;
+     }
+     closeQuietly(socket);
++    if (releasedConnection != null) {
++      eventListener.connectionReleased(call, releasedConnection);
++    }
+   }
+ 
+   public HttpCodec codec() {
+@@ -272,19 +293,31 @@ public synchronized RealConnection connection() {
+ 
+   public void release() {
+     Socket socket;
++    Connection releasedConnection;
+     synchronized (connectionPool) {
++      releasedConnection = connection;
+       socket = deallocate(false, true, false);
++      if (connection != null) releasedConnection = null;
+     }
+     closeQuietly(socket);
++    if (releasedConnection != null) {
++      eventListener.connectionReleased(call, releasedConnection);
++    }
+   }
+ 
+   /** Forbid new streams from being created on the connection that hosts this allocation. */
+   public void noNewStreams() {
+     Socket socket;
++    Connection releasedConnection;
+     synchronized (connectionPool) {
++      releasedConnection = connection;
+       socket = deallocate(true, false, false);
++      if (connection != null) releasedConnection = null;
+     }
+     closeQuietly(socket);
++    if (releasedConnection != null) {
++      eventListener.connectionReleased(call, releasedConnection);
++    }
+   }
+ 
+   /**
+@@ -301,9 +334,6 @@ private Socket deallocate(boolean noNewStreams, boolean released, boolean stream
+       this.codec = null;
+     }
+     if (released) {
+-      if (connection != null) {
+-        eventListener.connectionReleased(call, connection);
+-      }
+       this.released = true;
+     }
+     Socket socket = null;
+@@ -342,6 +372,7 @@ public void cancel() {
+ 
+   public void streamFailed(IOException e) {
+     Socket socket;
++    Connection releasedConnection;
+     boolean noNewStreams = false;
+ 
+     synchronized (connectionPool) {
+@@ -368,10 +399,15 @@ public void streamFailed(IOException e) {
+           route = null;
+         }
+       }
++      releasedConnection = connection;
+       socket = deallocate(noNewStreams, false, true);
++      if (connection != null) releasedConnection = null;
+     }
+ 
+     closeQuietly(socket);
++    if (releasedConnection != null) {
++      eventListener.connectionReleased(call, releasedConnection);
++    }
+   }
+ 
+   /**
+diff --git a/okhttp/src/main/java/okhttp3/internal/http/RetryAndFollowUpInterceptor.java b/okhttp/src/main/java/okhttp3/internal/http/RetryAndFollowUpInterceptor.java
+index fe9b3abcb5..937ba28ea7 100644
+--- a/okhttp/src/main/java/okhttp3/internal/http/RetryAndFollowUpInterceptor.java
++++ b/okhttp/src/main/java/okhttp3/internal/http/RetryAndFollowUpInterceptor.java
+@@ -119,7 +119,7 @@ public StreamAllocation streamAllocation() {
+         throw new IOException("Canceled");
+       }
+ 
+-      Response response = null;
++      Response response;
+       boolean releaseConnection = true;
+       try {
+         response = realChain.proceed(request, streamAllocation, null, null);
+diff --git a/okhttp/src/main/java/okhttp3/internal/http2/Http2Codec.java b/okhttp/src/main/java/okhttp3/internal/http2/Http2Codec.java
+index 5267584990..2a94fc0f1e 100644
+--- a/okhttp/src/main/java/okhttp3/internal/http2/Http2Codec.java
++++ b/okhttp/src/main/java/okhttp3/internal/http2/Http2Codec.java
+@@ -35,7 +35,6 @@
+ import okhttp3.internal.http.RealResponseBody;
+ import okhttp3.internal.http.RequestLine;
+ import okhttp3.internal.http.StatusLine;
+-import okio.Buffer;
+ import okio.ByteString;
+ import okio.ForwardingSource;
+ import okio.Okio;
+@@ -195,28 +194,18 @@ public Http2Codec(OkHttpClient client, Interceptor.Chain chain, StreamAllocation
+   }
+ 
+   class StreamFinishingSource extends ForwardingSource {
+-    private boolean completed = false;
++    boolean completed = false;
+ 
+     StreamFinishingSource(Source delegate) {
+       super(delegate);
+     }
+ 
+-    @Override public long read(Buffer sink, long byteCount) throws IOException {
+-      try {
+-        return super.read(sink, byteCount);
+-      } catch (IOException ioe) {
+-        completed = true;
+-        streamAllocation.eventListener.responseBodyEnd(streamAllocation.call, ioe);
+-        throw ioe;
+-      }
+-    }
+-
+     @Override public void close() throws IOException {
+-      if (!completed) {
+-        streamAllocation.eventListener.responseBodyEnd(streamAllocation.call, null);
+-      }
+-      streamAllocation.streamFinished(false, Http2Codec.this);
++      if (completed) return;
+       super.close();
++      completed = true;
++      streamAllocation.eventListener.responseBodyEnd(streamAllocation.call, null);
++      streamAllocation.streamFinished(false, Http2Codec.this);
+     }
+   }
+ }

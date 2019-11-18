@@ -1,0 +1,416 @@
+diff --git a/okhttp-tests/src/test/java/com/squareup/okhttp/internal/DiskLruCacheTest.java b/okhttp-tests/src/test/java/com/squareup/okhttp/internal/DiskLruCacheTest.java
+index 0cd3583c5e..c996d202dd 100644
+--- a/okhttp-tests/src/test/java/com/squareup/okhttp/internal/DiskLruCacheTest.java
++++ b/okhttp-tests/src/test/java/com/squareup/okhttp/internal/DiskLruCacheTest.java
+@@ -16,7 +16,6 @@
+ package com.squareup.okhttp.internal;
+ 
+ import com.squareup.okhttp.internal.io.FileSystem;
+-import com.squareup.okhttp.internal.io.InMemoryFileSystem;
+ import java.io.File;
+ import java.io.IOException;
+ import java.util.ArrayDeque;
+@@ -53,7 +52,7 @@
+   @Rule public final TemporaryFolder tempDir = new TemporaryFolder();
+   @Rule public final Timeout timeout = new Timeout(30 * 1000);
+ 
+-  private final FileSystem fileSystem = FileSystem.SYSTEM;
++  private final FaultyFileSystem fileSystem = new FaultyFileSystem(FileSystem.SYSTEM);
+   private final int appVersion = 100;
+   private File cacheDir;
+   private File journalFile;
+@@ -1070,6 +1069,95 @@ private void createNewCacheWithSize(int maxSize) throws IOException {
+     assertTrue(cache.isClosed());
+   }
+ 
++  @Test public void journalWriteFailsDuringEdit() throws Exception {
++    set("a", "a", "a");
++    set("b", "b", "b");
++
++    // We can't begin the edit if writing 'DIRTY' fails.
++    fileSystem.setFaulty(journalFile, true);
++    assertNull(cache.edit("c"));
++
++    // Once the journal has a failure, subsequent writes aren't permitted.
++    fileSystem.setFaulty(journalFile, false);
++    assertNull(cache.edit("d"));
++
++    // Confirm that the fault didn't corrupt entries stored before the fault was introduced.
++    cache.close();
++    cache = new DiskLruCache(fileSystem, cacheDir, appVersion, 2, Integer.MAX_VALUE, executor);
++    assertValue("a", "a", "a");
++    assertValue("b", "b", "b");
++    assertAbsent("c");
++    assertAbsent("d");
++  }
++
++  /**
++   * We had a bug where the cache was left in an inconsistent state after a journal write failed.
++   * https://github.com/square/okhttp/issues/1211
++   */
++  @Test public void journalWriteFailsDuringEditorCommit() throws Exception {
++    set("a", "a", "a");
++    set("b", "b", "b");
++
++    // Create an entry that fails to write to the journal during commit.
++    DiskLruCache.Editor editor = cache.edit("c");
++    setString(editor, 0, "c");
++    setString(editor, 1, "c");
++    fileSystem.setFaulty(journalFile, true);
++    editor.commit();
++
++    // Once the journal has a failure, subsequent writes aren't permitted.
++    fileSystem.setFaulty(journalFile, false);
++    assertNull(cache.edit("d"));
++
++    // Confirm that the fault didn't corrupt entries stored before the fault was introduced.
++    cache.close();
++    cache = new DiskLruCache(fileSystem, cacheDir, appVersion, 2, Integer.MAX_VALUE, executor);
++    assertValue("a", "a", "a");
++    assertValue("b", "b", "b");
++    assertAbsent("c");
++    assertAbsent("d");
++  }
++
++  @Test public void journalWriteFailsDuringEditorAbort() throws Exception {
++    set("a", "a", "a");
++    set("b", "b", "b");
++
++    // Create an entry that fails to write to the journal during abort.
++    DiskLruCache.Editor editor = cache.edit("c");
++    setString(editor, 0, "c");
++    setString(editor, 1, "c");
++    fileSystem.setFaulty(journalFile, true);
++    editor.abort();
++
++    // Once the journal has a failure, subsequent writes aren't permitted.
++    fileSystem.setFaulty(journalFile, false);
++    assertNull(cache.edit("d"));
++
++    // Confirm that the fault didn't corrupt entries stored before the fault was introduced.
++    cache.close();
++    cache = new DiskLruCache(fileSystem, cacheDir, appVersion, 2, Integer.MAX_VALUE, executor);
++    assertValue("a", "a", "a");
++    assertValue("b", "b", "b");
++    assertAbsent("c");
++    assertAbsent("d");
++  }
++
++  @Test public void journalWriteFailsDuringRemove() throws Exception {
++    set("a", "a", "a");
++    set("b", "b", "b");
++
++    // Remove, but the journal write will fail.
++    fileSystem.setFaulty(journalFile, true);
++    assertTrue(cache.remove("a"));
++
++    // Confirm that the entry was still removed.
++    fileSystem.setFaulty(journalFile, false);
++    cache.close();
++    cache = new DiskLruCache(fileSystem, cacheDir, appVersion, 2, Integer.MAX_VALUE, executor);
++    assertAbsent("a");
++    assertValue("b", "b", "b");
++  }
++
+   private void assertJournalEquals(String... expectedBodyLines) throws Exception {
+     List<String> expectedLines = new ArrayList<>();
+     expectedLines.add(MAGIC);
+diff --git a/okhttp-tests/src/test/java/com/squareup/okhttp/internal/FaultyFileSystem.java b/okhttp-tests/src/test/java/com/squareup/okhttp/internal/FaultyFileSystem.java
+new file mode 100644
+index 0000000000..537f361c38
+--- /dev/null
++++ b/okhttp-tests/src/test/java/com/squareup/okhttp/internal/FaultyFileSystem.java
+@@ -0,0 +1,90 @@
++/*
++ * Copyright (C) 2011 The Android Open Source Project
++ *
++ * Licensed under the Apache License, Version 2.0 (the "License");
++ * you may not use this file except in compliance with the License.
++ * You may obtain a copy of the License at
++ *
++ *      http://www.apache.org/licenses/LICENSE-2.0
++ *
++ * Unless required by applicable law or agreed to in writing, software
++ * distributed under the License is distributed on an "AS IS" BASIS,
++ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++ * See the License for the specific language governing permissions and
++ * limitations under the License.
++ */
++package com.squareup.okhttp.internal;
++
++import com.squareup.okhttp.internal.io.FileSystem;
++import java.io.File;
++import java.io.FileNotFoundException;
++import java.io.IOException;
++import java.util.LinkedHashSet;
++import java.util.Set;
++import okio.Buffer;
++import okio.ForwardingSink;
++import okio.Sink;
++import okio.Source;
++
++public final class FaultyFileSystem implements FileSystem {
++  private final FileSystem delegate;
++  private final Set<File> writeFaults = new LinkedHashSet<>();
++
++  public FaultyFileSystem(FileSystem delegate) {
++    this.delegate = delegate;
++  }
++
++  public void setFaulty(File file, boolean faulty) {
++    if (faulty) {
++      writeFaults.add(file);
++    } else {
++      writeFaults.remove(file);
++    }
++  }
++
++  @Override public Source source(File file) throws FileNotFoundException {
++    return delegate.source(file);
++  }
++
++  @Override public Sink sink(File file) throws FileNotFoundException {
++    return new FaultySink(delegate.sink(file), file);
++  }
++
++  @Override public Sink appendingSink(File file) throws FileNotFoundException {
++    return new FaultySink(delegate.appendingSink(file), file);
++  }
++
++  @Override public void delete(File file) throws IOException {
++    delegate.delete(file);
++  }
++
++  @Override public boolean exists(File file) throws IOException {
++    return delegate.exists(file);
++  }
++
++  @Override public long size(File file) {
++    return delegate.size(file);
++  }
++
++  @Override public void rename(File from, File to) throws IOException {
++    delegate.rename(from, to);
++  }
++
++  @Override public void deleteContents(File directory) throws IOException {
++    delegate.deleteContents(directory);
++  }
++
++  private class FaultySink extends ForwardingSink {
++    private final File file;
++
++    public FaultySink(Sink delegate, File file) {
++      super(delegate);
++      this.file = file;
++    }
++
++    @Override public void write(Buffer source, long byteCount) throws IOException {
++      if (writeFaults.contains(file)) throw new IOException("boom!");
++      super.write(source, byteCount);
++    }
++  }
++}
+diff --git a/okhttp/src/main/java/com/squareup/okhttp/internal/DiskLruCache.java b/okhttp/src/main/java/com/squareup/okhttp/internal/DiskLruCache.java
+index 29f59efcaf..284771fc34 100644
+--- a/okhttp/src/main/java/com/squareup/okhttp/internal/DiskLruCache.java
++++ b/okhttp/src/main/java/com/squareup/okhttp/internal/DiskLruCache.java
+@@ -36,7 +36,6 @@
+ import okio.Buffer;
+ import okio.BufferedSink;
+ import okio.BufferedSource;
+-import okio.ForwardingSink;
+ import okio.Okio;
+ import okio.Sink;
+ import okio.Source;
+@@ -151,6 +150,7 @@
+   private BufferedSink journalWriter;
+   private final LinkedHashMap<String, Entry> lruEntries = new LinkedHashMap<>(0, 0.75f, true);
+   private int redundantOpCount;
++  private boolean hasJournalErrors;
+ 
+   // Must be read and written when synchronized on 'this'.
+   private boolean initialized;
+@@ -291,13 +291,24 @@ private void readJournal() throws IOException {
+       if (!source.exhausted()) {
+         rebuildJournal();
+       } else {
+-        journalWriter = Okio.buffer(fileSystem.appendingSink(journalFile));
++        journalWriter = newJournalWriter();
+       }
+     } finally {
+       Util.closeQuietly(source);
+     }
+   }
+ 
++  private BufferedSink newJournalWriter() throws FileNotFoundException {
++    Sink fileSink = fileSystem.appendingSink(journalFile);
++    Sink faultHidingSink = new FaultHidingSink(fileSink) {
++      @Override protected void onException(IOException e) {
++        assert (Thread.holdsLock(DiskLruCache.this));
++        hasJournalErrors = true;
++      }
++    };
++    return Okio.buffer(faultHidingSink);
++  }
++
+   private void readJournalLine(String line) throws IOException {
+     int firstSpace = line.indexOf(' ');
+     if (firstSpace == -1) {
+@@ -399,7 +410,8 @@ private synchronized void rebuildJournal() throws IOException {
+     fileSystem.rename(journalFileTmp, journalFile);
+     fileSystem.delete(journalFileBackup);
+ 
+-    journalWriter = Okio.buffer(fileSystem.appendingSink(journalFile));
++    journalWriter = newJournalWriter();
++    hasJournalErrors = false;
+   }
+ 
+   /**
+@@ -445,19 +457,24 @@ private synchronized Editor edit(String key, long expectedSequenceNumber) throws
+         || entry.sequenceNumber != expectedSequenceNumber)) {
+       return null; // Snapshot is stale.
+     }
+-    if (entry == null) {
+-      entry = new Entry(key);
+-      lruEntries.put(key, entry);
+-    } else if (entry.currentEditor != null) {
++    if (entry != null && entry.currentEditor != null) {
+       return null; // Another edit is in progress.
+     }
+ 
+-    Editor editor = new Editor(entry);
+-    entry.currentEditor = editor;
+-
+     // Flush the journal before creating files to prevent file leaks.
+     journalWriter.writeUtf8(DIRTY).writeByte(' ').writeUtf8(key).writeByte('\n');
+     journalWriter.flush();
++
++    if (hasJournalErrors) {
++      return null; // Don't edit; the journal can't be written.
++    }
++
++    if (entry == null) {
++      entry = new Entry(key);
++      lruEntries.put(key, entry);
++    }
++    Editor editor = new Editor(entry);
++    entry.currentEditor = editor;
+     return editor;
+   }
+ 
+@@ -860,7 +877,13 @@ public Sink newSink(int index) throws IOException {
+         } catch (FileNotFoundException e) {
+           return NULL_SINK;
+         }
+-        return new FaultHidingSink(sink);
++        return new FaultHidingSink(sink) {
++          @Override protected void onException(IOException e) {
++            synchronized (DiskLruCache.this) {
++              hasErrors = true;
++            }
++          }
++        };
+       }
+     }
+ 
+@@ -900,42 +923,6 @@ public void abortUnlessCommitted() {
+         }
+       }
+     }
+-
+-    private class FaultHidingSink extends ForwardingSink {
+-      public FaultHidingSink(Sink delegate) {
+-        super(delegate);
+-      }
+-
+-      @Override public void write(Buffer source, long byteCount) throws IOException {
+-        try {
+-          super.write(source, byteCount);
+-        } catch (IOException e) {
+-          synchronized (DiskLruCache.this) {
+-            hasErrors = true;
+-          }
+-        }
+-      }
+-
+-      @Override public void flush() throws IOException {
+-        try {
+-          super.flush();
+-        } catch (IOException e) {
+-          synchronized (DiskLruCache.this) {
+-            hasErrors = true;
+-          }
+-        }
+-      }
+-
+-      @Override public void close() throws IOException {
+-        try {
+-          super.close();
+-        } catch (IOException e) {
+-          synchronized (DiskLruCache.this) {
+-            hasErrors = true;
+-          }
+-        }
+-      }
+-    }
+   }
+ 
+   private final class Entry {
+diff --git a/okhttp/src/main/java/com/squareup/okhttp/internal/FaultHidingSink.java b/okhttp/src/main/java/com/squareup/okhttp/internal/FaultHidingSink.java
+new file mode 100644
+index 0000000000..91e990db8d
+--- /dev/null
++++ b/okhttp/src/main/java/com/squareup/okhttp/internal/FaultHidingSink.java
+@@ -0,0 +1,51 @@
++package com.squareup.okhttp.internal;
++
++import java.io.IOException;
++import okio.Buffer;
++import okio.ForwardingSink;
++import okio.Sink;
++
++/** A sink that never throws IOExceptions, even if the underlying sink does. */
++class FaultHidingSink extends ForwardingSink {
++  private boolean hasErrors;
++
++  public FaultHidingSink(Sink delegate) {
++    super(delegate);
++  }
++
++  @Override public void write(Buffer source, long byteCount) throws IOException {
++    if (hasErrors) {
++      source.skip(byteCount);
++      return;
++    }
++    try {
++      super.write(source, byteCount);
++    } catch (IOException e) {
++      hasErrors = true;
++      onException(e);
++    }
++  }
++
++  @Override public void flush() throws IOException {
++    if (hasErrors) return;
++    try {
++      super.flush();
++    } catch (IOException e) {
++      hasErrors = true;
++      onException(e);
++    }
++  }
++
++  @Override public void close() throws IOException {
++    if (hasErrors) return;
++    try {
++      super.close();
++    } catch (IOException e) {
++      hasErrors = true;
++      onException(e);
++    }
++  }
++
++  protected void onException(IOException e) {
++  }
++}

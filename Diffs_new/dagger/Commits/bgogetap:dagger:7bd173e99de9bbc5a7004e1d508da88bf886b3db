@@ -1,0 +1,1239 @@
+diff --git a/java/dagger/internal/SetBuilder.java b/java/dagger/internal/SetBuilder.java
+new file mode 100644
+index 000000000..2ca84628d
+--- /dev/null
++++ b/java/dagger/internal/SetBuilder.java
+@@ -0,0 +1,66 @@
++/*
++ * Copyright (C) 2017 The Dagger Authors.
++ *
++ * Licensed under the Apache License, Version 2.0 (the "License");
++ * you may not use this file except in compliance with the License.
++ * You may obtain a copy of the License at
++ *
++ * http://www.apache.org/licenses/LICENSE-2.0
++ *
++ * Unless required by applicable law or agreed to in writing, software
++ * distributed under the License is distributed on an "AS IS" BASIS,
++ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++ * See the License for the specific language governing permissions and
++ * limitations under the License.
++ */
++
++package dagger.internal;
++
++import java.util.ArrayList;
++import java.util.Collection;
++import java.util.Collections;
++import java.util.HashSet;
++import java.util.List;
++import java.util.Set;
++
++/**
++ * A fluent builder class that returns a {@link Set}. Used in component implementations where a set
++ * must be created in one fluent statement for inlined request fulfillments.
++ */
++public final class SetBuilder<T> {
++  private final List<T> contributions;
++
++  private SetBuilder(int estimatedSize) {
++    contributions = new ArrayList<>(estimatedSize);
++  }
++
++  /**
++   * {@code estimatedSize} is the number of bindings which contribute to the set. They may each
++   * provide {@code [0..n)} instances to the set. Because the final size is unknown, {@code
++   * contributions} are collected in a list and only hashed in {@link #create()}.
++   */
++  public static <T> SetBuilder<T> newSetBuilder(int estimatedSize) {
++    return new SetBuilder<T>(estimatedSize);
++  }
++
++  public SetBuilder<T> add(T t) {
++    contributions.add(t);
++    return this;
++  }
++
++  public SetBuilder<T> addAll(Collection<? extends T> collection) {
++    contributions.addAll(collection);
++    return this;
++  }
++
++  public Set<T> create() {
++    switch (contributions.size()) {
++      case 0:
++        return Collections.emptySet();
++      case 1:
++        return Collections.singleton(contributions.get(0));
++      default:
++        return Collections.unmodifiableSet(new HashSet<>(contributions));
++    }
++  }
++}
+diff --git a/java/dagger/internal/codegen/RequestFulfillmentRegistry.java b/java/dagger/internal/codegen/RequestFulfillmentRegistry.java
+index ec140fd65..3d9b61aa1 100644
+--- a/java/dagger/internal/codegen/RequestFulfillmentRegistry.java
++++ b/java/dagger/internal/codegen/RequestFulfillmentRegistry.java
+@@ -68,21 +68,30 @@ private RequestFulfillment createRequestFulfillment(BindingKey bindingKey) {
+         ProviderFieldRequestFulfillment providerFieldRequestFulfillment =
+             new ProviderFieldRequestFulfillment(bindingKey, memberSelect);
+ 
+-        if (provisionBinding.bindingKind().equals(ContributionBinding.Kind.SUBCOMPONENT_BUILDER)) {
+-          return new SubcomponentBuilderRequestFulfillment(
+-              bindingKey, providerFieldRequestFulfillment, subcomponentNames.get(bindingKey));
++        switch (provisionBinding.bindingKind()) {
++          case SUBCOMPONENT_BUILDER:
++            return new SubcomponentBuilderRequestFulfillment(
++                bindingKey, providerFieldRequestFulfillment, subcomponentNames.get(bindingKey));
++          case SYNTHETIC_MULTIBOUND_SET:
++            return new SetBindingRequestFulfillment(
++                bindingKey,
++                provisionBinding,
++                resolvedBindingsMap,
++                this,
++                providerFieldRequestFulfillment);
++          case INJECTION:
++          case PROVISION:
++            if (provisionBinding.implicitDependencies().isEmpty()
++                && !provisionBinding.scope().isPresent()
++                && !provisionBinding.requiresModuleInstance()
++                && provisionBinding.bindingElement().isPresent()) {
++              return new SimpleMethodRequestFulfillment(
++                  bindingKey, provisionBinding, providerFieldRequestFulfillment, this);
++            }
++            // fall through
++          default:
++            return providerFieldRequestFulfillment;
+         }
+-
+-        if (provisionBinding.implicitDependencies().isEmpty()
+-            && !provisionBinding.scope().isPresent()
+-            && !provisionBinding.requiresModuleInstance()
+-            && provisionBinding.bindingElement().isPresent()
+-            && (provisionBinding.bindingKind().equals(INJECTION)
+-                || provisionBinding.bindingKind().equals(PROVISION))) {
+-          return new SimpleMethodRequestFulfillment(
+-              bindingKey, provisionBinding, providerFieldRequestFulfillment, this);
+-        }
+-        return providerFieldRequestFulfillment;
+       default:
+         throw new AssertionError();
+     }
+diff --git a/java/dagger/internal/codegen/SetBindingRequestFulfillment.java b/java/dagger/internal/codegen/SetBindingRequestFulfillment.java
+new file mode 100644
+index 000000000..9740e05de
+--- /dev/null
++++ b/java/dagger/internal/codegen/SetBindingRequestFulfillment.java
+@@ -0,0 +1,121 @@
++/*
++ * Copyright (C) 2017 The Dagger Authors.
++ *
++ * Licensed under the Apache License, Version 2.0 (the "License");
++ * you may not use this file except in compliance with the License.
++ * You may obtain a copy of the License at
++ *
++ * http://www.apache.org/licenses/LICENSE-2.0
++ *
++ * Unless required by applicable law or agreed to in writing, software
++ * distributed under the License is distributed on an "AS IS" BASIS,
++ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++ * See the License for the specific language governing permissions and
++ * limitations under the License.
++ */
++
++package dagger.internal.codegen;
++
++import static com.google.common.collect.Iterables.getOnlyElement;
++import static com.squareup.javapoet.CodeBlock.of;
++import static dagger.internal.codegen.Accessibility.isTypeAccessibleFrom;
++
++import com.google.common.collect.ImmutableMap;
++import com.squareup.javapoet.ClassName;
++import com.squareup.javapoet.CodeBlock;
++import dagger.internal.SetBuilder;
++import java.util.Collections;
++import javax.lang.model.type.TypeMirror;
++
++/**
++ * A {@link RequestFulfillment} for {@link
++ * dagger.internal.codegen.ContributionBinding.Kind#SYNTHETIC_MULTIBOUND_SET}
++ */
++final class SetBindingRequestFulfillment extends SimpleInvocationRequestFulfillment {
++  private final ProvisionBinding binding;
++  private final ImmutableMap<BindingKey, ResolvedBindings> resolvedBindingsMap;
++  private final RequestFulfillmentRegistry registry;
++
++  SetBindingRequestFulfillment(
++      BindingKey bindingKey,
++      ProvisionBinding binding,
++      ImmutableMap<BindingKey, ResolvedBindings> resolvedBindingsMap,
++      RequestFulfillmentRegistry registry,
++      RequestFulfillment delegate) {
++    super(bindingKey, delegate);
++    this.binding = binding;
++    this.resolvedBindingsMap = resolvedBindingsMap;
++    this.registry = registry;
++  }
++
++  @Override
++  CodeBlock getSimpleInvocation(DependencyRequest request, ClassName requestingClass) {
++    // TODO(ronshapiro): if you have ImmutableSet on your classpath, use ImmutableSet.Builder
++    // otherwise, we can consider providing our own static factories for multibinding cases where
++    // all of the dependencies are @IntoSet
++    switch (binding.dependencies().size()) {
++      case 0:
++        return collectionsStaticFactoryInvocation(
++            request, requestingClass, CodeBlock.of("emptySet()"));
++      case 1:
++        {
++          DependencyRequest dependency = getOnlyElement(binding.dependencies());
++          if (isSingleValue(dependency)) {
++            return collectionsStaticFactoryInvocation(
++                request,
++                requestingClass,
++                CodeBlock.of(
++                    "singleton($L)",
++                    getRequestFulfillmentForDependency(dependency, requestingClass)));
++          }
++        }
++        // fall through
++      default:
++        CodeBlock.Builder instantiation = CodeBlock.builder();
++        instantiation
++            .add("$T.", SetBuilder.class)
++            .add(maybeTypeParameter(request, requestingClass))
++            .add("newSetBuilder($L)", binding.dependencies().size());
++        for (DependencyRequest dependency : binding.dependencies()) {
++          String builderMethod = isSingleValue(dependency) ? "add" : "addAll";
++          instantiation.add(
++              ".$L($L)",
++              builderMethod,
++              getRequestFulfillmentForDependency(dependency, requestingClass));
++        }
++        return instantiation.add(".create()").build();
++    }
++  }
++
++  private CodeBlock getRequestFulfillmentForDependency(
++      DependencyRequest dependency, ClassName requestingClass) {
++    return registry
++        .getRequestFulfillment(dependency.bindingKey())
++        .getSnippetForDependencyRequest(dependency, requestingClass);
++  }
++
++  private static CodeBlock collectionsStaticFactoryInvocation(
++      DependencyRequest request, ClassName requestingClass, CodeBlock methodInvocation) {
++    return CodeBlock.builder()
++        .add("$T.", Collections.class)
++        .add(maybeTypeParameter(request, requestingClass))
++        .add(methodInvocation)
++        .build();
++  }
++
++  private static CodeBlock maybeTypeParameter(
++      DependencyRequest request, ClassName requestingClass) {
++    TypeMirror elementType = SetType.from(request.key()).elementType();
++    return isTypeAccessibleFrom(elementType, requestingClass.packageName())
++        ? of("<$T>", elementType)
++        : of("");
++  }
++
++  private boolean isSingleValue(DependencyRequest dependency) {
++    return resolvedBindingsMap
++        .get(dependency.bindingKey())
++        .contributionBinding()
++        .contributionType()
++        .equals(ContributionType.SET);
++  }
++}
+diff --git a/java/dagger/internal/codegen/SimpleInvocationRequestFulfillment.java b/java/dagger/internal/codegen/SimpleInvocationRequestFulfillment.java
+new file mode 100644
+index 000000000..0e430112c
+--- /dev/null
++++ b/java/dagger/internal/codegen/SimpleInvocationRequestFulfillment.java
+@@ -0,0 +1,56 @@
++/*
++ * Copyright (C) 2016 The Dagger Authors.
++ *
++ * Licensed under the Apache License, Version 2.0 (the "License");
++ * you may not use this file except in compliance with the License.
++ * You may obtain a copy of the License at
++ *
++ * http://www.apache.org/licenses/LICENSE-2.0
++ *
++ * Unless required by applicable law or agreed to in writing, software
++ * distributed under the License is distributed on an "AS IS" BASIS,
++ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++ * See the License for the specific language governing permissions and
++ * limitations under the License.
++ */
++
++package dagger.internal.codegen;
++
++import com.google.common.util.concurrent.Futures;
++import com.squareup.javapoet.ClassName;
++import com.squareup.javapoet.CodeBlock;
++
++/**
++ * A {@link RequestFulfillment} that can fulfill its request with a simple call when possible, and
++ * otherwise delegates to a backing provider field.
++ */
++abstract class SimpleInvocationRequestFulfillment extends RequestFulfillment {
++  private final RequestFulfillment delegate;
++
++  SimpleInvocationRequestFulfillment(BindingKey bindingKey, RequestFulfillment delegate) {
++    super(bindingKey);
++    this.delegate = delegate;
++  }
++
++  abstract CodeBlock getSimpleInvocation(DependencyRequest request, ClassName requestingClass);
++
++  @Override
++  final CodeBlock getSnippetForDependencyRequest(
++      DependencyRequest request, ClassName requestingClass) {
++    switch (request.kind()) {
++      case INSTANCE:
++        return getSimpleInvocation(request, requestingClass);
++      case FUTURE:
++        return CodeBlock.of(
++            "$T.immediateFuture($L)", Futures.class, getSimpleInvocation(request, requestingClass));
++      default:
++        return delegate.getSnippetForDependencyRequest(request, requestingClass);
++    }
++  }
++
++  @Override
++  final CodeBlock getSnippetForFrameworkDependency(
++      FrameworkDependency frameworkDependency, ClassName requestingClass) {
++    return delegate.getSnippetForFrameworkDependency(frameworkDependency, requestingClass);
++  }
++}
+diff --git a/java/dagger/internal/codegen/SimpleMethodRequestFulfillment.java b/java/dagger/internal/codegen/SimpleMethodRequestFulfillment.java
+index 8c7fb6dfb..791af2ce3 100644
+--- a/java/dagger/internal/codegen/SimpleMethodRequestFulfillment.java
++++ b/java/dagger/internal/codegen/SimpleMethodRequestFulfillment.java
+@@ -29,7 +29,6 @@
+ import static java.util.stream.Collectors.toList;
+ import static javax.lang.model.element.Modifier.STATIC;
+ 
+-import com.google.common.util.concurrent.Futures;
+ import com.squareup.javapoet.ClassName;
+ import com.squareup.javapoet.CodeBlock;
+ import com.squareup.javapoet.TypeName;
+@@ -41,10 +40,9 @@
+  * requests whenever possible. In cases where direct invocation is not possible, this implementation
+  * delegates to one that uses a {@link javax.inject.Provider}.
+  */
+-final class SimpleMethodRequestFulfillment extends RequestFulfillment {
++final class SimpleMethodRequestFulfillment extends SimpleInvocationRequestFulfillment {
+ 
+   private final ProvisionBinding provisionBinding;
+-  private final RequestFulfillment providerDelegate;
+   private final RequestFulfillmentRegistry registry;
+ 
+   SimpleMethodRequestFulfillment(
+@@ -52,7 +50,7 @@
+       ProvisionBinding provisionBinding,
+       RequestFulfillment providerDelegate,
+       RequestFulfillmentRegistry registry) {
+-    super(bindingKey);
++    super(bindingKey, providerDelegate);
+     checkArgument(
+         provisionBinding.implicitDependencies().isEmpty(),
+         "framework deps are not currently supported");
+@@ -60,30 +58,11 @@
+     checkArgument(!provisionBinding.requiresModuleInstance());
+     checkArgument(provisionBinding.bindingElement().isPresent());
+     this.provisionBinding = provisionBinding;
+-    this.providerDelegate = providerDelegate;
+     this.registry = registry;
+   }
+ 
+   @Override
+-  CodeBlock getSnippetForDependencyRequest(DependencyRequest request, ClassName requestingClass) {
+-    switch (request.kind()) {
+-      case INSTANCE:
+-        return invokeMethodOrProxy(requestingClass);
+-      case FUTURE:
+-        return CodeBlock.of(
+-            "$T.immediateFuture($L)", Futures.class, invokeMethodOrProxy(requestingClass));
+-      default:
+-        return providerDelegate.getSnippetForDependencyRequest(request, requestingClass);
+-    }
+-  }
+-
+-  @Override
+-  CodeBlock getSnippetForFrameworkDependency(
+-      FrameworkDependency frameworkDependency, ClassName requestingClass) {
+-    return providerDelegate.getSnippetForFrameworkDependency(frameworkDependency, requestingClass);
+-  }
+-
+-  private CodeBlock invokeMethodOrProxy(ClassName requestingClass) {
++  CodeBlock getSimpleInvocation(DependencyRequest request, ClassName requestingClass) {
+     ExecutableElement bindingElement = asExecutable(provisionBinding.bindingElement().get());
+     return requiresProxyAccess(bindingElement, requestingClass.packageName())
+         ? invokeProxyMethod(requestingClass)
+diff --git a/java/dagger/internal/codegen/SubcomponentBuilderRequestFulfillment.java b/java/dagger/internal/codegen/SubcomponentBuilderRequestFulfillment.java
+index ec4e291d1..6afb95a9f 100644
+--- a/java/dagger/internal/codegen/SubcomponentBuilderRequestFulfillment.java
++++ b/java/dagger/internal/codegen/SubcomponentBuilderRequestFulfillment.java
+@@ -18,30 +18,18 @@
+ 
+ import com.squareup.javapoet.ClassName;
+ import com.squareup.javapoet.CodeBlock;
+-import dagger.internal.codegen.DependencyRequest.Kind;
+ 
+-final class SubcomponentBuilderRequestFulfillment extends RequestFulfillment {
+-  private final RequestFulfillment delegate;
++final class SubcomponentBuilderRequestFulfillment extends SimpleInvocationRequestFulfillment {
+   private final String subcomponentBuilderName;
+ 
+   SubcomponentBuilderRequestFulfillment(
+       BindingKey bindingKey, RequestFulfillment delegate, String subcomponentBuilderName) {
+-    super(bindingKey);
+-    this.delegate = delegate;
++    super(bindingKey, delegate);
+     this.subcomponentBuilderName = subcomponentBuilderName;
+   }
+ 
+   @Override
+-  CodeBlock getSnippetForDependencyRequest(DependencyRequest request, ClassName requestingClass) {
+-    if (request.kind().equals(Kind.INSTANCE)) {
+-      return CodeBlock.of("new $LBuilder()", subcomponentBuilderName);
+-    }
+-    return delegate.getSnippetForDependencyRequest(request, requestingClass);
+-  }
+-
+-  @Override
+-  CodeBlock getSnippetForFrameworkDependency(
+-      FrameworkDependency frameworkDependency, ClassName requestingClass) {
+-    return delegate.getSnippetForFrameworkDependency(frameworkDependency, requestingClass);
++  CodeBlock getSimpleInvocation(DependencyRequest request, ClassName requestingClass) {
++    return CodeBlock.of("new $LBuilder()", subcomponentBuilderName);
+   }
+ }
+diff --git a/javatests/dagger/internal/codegen/ComponentProcessorTest.java b/javatests/dagger/internal/codegen/ComponentProcessorTest.java
+index 18e02de4b..0e86e8778 100644
+--- a/javatests/dagger/internal/codegen/ComponentProcessorTest.java
++++ b/javatests/dagger/internal/codegen/ComponentProcessorTest.java
+@@ -910,154 +910,6 @@ public void generatedModuleInSubcomponent() {
+         .succeeded();
+   }
+ 
+-  @Test
+-  public void subcomponentOmitsInheritedBindings() {
+-    JavaFileObject parent =
+-        JavaFileObjects.forSourceLines(
+-            "test.Parent",
+-            "package test;",
+-            "",
+-            "import dagger.Component;",
+-            "",
+-            "@Component(modules = ParentModule.class)",
+-            "interface Parent {",
+-            "  Child child();",
+-            "}");
+-    JavaFileObject parentModule =
+-        JavaFileObjects.forSourceLines(
+-            "test.ParentModule",
+-            "package test;",
+-            "",
+-            "import dagger.Module;",
+-            "import dagger.Provides;",
+-            "import dagger.multibindings.IntoSet;",
+-            "import dagger.multibindings.IntoMap;",
+-            "import dagger.multibindings.StringKey;",
+-            "",
+-            "@Module",
+-            "class ParentModule {",
+-            "  @Provides @IntoSet static Object parentObject() {",
+-            "    return \"parent object\";",
+-            "  }",
+-            "",
+-            "  @Provides @IntoMap @StringKey(\"parent key\") Object parentKeyObject() {",
+-            "    return \"parent value\";",
+-            "  }",
+-            "}");
+-    JavaFileObject child =
+-        JavaFileObjects.forSourceLines(
+-            "test.Child",
+-            "package test;",
+-            "",
+-            "import dagger.Subcomponent;",
+-            "import java.util.Map;",
+-            "import java.util.Set;",
+-            "",
+-            "@Subcomponent",
+-            "interface Child {",
+-            "  Set<Object> objectSet();",
+-            "  Map<String, Object> objectMap();",
+-            "}");
+-    JavaFileObject expected =
+-        JavaFileObjects.forSourceLines(
+-            "test.DaggerParent",
+-            "package test;",
+-            "",
+-            "import dagger.internal.MapFactory;",
+-            "import dagger.internal.MapProviderFactory;",
+-            "import dagger.internal.Preconditions;",
+-            "import dagger.internal.SetFactory;",
+-            "import java.util.Map;",
+-            "import java.util.Set;",
+-            "import javax.annotation.Generated;",
+-            "import javax.inject.Provider;",
+-            "",
+-            GENERATED_ANNOTATION,
+-            "public final class DaggerParent implements Parent {",
+-            "  private Provider<Object> parentKeyObjectProvider;",
+-            "",
+-            "  private DaggerParent(Builder builder) {",
+-            "    assert builder != null;",
+-            "    initialize(builder);",
+-            "  }",
+-            "",
+-            "  public static Builder builder() {",
+-            "    return new Builder();",
+-            "  }",
+-            "",
+-            "  public static Parent create() {",
+-            "    return new Builder().build();",
+-            "  }",
+-            "",
+-            "  @SuppressWarnings(\"unchecked\")",
+-            "  private void initialize(final Builder builder) {",
+-            "    this.parentKeyObjectProvider =",
+-            "        ParentModule_ParentKeyObjectFactory.create(builder.parentModule);",
+-            "  }",
+-            "",
+-            "  @Override",
+-            "  public Child child() {",
+-            "    return new ChildImpl();",
+-            "  }",
+-            "",
+-            "  public static final class Builder {",
+-            "    private ParentModule parentModule;",
+-            "",
+-            "    private Builder() {}",
+-            "",
+-            "    public Parent build() {",
+-            "      if (parentModule == null) {",
+-            "        this.parentModule = new ParentModule();",
+-            "      }",
+-            "      return new DaggerParent(this);",
+-            "    }",
+-            "",
+-            "    public Builder parentModule(ParentModule parentModule) {",
+-            "      this.parentModule = Preconditions.checkNotNull(parentModule);",
+-            "      return this;",
+-            "    }",
+-            "  }",
+-            "",
+-            "  private final class ChildImpl implements Child {",
+-            "    private Provider<Set<Object>> setOfObjectProvider;",
+-            "    private Provider<Map<String, Provider<Object>>>",
+-            "        mapOfStringAndProviderOfObjectProvider;",
+-            "    private Provider<Map<String, Object>> mapOfStringAndObjectProvider;",
+-            "",
+-            "    private ChildImpl() {",
+-            "      initialize();",
+-            "    }",
+-            "",
+-            "    @SuppressWarnings(\"unchecked\")",
+-            "    private void initialize() {",
+-            "      this.setOfObjectProvider = SetFactory.<Object>builder(1, 0)",
+-            "          .addProvider(ParentModule_ParentObjectFactory.create()).build();",
+-            "      this.mapOfStringAndProviderOfObjectProvider =",
+-            "          MapProviderFactory.<String, Object>builder(1)",
+-            "              .put(\"parent key\", DaggerParent.this.parentKeyObjectProvider)",
+-            "              .build();",
+-            "      this.mapOfStringAndObjectProvider = MapFactory.create(",
+-            "          mapOfStringAndProviderOfObjectProvider);",
+-            "    }",
+-            "",
+-            "    @Override",
+-            "    public Set<Object> objectSet() {",
+-            "      return setOfObjectProvider.get();",
+-            "    }",
+-            "",
+-            "    @Override",
+-            "    public Map<String, Object> objectMap() {",
+-            "      return mapOfStringAndObjectProvider.get();",
+-            "    }",
+-            "  }",
+-            "}");
+-    Compilation compilation = daggerCompiler().compile(parent, parentModule, child);
+-    assertThat(compilation).succeeded();
+-    assertThat(compilation)
+-        .generatedSourceFile("test.DaggerParent")
+-        .hasSourceEquivalentTo(expected);
+-  }
+-
+   @Test
+   public void subcomponentNotGeneratedIfNotUsedInGraph() {
+     JavaFileObject component =
+@@ -1179,126 +1031,6 @@ public void testDefaultPackage() {
+     assertThat(daggerCompiler().compile(aModule, aClass, bClass, component)).succeeded();
+   }
+ 
+-  @Test public void setBindings() {
+-    JavaFileObject emptySetModuleFile = JavaFileObjects.forSourceLines("test.EmptySetModule",
+-        "package test;",
+-        "",
+-        "import dagger.Module;",
+-        "import dagger.Provides;",
+-        "import dagger.multibindings.ElementsIntoSet;",
+-        "import java.util.Collections;",
+-        "import java.util.Set;",
+-        "",
+-        "@Module",
+-        "final class EmptySetModule {",
+-        "  @Provides @ElementsIntoSet Set<String> emptySet() { return Collections.emptySet(); }",
+-        "}");
+-    JavaFileObject setModuleFile = JavaFileObjects.forSourceLines("test.SetModule",
+-        "package test;",
+-        "",
+-        "import dagger.Module;",
+-        "import dagger.Provides;",
+-        "import dagger.multibindings.IntoSet;",
+-        "",
+-        "@Module",
+-        "final class SetModule {",
+-        "  @Provides @IntoSet String string() { return \"\"; }",
+-        "}");
+-    JavaFileObject componentFile = JavaFileObjects.forSourceLines("test.TestComponent",
+-        "package test;",
+-        "",
+-        "import dagger.Component;",
+-        "import java.util.Set;",
+-        "import javax.inject.Provider;",
+-        "",
+-        "@Component(modules = {EmptySetModule.class, SetModule.class})",
+-        "interface TestComponent {",
+-        "  Set<String> strings();",
+-        "}");
+-    JavaFileObject generatedComponent =
+-        JavaFileObjects.forSourceLines(
+-            "test.DaggerTestComponent",
+-            "package test;",
+-            "",
+-            "import dagger.internal.Preconditions;",
+-            "import dagger.internal.SetFactory;",
+-            "import java.util.Set;",
+-            "import javax.annotation.Generated;",
+-            "import javax.inject.Provider;",
+-            "",
+-            GENERATED_ANNOTATION,
+-            "public final class DaggerTestComponent implements TestComponent {",
+-            "  private Provider<Set<String>> emptySetProvider;",
+-            "  private Provider<String> stringProvider;",
+-            "  private Provider<Set<String>> setOfStringProvider;",
+-            "",
+-            "  private DaggerTestComponent(Builder builder) {",
+-            "    assert builder != null;",
+-            "    initialize(builder);",
+-            "  }",
+-            "",
+-            "  public static Builder builder() {",
+-            "    return new Builder();",
+-            "  }",
+-            "",
+-            "  public static TestComponent create() {",
+-            "    return new Builder().build();",
+-            "  }",
+-            "",
+-            "  @SuppressWarnings(\"unchecked\")",
+-            "  private void initialize(final Builder builder) {",
+-            "    this.emptySetProvider =",
+-            "        EmptySetModule_EmptySetFactory.create(builder.emptySetModule);",
+-            "    this.stringProvider =",
+-            "        SetModule_StringFactory.create(builder.setModule);",
+-            "    this.setOfStringProvider = ",
+-            "        SetFactory.<String>builder(1, 1)",
+-            "            .addCollectionProvider(emptySetProvider)",
+-            "            .addProvider(stringProvider)",
+-            "            .build();",
+-            "  }",
+-            "",
+-            "  @Override",
+-            "  public Set<String> strings() {",
+-            "    return setOfStringProvider.get();",
+-            "  }",
+-            "",
+-            "  public static final class Builder {",
+-            "    private EmptySetModule emptySetModule;",
+-            "    private SetModule setModule;",
+-            "",
+-            "    private Builder() {",
+-            "    }",
+-            "",
+-            "    public TestComponent build() {",
+-            "      if (emptySetModule == null) {",
+-            "        this.emptySetModule = new EmptySetModule();",
+-            "      }",
+-            "      if (setModule == null) {",
+-            "        this.setModule = new SetModule();",
+-            "      }",
+-            "      return new DaggerTestComponent(this);",
+-            "    }",
+-            "",
+-            "    public Builder emptySetModule(EmptySetModule emptySetModule) {",
+-            "      this.emptySetModule = Preconditions.checkNotNull(emptySetModule);",
+-            "      return this;",
+-            "    }",
+-            "",
+-            "    public Builder setModule(SetModule setModule) {",
+-            "      this.setModule = Preconditions.checkNotNull(setModule);",
+-            "      return this;",
+-            "    }",
+-            "  }",
+-            "}");
+-    Compilation compilation =
+-        daggerCompiler().compile(emptySetModuleFile, setModuleFile, componentFile);
+-    assertThat(compilation).succeeded();
+-    assertThat(compilation)
+-        .generatedSourceFile("test.DaggerTestComponent")
+-        .hasSourceEquivalentTo(generatedComponent);
+-  }
+-
+   @Test public void membersInjection() {
+     JavaFileObject injectableTypeFile = JavaFileObjects.forSourceLines("test.SomeInjectableType",
+         "package test;",
+diff --git a/javatests/dagger/internal/codegen/SetBindingRequestFulfillmentTest.java b/javatests/dagger/internal/codegen/SetBindingRequestFulfillmentTest.java
+new file mode 100644
+index 000000000..67cad21eb
+--- /dev/null
++++ b/javatests/dagger/internal/codegen/SetBindingRequestFulfillmentTest.java
+@@ -0,0 +1,533 @@
++/*
++ * Copyright (C) 2017 The Dagger Authors.
++ *
++ * Licensed under the Apache License, Version 2.0 (the "License");
++ * you may not use this file except in compliance with the License.
++ * You may obtain a copy of the License at
++ *
++ * http://www.apache.org/licenses/LICENSE-2.0
++ *
++ * Unless required by applicable law or agreed to in writing, software
++ * distributed under the License is distributed on an "AS IS" BASIS,
++ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++ * See the License for the specific language governing permissions and
++ * limitations under the License.
++ */
++
++package dagger.internal.codegen;
++
++import static com.google.testing.compile.CompilationSubject.assertThat;
++import static dagger.internal.codegen.Compilers.daggerCompiler;
++import static dagger.internal.codegen.GeneratedLines.GENERATED_ANNOTATION;
++
++import com.google.testing.compile.Compilation;
++import com.google.testing.compile.JavaFileObjects;
++import javax.tools.JavaFileObject;
++import org.junit.Test;
++import org.junit.runner.RunWith;
++import org.junit.runners.JUnit4;
++
++@RunWith(JUnit4.class)
++public class SetBindingRequestFulfillmentTest {
++  @Test
++  public void setBindings() {
++    JavaFileObject emptySetModuleFile = JavaFileObjects.forSourceLines("test.EmptySetModule",
++        "package test;",
++        "",
++        "import dagger.Module;",
++        "import dagger.Provides;",
++        "import dagger.multibindings.ElementsIntoSet;",
++        "import dagger.multibindings.Multibinds;",
++        "import java.util.Collections;",
++        "import java.util.Set;",
++        "",
++        "@Module",
++        "abstract class EmptySetModule {",
++        "  @Multibinds abstract Set<Object> objects();",
++        "",
++        "  @Provides @ElementsIntoSet",
++        "  static Set<String> emptySet() { ",
++        "    return Collections.emptySet();",
++        "  }",
++        "}");
++    JavaFileObject setModuleFile = JavaFileObjects.forSourceLines("test.SetModule",
++        "package test;",
++        "",
++        "import dagger.Module;",
++        "import dagger.Provides;",
++        "import dagger.multibindings.IntoSet;",
++        "",
++        "@Module",
++        "final class SetModule {",
++        "  @Provides @IntoSet static String string() { return \"\"; }",
++        "}");
++    JavaFileObject componentFile = JavaFileObjects.forSourceLines("test.TestComponent",
++        "package test;",
++        "",
++        "import dagger.Component;",
++        "import java.util.Set;",
++        "import javax.inject.Provider;",
++        "",
++        "@Component(modules = {EmptySetModule.class, SetModule.class})",
++        "interface TestComponent {",
++        "  Set<String> strings();",
++        "  Set<Object> objects();",
++        "}");
++    JavaFileObject generatedComponent =
++        JavaFileObjects.forSourceLines(
++            "test.DaggerTestComponent",
++            "package test;",
++            "",
++            "import dagger.internal.Preconditions;",
++            "import dagger.internal.SetBuilder;",
++            "import dagger.internal.SetFactory;",
++            "import java.util.Collections;",
++            "import java.util.Set;",
++            "import javax.annotation.Generated;",
++            "import javax.inject.Provider;",
++            "",
++            GENERATED_ANNOTATION,
++            "public final class DaggerTestComponent implements TestComponent {",
++            "  private Provider<Set<String>> setOfStringProvider;",
++            "",
++            "  private DaggerTestComponent(Builder builder) {",
++            "    assert builder != null;",
++            "    initialize(builder);",
++            "  }",
++            "",
++            "  public static Builder builder() {",
++            "    return new Builder();",
++            "  }",
++            "",
++            "  public static TestComponent create() {",
++            "    return new Builder().build();",
++            "  }",
++            "",
++            "  @SuppressWarnings(\"unchecked\")",
++            "  private void initialize(final Builder builder) {",
++            "    this.setOfStringProvider = ",
++            "        SetFactory.<String>builder(1, 1)",
++            "            .addCollectionProvider(EmptySetModule_EmptySetFactory.create())",
++            "            .addProvider(SetModule_StringFactory.create())",
++            "            .build();",
++            "  }",
++            "",
++            "  @Override",
++            "  public Set<String> strings() {",
++            "    return SetBuilder.<String>newSetBuilder(2)",
++            "        .addAll(EmptySetModule.emptySet())",
++            "        .add(SetModule.string())",
++            "        .create();",
++            "  }",
++            "",
++            "  @Override",
++            "  public Set<Object> objects() {",
++            "    return Collections.<Object>emptySet();",
++            "  }",
++            "",
++            "  public static final class Builder {",
++            "    private Builder() {",
++            "    }",
++            "",
++            "    public TestComponent build() {",
++            "      return new DaggerTestComponent(this);",
++            "    }",
++            "",
++            "    @Deprecated",
++            "    public Builder setModule(SetModule setModule) {",
++            "      Preconditions.checkNotNull(setModule);",
++            "      return this;",
++            "    }",
++            "  }",
++            "}");
++    Compilation compilation =
++        daggerCompiler().compile(emptySetModuleFile, setModuleFile, componentFile);
++    assertThat(compilation).succeeded();
++    assertThat(compilation)
++        .generatedSourceFile("test.DaggerTestComponent")
++        .hasSourceEquivalentTo(generatedComponent);
++  }
++
++  @Test
++  public void inaccessible() {
++    JavaFileObject inaccessible =
++        JavaFileObjects.forSourceLines(
++            "other.Inaccessible",
++            "package other;",
++            "",
++            "class Inaccessible {}");
++    JavaFileObject inaccessible2 =
++        JavaFileObjects.forSourceLines(
++            "other.Inaccessible2",
++            "package other;",
++            "",
++            "class Inaccessible2 {}");
++    JavaFileObject usesInaccessible =
++        JavaFileObjects.forSourceLines(
++            "other.UsesInaccessible",
++            "package other;",
++            "",
++            "import java.util.Set;",
++            "import javax.inject.Inject;",
++            "",
++            "public class UsesInaccessible {",
++            "  @Inject UsesInaccessible(Set<Inaccessible> set1, Set<Inaccessible2> set2) {}",
++            "}");
++
++    JavaFileObject module =
++        JavaFileObjects.forSourceLines(
++            "other.TestModule",
++            "package other;",
++            "",
++            "import dagger.Module;",
++            "import dagger.Provides;",
++            "import dagger.multibindings.ElementsIntoSet;",
++            "import dagger.multibindings.Multibinds;",
++            "import java.util.Collections;",
++            "import java.util.Set;",
++            "",
++            "@Module",
++            "public abstract class TestModule {",
++            "  @Multibinds abstract Set<Inaccessible> objects();",
++            "",
++            "  @Provides @ElementsIntoSet",
++            "  static Set<Inaccessible2> emptySet() { ",
++            "    return Collections.emptySet();",
++            "  }",
++            "}");
++    JavaFileObject componentFile =
++        JavaFileObjects.forSourceLines(
++            "test.TestComponent",
++            "package test;",
++            "",
++            "import dagger.Component;",
++            "import java.util.Set;",
++            "import javax.inject.Provider;",
++            "import other.TestModule;",
++            "import other.UsesInaccessible;",
++            "",
++            "@Component(modules = TestModule.class)",
++            "interface TestComponent {",
++            "  UsesInaccessible usesInaccessible();",
++            "}");
++    JavaFileObject generatedComponent =
++        JavaFileObjects.forSourceLines(
++            "test.DaggerTestComponent",
++            "package test;",
++            "",
++            "import dagger.internal.Factory;",
++            "import dagger.internal.SetBuilder;",
++            "import dagger.internal.SetFactory;",
++            "import java.util.Collections;",
++            "import javax.annotation.Generated;",
++            "import javax.inject.Provider;",
++            "import other.TestModule_EmptySetFactory;",
++            "import other.UsesInaccessible;",
++            "import other.UsesInaccessible_Factory;",
++            "",
++            GENERATED_ANNOTATION,
++            "public final class DaggerTestComponent implements TestComponent {",
++            "  @SuppressWarnings(\"rawtypes\")",
++            "  private Provider setOfInaccessible2Provider;",
++            "  private Provider<UsesInaccessible> usesInaccessibleProvider;",
++            "",
++            "  private DaggerTestComponent(Builder builder) {",
++            "    assert builder != null;",
++            "    initialize(builder);",
++            "  }",
++            "",
++            "  public static Builder builder() {",
++            "    return new Builder();",
++            "  }",
++            "",
++            "  public static TestComponent create() {",
++            "    return new Builder().build();",
++            "  }",
++            "",
++            "  @SuppressWarnings(\"unchecked\")",
++            "  private void initialize(final Builder builder) {",
++            "    this.setOfInaccessible2Provider =",
++            "        SetFactory.builder(0, 1)",
++            "            .addCollectionProvider((Provider) TestModule_EmptySetFactory.create())",
++            "            .build();",
++            "    this.usesInaccessibleProvider =",
++            "        UsesInaccessible_Factory.create(",
++            "            ((Factory) SetFactory.empty()), setOfInaccessible2Provider);",
++            "  }",
++            "",
++            "  @Override",
++            "  public UsesInaccessible usesInaccessible() {",
++            "    return UsesInaccessible_Factory.newUsesInaccessible(",
++            "        Collections.emptySet(),",
++            "        SetBuilder.newSetBuilder(1)",
++            "            .addAll(TestModule_EmptySetFactory.proxyEmptySet())",
++            "            .create());",
++            "  }",
++            "",
++            "  public static final class Builder {",
++            "    private Builder() {",
++            "    }",
++            "",
++            "    public TestComponent build() {",
++            "      return new DaggerTestComponent(this);",
++            "    }",
++            "  }",
++            "}");
++    Compilation compilation =
++        daggerCompiler()
++            .compile(module, inaccessible, inaccessible2, usesInaccessible, componentFile);
++    assertThat(compilation).succeeded();
++    assertThat(compilation)
++        .generatedSourceFile("test.DaggerTestComponent")
++        .hasSourceEquivalentTo(generatedComponent);
++  }
++
++  @Test
++  public void subcomponentOmitsInheritedBindings() {
++    JavaFileObject parent =
++        JavaFileObjects.forSourceLines(
++            "test.Parent",
++            "package test;",
++            "",
++            "import dagger.Component;",
++            "",
++            "@Component(modules = ParentModule.class)",
++            "interface Parent {",
++            "  Child child();",
++            "}");
++    JavaFileObject parentModule =
++        JavaFileObjects.forSourceLines(
++            "test.ParentModule",
++            "package test;",
++            "",
++            "import dagger.Module;",
++            "import dagger.Provides;",
++            "import dagger.multibindings.IntoSet;",
++            "import dagger.multibindings.IntoMap;",
++            "import dagger.multibindings.StringKey;",
++            "",
++            "@Module",
++            "class ParentModule {",
++            "  @Provides @IntoSet static Object parentObject() {",
++            "    return \"parent object\";",
++            "  }",
++            "",
++            "  @Provides @IntoMap @StringKey(\"parent key\") Object parentKeyObject() {",
++            "    return \"parent value\";",
++            "  }",
++            "}");
++    JavaFileObject child =
++        JavaFileObjects.forSourceLines(
++            "test.Child",
++            "package test;",
++            "",
++            "import dagger.Subcomponent;",
++            "import java.util.Map;",
++            "import java.util.Set;",
++            "",
++            "@Subcomponent",
++            "interface Child {",
++            "  Set<Object> objectSet();",
++            "  Map<String, Object> objectMap();",
++            "}");
++    JavaFileObject expected =
++        JavaFileObjects.forSourceLines(
++            "test.DaggerParent",
++            "package test;",
++            "",
++            "import dagger.internal.MapFactory;",
++            "import dagger.internal.MapProviderFactory;",
++            "import dagger.internal.Preconditions;",
++            "import dagger.internal.SetFactory;",
++            "import java.util.Collections;",
++            "import java.util.Map;",
++            "import java.util.Set;",
++            "import javax.annotation.Generated;",
++            "import javax.inject.Provider;",
++            "",
++            GENERATED_ANNOTATION,
++            "public final class DaggerParent implements Parent {",
++            "  private Provider<Object> parentKeyObjectProvider;",
++            "",
++            "  private DaggerParent(Builder builder) {",
++            "    assert builder != null;",
++            "    initialize(builder);",
++            "  }",
++            "",
++            "  public static Builder builder() {",
++            "    return new Builder();",
++            "  }",
++            "",
++            "  public static Parent create() {",
++            "    return new Builder().build();",
++            "  }",
++            "",
++            "  @SuppressWarnings(\"unchecked\")",
++            "  private void initialize(final Builder builder) {",
++            "    this.parentKeyObjectProvider =",
++            "        ParentModule_ParentKeyObjectFactory.create(builder.parentModule);",
++            "  }",
++            "",
++            "  @Override",
++            "  public Child child() {",
++            "    return new ChildImpl();",
++            "  }",
++            "",
++            "  public static final class Builder {",
++            "    private ParentModule parentModule;",
++            "",
++            "    private Builder() {}",
++            "",
++            "    public Parent build() {",
++            "      if (parentModule == null) {",
++            "        this.parentModule = new ParentModule();",
++            "      }",
++            "      return new DaggerParent(this);",
++            "    }",
++            "",
++            "    public Builder parentModule(ParentModule parentModule) {",
++            "      this.parentModule = Preconditions.checkNotNull(parentModule);",
++            "      return this;",
++            "    }",
++            "  }",
++            "",
++            "  private final class ChildImpl implements Child {",
++            "    private Provider<Set<Object>> setOfObjectProvider;",
++            "    private Provider<Map<String, Provider<Object>>>",
++            "        mapOfStringAndProviderOfObjectProvider;",
++            "    private Provider<Map<String, Object>> mapOfStringAndObjectProvider;",
++            "",
++            "    private ChildImpl() {",
++            "      initialize();",
++            "    }",
++            "",
++            "    @SuppressWarnings(\"unchecked\")",
++            "    private void initialize() {",
++            "      this.setOfObjectProvider = SetFactory.<Object>builder(1, 0)",
++            "          .addProvider(ParentModule_ParentObjectFactory.create()).build();",
++            "      this.mapOfStringAndProviderOfObjectProvider =",
++            "          MapProviderFactory.<String, Object>builder(1)",
++            "              .put(\"parent key\", DaggerParent.this.parentKeyObjectProvider)",
++            "              .build();",
++            "      this.mapOfStringAndObjectProvider = MapFactory.create(",
++            "          mapOfStringAndProviderOfObjectProvider);",
++            "    }",
++            "",
++            "    @Override",
++            "    public Set<Object> objectSet() {",
++            "      return Collections.<Object>singleton(ParentModule.parentObject());",
++            "    }",
++            "",
++            "    @Override",
++            "    public Map<String, Object> objectMap() {",
++            "      return mapOfStringAndObjectProvider.get();",
++            "    }",
++            "  }",
++            "}");
++    Compilation compilation = daggerCompiler().compile(parent, parentModule, child);
++    assertThat(compilation).succeeded();
++    assertThat(compilation)
++        .generatedSourceFile("test.DaggerParent")
++        .hasSourceEquivalentTo(expected);
++  }
++
++  @Test
++  public void productionComponents() {
++    JavaFileObject emptySetModuleFile = JavaFileObjects.forSourceLines("test.EmptySetModule",
++        "package test;",
++        "",
++        "import dagger.Module;",
++        "import dagger.Provides;",
++        "import dagger.multibindings.ElementsIntoSet;",
++        "import java.util.Collections;",
++        "import java.util.Set;",
++        "",
++        "@Module",
++        "abstract class EmptySetModule {",
++        "  @Provides @ElementsIntoSet",
++        "  static Set<String> emptySet() { ",
++        "    return Collections.emptySet();",
++        "  }",
++        "}");
++    JavaFileObject componentFile = JavaFileObjects.forSourceLines("test.TestComponent",
++        "package test;",
++        "",
++        "import com.google.common.util.concurrent.ListenableFuture;",
++        "import dagger.producers.ProductionComponent;",
++        "import java.util.Set;",
++        "",
++        "@ProductionComponent(modules = EmptySetModule.class)",
++        "interface TestComponent {",
++        "  ListenableFuture<Set<String>> strings();",
++        "}");
++    JavaFileObject generatedComponent =
++        JavaFileObjects.forSourceLines(
++            "test.DaggerTestComponent",
++            "package test;",
++            "",
++            "import com.google.common.util.concurrent.Futures;",
++            "import com.google.common.util.concurrent.ListenableFuture;",
++            "import dagger.internal.Preconditions;",
++            "import dagger.internal.SetBuilder;",
++            "import dagger.internal.SetFactory;",
++            "import java.util.Set;",
++            "import javax.annotation.Generated;",
++            "import javax.inject.Provider;",
++            "",
++            GENERATED_ANNOTATION,
++            "public final class DaggerTestComponent implements TestComponent {",
++            "  private Provider<Set<String>> setOfStringProvider;",
++            "",
++            "  private DaggerTestComponent(Builder builder) {",
++            "    assert builder != null;",
++            "    initialize(builder);",
++            "  }",
++            "",
++            "  public static Builder builder() {",
++            "    return new Builder();",
++            "  }",
++            "",
++            "  public static TestComponent create() {",
++            "    return new Builder().build();",
++            "  }",
++            "",
++            "  @SuppressWarnings(\"unchecked\")",
++            "  private void initialize(final Builder builder) {",
++            "    this.setOfStringProvider =",
++            "        SetFactory.<String>builder(0, 1)",
++            "            .addCollectionProvider(EmptySetModule_EmptySetFactory.create())",
++            "            .build();",
++            "  }",
++            "",
++            "  @Override",
++            "  public ListenableFuture<Set<String>> strings() {",
++            "    return Futures.immediateFuture(",
++            "        SetBuilder.<String>newSetBuilder(1)",
++            "            .addAll(EmptySetModule.emptySet())",
++            "            .create());",
++            "  }",
++            "",
++            "  public static final class Builder {",
++            "    private Builder() {}",
++            "",
++            "    public TestComponent build() {",
++            "      return new DaggerTestComponent(this);",
++            "    }",
++            "",
++            "    @Deprecated",
++            "    public Builder testComponent_ProductionExecutorModule(",
++            "        TestComponent_ProductionExecutorModule",
++            "            testComponent_ProductionExecutorModule) {",
++            "      Preconditions.checkNotNull(testComponent_ProductionExecutorModule);",
++            "      return this;",
++            "    }",
++            "  }",
++            "}");
++    Compilation compilation =
++        daggerCompiler().compile(emptySetModuleFile, componentFile);
++    assertThat(compilation).succeeded();
++    assertThat(compilation)
++        .generatedSourceFile("test.DaggerTestComponent")
++        .hasSourceEquivalentTo(generatedComponent);
++  }
++}

@@ -1,0 +1,493 @@
+diff --git a/java/dagger/internal/codegen/BUILD b/java/dagger/internal/codegen/BUILD
+index 490e2b1b0..a780e93fb 100644
+--- a/java/dagger/internal/codegen/BUILD
++++ b/java/dagger/internal/codegen/BUILD
+@@ -223,6 +223,7 @@ java_library(
+     name = "processor",
+     srcs = [
+         "CanReleaseReferencesProcessingStep.java",
++        "ComponentHjarProcessingStep.java",
+         "ComponentProcessingStep.java",
+         "ComponentProcessor.java",
+         "InjectBindingRegistryImpl.java",
+diff --git a/java/dagger/internal/codegen/CompilerOptions.java b/java/dagger/internal/codegen/CompilerOptions.java
+index 44d926184..b54490c8f 100644
+--- a/java/dagger/internal/codegen/CompilerOptions.java
++++ b/java/dagger/internal/codegen/CompilerOptions.java
+@@ -60,14 +60,16 @@ boolean doCheckForNulls() {
+   abstract boolean ignorePrivateAndStaticInjectionForComponent();
+   abstract ValidationType scopeCycleValidationType();
+   abstract boolean warnIfInjectionFactoryNotGeneratedUpstream();
++  abstract boolean headerCompilation();
+ 
+   static Builder builder() {
+-    return new AutoValue_CompilerOptions.Builder();
++    return new AutoValue_CompilerOptions.Builder().headerCompilation(false);
+   }
+ 
+   static CompilerOptions create(ProcessingEnvironment processingEnv, Elements elements) {
+     return builder()
+         .usesProducers(elements.getTypeElement(Produces.class.getCanonicalName()) != null)
++        .headerCompilation(processingEnv.getOptions().containsKey(HEADER_COMPILATION))
+         .experimentalAndroidMode(experimentalAndroidMode(processingEnv)
+             .equals(FeatureStatus.ENABLED))
+         .writeProducerNameInToken(
+@@ -89,6 +91,7 @@ static CompilerOptions create(ProcessingEnvironment processingEnv, Elements elem
+   @AutoValue.Builder
+   interface Builder {
+     Builder usesProducers(boolean usesProduces);
++    Builder headerCompilation(boolean headerCompilation);
+     Builder experimentalAndroidMode(boolean experimentalAndroidMode);
+     Builder writeProducerNameInToken(boolean writeProducerNameInToken);
+     Builder nullableValidationKind(Diagnostic.Kind kind);
+@@ -102,6 +105,8 @@ Builder warnIfInjectionFactoryNotGeneratedUpstream(
+     CompilerOptions build();
+   }
+ 
++  private static final String HEADER_COMPILATION = "experimental_turbine_hjar";
++
+   static final String EXPERIMENTAL_ANDROID_MODE = "dagger.experimentalAndroidMode";
+ 
+   static final String WRITE_PRODUCER_NAME_IN_TOKEN_KEY = "dagger.writeProducerNameInToken";
+@@ -131,6 +136,7 @@ Builder warnIfInjectionFactoryNotGeneratedUpstream(
+   static final ImmutableSet<String> SUPPORTED_OPTIONS =
+       ImmutableSet.of(
+           EXPERIMENTAL_ANDROID_MODE,
++          HEADER_COMPILATION,
+           WRITE_PRODUCER_NAME_IN_TOKEN_KEY,
+           DISABLE_INTER_COMPONENT_SCOPE_VALIDATION_KEY,
+           NULLABLE_VALIDATION_KEY,
+diff --git a/java/dagger/internal/codegen/ComponentGenerator.java b/java/dagger/internal/codegen/ComponentGenerator.java
+index bca63f0c1..8d24aa5d6 100644
+--- a/java/dagger/internal/codegen/ComponentGenerator.java
++++ b/java/dagger/internal/codegen/ComponentGenerator.java
+@@ -16,13 +16,15 @@
+ 
+ package dagger.internal.codegen;
+ 
+-import com.google.common.base.Joiner;
++import static dagger.internal.codegen.SourceFiles.classFileName;
++
+ import com.squareup.javapoet.ClassName;
+ import com.squareup.javapoet.TypeSpec;
+ import dagger.Component;
+ import java.util.Optional;
+ import javax.annotation.processing.Filer;
+ import javax.lang.model.element.Element;
++import javax.lang.model.element.TypeElement;
+ import javax.lang.model.util.Elements;
+ 
+ /**
+@@ -52,10 +54,12 @@
+ 
+   @Override
+   ClassName nameGeneratedType(BindingGraph input) {
+-    ClassName componentDefinitionClassName = ClassName.get(input.componentType());
+-    String componentName =
+-        "Dagger" + Joiner.on('_').join(componentDefinitionClassName.simpleNames());
+-    return componentDefinitionClassName.topLevelClassName().peerClass(componentName);
++    return componentName(input.componentType());
++  }
++
++  static ClassName componentName(TypeElement componentDefinitionType) {
++    ClassName componentName = ClassName.get(componentDefinitionType);
++    return ClassName.get(componentName.packageName(), "Dagger" + classFileName(componentName));
+   }
+ 
+   @Override
+diff --git a/java/dagger/internal/codegen/ComponentHjarProcessingStep.java b/java/dagger/internal/codegen/ComponentHjarProcessingStep.java
+new file mode 100644
+index 000000000..ab8c9ac9e
+--- /dev/null
++++ b/java/dagger/internal/codegen/ComponentHjarProcessingStep.java
+@@ -0,0 +1,287 @@
++/*
++ * Copyright (C) 2017 The Dagger Authors.
++ *
++ * Licensed under the Apache License, Version 2.0 (the "License");
++ * you may not use this file except in compliance with the License.
++ * You may obtain a copy of the License at
++ *
++ * http://www.apache.org/licenses/LICENSE-2.0
++ *
++ * Unless required by applicable law or agreed to in writing, software
++ * distributed under the License is distributed on an "AS IS" BASIS,
++ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++ * See the License for the specific language governing permissions and
++ * limitations under the License.
++ */
++
++package dagger.internal.codegen;
++
++import static com.google.auto.common.MoreElements.isAnnotationPresent;
++import static com.google.common.base.CaseFormat.LOWER_CAMEL;
++import static com.google.common.base.CaseFormat.UPPER_CAMEL;
++import static com.google.common.base.Preconditions.checkArgument;
++import static com.squareup.javapoet.MethodSpec.constructorBuilder;
++import static dagger.internal.codegen.ComponentGenerator.componentName;
++import static dagger.internal.codegen.DaggerStreams.toImmutableSet;
++import static dagger.internal.codegen.TypeSpecs.addSupertype;
++import static javax.lang.model.element.Modifier.ABSTRACT;
++import static javax.lang.model.element.Modifier.FINAL;
++import static javax.lang.model.element.Modifier.PRIVATE;
++import static javax.lang.model.element.Modifier.PUBLIC;
++import static javax.lang.model.element.Modifier.STATIC;
++import static javax.lang.model.util.ElementFilter.methodsIn;
++
++import com.google.auto.common.BasicAnnotationProcessor.ProcessingStep;
++import com.google.auto.common.MoreElements;
++import com.google.auto.common.MoreTypes;
++import com.google.common.collect.ImmutableSet;
++import com.google.common.collect.SetMultimap;
++import com.google.common.collect.Sets;
++import com.squareup.javapoet.ClassName;
++import com.squareup.javapoet.MethodSpec;
++import com.squareup.javapoet.TypeName;
++import com.squareup.javapoet.TypeSpec;
++import dagger.BindsInstance;
++import dagger.internal.codegen.ComponentDescriptor.ComponentMethodDescriptor;
++import dagger.internal.codegen.ComponentDescriptor.Factory;
++import dagger.internal.codegen.ComponentValidator.ComponentValidationReport;
++import java.lang.annotation.Annotation;
++import java.util.Optional;
++import java.util.Set;
++import java.util.stream.Stream;
++import javax.annotation.processing.Filer;
++import javax.annotation.processing.Messager;
++import javax.lang.model.element.Element;
++import javax.lang.model.element.ExecutableElement;
++import javax.lang.model.element.TypeElement;
++import javax.lang.model.type.DeclaredType;
++import javax.lang.model.type.ExecutableType;
++import javax.lang.model.util.Elements;
++import javax.lang.model.util.Types;
++
++/**
++ * A processing step that emits the API of a generated component, without any actual implementation.
++ *
++ * <p>When compiling a header jar (hjar), Bazel needs to run annotation processors that generate
++ * API, like Dagger, to see what code they might output. Full {@link BindingGraph} analysis is
++ * costly and unnecessary from the perspective of the header compiler; it's sole goal is to pass
++ * along a slimmed down version of what will be the jar for a particular compilation, whether or not
++ * that compilation succeeds. If it does not, the compilation pipeline will fail, even if header
++ * compilation succeeded.
++ *
++ * <p>The components emitted by this processing step include all of the API elements exposed by the
++ * normal {@link AbstractComponentWriter}. Method bodies are omitted as Turbine ignores them
++ * entirely.
++ */
++final class ComponentHjarProcessingStep implements ProcessingStep {
++
++  private final ComponentDescriptor.Kind componentKind;
++  private final Elements elements;
++  private final Types types;
++  private final Filer filer;
++  private final Messager messager;
++  private final ComponentValidator componentValidator;
++  private final ComponentDescriptor.Factory componentDescriptorFactory;
++
++  ComponentHjarProcessingStep(
++      ComponentDescriptor.Kind componentKind,
++      Elements elements,
++      Types types,
++      Filer filer,
++      Messager messager,
++      ComponentValidator componentValidator,
++      Factory componentDescriptorFactory) {
++    this.componentKind = componentKind;
++    this.elements = elements;
++    this.types = types;
++    this.filer = filer;
++    this.messager = messager;
++    this.componentValidator = componentValidator;
++    this.componentDescriptorFactory = componentDescriptorFactory;
++  }
++
++  @Override
++  public Set<? extends Class<? extends Annotation>> annotations() {
++    return ImmutableSet.<Class<? extends Annotation>>builder()
++        .add(componentKind.annotationType())
++        .addAll(
++            componentKind
++                .subcomponentKinds()
++                .stream()
++                .flatMap(kind -> Stream.of(kind.annotationType(), kind.builderAnnotationType()))
++                .collect(toImmutableSet()))
++        .build();
++  }
++
++  @Override
++  public Set<Element> process(
++      SetMultimap<Class<? extends Annotation>, Element> elementsByAnnotation) {
++    ImmutableSet.Builder<Element> rejectedElements = ImmutableSet.builder();
++
++    for (Element element : elementsByAnnotation.get(componentKind.annotationType())) {
++      TypeElement componentTypeElement = MoreElements.asType(element);
++      try {
++        // TODO(ronshapiro): component validation might not be necessary. We should measure it and
++        // figure out if it's worth seeing if removing it will still work. We could potentially
++        // add a new catch clause for any exception that's not TypeNotPresentException and ignore
++        // the component entirely in that case.
++        ComponentValidationReport validationReport =
++            componentValidator.validate(componentTypeElement, ImmutableSet.of(), ImmutableSet.of());
++        validationReport.report().printMessagesTo(messager);
++        if (validationReport.report().isClean()) {
++          new EmptyComponentGenerator(filer, elements)
++              .generate(componentDescriptorFactory.forComponent(componentTypeElement), messager);
++        }
++      } catch (TypeNotPresentException e) {
++        rejectedElements.add(componentTypeElement);
++      }
++    }
++    return rejectedElements.build();
++  }
++
++  private final class EmptyComponentGenerator extends SourceFileGenerator<ComponentDescriptor> {
++    EmptyComponentGenerator(Filer filer, Elements elements) {
++      super(filer, elements);
++    }
++
++    @Override
++    ClassName nameGeneratedType(ComponentDescriptor input) {
++      return componentName(input.componentDefinitionType());
++    }
++
++    @Override
++    Optional<? extends Element> getElementForErrorReporting(ComponentDescriptor input) {
++      return Optional.of(input.componentDefinitionType());
++    }
++
++    @Override
++    Optional<TypeSpec.Builder> write(
++        ClassName generatedTypeName, ComponentDescriptor componentDescriptor) {
++      TypeSpec.Builder generatedComponent =
++          TypeSpec.classBuilder(generatedTypeName)
++              .addModifiers(PUBLIC, FINAL)
++              .addMethod(privateConstructor());
++      addSupertype(generatedComponent, componentDescriptor.componentDefinitionType());
++
++      TypeName builderMethodReturnType;
++      if (componentDescriptor.builderSpec().isPresent()) {
++        builderMethodReturnType =
++            ClassName.get(componentDescriptor.builderSpec().get().builderDefinitionType());
++      } else {
++        TypeSpec.Builder builder =
++            TypeSpec.classBuilder("Builder")
++                .addModifiers(PUBLIC, STATIC, FINAL)
++                .addMethod(privateConstructor());
++        ClassName builderClassName = generatedTypeName.nestedClass("Builder");
++        builderMethodReturnType = builderClassName;
++        componentRequirements(componentDescriptor)
++            .map(requirement -> builderInstanceMethod(requirement.typeElement(), builderClassName))
++            .forEach(builder::addMethod);
++        builder.addMethod(builderBuildMethod(componentDescriptor));
++        generatedComponent.addType(builder.build());
++      }
++
++      generatedComponent.addMethod(staticBuilderMethod(builderMethodReturnType));
++
++      if (componentRequirements(componentDescriptor)
++              .noneMatch(requirement -> requirement.requiresAPassedInstance(elements, types))
++          && !hasBindsInstanceMethods(componentDescriptor)) {
++        generatedComponent.addMethod(createMethod(componentDescriptor));
++      }
++
++      // TODO(ronshapiro): unify with AbstractComponentWriter
++      Set<MethodSignature> methodSignatures =
++          Sets.newHashSetWithExpectedSize(componentDescriptor.componentMethods().size());
++      componentDescriptor
++          .componentMethods()
++          .stream()
++          .filter(method -> methodSignatures.add(methodSignature(componentDescriptor, method)))
++          .forEach(
++              method ->
++                  generatedComponent.addMethod(
++                      emptyComponentMethod(
++                          componentDescriptor.componentDefinitionType(), method.methodElement())));
++
++      return Optional.of(generatedComponent);
++    }
++  }
++
++  // TODO(ronshapiro): unify with AbstractComponentWriter
++  private MethodSignature methodSignature(
++      ComponentDescriptor component, ComponentMethodDescriptor method) {
++    DeclaredType componentType = MoreTypes.asDeclared(component.componentDefinitionType().asType());
++    ExecutableType requestType =
++        MoreTypes.asExecutable(types.asMemberOf(componentType, method.methodElement()));
++    return
++        MethodSignature.fromExecutableType(
++            method.methodElement().getSimpleName().toString(), requestType);
++  }
++
++  private MethodSpec emptyComponentMethod(TypeElement typeElement, ExecutableElement baseMethod) {
++    return MethodSpec.overriding(baseMethod, MoreTypes.asDeclared(typeElement.asType()), types)
++        .build();
++  }
++
++  private MethodSpec privateConstructor() {
++    return constructorBuilder().addModifiers(PRIVATE).build();
++  }
++
++  /**
++   * Returns the {@link ComponentRequirement}s for a component that does not have a {@link
++   * ComponentDescriptor#builderSpec()}.
++   */
++  private Stream<ComponentRequirement> componentRequirements(ComponentDescriptor component) {
++    checkArgument(component.kind().isTopLevel());
++    return Stream.concat(
++        component
++            .dependencies()
++            .stream()
++            .map(typeElement -> ComponentRequirement.forDependency(typeElement.asType())),
++        component
++            .transitiveModules()
++            .stream()
++            .filter(module -> !module.moduleElement().getModifiers().contains(ABSTRACT))
++            .map(module -> ComponentRequirement.forModule(module.moduleElement().asType())));
++  }
++
++  private boolean hasBindsInstanceMethods(ComponentDescriptor componentDescriptor) {
++    return componentDescriptor.builderSpec().isPresent()
++        && methodsIn(
++                elements.getAllMembers(
++                    componentDescriptor.builderSpec().get().builderDefinitionType()))
++            .stream()
++            .anyMatch(method -> isAnnotationPresent(method, BindsInstance.class));
++  }
++
++  private MethodSpec builderInstanceMethod(
++      TypeElement componentRequirement, ClassName builderClass) {
++    String simpleName =
++        UPPER_CAMEL.to(LOWER_CAMEL, componentRequirement.getSimpleName().toString());
++    return MethodSpec.methodBuilder(simpleName)
++        .addModifiers(PUBLIC)
++        .addParameter(ClassName.get(componentRequirement), simpleName)
++        .returns(builderClass)
++        .build();
++  }
++
++  private MethodSpec builderBuildMethod(ComponentDescriptor component) {
++    return MethodSpec.methodBuilder("build")
++        .addModifiers(PUBLIC)
++        .returns(ClassName.get(component.componentDefinitionType()))
++        .build();
++  }
++
++  private MethodSpec staticBuilderMethod(TypeName builderMethodReturnType) {
++    return MethodSpec.methodBuilder("builder")
++        .addModifiers(PUBLIC, STATIC)
++        .returns(builderMethodReturnType)
++        .build();
++  }
++
++  private MethodSpec createMethod(ComponentDescriptor componentDescriptor) {
++    return MethodSpec.methodBuilder("create")
++        .addModifiers(PUBLIC, STATIC)
++        .returns(ClassName.get(componentDescriptor.componentDefinitionType()))
++        .build();
++  }
++}
+diff --git a/java/dagger/internal/codegen/ComponentProcessor.java b/java/dagger/internal/codegen/ComponentProcessor.java
+index 4097f7547..61cd5f1e3 100644
+--- a/java/dagger/internal/codegen/ComponentProcessor.java
++++ b/java/dagger/internal/codegen/ComponentProcessor.java
+@@ -61,7 +61,12 @@ public SourceVersion getSupportedSourceVersion() {
+     DaggerTypes types = new DaggerTypes(processingEnv);
+     DaggerElements elements = new DaggerElements(processingEnv);
+     CompilerOptions compilerOptions = CompilerOptions.create(processingEnv, elements);
+-    Filer filer =  new FormattingFiler(processingEnv.getFiler());
++    Filer filer;
++    if (compilerOptions.headerCompilation()) {
++      filer = processingEnv.getFiler();
++    } else {
++      filer = new FormattingFiler(processingEnv.getFiler());
++    }
+ 
+     MethodSignatureFormatter methodSignatureFormatter = new MethodSignatureFormatter(types);
+     BindingDeclarationFormatter bindingDeclarationFormatter =
+@@ -184,6 +189,32 @@ public SourceVersion getSupportedSourceVersion() {
+             dependencyRequestFormatter,
+             keyFactory);
+ 
++    class ComponentProcessingStepFactory {
++      ProcessingStep create(ComponentDescriptor.Kind componentKind) {
++        if (compilerOptions.headerCompilation()) {
++          return new ComponentHjarProcessingStep(
++              componentKind,
++              elements,
++              types,
++              filer,
++              messager,
++              componentValidator,
++              componentDescriptorFactory);
++        } else {
++          return new ComponentProcessingStep(
++              componentKind,
++              messager,
++              componentValidator,
++              subcomponentValidator,
++              builderValidator,
++              componentHierarchyValidator,
++              bindingGraphValidator,
++              componentDescriptorFactory,
++              bindingGraphFactory,
++              componentGenerator);
++        }
++      }
++    }
+     return ImmutableList.of(
+         new MapKeyProcessingStep(
+             messager, types, mapKeyValidator, annotationCreatorGenerator, unwrappedMapKeyGenerator),
+@@ -196,17 +227,7 @@ public SourceVersion getSupportedSourceVersion() {
+         new MultibindingAnnotationsProcessingStep(messager),
+         new BindsInstanceProcessingStep(messager),
+         moduleProcessingStep(messager, moduleValidator, provisionBindingFactory, factoryGenerator),
+-        new ComponentProcessingStep(
+-            ComponentDescriptor.Kind.COMPONENT,
+-            messager,
+-            componentValidator,
+-            subcomponentValidator,
+-            builderValidator,
+-            componentHierarchyValidator,
+-            bindingGraphValidator,
+-            componentDescriptorFactory,
+-            bindingGraphFactory,
+-            componentGenerator),
++        new ComponentProcessingStepFactory().create(ComponentDescriptor.Kind.COMPONENT),
+         producerModuleProcessingStep(
+             messager,
+             moduleValidator,
+@@ -214,17 +235,7 @@ public SourceVersion getSupportedSourceVersion() {
+             factoryGenerator,
+             productionBindingFactory,
+             producerFactoryGenerator),
+-        new ComponentProcessingStep(
+-            ComponentDescriptor.Kind.PRODUCTION_COMPONENT,
+-            messager,
+-            componentValidator,
+-            subcomponentValidator,
+-            builderValidator,
+-            componentHierarchyValidator,
+-            bindingGraphValidator,
+-            componentDescriptorFactory,
+-            bindingGraphFactory,
+-            componentGenerator),
++        new ComponentProcessingStepFactory().create(ComponentDescriptor.Kind.PRODUCTION_COMPONENT),
+         new BindingMethodProcessingStep(messager, anyBindingMethodValidator));
+   }
+ 
+diff --git a/javatests/dagger/functional/BUILD b/javatests/dagger/functional/BUILD
+index ee51856f2..eac8ac1d6 100644
+--- a/javatests/dagger/functional/BUILD
++++ b/javatests/dagger/functional/BUILD
+@@ -28,6 +28,9 @@ GenJavaTests(
+     name = "functional_tests",
+     srcs = glob(
+         ["**/*.java"],
++        exclude = [
++            "HjarTest.java",
++        ],
+     ),
+     javacopts = DOCLINT_HTML_AND_SYNTAX,
+     lib_javacopts = SOURCE_7_TARGET_7,

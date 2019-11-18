@@ -1,0 +1,410 @@
+diff --git a/RELEASENOTES.md b/RELEASENOTES.md
+index 46515d8fa8..9d66a6f800 100644
+--- a/RELEASENOTES.md
++++ b/RELEASENOTES.md
+@@ -22,6 +22,8 @@
+ * Flac extension: Parse `VORBIS_COMMENT` metadata
+   ([#5527](https://github.com/google/ExoPlayer/issues/5527)).
+ * Set `compileSdkVersion` to 29 to use Android Q APIs.
++* Add `enable` and `disable` methods to `MediaSource` to improve resource
++  management in playlists.
+ 
+ ### 2.10.3 ###
+ 
+diff --git a/library/core/src/main/java/com/google/android/exoplayer2/source/BaseMediaSource.java b/library/core/src/main/java/com/google/android/exoplayer2/source/BaseMediaSource.java
+index 886952f5c3..86e00e0a37 100644
+--- a/library/core/src/main/java/com/google/android/exoplayer2/source/BaseMediaSource.java
++++ b/library/core/src/main/java/com/google/android/exoplayer2/source/BaseMediaSource.java
+@@ -22,6 +22,7 @@
+ import com.google.android.exoplayer2.upstream.TransferListener;
+ import com.google.android.exoplayer2.util.Assertions;
+ import java.util.ArrayList;
++import java.util.HashSet;
+ 
+ /**
+  * Base {@link MediaSource} implementation to handle parallel reuse and to keep a list of {@link
+@@ -33,6 +34,7 @@
+ public abstract class BaseMediaSource implements MediaSource {
+ 
+   private final ArrayList<MediaSourceCaller> mediaSourceCallers;
++  private final HashSet<MediaSourceCaller> enabledMediaSourceCallers;
+   private final MediaSourceEventListener.EventDispatcher eventDispatcher;
+ 
+   @Nullable private Looper looper;
+@@ -40,11 +42,13 @@
+ 
+   public BaseMediaSource() {
+     mediaSourceCallers = new ArrayList<>(/* initialCapacity= */ 1);
++    enabledMediaSourceCallers = new HashSet<>(/* initialCapacity= */ 1);
+     eventDispatcher = new MediaSourceEventListener.EventDispatcher();
+   }
+ 
+   /**
+-   * Starts source preparation. This method is called at most once until the next call to {@link
++   * Starts source preparation and enables the source, see {@link #prepareSource(MediaSourceCaller,
++   * TransferListener)}. This method is called at most once until the next call to {@link
+    * #releaseSourceInternal()}.
+    *
+    * @param mediaTransferListener The transfer listener which should be informed of any media data
+@@ -54,9 +58,15 @@ public BaseMediaSource() {
+    */
+   protected abstract void prepareSourceInternal(@Nullable TransferListener mediaTransferListener);
+ 
++  /** Enables the source, see {@link #enable(MediaSourceCaller)}. */
++  protected void enableInternal() {}
++
++  /** Disables the source, see {@link #disable(MediaSourceCaller)}. */
++  protected void disableInternal() {}
++
+   /**
+-   * Releases the source. This method is called exactly once after each call to {@link
+-   * #prepareSourceInternal(TransferListener)}.
++   * Releases the source, see {@link #releaseSource(MediaSourceCaller)}. This method is called
++   * exactly once after each call to {@link #prepareSourceInternal(TransferListener)}.
+    */
+   protected abstract void releaseSourceInternal();
+ 
+@@ -115,6 +125,11 @@ protected final void refreshSourceInfo(Timeline timeline) {
+     return eventDispatcher.withParameters(windowIndex, mediaPeriodId, mediaTimeOffsetMs);
+   }
+ 
++  /** Returns whether the source is enabled. */
++  protected final boolean isEnabled() {
++    return !enabledMediaSourceCallers.isEmpty();
++  }
++
+   @Override
+   public final void addEventListener(Handler handler, MediaSourceEventListener eventListener) {
+     eventDispatcher.addEventListener(handler, eventListener);
+@@ -130,22 +145,47 @@ public final void prepareSource(
+       MediaSourceCaller caller, @Nullable TransferListener mediaTransferListener) {
+     Looper looper = Looper.myLooper();
+     Assertions.checkArgument(this.looper == null || this.looper == looper);
++    Timeline timeline = this.timeline;
+     mediaSourceCallers.add(caller);
+     if (this.looper == null) {
+       this.looper = looper;
++      enabledMediaSourceCallers.add(caller);
+       prepareSourceInternal(mediaTransferListener);
+     } else if (timeline != null) {
++      enable(caller);
+       caller.onSourceInfoRefreshed(/* source= */ this, timeline);
+     }
+   }
+ 
++  @Override
++  public final void enable(MediaSourceCaller caller) {
++    Assertions.checkNotNull(looper);
++    boolean wasDisabled = enabledMediaSourceCallers.isEmpty();
++    enabledMediaSourceCallers.add(caller);
++    if (wasDisabled) {
++      enableInternal();
++    }
++  }
++
++  @Override
++  public final void disable(MediaSourceCaller caller) {
++    boolean wasEnabled = !enabledMediaSourceCallers.isEmpty();
++    enabledMediaSourceCallers.remove(caller);
++    if (wasEnabled && enabledMediaSourceCallers.isEmpty()) {
++      disableInternal();
++    }
++  }
++
+   @Override
+   public final void releaseSource(MediaSourceCaller caller) {
+     mediaSourceCallers.remove(caller);
+     if (mediaSourceCallers.isEmpty()) {
+       looper = null;
+       timeline = null;
++      enabledMediaSourceCallers.clear();
+       releaseSourceInternal();
++    } else {
++      disable(caller);
+     }
+   }
+ }
+diff --git a/library/core/src/main/java/com/google/android/exoplayer2/source/CompositeMediaSource.java b/library/core/src/main/java/com/google/android/exoplayer2/source/CompositeMediaSource.java
+index 3eac3df5fe..3672c304cc 100644
+--- a/library/core/src/main/java/com/google/android/exoplayer2/source/CompositeMediaSource.java
++++ b/library/core/src/main/java/com/google/android/exoplayer2/source/CompositeMediaSource.java
+@@ -37,7 +37,7 @@
+   @Nullable private Handler eventHandler;
+   @Nullable private TransferListener mediaTransferListener;
+ 
+-  /** Create composite media source without child sources. */
++  /** Creates composite media source without child sources. */
+   protected CompositeMediaSource() {
+     childSources = new HashMap<>();
+   }
+@@ -57,6 +57,22 @@ public void maybeThrowSourceInfoRefreshError() throws IOException {
+     }
+   }
+ 
++  @Override
++  @CallSuper
++  protected void enableInternal() {
++    for (MediaSourceAndListener childSource : childSources.values()) {
++      childSource.mediaSource.enable(childSource.caller);
++    }
++  }
++
++  @Override
++  @CallSuper
++  protected void disableInternal() {
++    for (MediaSourceAndListener childSource : childSources.values()) {
++      childSource.mediaSource.disable(childSource.caller);
++    }
++  }
++
+   @Override
+   @CallSuper
+   protected void releaseSourceInternal() {
+@@ -97,6 +113,29 @@ protected final void prepareChildSource(final T id, MediaSource mediaSource) {
+     childSources.put(id, new MediaSourceAndListener(mediaSource, caller, eventListener));
+     mediaSource.addEventListener(Assertions.checkNotNull(eventHandler), eventListener);
+     mediaSource.prepareSource(caller, mediaTransferListener);
++    if (!isEnabled()) {
++      mediaSource.disable(caller);
++    }
++  }
++
++  /**
++   * Enables a child source.
++   *
++   * @param id The unique id used to prepare the child source.
++   */
++  protected final void enableChildSource(final T id) {
++    MediaSourceAndListener enabledChild = Assertions.checkNotNull(childSources.get(id));
++    enabledChild.mediaSource.enable(enabledChild.caller);
++  }
++
++  /**
++   * Disables a child source.
++   *
++   * @param id The unique id used to prepare the child source.
++   */
++  protected final void disableChildSource(final T id) {
++    MediaSourceAndListener disabledChild = Assertions.checkNotNull(childSources.get(id));
++    disabledChild.mediaSource.disable(disabledChild.caller);
+   }
+ 
+   /**
+diff --git a/library/core/src/main/java/com/google/android/exoplayer2/source/ConcatenatingMediaSource.java b/library/core/src/main/java/com/google/android/exoplayer2/source/ConcatenatingMediaSource.java
+index 18d5c49fb4..669a0e7bb4 100644
+--- a/library/core/src/main/java/com/google/android/exoplayer2/source/ConcatenatingMediaSource.java
++++ b/library/core/src/main/java/com/google/android/exoplayer2/source/ConcatenatingMediaSource.java
+@@ -35,6 +35,7 @@
+ import java.util.HashMap;
+ import java.util.HashSet;
+ import java.util.IdentityHashMap;
++import java.util.Iterator;
+ import java.util.List;
+ import java.util.Map;
+ import java.util.Set;
+@@ -68,6 +69,7 @@
+   private final List<MediaSourceHolder> mediaSourceHolders;
+   private final Map<MediaPeriod, MediaSourceHolder> mediaSourceByMediaPeriod;
+   private final Map<Object, MediaSourceHolder> mediaSourceByUid;
++  private final Set<MediaSourceHolder> enabledMediaSourceHolders;
+   private final boolean isAtomic;
+   private final boolean useLazyPreparation;
+ 
+@@ -131,6 +133,7 @@ public ConcatenatingMediaSource(
+     this.mediaSourceHolders = new ArrayList<>();
+     this.nextTimelineUpdateOnCompletionActions = new HashSet<>();
+     this.pendingOnCompletionActions = new HashSet<>();
++    this.enabledMediaSourceHolders = new HashSet<>();
+     this.isAtomic = isAtomic;
+     this.useLazyPreparation = useLazyPreparation;
+     addMediaSources(Arrays.asList(mediaSources));
+@@ -418,7 +421,8 @@ public Object getTag() {
+   }
+ 
+   @Override
+-  public synchronized void prepareSourceInternal(@Nullable TransferListener mediaTransferListener) {
++  protected synchronized void prepareSourceInternal(
++      @Nullable TransferListener mediaTransferListener) {
+     super.prepareSourceInternal(mediaTransferListener);
+     playbackThreadHandler = new Handler(/* callback= */ this::handleMessage);
+     if (mediaSourcesPublic.isEmpty()) {
+@@ -430,6 +434,12 @@ public synchronized void prepareSourceInternal(@Nullable TransferListener mediaT
+     }
+   }
+ 
++  @SuppressWarnings("MissingSuperCall")
++  @Override
++  protected void enableInternal() {
++    // Suppress enabling all child sources here as they can be lazily enabled when creating periods.
++  }
++
+   @Override
+   public MediaPeriod createPeriod(MediaPeriodId id, Allocator allocator, long startPositionUs) {
+     Object mediaSourceHolderUid = getMediaSourceHolderUid(id.periodUid);
+@@ -441,10 +451,12 @@ public MediaPeriod createPeriod(MediaPeriodId id, Allocator allocator, long star
+       holder.isRemoved = true;
+       prepareChildSource(holder, holder.mediaSource);
+     }
++    enableMediaSource(holder);
+     holder.activeMediaPeriodIds.add(childMediaPeriodId);
+     MediaPeriod mediaPeriod =
+         holder.mediaSource.createPeriod(childMediaPeriodId, allocator, startPositionUs);
+     mediaSourceByMediaPeriod.put(mediaPeriod, holder);
++    disableUnusedMediaSources();
+     return mediaPeriod;
+   }
+ 
+@@ -454,13 +466,23 @@ public void releasePeriod(MediaPeriod mediaPeriod) {
+         Assertions.checkNotNull(mediaSourceByMediaPeriod.remove(mediaPeriod));
+     holder.mediaSource.releasePeriod(mediaPeriod);
+     holder.activeMediaPeriodIds.remove(((MaskingMediaPeriod) mediaPeriod).id);
++    if (!mediaSourceByMediaPeriod.isEmpty()) {
++      disableUnusedMediaSources();
++    }
+     maybeReleaseChildSource(holder);
+   }
+ 
+   @Override
+-  public synchronized void releaseSourceInternal() {
++  protected void disableInternal() {
++    super.disableInternal();
++    enabledMediaSourceHolders.clear();
++  }
++
++  @Override
++  protected synchronized void releaseSourceInternal() {
+     super.releaseSourceInternal();
+     mediaSourceHolders.clear();
++    enabledMediaSourceHolders.clear();
+     mediaSourceByUid.clear();
+     shuffleOrder = shuffleOrder.cloneAndClear();
+     if (playbackThreadHandler != null) {
+@@ -718,6 +740,11 @@ private void addMediaSourceInternal(int newIndex, MediaSourceHolder newMediaSour
+     mediaSourceHolders.add(newIndex, newMediaSourceHolder);
+     mediaSourceByUid.put(newMediaSourceHolder.uid, newMediaSourceHolder);
+     prepareChildSource(newMediaSourceHolder, newMediaSourceHolder.mediaSource);
++    if (isEnabled() && mediaSourceByMediaPeriod.isEmpty()) {
++      enabledMediaSourceHolders.add(newMediaSourceHolder);
++    } else {
++      disableChildSource(newMediaSourceHolder);
++    }
+   }
+ 
+   private void updateMediaSourceInternal(MediaSourceHolder mediaSourceHolder, Timeline timeline) {
+@@ -772,10 +799,27 @@ private void correctOffsets(int startIndex, int childIndexUpdate, int windowOffs
+   private void maybeReleaseChildSource(MediaSourceHolder mediaSourceHolder) {
+     // Release if the source has been removed from the playlist and no periods are still active.
+     if (mediaSourceHolder.isRemoved && mediaSourceHolder.activeMediaPeriodIds.isEmpty()) {
++      enabledMediaSourceHolders.remove(mediaSourceHolder);
+       releaseChildSource(mediaSourceHolder);
+     }
+   }
+ 
++  private void enableMediaSource(MediaSourceHolder mediaSourceHolder) {
++    enabledMediaSourceHolders.add(mediaSourceHolder);
++    enableChildSource(mediaSourceHolder);
++  }
++
++  private void disableUnusedMediaSources() {
++    Iterator<MediaSourceHolder> iterator = enabledMediaSourceHolders.iterator();
++    while (iterator.hasNext()) {
++      MediaSourceHolder holder = iterator.next();
++      if (holder.activeMediaPeriodIds.isEmpty()) {
++        disableChildSource(holder);
++        iterator.remove();
++      }
++    }
++  }
++
+   /** Return uid of media source holder from period uid of concatenated source. */
+   private static Object getMediaSourceHolderUid(Object periodUid) {
+     return ConcatenatedTimeline.getChildTimelineUidFromConcatenatedUid(periodUid);
+diff --git a/library/core/src/main/java/com/google/android/exoplayer2/source/MediaSource.java b/library/core/src/main/java/com/google/android/exoplayer2/source/MediaSource.java
+index c3219a03c1..5ee980d01f 100644
+--- a/library/core/src/main/java/com/google/android/exoplayer2/source/MediaSource.java
++++ b/library/core/src/main/java/com/google/android/exoplayer2/source/MediaSource.java
+@@ -235,7 +235,8 @@ default Object getTag() {
+   }
+ 
+   /**
+-   * Registers a {@link MediaSourceCaller} and starts source preparation if needed.
++   * Registers a {@link MediaSourceCaller}. Starts source preparation if needed and enables the
++   * source for the creation of {@link MediaPeriod MediaPerods}.
+    *
+    * <p>Should not be called directly from application code.
+    *
+@@ -255,17 +256,31 @@ default Object getTag() {
+ 
+   /**
+    * Throws any pending error encountered while loading or refreshing source information.
+-   * <p>
+-   * Should not be called directly from application code.
++   *
++   * <p>Should not be called directly from application code.
++   *
++   * <p>Must only be called after {@link #prepareSource(MediaSourceCaller, TransferListener)}.
+    */
+   void maybeThrowSourceInfoRefreshError() throws IOException;
+ 
+   /**
+-   * Returns a new {@link MediaPeriod} identified by {@code periodId}. This method may be called
+-   * multiple times without an intervening call to {@link #releasePeriod(MediaPeriod)}.
++   * Enables the source for the creation of {@link MediaPeriod MediaPeriods}.
+    *
+    * <p>Should not be called directly from application code.
+    *
++   * <p>Must only be called after {@link #prepareSource(MediaSourceCaller, TransferListener)}.
++   *
++   * @param caller The {@link MediaSourceCaller} enabling the source.
++   */
++  void enable(MediaSourceCaller caller);
++
++  /**
++   * Returns a new {@link MediaPeriod} identified by {@code periodId}.
++   *
++   * <p>Should not be called directly from application code.
++   *
++   * <p>Must only be called if the source is enabled.
++   *
+    * @param id The identifier of the period.
+    * @param allocator An {@link Allocator} from which to obtain media buffer allocations.
+    * @param startPositionUs The expected start position, in microseconds.
+@@ -275,18 +290,35 @@ default Object getTag() {
+ 
+   /**
+    * Releases the period.
+-   * <p>
+-   * Should not be called directly from application code.
++   *
++   * <p>Should not be called directly from application code.
+    *
+    * @param mediaPeriod The period to release.
+    */
+   void releasePeriod(MediaPeriod mediaPeriod);
+ 
+   /**
+-   * Unregisters a caller and releases the source if no longer required.
++   * Disables the source for the creation of {@link MediaPeriod MediaPeriods}. The implementation
++   * should not hold onto limited resources used for the creation of media periods.
++   *
++   * <p>Should not be called directly from application code.
++   *
++   * <p>Must only be called after all {@link MediaPeriod MediaPeriods} previously created by {@link
++   * #createPeriod(MediaPeriodId, Allocator, long)} have been released by {@link
++   * #releasePeriod(MediaPeriod)}.
++   *
++   * @param caller The {@link MediaSourceCaller} disabling the source.
++   */
++  void disable(MediaSourceCaller caller);
++
++  /**
++   * Unregisters a caller, and disables and releases the source if no longer required.
+    *
+    * <p>Should not be called directly from application code.
+    *
++   * <p>Must only be called if all created {@link MediaPeriod MediaPeriods} have been released by
++   * {@link #releasePeriod(MediaPeriod)}.
++   *
+    * @param caller The {@link MediaSourceCaller} to be unregistered.
+    */
+   void releaseSource(MediaSourceCaller caller);

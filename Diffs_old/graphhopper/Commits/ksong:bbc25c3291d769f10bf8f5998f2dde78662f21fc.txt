@@ -1,0 +1,1257 @@
+diff --git a/config-example.properties b/config-example.properties
+index f0aa981bef..c3b2067732 100644
+--- a/config-example.properties
++++ b/config-example.properties
+@@ -14,7 +14,8 @@ graph.flag_encoders=car
+ ##### Elevation #####
+ 
+ 
+-# To populate your graph with elevation data use SRTM, default is noop (no elevation)
++# Per default GraphHopper doesn't use elevation data, you can enable elevation by setting graph.elevation.provider
++# to srtm, cgiar, gmted, or multi. See the corresponding classes at com.graphhopper.reader.dem for more information.
+ # graph.elevation.provider=srtm
+ 
+ 
+diff --git a/core/src/main/java/com/graphhopper/GraphHopper.java b/core/src/main/java/com/graphhopper/GraphHopper.java
+index 2b74df151d..0a8c326924 100644
+--- a/core/src/main/java/com/graphhopper/GraphHopper.java
++++ b/core/src/main/java/com/graphhopper/GraphHopper.java
+@@ -576,10 +576,15 @@ public GraphHopper init(CmdArgs args) {
+             CGIARProvider cgiarProvider = new CGIARProvider();
+             cgiarProvider.setAutoRemoveTemporaryFiles(args.getBool("graph.elevation.cgiar.clear", true));
+             tmpProvider = cgiarProvider;
++        } else if (eleProviderStr.equalsIgnoreCase("gmted")) {
++            tmpProvider = new GMTEDProvider();
++        } else if (eleProviderStr.equalsIgnoreCase("multi")) {
++            tmpProvider = new MultiSourceElevationProvider();
+         }
+ 
+         tmpProvider.setCalcMean(eleCalcMean);
+-        tmpProvider.setCacheDir(new File(cacheDirStr));
++        if (!cacheDirStr.isEmpty())
++            tmpProvider.setCacheDir(new File(cacheDirStr));
+         if (!baseURL.isEmpty())
+             tmpProvider.setBaseURL(baseURL);
+         tmpProvider.setDAType(elevationDAType);
+diff --git a/core/src/main/java/com/graphhopper/reader/dem/AbstractTiffElevationProvider.java b/core/src/main/java/com/graphhopper/reader/dem/AbstractTiffElevationProvider.java
+new file mode 100644
+index 0000000000..2944228dc0
+--- /dev/null
++++ b/core/src/main/java/com/graphhopper/reader/dem/AbstractTiffElevationProvider.java
+@@ -0,0 +1,173 @@
++/*
++ *  Licensed to GraphHopper GmbH under one or more contributor
++ *  license agreements. See the NOTICE file distributed with this work for 
++ *  additional information regarding copyright ownership.
++ * 
++ *  GraphHopper GmbH licenses this file to you under the Apache License, 
++ *  Version 2.0 (the "License"); you may not use this file except in 
++ *  compliance with the License. You may obtain a copy of the License at
++ * 
++ *       http://www.apache.org/licenses/LICENSE-2.0
++ * 
++ *  Unless required by applicable law or agreed to in writing, software
++ *  distributed under the License is distributed on an "AS IS" BASIS,
++ *  WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++ *  See the License for the specific language governing permissions and
++ *  limitations under the License.
++ */
++package com.graphhopper.reader.dem;
++
++import com.graphhopper.storage.DAType;
++import com.graphhopper.storage.DataAccess;
++import com.graphhopper.storage.Directory;
++import com.graphhopper.storage.GHDirectory;
++import com.graphhopper.util.Downloader;
++import org.slf4j.Logger;
++import org.slf4j.LoggerFactory;
++
++import java.awt.image.Raster;
++import java.io.File;
++import java.io.IOException;
++import java.net.SocketTimeoutException;
++import java.util.HashMap;
++import java.util.Map;
++
++/**
++ * Provides basic methods that are usually used in an ElevationProvider that reads tiff files.
++ *
++ * @author Robin Boldt
++ */
++public abstract class AbstractTiffElevationProvider implements ElevationProvider {
++    final Logger logger = LoggerFactory.getLogger(getClass());
++    final Map<String, HeightTile> cacheData = new HashMap<String, HeightTile>();
++    protected Downloader downloader;
++    File cacheDir;
++    String baseUrl;
++    private Directory dir;
++    private DAType daType = DAType.MMAP;
++    boolean calcMean = false;
++    boolean autoRemoveTemporary = true;
++    long sleep = 2000;
++
++    public AbstractTiffElevationProvider(String baseUrl, String cacheDir, String downloaderName) {
++        this.baseUrl = baseUrl;
++        this.cacheDir = new File(cacheDir);
++        downloader = new Downloader(downloaderName).setTimeout(10000);
++    }
++
++    @Override
++    public void setCalcMean(boolean eleCalcMean) {
++        calcMean = eleCalcMean;
++    }
++
++    void setSleep(long sleep) {
++        this.sleep = sleep;
++    }
++
++    /**
++     * Creating temporary files can take a long time as we need to unpack tiff as well as to fill
++     * our DataAccess object, so this option can be used to disable the default clear mechanism via
++     * specifying 'false'.
++     */
++    public void setAutoRemoveTemporaryFiles(boolean autoRemoveTemporary) {
++        this.autoRemoveTemporary = autoRemoveTemporary;
++    }
++
++    public void setDownloader(Downloader downloader) {
++        this.downloader = downloader;
++    }
++
++    @Override
++    public ElevationProvider setCacheDir(File cacheDir) {
++        if (cacheDir.exists() && !cacheDir.isDirectory())
++            throw new IllegalArgumentException("Cache path has to be a directory");
++        try {
++            this.cacheDir = cacheDir.getCanonicalFile();
++        } catch (IOException ex) {
++            throw new RuntimeException(ex);
++        }
++        return this;
++    }
++
++    protected File getCacheDir() {
++        return cacheDir;
++    }
++
++    @Override
++    public ElevationProvider setBaseURL(String baseUrl) {
++        if (baseUrl == null || baseUrl.isEmpty())
++            throw new IllegalArgumentException("baseUrl cannot be empty");
++
++        this.baseUrl = baseUrl;
++        return this;
++    }
++
++    @Override
++    public ElevationProvider setDAType(DAType daType) {
++        this.daType = daType;
++        return this;
++    }
++
++
++    @Override
++    public void release() {
++        cacheData.clear();
++
++        // for memory mapped type we create temporary unpacked files which should be removed
++        if (autoRemoveTemporary && dir != null)
++            dir.clear();
++    }
++
++    /**
++     * Download a file at the provided url and save it as the given downloadFile if the downloadFile does not exist.
++     */
++    protected void downloadFile(File downloadFile, String url) throws IOException {
++        if (!downloadFile.exists()) {
++            int max = 3;
++            for (int trial = 0; trial < max; trial++) {
++                try {
++                    downloader.downloadFile(url, downloadFile.getAbsolutePath());
++                    return;
++                } catch (SocketTimeoutException ex) {
++                    if (trial >= max - 1)
++                        throw new RuntimeException(ex);
++                    try {
++                        Thread.sleep(sleep);
++                    } catch (InterruptedException ignored) {
++                    }
++                }
++            }
++        }
++    }
++
++    protected void fillDataAccessWithElevationData(Raster raster, DataAccess heights, int dataAccessWidth) {
++        final int height = raster.getHeight();
++        final int width = raster.getWidth();
++        int x = 0;
++        int y = 0;
++        try {
++            for (y = 0; y < height; y++) {
++                for (x = 0; x < width; x++) {
++                    short val = (short) raster.getPixel(x, y, (int[]) null)[0];
++                    if (val < -1000 || val > 12000)
++                        val = Short.MIN_VALUE;
++
++                    heights.setShort(2 * (y * dataAccessWidth + x), val);
++                }
++            }
++            heights.flush();
++
++            // TODO remove tifName and zip?
++        } catch (Exception ex) {
++            throw new RuntimeException("Problem at x:" + x + ", y:" + y, ex);
++        }
++    }
++
++    protected Directory getDirectory() {
++        if (dir != null)
++            return dir;
++
++        logger.info(this.toString() + " Elevation Provider, from: " + baseUrl + ", to: " + cacheDir + ", as: " + daType);
++        return dir = new GHDirectory(cacheDir.getAbsolutePath(), daType);
++    }
++}
+\ No newline at end of file
+diff --git a/core/src/main/java/com/graphhopper/reader/dem/CGIARProvider.java b/core/src/main/java/com/graphhopper/reader/dem/CGIARProvider.java
+index 973a54bf03..e1d527400f 100644
+--- a/core/src/main/java/com/graphhopper/reader/dem/CGIARProvider.java
++++ b/core/src/main/java/com/graphhopper/reader/dem/CGIARProvider.java
+@@ -17,26 +17,17 @@
+  */
+ package com.graphhopper.reader.dem;
+ 
+-import com.graphhopper.storage.DAType;
+ import com.graphhopper.storage.DataAccess;
+-import com.graphhopper.storage.Directory;
+-import com.graphhopper.storage.GHDirectory;
+-import com.graphhopper.util.Downloader;
+ import com.graphhopper.util.Helper;
+ import org.apache.xmlgraphics.image.codec.tiff.TIFFDecodeParam;
+ import org.apache.xmlgraphics.image.codec.tiff.TIFFImageDecoder;
+ import org.apache.xmlgraphics.image.codec.util.SeekableStream;
+-import org.slf4j.Logger;
+-import org.slf4j.LoggerFactory;
+ 
+ import java.awt.image.Raster;
+ import java.io.File;
+ import java.io.FileInputStream;
+ import java.io.IOException;
+ import java.io.InputStream;
+-import java.net.SocketTimeoutException;
+-import java.util.HashMap;
+-import java.util.Map;
+ import java.util.zip.ZipEntry;
+ import java.util.zip.ZipInputStream;
+ 
+@@ -56,22 +47,17 @@
+  * @author NopMap
+  * @author Peter Karich
+  */
+-public class CGIARProvider implements ElevationProvider {
++public class CGIARProvider extends AbstractTiffElevationProvider {
+     private static final int WIDTH = 6000;
+-    final double precision = 1e7;
+-    private final Logger logger = LoggerFactory.getLogger(getClass());
+-    private final Map<String, HeightTile> cacheData = new HashMap<String, HeightTile>();
++    private final double precision = 1e7;
+     private final double invPrecision = 1 / precision;
+     private final int degree = 5;
+-    private Downloader downloader = new Downloader("GraphHopper CGIARReader").setTimeout(10000);
+-    private File cacheDir = new File("/tmp/cgiar");
+-    // for alternatives see #346
+-    private String baseUrl = "http://srtm.csi.cgiar.org/SRT-ZIP/SRTM_V41/SRTM_Data_GeoTiff";
+-    private Directory dir;
+-    private DAType daType = DAType.MMAP;
+-    private boolean calcMean = false;
+-    private boolean autoRemoveTemporary = true;
+-    private long sleep = 2000;
++
++    public CGIARProvider() {
++        super("http://srtm.csi.cgiar.org/SRT-ZIP/SRTM_V41/SRTM_Data_GeoTiff",
++                "/tmp/cgiar",
++                "GraphHopper CGIARReader");
++    }
+ 
+     public static void main(String[] args) {
+         CGIARProvider provider = new CGIARProvider();
+@@ -80,85 +66,33 @@ public static void main(String[] args) {
+ 
+         // 337.0
+         System.out.println(provider.getEle(49.949784, 11.57517));
+-        // 453.0
++        // 466.0
+         System.out.println(provider.getEle(49.968668, 11.575127));
+-        // 447.0
++        // 455.0
+         System.out.println(provider.getEle(49.968682, 11.574842));
+ 
+-        // 3131
++        // 3134
+         System.out.println(provider.getEle(-22.532854, -65.110474));
+ 
+-        // 123
++        // 120
+         System.out.println(provider.getEle(38.065392, -87.099609));
+ 
+         // 1615
+         System.out.println(provider.getEle(40, -105.2277023));
+         System.out.println(provider.getEle(39.99999999, -105.2277023));
+         System.out.println(provider.getEle(39.9999999, -105.2277023));
+-        // 1617
++        // 1616
+         System.out.println(provider.getEle(39.999999, -105.2277023));
+ 
+         // 0
+         System.out.println(provider.getEle(29.840644, -42.890625));
+     }
+ 
+-    @Override
+-    public void setCalcMean(boolean eleCalcMean) {
+-        calcMean = eleCalcMean;
+-    }
+-
+-    void setSleep(long sleep) {
+-        this.sleep = sleep;
+-    }
+-
+-    /**
+-     * Creating temporary files can take a long time as we need to unpack tiff as well as to fill
+-     * our DataAccess object, so this option can be used to disable the default clear mechanism via
+-     * specifying 'false'.
+-     */
+-    public void setAutoRemoveTemporaryFiles(boolean autoRemoveTemporary) {
+-        this.autoRemoveTemporary = autoRemoveTemporary;
+-    }
+-
+-    public void setDownloader(Downloader downloader) {
+-        this.downloader = downloader;
+-    }
+-
+-    @Override
+-    public ElevationProvider setCacheDir(File cacheDir) {
+-        if (cacheDir.exists() && !cacheDir.isDirectory())
+-            throw new IllegalArgumentException("Cache path has to be a directory");
+-        try {
+-            this.cacheDir = cacheDir.getCanonicalFile();
+-        } catch (IOException ex) {
+-            throw new RuntimeException(ex);
+-        }
+-        return this;
+-    }
+-
+-    protected File getCacheDir() {
+-        return cacheDir;
+-    }
+-
+-    @Override
+-    public ElevationProvider setBaseURL(String baseUrl) {
+-        if (baseUrl == null || baseUrl.isEmpty())
+-            throw new IllegalArgumentException("baseUrl cannot be empty");
+-
+-        this.baseUrl = baseUrl;
+-        return this;
+-    }
+-
+-    @Override
+-    public ElevationProvider setDAType(DAType daType) {
+-        this.daType = daType;
+-        return this;
+-    }
+-
+     @Override
+     public double getEle(double lat, double lon) {
+-        // no data we can avoid the trouble
+-        if (lat > 60 || lat < -60)
++        // Return fast, if there is no data available
++        // See https://www2.jpl.nasa.gov/srtm/faq.html
++        if (lat >= 60 || lat <= -56)
+             return 0;
+ 
+         lat = (int) (lat * precision) / precision;
+@@ -172,7 +106,7 @@ public double getEle(double lat, double lon) {
+             int minLat = down(lat);
+             int minLon = down(lon);
+             // less restrictive against boundary checking
+-            demProvider = new HeightTile(minLat, minLon, WIDTH, degree * precision, degree);
++            demProvider = new HeightTile(minLat, minLon, WIDTH, WIDTH, degree * precision, degree, degree);
+             demProvider.setCalcMean(calcMean);
+ 
+             cacheData.put(name, demProvider);
+@@ -190,31 +124,14 @@ public double getEle(double lat, double lon) {
+                 String zippedURL = baseUrl + "/" + name + ".zip";
+                 File file = new File(cacheDir, new File(zippedURL).getName());
+ 
+-                // get zip file if not already in cacheDir - unzip later and in-memory only!
+-                if (!file.exists()) {
+-                    try {
+-                        int max = 3;
+-                        for (int trial = 0; trial < max; trial++) {
+-                            try {
+-                                downloader.downloadFile(zippedURL, file.getAbsolutePath());
+-                                break;
+-                            } catch (SocketTimeoutException ex) {
+-                                // just try again after a little nap
+-                                Thread.sleep(sleep);
+-                                if (trial >= max - 1)
+-                                    throw ex;
+-                                continue;
+-                            } catch (IOException ex) {
+-                                demProvider.setSeaLevel(true);
+-                                // use small size on disc and in-memory
+-                                heights.setSegmentSize(100).create(10).
+-                                        flush();
+-                                return 0;
+-                            }
+-                        }
+-                    } catch (Exception ex) {
+-                        throw new RuntimeException(ex);
+-                    }
++                try {
++                    downloadFile(file, zippedURL);
++                } catch (IOException e) {
++                    demProvider.setSeaLevel(true);
++                    // use small size on disc and in-memory
++                    heights.setSegmentSize(100).create(10).
++                            flush();
++                    return 0;
+                 }
+ 
+                 // short == 2 bytes
+@@ -243,26 +160,8 @@ public double getEle(double lat, double lon) {
+                         Helper.close(ss);
+                 }
+ 
+-                // logger.info("start converting to our format");
+-                final int height = raster.getHeight();
+-                final int width = raster.getWidth();
+-                int x = 0, y = 0;
+-                try {
+-                    for (y = 0; y < height; y++) {
+-                        for (x = 0; x < width; x++) {
+-                            short val = (short) raster.getPixel(x, y, (int[]) null)[0];
+-                            if (val < -1000 || val > 12000)
+-                                val = Short.MIN_VALUE;
+-
+-                            heights.setShort(2 * (y * WIDTH + x), val);
+-                        }
+-                    }
+-                    heights.flush();
++                fillDataAccessWithElevationData(raster, heights, WIDTH);
+ 
+-                    // TODO remove tifName and zip?
+-                } catch (Exception ex) {
+-                    throw new RuntimeException("Problem at x:" + x + ", y:" + y, ex);
+-                }
+             } // loadExisting
+         }
+ 
+@@ -301,25 +200,8 @@ protected String getFileName(double lat, double lon) {
+         return str;
+     }
+ 
+-    @Override
+-    public void release() {
+-        cacheData.clear();
+-
+-        // for memory mapped type we create temporary unpacked files which should be removed
+-        if (autoRemoveTemporary && dir != null)
+-            dir.clear();
+-    }
+-
+     @Override
+     public String toString() {
+         return "CGIAR";
+     }
+-
+-    private Directory getDirectory() {
+-        if (dir != null)
+-            return dir;
+-
+-        logger.info(this.toString() + " Elevation Provider, from: " + baseUrl + ", to: " + cacheDir + ", as: " + daType);
+-        return dir = new GHDirectory(cacheDir.getAbsolutePath(), daType);
+-    }
+-}
++}
+\ No newline at end of file
+diff --git a/core/src/main/java/com/graphhopper/reader/dem/GMTEDProvider.java b/core/src/main/java/com/graphhopper/reader/dem/GMTEDProvider.java
+new file mode 100644
+index 0000000000..4cfe21dbfd
+--- /dev/null
++++ b/core/src/main/java/com/graphhopper/reader/dem/GMTEDProvider.java
+@@ -0,0 +1,261 @@
++/*
++ *  Licensed to GraphHopper GmbH under one or more contributor
++ *  license agreements. See the NOTICE file distributed with this work for 
++ *  additional information regarding copyright ownership.
++ * 
++ *  GraphHopper GmbH licenses this file to you under the Apache License, 
++ *  Version 2.0 (the "License"); you may not use this file except in 
++ *  compliance with the License. You may obtain a copy of the License at
++ * 
++ *       http://www.apache.org/licenses/LICENSE-2.0
++ * 
++ *  Unless required by applicable law or agreed to in writing, software
++ *  distributed under the License is distributed on an "AS IS" BASIS,
++ *  WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++ *  See the License for the specific language governing permissions and
++ *  limitations under the License.
++ */
++package com.graphhopper.reader.dem;
++
++import com.graphhopper.storage.DataAccess;
++import com.graphhopper.util.Helper;
++import org.apache.xmlgraphics.image.codec.tiff.TIFFDecodeParam;
++import org.apache.xmlgraphics.image.codec.tiff.TIFFImageDecoder;
++import org.apache.xmlgraphics.image.codec.util.SeekableStream;
++
++import java.awt.image.Raster;
++import java.io.File;
++import java.io.FileInputStream;
++import java.io.IOException;
++import java.io.InputStream;
++
++/**
++ * Elevation data from Global Multi-resolution Terrain Elevation Data 2010 (GMTED2010).
++ * The data provides 7.5 arc seconds resolution (~250 m) global elevation data. The data is available between latitudes
++ * of 84°N and 70°S. The data is available as .tiff and the we are using the mean elevation per cell (other options are
++ * median, min, max, etc.).
++ * <p>
++ * More information can be found here: https://topotools.cr.usgs.gov/gmted_viewer/
++ * <p>
++ * When using the data we have to acknowledge the source: "Data available from the U.S. Geological Survey.",
++ * more information can be found here: https://lta.cr.usgs.gov/citation
++ * <p>
++ * The gdalinfo of one GeoTiff is:
++ * Driver: GTiff/GeoTIFF
++ * Files: 50N000E_20101117_gmted_mea075.tif
++ * Size is 14400, 9600
++ * Coordinate System is:
++ * GEOGCS["WGS 84",
++ * DATUM["WGS_1984",
++ * SPHEROID["WGS 84",6378137,298.257223563,
++ * AUTHORITY["EPSG","7030"]],
++ * AUTHORITY["EPSG","6326"]],
++ * PRIMEM["Greenwich",0],
++ * UNIT["degree",0.0174532925199433],
++ * AUTHORITY["EPSG","4326"]]
++ * Origin = (-0.000138888888889,69.999861111111116)
++ * Pixel Size = (0.002083333333333,-0.002083333333333)
++ * Metadata:
++ * AREA_OR_POINT=Area
++ * Image Structure Metadata:
++ * INTERLEAVE=BAND
++ * Corner Coordinates:
++ * Upper Left  (  -0.0001389,  69.9998611) (  0d 0' 0.50"W, 69d59'59.50"N)
++ * Lower Left  (  -0.0001389,  49.9998611) (  0d 0' 0.50"W, 49d59'59.50"N)
++ * Upper Right (  29.9998611,  69.9998611) ( 29d59'59.50"E, 69d59'59.50"N)
++ * Lower Right (  29.9998611,  49.9998611) ( 29d59'59.50"E, 49d59'59.50"N)
++ * Center      (  14.9998611,  59.9998611) ( 14d59'59.50"E, 59d59'59.50"N)
++ * Band 1 Block=14400x1 Type=Int16, ColorInterp=Gray
++ * Min=-209.000 Max=2437.000
++ * Minimum=-209.000, Maximum=2437.000, Mean=149.447, StdDev=239.767
++ * NoData Value=-32768
++ * Metadata:
++ * STATISTICS_EXCLUDEDVALUES=-32768
++ * STATISTICS_MAXIMUM=2437
++ * STATISTICS_MEAN=149.44718774595
++ * STATISTICS_MINIMUM=-209
++ * STATISTICS_STDDEV=239.767158482
++ *
++ * @author Robin Boldt
++ */
++public class GMTEDProvider extends AbstractTiffElevationProvider {
++    private static final int WIDTH = 14400;
++    private static final int HEIGHT = 9600;
++    // TODO is the precision correct?
++    private final double precision = 1e7;
++    private final int latDegree = 20;
++    private final int lonDegree = 30;
++    // for alternatives see #346
++    private final String FILE_NAME_END = "_20101117_gmted_mea075";
++
++    public GMTEDProvider() {
++        super("https://edcintl.cr.usgs.gov/downloads/sciweb1/shared/topo/downloads/GMTED/Global_tiles_GMTED/075darcsec/mea/",
++                "/tmp/gmted",
++                "GraphHopper GMTEDReader");
++    }
++
++    public static void main(String[] args) {
++        GMTEDProvider provider = new GMTEDProvider();
++
++        System.out.println(provider.getEle(46, -20));
++
++        // 337.0 (339)
++        System.out.println(provider.getEle(49.949784, 11.57517));
++        // 453.0 (438)
++        System.out.println(provider.getEle(49.968668, 11.575127));
++        // 447.0 (432)
++        System.out.println(provider.getEle(49.968682, 11.574842));
++
++        // 3131 (3169)
++        System.out.println(provider.getEle(-22.532854, -65.110474));
++
++        // 123 (124)
++        System.out.println(provider.getEle(38.065392, -87.099609));
++
++        // 1615 (1615)
++        System.out.println(provider.getEle(40, -105.2277023));
++        // (1618)
++        System.out.println(provider.getEle(39.99999999, -105.2277023));
++        System.out.println(provider.getEle(39.9999999, -105.2277023));
++        // 1617 (1618)
++        System.out.println(provider.getEle(39.999999, -105.2277023));
++
++        // 1046 (1070)
++        System.out.println(provider.getEle(47.468668, 14.575127));
++        // 1113 (1115)
++        System.out.println(provider.getEle(47.467753, 14.573911));
++
++        // 1946 (1990)
++        System.out.println(provider.getEle(46.468835, 12.578777));
++
++        // 845 (841)
++        System.out.println(provider.getEle(48.469123, 9.576393));
++
++        // 1113 vs new: (1115)
++        provider.setCalcMean(true);
++        System.out.println(provider.getEle(47.467753, 14.573911));
++
++        // 0
++        System.out.println(provider.getEle(29.840644, -42.890625));
++    }
++
++    @Override
++    public double getEle(double lat, double lon) {
++        // Return fast, if there is no data available
++        if (lat > 84 || lat < -70)
++            return 0;
++
++        lat = (int) (lat * precision) / precision;
++        lon = (int) (lon * precision) / precision;
++        String name = getFileName(lat, lon);
++        // To lowercase and remove the directory and file ending so it works with the DataAccess
++        HeightTile demProvider = cacheData.get(name);
++        if (demProvider == null) {
++            if (!cacheDir.exists())
++                cacheDir.mkdirs();
++
++            int minLat = getMinLatForTile(lat);
++            int minLon = getMinLonForTile(lon);
++            // less restrictive against boundary checking
++            demProvider = new HeightTile(minLat, minLon, WIDTH, HEIGHT, lonDegree * precision, lonDegree, latDegree);
++            demProvider.setCalcMean(calcMean);
++
++            cacheData.put(name, demProvider);
++            DataAccess heights = getDirectory().find(name + ".gh");
++            demProvider.setHeights(heights);
++            boolean loadExisting = false;
++            try {
++                loadExisting = heights.loadExisting();
++            } catch (Exception ex) {
++                logger.warn("cannot load " + name + ", error: " + ex.getMessage());
++            }
++
++            if (!loadExisting) {
++                String zippedURL = baseUrl + "/" + getDownloadURL(lat, lon);
++                File file = new File(cacheDir, new File(name + ".tif").getName());
++
++                try {
++                    downloadFile(file, zippedURL);
++                } catch (IOException e) {
++                    demProvider.setSeaLevel(true);
++                    // use small size on disc and in-memory
++                    heights.setSegmentSize(100).create(10).
++                            flush();
++                    return 0;
++                }
++
++                // short == 2 bytes
++                heights.create(2 * WIDTH * HEIGHT);
++
++                Raster raster;
++                SeekableStream ss = null;
++                try {
++                    InputStream is = new FileInputStream(file);
++                    ss = SeekableStream.wrapInputStream(is, true);
++                    TIFFImageDecoder imageDecoder = new TIFFImageDecoder(ss, new TIFFDecodeParam());
++                    raster = imageDecoder.decodeAsRaster();
++                } catch (Exception e) {
++                    throw new RuntimeException("Can't decode " + file.getName(), e);
++                } finally {
++                    if (ss != null)
++                        Helper.close(ss);
++                }
++
++                fillDataAccessWithElevationData(raster, heights, WIDTH);
++
++            } // loadExisting
++        }
++
++        if (demProvider.isSeaLevel())
++            return 0;
++
++        return demProvider.getHeight(lat, lon);
++    }
++
++    int getMinLatForTile(double lat) {
++        return (int) (Math.floor((90 + lat) / latDegree) * latDegree) - 90;
++    }
++
++    int getMinLonForTile(double lon) {
++        return (int) (Math.floor((180 + lon) / lonDegree) * lonDegree) - 180;
++    }
++
++    // TODO it is a bit ugly that we have to duplicate the code with getDownloadURL, but since the DataAccess only allows lower case strings, but the files on the server are uppper cases, this creates too many issues
++    String getFileName(double lat, double lon) {
++        int lonInt = getMinLonForTile(lon);
++        int latInt = getMinLatForTile(lat);
++        String north = getNorthString(latInt);
++        String east = getEastString(lonInt);
++        String lonString = String.format("%03d", Math.abs(lonInt));
++        return (String.format("%02d", Math.abs(latInt)) + north + lonString + east + FILE_NAME_END).toLowerCase();
++    }
++
++    String getDownloadURL(double lat, double lon) {
++        int lonInt = getMinLonForTile(lon);
++        int latInt = getMinLatForTile(lat);
++        String north = getNorthString(latInt);
++        String east = getEastString(lonInt);
++        String lonString = String.format("%03d", Math.abs(lonInt));
++        return east + lonString + "/" + String.format("%02d", Math.abs(latInt)) + north + lonString + east + FILE_NAME_END + ".tif";
++    }
++
++    private String getNorthString(int lat) {
++        if (lat < 0) {
++            return "S";
++        }
++        return "N";
++    }
++
++    private String getEastString(int lon) {
++        if (lon < 0) {
++            return "W";
++        }
++        return "E";
++    }
++
++    @Override
++    public String toString() {
++        return "gmted";
++    }
++
++}
+\ No newline at end of file
+diff --git a/core/src/main/java/com/graphhopper/reader/dem/HeightTile.java b/core/src/main/java/com/graphhopper/reader/dem/HeightTile.java
+index 7fb681172e..c7b5b866c1 100644
+--- a/core/src/main/java/com/graphhopper/reader/dem/HeightTile.java
++++ b/core/src/main/java/com/graphhopper/reader/dem/HeightTile.java
+@@ -36,21 +36,27 @@
+     private final int minLat;
+     private final int minLon;
+     private final int width;
+-    private final int degree;
++    private final int height;
++    private final int horizontalDegree;
++    private final int verticalDegree;
+     private final double lowerBound;
+-    private final double higherBound;
++    private final double lonHigherBound;
++    private final double latHigherBound;
+     private DataAccess heights;
+     private boolean calcMean;
+ 
+-    public HeightTile(int minLat, int minLon, int width, double precision, int degree) {
++    public HeightTile(int minLat, int minLon, int width, int height, double precision, int horizontalDegree, int verticalDegree) {
+         this.minLat = minLat;
+         this.minLon = minLon;
+         this.width = width;
++        this.height = height;
+ 
+         this.lowerBound = -1 / precision;
+-        this.higherBound = degree + 1 / precision;
++        this.lonHigherBound = horizontalDegree + 1 / precision;
++        this.latHigherBound = verticalDegree + 1 / precision;
+ 
+-        this.degree = degree;
++        this.horizontalDegree = horizontalDegree;
++        this.verticalDegree = verticalDegree;
+     }
+ 
+     public HeightTile setCalcMean(boolean b) {
+@@ -74,18 +80,18 @@ void setHeights(DataAccess da) {
+     public double getHeight(double lat, double lon) {
+         double deltaLat = Math.abs(lat - minLat);
+         double deltaLon = Math.abs(lon - minLon);
+-        if (deltaLat > higherBound || deltaLat < lowerBound)
++        if (deltaLat > latHigherBound || deltaLat < lowerBound)
+             throw new IllegalStateException("latitude not in boundary of this file:" + lat + "," + lon + ", this:" + this.toString());
+-        if (deltaLon > higherBound || deltaLon < lowerBound)
++        if (deltaLon > lonHigherBound || deltaLon < lowerBound)
+             throw new IllegalStateException("longitude not in boundary of this file:" + lat + "," + lon + ", this:" + this.toString());
+ 
+         // first row in the file is the northernmost one
+         // http://gis.stackexchange.com/a/43756/9006
+-        int lonSimilar = (int) (width / degree * deltaLon);
++        int lonSimilar = (int) (width / horizontalDegree * deltaLon);
+         // different fallback methods for lat and lon as we have different rounding (lon -> positive, lat -> negative)
+         if (lonSimilar >= width)
+             lonSimilar = width - 1;
+-        int latSimilar = width - 1 - (int) (width / degree * deltaLat);
++        int latSimilar = height - 1 - (int) (height / verticalDegree * deltaLat);
+         if (latSimilar < 0)
+             latSimilar = 0;
+ 
+@@ -106,7 +112,7 @@ public double getHeight(double lat, double lon) {
+             if (latSimilar > 0)
+                 value += includePoint(daPointer - 2 * width, counter);
+ 
+-            if (latSimilar < width - 1)
++            if (latSimilar < height - 1)
+                 value += includePoint(daPointer + 2 * width, counter);
+         }
+ 
+@@ -127,14 +133,13 @@ public void toImage(String imageFile) throws IOException {
+     }
+ 
+     protected BufferedImage makeARGB() {
+-        int height = width;
+         BufferedImage argbImage = new BufferedImage(width, height, BufferedImage.TYPE_INT_ARGB);
+         Graphics g = argbImage.getGraphics();
+-        long len = width * width;
++        long len = width * height;
+         for (int i = 0; i < len; i++) {
+             int lonSimilar = i % width;
+             // no need for width - y as coordinate system for Graphics is already this way
+-            int latSimilar = i / width;
++            int latSimilar = i / height;
+             int green = Math.abs(heights.getShort(i * 2));
+             if (green == 0) {
+                 g.setColor(new Color(255, 0, 0, 255));
+@@ -154,8 +159,7 @@ protected BufferedImage makeARGB() {
+         return argbImage;
+     }
+ 
+-    public BufferedImage getImageFromArray(int[] pixels, int width) {
+-        int height = width;
++    public BufferedImage getImageFromArray(int[] pixels, int width, int height) {
+         BufferedImage tmpImage = new BufferedImage(width, height, BufferedImage.TYPE_INT_ARGB_PRE);
+         tmpImage.setRGB(0, 0, width, height, pixels, 0, width);
+         return tmpImage;
+@@ -165,4 +169,4 @@ public BufferedImage getImageFromArray(int[] pixels, int width) {
+     public String toString() {
+         return minLat + "," + minLon;
+     }
+-}
++}
+\ No newline at end of file
+diff --git a/core/src/main/java/com/graphhopper/reader/dem/MultiSourceElevationProvider.java b/core/src/main/java/com/graphhopper/reader/dem/MultiSourceElevationProvider.java
+new file mode 100644
+index 0000000000..6b7e2e13d4
+--- /dev/null
++++ b/core/src/main/java/com/graphhopper/reader/dem/MultiSourceElevationProvider.java
+@@ -0,0 +1,108 @@
++/*
++ *  Licensed to GraphHopper GmbH under one or more contributor
++ *  license agreements. See the NOTICE file distributed with this work for 
++ *  additional information regarding copyright ownership.
++ * 
++ *  GraphHopper GmbH licenses this file to you under the Apache License, 
++ *  Version 2.0 (the "License"); you may not use this file except in 
++ *  compliance with the License. You may obtain a copy of the License at
++ * 
++ *       http://www.apache.org/licenses/LICENSE-2.0
++ * 
++ *  Unless required by applicable law or agreed to in writing, software
++ *  distributed under the License is distributed on an "AS IS" BASIS,
++ *  WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++ *  See the License for the specific language governing permissions and
++ *  limitations under the License.
++ */
++package com.graphhopper.reader.dem;
++
++import com.graphhopper.storage.DAType;
++import com.graphhopper.storage.DataAccess;
++import com.graphhopper.util.Helper;
++import org.apache.xmlgraphics.image.codec.tiff.TIFFDecodeParam;
++import org.apache.xmlgraphics.image.codec.tiff.TIFFImageDecoder;
++import org.apache.xmlgraphics.image.codec.util.SeekableStream;
++
++import java.awt.image.Raster;
++import java.io.File;
++import java.io.FileInputStream;
++import java.io.IOException;
++import java.io.InputStream;
++
++/**
++ * The MultiSourceElevationProvider mixes different elevation providers to provide the best available elevation data
++ * for a certain area.
++ *
++ * @author Robin Boldt
++ */
++public class MultiSourceElevationProvider implements ElevationProvider {
++
++    private CGIARProvider cgiarProvider;
++    private GMTEDProvider gmtedProvider;
++
++    public MultiSourceElevationProvider(CGIARProvider cgiarProvider, GMTEDProvider gmtedProvider) {
++        this.cgiarProvider = cgiarProvider;
++        this.gmtedProvider = gmtedProvider;
++    }
++
++    public MultiSourceElevationProvider() {
++        this(new CGIARProvider(), new GMTEDProvider());
++    }
++
++    @Override
++    public double getEle(double lat, double lon) {
++        // Sometimes the cgiar data north of 59.999 equals 0
++        if (lat < 59.999 && lat > -56) {
++            return cgiarProvider.getEle(lat, lon);
++        }
++        return gmtedProvider.getEle(lat, lon);
++    }
++
++    /**
++     * For the MultiSourceElevationProvider you have to specify the base URL separated by a ';'.
++     * The first for cgiar, the second for gmted.
++     */
++    @Override
++    public ElevationProvider setBaseURL(String baseURL) {
++        String[] urls = baseURL.split(";");
++        if (urls.length != 2) {
++            throw new IllegalArgumentException("The base url must consist of two urls separated by a ';'. The first for cgiar, the second for gmted");
++        }
++        cgiarProvider.setBaseURL(urls[0]);
++        gmtedProvider.setBaseURL(urls[1]);
++        return this;
++    }
++
++    @Override
++    public ElevationProvider setCacheDir(File cacheDir) {
++        cgiarProvider.setCacheDir(cacheDir);
++        gmtedProvider.setCacheDir(cacheDir);
++        return this;
++    }
++
++    @Override
++    public ElevationProvider setDAType(DAType daType) {
++        cgiarProvider.setDAType(daType);
++        gmtedProvider.setDAType(daType);
++        return this;
++    }
++
++    @Override
++    public void setCalcMean(boolean calcMean) {
++        cgiarProvider.setCalcMean(calcMean);
++        gmtedProvider.setCalcMean(calcMean);
++    }
++
++    @Override
++    public void release() {
++        cgiarProvider.release();
++        gmtedProvider.release();
++    }
++
++    @Override
++    public String toString() {
++        return "multi";
++    }
++
++}
+\ No newline at end of file
+diff --git a/core/src/main/java/com/graphhopper/reader/dem/SRTMProvider.java b/core/src/main/java/com/graphhopper/reader/dem/SRTMProvider.java
+index 7c1fc29c16..74adffd0f6 100644
+--- a/core/src/main/java/com/graphhopper/reader/dem/SRTMProvider.java
++++ b/core/src/main/java/com/graphhopper/reader/dem/SRTMProvider.java
+@@ -199,6 +199,11 @@ String getFileString(double lat, double lon) {
+ 
+     @Override
+     public double getEle(double lat, double lon) {
++        // Return fast, if there is no data available
++        // See https://www2.jpl.nasa.gov/srtm/faq.html
++        if (lat >= 60 || lat <= -56)
++            return 0;
++
+         lat = (int) (lat * precision) / precision;
+         lon = (int) (lon * precision) / precision;
+         int intKey = calcIntKey(lat, lon);
+@@ -228,7 +233,7 @@ public double getEle(double lat, double lon) {
+         if (width == 0)
+             width = DEFAULT_WIDTH;
+ 
+-        demProvider = new HeightTile(down(lat), down(lon), width, precision, 1);
++        demProvider = new HeightTile(down(lat), down(lon), width, width, precision, 1, 1);
+         cacheData.put(intKey, demProvider);
+         demProvider.setCalcMean(calcMean);
+         demProvider.setHeights(heights);
+@@ -307,4 +312,4 @@ private Directory getDirectory() {
+         logger.info(this.toString() + " Elevation Provider, from: " + baseUrl + ", to: " + cacheDir + ", as: " + daType);
+         return dir = new GHDirectory(cacheDir.getAbsolutePath(), daType);
+     }
+-}
++}
+\ No newline at end of file
+diff --git a/core/src/test/java/com/graphhopper/reader/dem/GMTEDProviderTest.java b/core/src/test/java/com/graphhopper/reader/dem/GMTEDProviderTest.java
+new file mode 100644
+index 0000000000..6c72cae7c1
+--- /dev/null
++++ b/core/src/test/java/com/graphhopper/reader/dem/GMTEDProviderTest.java
+@@ -0,0 +1,113 @@
++/*
++ *  Licensed to GraphHopper GmbH under one or more contributor
++ *  license agreements. See the NOTICE file distributed with this work for 
++ *  additional information regarding copyright ownership.
++ * 
++ *  GraphHopper GmbH licenses this file to you under the Apache License, 
++ *  Version 2.0 (the "License"); you may not use this file except in 
++ *  compliance with the License. You may obtain a copy of the License at
++ * 
++ *       http://www.apache.org/licenses/LICENSE-2.0
++ * 
++ *  Unless required by applicable law or agreed to in writing, software
++ *  distributed under the License is distributed on an "AS IS" BASIS,
++ *  WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++ *  See the License for the specific language governing permissions and
++ *  limitations under the License.
++ */
++package com.graphhopper.reader.dem;
++
++import com.graphhopper.util.Downloader;
++import org.junit.Before;
++import org.junit.Test;
++
++import java.io.File;
++import java.io.FileNotFoundException;
++import java.io.IOException;
++import java.net.SocketTimeoutException;
++
++import static org.junit.Assert.assertEquals;
++import static org.junit.Assert.assertTrue;
++
++/**
++ * @author Robin Boldt
++ */
++public class GMTEDProviderTest {
++    GMTEDProvider instance;
++
++    @Before
++    public void setUp() {
++        instance = new GMTEDProvider();
++    }
++
++    @Test
++    public void testMinLat() {
++        assertEquals(50, instance.getMinLatForTile(52.5));
++        assertEquals(10, instance.getMinLatForTile(29.9));
++        assertEquals(-70, instance.getMinLatForTile(-59.9));
++    }
++
++    @Test
++    public void testMinLon() {
++        assertEquals(-60, instance.getMinLonForTile(-59.9));
++        assertEquals(0, instance.getMinLonForTile(0.9));
++    }
++
++    @Test
++    public void testGetDownloadUrl() {
++        // Created a couple of random tests and compared to https://topotools.cr.usgs.gov/gmted_viewer/viewer.htm
++        assertEquals("E000/30N000E_20101117_gmted_mea075.tif", instance.getDownloadURL(42.940339, 11.953125));
++        assertEquals("W090/30N090W_20101117_gmted_mea075.tif", instance.getDownloadURL(38.548165, -77.167969));
++        assertEquals("W180/70N180W_20101117_gmted_mea075.tif", instance.getDownloadURL(74.116047, -169.277344));
++        assertEquals("W180/70S180W_20101117_gmted_mea075.tif", instance.getDownloadURL(-61.015725, -156.621094));
++        assertEquals("E150/70N150E_20101117_gmted_mea075.tif", instance.getDownloadURL(74.590108, 166.640625));
++        assertEquals("E150/70S150E_20101117_gmted_mea075.tif", instance.getDownloadURL(-61.015725, 162.949219));
++    }
++
++    @Test
++    public void testGetFileName() {
++        assertEquals("30n000e_20101117_gmted_mea075", instance.getFileName(42.940339, 11.953125));
++        assertEquals("30n090w_20101117_gmted_mea075", instance.getFileName(38.548165, -77.167969));
++        assertEquals("70n180w_20101117_gmted_mea075", instance.getFileName(74.116047, -169.277344));
++        assertEquals("70s180w_20101117_gmted_mea075", instance.getFileName(-61.015725, -156.621094));
++        assertEquals("70n150e_20101117_gmted_mea075", instance.getFileName(74.590108, 166.640625));
++        assertEquals("70s150e_20101117_gmted_mea075", instance.getFileName(-61.015725, 162.949219));
++    }
++
++    @Test
++    public void testFileNotFound() {
++        File file = new File(instance.getCacheDir(), instance.getFileName(46, -20) + ".gh");
++        File zipFile = new File(instance.getCacheDir(), instance.getFileName(46, -20) + ".tif");
++        file.delete();
++        zipFile.delete();
++
++        instance.setDownloader(new Downloader("test GH") {
++            @Override
++            public void downloadFile(String url, String toFile) throws IOException {
++                throw new FileNotFoundException("xyz");
++            }
++        });
++        assertEquals(0, instance.getEle(46, -20), 1);
++
++        // file not found => small!
++        assertTrue(file.exists());
++        assertEquals(228, file.length());
++
++        instance.setDownloader(new Downloader("test GH") {
++            @Override
++            public void downloadFile(String url, String toFile) throws IOException {
++                throw new SocketTimeoutException("xyz");
++            }
++        });
++
++        try {
++            instance.setSleep(30);
++            instance.getEle(16, -20);
++            assertTrue(false);
++        } catch (Exception ex) {
++        }
++
++        file.delete();
++        zipFile.delete();
++    }
++}
+\ No newline at end of file
+diff --git a/core/src/test/java/com/graphhopper/reader/dem/HeightTileTest.java b/core/src/test/java/com/graphhopper/reader/dem/HeightTileTest.java
+index 046ff8d5e8..8bc1d90b5b 100644
+--- a/core/src/test/java/com/graphhopper/reader/dem/HeightTileTest.java
++++ b/core/src/test/java/com/graphhopper/reader/dem/HeightTileTest.java
+@@ -32,17 +32,18 @@ public void testGetHeight() {
+         // data access has same coordinate system as graphical or UI systems have (or the original DEM data has).
+         // But HeightTile has lat,lon system ('mathematically')
+         int width = 10;
+-        HeightTile instance = new HeightTile(0, 0, width, 1e-6, 10);
++        int height = 20;
++        HeightTile instance = new HeightTile(0, 0, width, height, 1e-6, 10, 20);
+         DataAccess heights = new RAMDirectory().find("tmp");
+-        heights.create(2 * 10 * 10);
++        heights.create(2 * width * height);
+         instance.setHeights(heights);
+-        init(heights, width, 1);
++        init(heights, width, height, 1);
+ 
+         // x,y=1,7
+-        heights.setShort(2 * (7 * width + 1), (short) 70);
++        heights.setShort(2 * (17 * width + 1), (short) 70);
+ 
+         // x,y=2,9
+-        heights.setShort(2 * (9 * width + 2), (short) 90);
++        heights.setShort(2 * (19 * width + 2), (short) 90);
+ 
+         assertEquals(1, instance.getHeight(5, 5), 1e-3);
+         assertEquals(70, instance.getHeight(2.5, 1.5), 1e-3);
+@@ -50,7 +51,7 @@ public void testGetHeight() {
+         assertEquals(1, instance.getHeight(3, 2), 1e-3);
+         assertEquals(70, instance.getHeight(2, 1), 1e-3);
+ 
+-        // edge cases for the whole object        
++        // edge cases for the whole object
+         assertEquals(1, instance.getHeight(+1.0, 2), 1e-3);
+         assertEquals(90, instance.getHeight(0.5, 2.5), 1e-3);
+         assertEquals(90, instance.getHeight(0.0, 2.5), 1e-3);
+@@ -75,11 +76,11 @@ public void testGetHeight() {
+     @Test
+     public void testGetHeightForNegativeTile() {
+         int width = 10;
+-        HeightTile instance = new HeightTile(-20, -20, width, 1e-6, 10);
++        HeightTile instance = new HeightTile(-20, -20, width, width, 1e-6, 10, 10);
+         DataAccess heights = new RAMDirectory().find("tmp");
+         heights.create(2 * 10 * 10);
+         instance.setHeights(heights);
+-        init(heights, width, 1);
++        init(heights, width, width, 1);
+ 
+         // x,y=1,7
+         heights.setShort(2 * (7 * width + 1), (short) 70);
+@@ -97,11 +98,11 @@ public void testGetHeightForNegativeTile() {
+     @Test
+     public void testCalcMean() {
+         int width = 10;
+-        HeightTile instance = new HeightTile(0, 0, width, 1e-6, 10).setCalcMean(true);
++        HeightTile instance = new HeightTile(0, 0, width, width, 1e-6, 10, 10).setCalcMean(true);
+         DataAccess heights = new RAMDirectory().find("tmp");
+         heights.create(2 * 10 * 10);
+         instance.setHeights(heights);
+-        init(heights, width, 1);
++        init(heights, width, width, 1);
+ 
+         // x,y=0,9
+         heights.setShort(2 * (9 * width + 0), (short) 10);
+@@ -121,11 +122,11 @@ public void testCalcMean() {
+         assertEquals((10 + 2) / 3d, instance.getHeight(-0.5, -0.5), 1e-3);
+     }
+ 
+-    private void init(DataAccess da, int width, int i) {
++    private void init(DataAccess da, int width, int height, int i) {
+         for (int x = 0; x < width; x++) {
+-            for (int y = 0; y < width; y++) {
++            for (int y = 0; y < height; y++) {
+                 da.setShort(2 * (y * width + x), (short) 1);
+             }
+         }
+     }
+-}
++}
+\ No newline at end of file
+diff --git a/core/src/test/java/com/graphhopper/reader/dem/MultiSourceElevationProviderTest.java b/core/src/test/java/com/graphhopper/reader/dem/MultiSourceElevationProviderTest.java
+new file mode 100644
+index 0000000000..e8158db64e
+--- /dev/null
++++ b/core/src/test/java/com/graphhopper/reader/dem/MultiSourceElevationProviderTest.java
+@@ -0,0 +1,55 @@
++/*
++ *  Licensed to GraphHopper GmbH under one or more contributor
++ *  license agreements. See the NOTICE file distributed with this work for 
++ *  additional information regarding copyright ownership.
++ * 
++ *  GraphHopper GmbH licenses this file to you under the Apache License, 
++ *  Version 2.0 (the "License"); you may not use this file except in 
++ *  compliance with the License. You may obtain a copy of the License at
++ * 
++ *       http://www.apache.org/licenses/LICENSE-2.0
++ * 
++ *  Unless required by applicable law or agreed to in writing, software
++ *  distributed under the License is distributed on an "AS IS" BASIS,
++ *  WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++ *  See the License for the specific language governing permissions and
++ *  limitations under the License.
++ */
++package com.graphhopper.reader.dem;
++
++import org.junit.Before;
++import org.junit.Test;
++
++import static org.junit.Assert.assertEquals;
++
++/**
++ * @author Robin Boldt
++ */
++public class MultiSourceElevationProviderTest {
++    MultiSourceElevationProvider instance;
++
++    @Before
++    public void setUp() {
++        instance = new MultiSourceElevationProvider(
++                new CGIARProvider() {
++                    @Override
++                    public double getEle(double lat, double lon) {
++                        return 1;
++                    }
++                },
++                new GMTEDProvider() {
++                    @Override
++                    public double getEle(double lat, double lon) {
++                        return 2;
++                    }
++                }
++        );
++    }
++
++    @Test
++    public void testGetEle() {
++        assertEquals(1, instance.getEle(0, 0), .1);
++        assertEquals(2, instance.getEle(60.0001, 0), .1);
++        assertEquals(2, instance.getEle(-56.0001, 0), .1);
++    }
++}
+\ No newline at end of file

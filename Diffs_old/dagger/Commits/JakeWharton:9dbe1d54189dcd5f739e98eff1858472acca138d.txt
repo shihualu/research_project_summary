@@ -1,0 +1,354 @@
+diff --git a/reflect/reflect/src/main/java/dagger/reflect/Binding.java b/reflect/reflect/src/main/java/dagger/reflect/Binding.java
+index 23370b6e0..d55a792d0 100644
+--- a/reflect/reflect/src/main/java/dagger/reflect/Binding.java
++++ b/reflect/reflect/src/main/java/dagger/reflect/Binding.java
+@@ -1,9 +1,12 @@
+ package dagger.reflect;
+ 
++import java.lang.annotation.Annotation;
++import org.jetbrains.annotations.Nullable;
++
+ abstract class Binding<T> {
+   private Request[] requests;
+ 
+-  protected abstract Request[] initialize();
++  protected abstract Request[] initialize(@Nullable Annotation scope);
+ 
+   protected abstract T resolve(Object[] dependencies);
+ 
+@@ -13,7 +16,7 @@ final T resolve(InstanceGraph graph) {
+       synchronized (this) {
+         requests = this.requests;
+         if (requests == null) {
+-          requests = initialize();
++          requests = initialize(graph.scope);
+           if (requests == null) {
+             throw new IllegalStateException("Binding " + this + " returned null from initialize()");
+           }
+diff --git a/reflect/reflect/src/main/java/dagger/reflect/BindsBinding.java b/reflect/reflect/src/main/java/dagger/reflect/BindsBinding.java
+index c41f69bf0..a6b6748d1 100644
+--- a/reflect/reflect/src/main/java/dagger/reflect/BindsBinding.java
++++ b/reflect/reflect/src/main/java/dagger/reflect/BindsBinding.java
+@@ -2,20 +2,18 @@
+ 
+ import java.lang.annotation.Annotation;
+ import java.lang.reflect.Method;
++import org.jetbrains.annotations.Nullable;
+ 
+-import static dagger.reflect.Util.findScope;
+ import static java.lang.reflect.Modifier.ABSTRACT;
+ 
+ final class BindsBinding extends Binding<Object> {
+   private final Method method;
+-  private final Annotation scope;
+ 
+-  BindsBinding(Method method, Annotation scope) {
++  BindsBinding(Method method) {
+     this.method = method;
+-    this.scope = scope;
+   }
+ 
+-  @Override protected Request[] initialize() {
++  @Override protected Request[] initialize(@Nullable Annotation scope) {
+     int parameterCount = method.getParameterTypes().length;
+     if (parameterCount != 1) {
+       throw new IllegalStateException("@Binds must have single parameter: "
+@@ -33,12 +31,7 @@
+     // TODO check visibility
+     method.setAccessible(true);
+ 
+-    Annotation[] annotations = method.getDeclaredAnnotations();
+-    Annotation methodScope = findScope(annotations);
+-    if (!Util.equals(scope, methodScope)) {
+-      // TODO real error message
+-      throw new IllegalStateException("Cannot provide " + methodScope + " in " + scope);
+-    }
++    // TODO validate scope
+ 
+     Key delegate = Key.fromMethodParameter(method, 0);
+     return new Request[] { Request.of(delegate, Request.Lookup.INSTANCE) };
+@@ -47,4 +40,8 @@
+   @Override protected Object resolve(Object[] dependencies) {
+     return dependencies[0];
+   }
++
++  @Override public String toString() {
++    return "BindsBinding[" + method + "]";
++  }
+ }
+diff --git a/reflect/reflect/src/main/java/dagger/reflect/DaggerReflect.java b/reflect/reflect/src/main/java/dagger/reflect/DaggerReflect.java
+index 4cc0bd00a..d6e320959 100644
+--- a/reflect/reflect/src/main/java/dagger/reflect/DaggerReflect.java
++++ b/reflect/reflect/src/main/java/dagger/reflect/DaggerReflect.java
+@@ -34,9 +34,9 @@
+       throw notImplemented("Component dependencies");
+     }
+ 
+-    Annotation scope = findScope(componentClass.getAnnotations());
++    InstanceGraph.Builder graphBuilder = new InstanceGraph.Builder()
++        .scope(findScope(componentClass.getAnnotations()));
+ 
+-    final InstanceGraph instanceGraph = new InstanceGraph();
+     Deque<Class<?>> moduleQueue = new ArrayDeque<Class<?>>();
+     Set<Class<?>> seenModules = new LinkedHashSet<Class<?>>();
+     Collections.addAll(moduleQueue, component.modules());
+@@ -57,22 +57,25 @@
+       }
+       Collections.addAll(moduleQueue, module.includes());
+ 
+-      for (final Method method : moduleClass.getDeclaredMethods()) {
++      for (Method method : moduleClass.getDeclaredMethods()) {
+         Type returnType = method.getGenericReturnType();
+         Annotation[] annotations = method.getDeclaredAnnotations();
+         Annotation qualifier = findQualifier(annotations);
+         Key key = Key.of(qualifier, returnType);
+ 
++        Binding<?> binding;
+         if (hasAnnotation(annotations, Provides.class)) {
+-          instanceGraph.put(key, new ProvidesBinding(method, scope));
++          binding = new ProvidesBinding(method);
+         } else if (hasAnnotation(annotations, Binds.class)) {
+-          instanceGraph.put(key, new BindsBinding(method, scope));
++          binding = new BindsBinding(method);
+         } else {
+           throw notImplemented("Method " + method);
+         }
++        graphBuilder.addBinding(key, binding);
+       }
+     }
+ 
++    InstanceGraph instanceGraph = graphBuilder.build();
+     //noinspection unchecked Single interface proxy.
+     return (C) Proxy.newProxyInstance(componentClass.getClassLoader(),
+         new Class<?>[] { componentClass }, new ComponentInvocationHandler(instanceGraph));
+diff --git a/reflect/reflect/src/main/java/dagger/reflect/InstanceGraph.java b/reflect/reflect/src/main/java/dagger/reflect/InstanceGraph.java
+index cbc68eb72..59744a291 100644
+--- a/reflect/reflect/src/main/java/dagger/reflect/InstanceGraph.java
++++ b/reflect/reflect/src/main/java/dagger/reflect/InstanceGraph.java
+@@ -2,27 +2,25 @@
+ 
+ import dagger.Lazy;
+ import dagger.internal.DoubleCheck;
++import java.lang.annotation.Annotation;
++import java.util.LinkedHashMap;
++import java.util.Map;
+ import java.util.concurrent.ConcurrentHashMap;
+ import javax.inject.Provider;
+ import org.jetbrains.annotations.Nullable;
+ 
+ final class InstanceGraph {
++  private final ConcurrentHashMap<Key, Binding<?>> bindings;
+   private final @Nullable InstanceGraph parent;
+-  private final ConcurrentHashMap<Key, Binding<?>> bindings =
+-      new ConcurrentHashMap<Key, Binding<?>>();
++  final @Nullable Annotation scope;
+ 
+-  InstanceGraph() {
+-    this(null);
+-  }
+-
+-  InstanceGraph(@Nullable InstanceGraph parent) {
++  private InstanceGraph(
++      Map<Key, Binding<?>> bindings,
++      @Nullable InstanceGraph parent,
++      @Nullable Annotation scope) {
++    this.scope = scope;
+     this.parent = parent;
+-  }
+-
+-  void put(Key key, Binding<?> provider) {
+-    if (bindings.put(key, provider) != null) {
+-      throw new IllegalStateException("Duplicate binding for " + key);
+-    }
++    this.bindings = new ConcurrentHashMap<Key, Binding<?>>(bindings);
+   }
+ 
+   private Binding<?> getBinding(Key key) {
+@@ -57,4 +55,40 @@ Object getInstance(Key key) {
+   Lazy<?> getLazy(Key key) {
+     return DoubleCheck.lazy(getProvider(key));
+   }
++
++  static final class Builder {
++    private final Map<Key, Binding<?>> bindings = new LinkedHashMap<Key, Binding<?>>();
++    private @Nullable InstanceGraph parent;
++    private @Nullable Annotation scope;
++
++    Builder scope(@Nullable Annotation scope) {
++      if (this.scope != null) {
++        throw new IllegalStateException("Scope already set");
++      }
++      this.scope = scope;
++      return this;
++    }
++
++    Builder parent(@Nullable InstanceGraph parent) {
++      if (this.parent != null) {
++        throw new IllegalStateException("Parent already set");
++      }
++      this.parent = parent;
++      return this;
++    }
++
++    Builder addBinding(Key key, Binding<?> binding) {
++      Binding<?> replaced = bindings.put(key, binding);
++      if (replaced != null) {
++        throw new IllegalStateException(
++            "Duplicate binding for " + key + ": " + replaced + " and " + binding);
++      }
++      return this;
++    }
++
++    InstanceGraph build() {
++      // TODO traverse scope hierarchy and validate?
++      return new InstanceGraph(bindings, parent, scope);
++    }
++  }
+ }
+diff --git a/reflect/reflect/src/main/java/dagger/reflect/JustInTimeBinding.java b/reflect/reflect/src/main/java/dagger/reflect/JustInTimeBinding.java
+index 1537d5479..736783a0d 100644
+--- a/reflect/reflect/src/main/java/dagger/reflect/JustInTimeBinding.java
++++ b/reflect/reflect/src/main/java/dagger/reflect/JustInTimeBinding.java
+@@ -1,6 +1,8 @@
+ package dagger.reflect;
+ 
++import java.lang.annotation.Annotation;
+ import java.lang.reflect.Constructor;
++import java.lang.reflect.Type;
+ import javax.inject.Inject;
+ 
+ import static dagger.reflect.Util.tryNewInstance;
+@@ -13,40 +15,46 @@
+     this.key = key;
+   }
+ 
+-  @Override protected Request[] initialize() {
+-    if (key.qualifer() == null && key.type() instanceof Class<?>) {
+-      Class<?> target = (Class<?>) key.type();
+-
+-      Constructor<?> constructor = null;
+-      for (Constructor<?> candidate : target.getDeclaredConstructors()) {
+-        if (candidate.getAnnotation(Inject.class) != null) {
+-          if (constructor != null) {
+-            throw new IllegalStateException(target + " defines multiple @Inject constructors");
+-          }
+-          constructor = candidate;
++  @Override protected Request[] initialize(Annotation scope) {
++    Type targetType = key.type();
++    if (key.qualifer() != null || !(targetType instanceof Class<?>)) {
++      throw new IllegalStateException("No binding for " + key);
++    }
++    Class<?> targetClass = (Class<?>) targetType;
++
++    // TODO validate scope
++
++    Constructor<?> constructor = null;
++    for (Constructor<?> candidate : targetClass.getDeclaredConstructors()) {
++      if (candidate.getAnnotation(Inject.class) != null) {
++        if (constructor != null) {
++          throw new IllegalStateException(targetClass + " defines multiple @Inject constructors");
+         }
++        constructor = candidate;
+       }
+-      if (constructor == null) {
+-        throw new IllegalStateException(target + " has no @Inject constructor");
+-      }
++    }
++    if (constructor == null) {
++      throw new IllegalStateException(targetClass + " has no @Inject constructor");
++    }
+ 
+-      // TODO check visibility
+-      constructor.setAccessible(true);
++    // TODO check visibility
++    constructor.setAccessible(true);
+ 
+-      this.constructor = constructor;
++    this.constructor = constructor;
+ 
+-      int parameterCount = constructor.getParameterTypes().length;
+-      Request[] requests = new Request[parameterCount];
+-      for (int i = 0; i < parameterCount; i++) {
+-        requests[i] = Request.fromConstructorParameter(constructor, i);
+-      }
+-      return requests;
++    int parameterCount = constructor.getParameterTypes().length;
++    Request[] requests = new Request[parameterCount];
++    for (int i = 0; i < parameterCount; i++) {
++      requests[i] = Request.fromConstructorParameter(constructor, i);
+     }
+-
+-    throw new IllegalStateException("No binding for " + key);
++    return requests;
+   }
+ 
+   @Override protected Object resolve(Object[] dependencies) {
+     return tryNewInstance(constructor, dependencies);
+   }
++
++  @Override public String toString() {
++    return "JustInTimeBinding[" + key + "]";
++  }
+ }
+diff --git a/reflect/reflect/src/main/java/dagger/reflect/ProvidesBinding.java b/reflect/reflect/src/main/java/dagger/reflect/ProvidesBinding.java
+index 715977850..a191ad926 100644
+--- a/reflect/reflect/src/main/java/dagger/reflect/ProvidesBinding.java
++++ b/reflect/reflect/src/main/java/dagger/reflect/ProvidesBinding.java
+@@ -2,29 +2,22 @@
+ 
+ import java.lang.annotation.Annotation;
+ import java.lang.reflect.Method;
++import org.jetbrains.annotations.Nullable;
+ 
+-import static dagger.reflect.Util.findScope;
+ import static dagger.reflect.Util.tryInvoke;
+ 
+ final class ProvidesBinding extends Binding<Object> {
+   private final Method method;
+-  private final Annotation scope;
+ 
+-  ProvidesBinding(Method method, Annotation scope) {
++  ProvidesBinding(Method method) {
+     this.method = method;
+-    this.scope = scope;
+   }
+ 
+-  @Override protected Request[] initialize() {
++  @Override protected Request[] initialize(@Nullable Annotation scope) {
+     // TODO check visibility
+     method.setAccessible(true);
+ 
+-    Annotation[] annotations = method.getDeclaredAnnotations();
+-    Annotation methodScope = findScope(annotations);
+-    if (!Util.equals(scope, methodScope)) {
+-      // TODO real error message
+-      throw new IllegalStateException("Cannot provide " + methodScope + " in " + scope);
+-    }
++    // TODO validate scope
+ 
+     int parameterCount = method.getParameterTypes().length;
+     Request[] requests = new Request[parameterCount];
+@@ -37,4 +30,8 @@
+   @Override protected Object resolve(Object[] dependencies) {
+     return tryInvoke(method, null, dependencies);
+   }
++
++  @Override public String toString() {
++    return "ProvidesBinding[" + method + "]";
++  }
+ }
+diff --git a/reflect/reflect/src/main/java/dagger/reflect/Util.java b/reflect/reflect/src/main/java/dagger/reflect/Util.java
+index f3ed82e94..fb4c2d12f 100644
+--- a/reflect/reflect/src/main/java/dagger/reflect/Util.java
++++ b/reflect/reflect/src/main/java/dagger/reflect/Util.java
+@@ -10,10 +10,6 @@
+ import org.jetbrains.annotations.Nullable;
+ 
+ final class Util {
+-  static boolean equals(@Nullable Object left, @Nullable Object right) {
+-    return left == null ? right == null : left.equals(right);
+-  }
+-
+   static @Nullable Annotation findQualifier(Annotation[] annotations) {
+     Annotation qualifier = null;
+     for (Annotation annotation : annotations) {

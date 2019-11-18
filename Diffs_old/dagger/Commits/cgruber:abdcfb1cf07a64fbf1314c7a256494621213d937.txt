@@ -1,0 +1,259 @@
+diff --git a/compiler/src/main/java/dagger/internal/codegen/ComponentProcessor.java b/compiler/src/main/java/dagger/internal/codegen/ComponentProcessor.java
+index ebc762e06..656b67ebd 100644
+--- a/compiler/src/main/java/dagger/internal/codegen/ComponentProcessor.java
++++ b/compiler/src/main/java/dagger/internal/codegen/ComponentProcessor.java
+@@ -72,6 +72,8 @@ public SourceVersion getSupportedSourceVersion() {
+     DependencyRequestFormatter dependencyRequestFormatter =
+         new DependencyRequestFormatter(types, elements);
+ 
++    Key.Factory keyFactory = new Key.Factory(types, elements);
++
+     InjectValidator injectValidator = new InjectValidator(types, elements, compilerOptions);
+     InjectValidator injectValidatorWhenGeneratingCode = injectValidator.whenGeneratingCode();
+     ProvidesMethodValidator providesMethodValidator = new ProvidesMethodValidator(elements, types);
+@@ -90,8 +92,21 @@ public SourceVersion getSupportedSourceVersion() {
+             bindsMethodValidator,
+             multibindsMethodValidator,
+             bindsOptionalOfMethodValidator);
++    MultibindingsValidator multibindingsValidator =
++        new MultibindingsValidator(
++            elements,
++            types,
++            keyFactory,
++            keyFormatter,
++            methodSignatureFormatter,
++            multibindingsMethodValidator);
+     ModuleValidator moduleValidator =
+-        new ModuleValidator(types, elements, anyBindingMethodValidator, methodSignatureFormatter);
++        new ModuleValidator(
++            types,
++            elements,
++            anyBindingMethodValidator,
++            multibindingsValidator,
++            methodSignatureFormatter);
+     BuilderValidator builderValidator = new BuilderValidator(elements, types);
+     ComponentValidator subcomponentValidator =
+         ComponentValidator.createForSubcomponent(
+@@ -101,17 +116,6 @@ public SourceVersion getSupportedSourceVersion() {
+             elements, types, moduleValidator, subcomponentValidator, builderValidator);
+     MapKeyValidator mapKeyValidator = new MapKeyValidator();
+ 
+-    Key.Factory keyFactory = new Key.Factory(types, elements);
+-
+-    MultibindingsValidator multibindingsValidator =
+-        new MultibindingsValidator(
+-            elements,
+-            types,
+-            keyFactory,
+-            keyFormatter,
+-            methodSignatureFormatter,
+-            multibindingsMethodValidator);
+-
+     this.factoryGenerator =
+         new FactoryGenerator(filer, elements, compilerOptions, injectValidatorWhenGeneratingCode);
+     this.membersInjectorGenerator =
+@@ -205,7 +209,6 @@ public SourceVersion getSupportedSourceVersion() {
+         new InjectProcessingStep(injectBindingRegistry),
+         new MonitoringModuleProcessingStep(messager, monitoringModuleGenerator),
+         new ProductionExecutorModuleProcessingStep(messager, productionExecutorModuleGenerator),
+-        new MultibindingsProcessingStep(messager, multibindingsValidator),
+         new MultibindingAnnotationsProcessingStep(messager),
+         moduleProcessingStep(messager, moduleValidator, provisionBindingFactory, factoryGenerator),
+         new ComponentProcessingStep(
+@@ -237,6 +240,7 @@ public SourceVersion getSupportedSourceVersion() {
+             componentDescriptorFactory,
+             bindingGraphFactory,
+             componentGenerator),
++        new MultibindingsProcessingStep(messager, multibindingsValidator),
+         new BindingMethodProcessingStep(messager, anyBindingMethodValidator));
+   }
+ 
+diff --git a/compiler/src/main/java/dagger/internal/codegen/ModuleValidator.java b/compiler/src/main/java/dagger/internal/codegen/ModuleValidator.java
+index bd2f9140a..a13347b10 100644
+--- a/compiler/src/main/java/dagger/internal/codegen/ModuleValidator.java
++++ b/compiler/src/main/java/dagger/internal/codegen/ModuleValidator.java
+@@ -43,6 +43,7 @@
+ import static javax.lang.model.element.Modifier.ABSTRACT;
+ import static javax.lang.model.element.Modifier.STATIC;
+ import static javax.lang.model.util.ElementFilter.methodsIn;
++import static javax.lang.model.util.ElementFilter.typesIn;
+ 
+ import com.google.auto.common.MoreElements;
+ import com.google.auto.common.MoreTypes;
+@@ -55,6 +56,7 @@
+ import com.google.common.collect.Sets;
+ import dagger.Binds;
+ import dagger.Module;
++import dagger.Multibindings;
+ import dagger.Subcomponent;
+ import dagger.multibindings.Multibinds;
+ import dagger.producers.ProducerModule;
+@@ -97,6 +99,7 @@
+   private final Types types;
+   private final Elements elements;
+   private final AnyBindingMethodValidator anyBindingMethodValidator;
++  private final MultibindingsValidator multibindingsValidator;
+   private final MethodSignatureFormatter methodSignatureFormatter;
+   private final Map<TypeElement, ValidationReport<TypeElement>> cache = new HashMap<>();
+   private final Set<TypeElement> knownModules = new HashSet<>();
+@@ -105,10 +108,12 @@
+       Types types,
+       Elements elements,
+       AnyBindingMethodValidator anyBindingMethodValidator,
++      MultibindingsValidator multibindingsValidator,
+       MethodSignatureFormatter methodSignatureFormatter) {
+     this.types = types;
+     this.elements = elements;
+     this.anyBindingMethodValidator = anyBindingMethodValidator;
++    this.multibindingsValidator = multibindingsValidator;
+     this.methodSignatureFormatter = methodSignatureFormatter;
+   }
+ 
+@@ -170,10 +175,20 @@ void addKnownModules(Collection<TypeElement> modules) {
+     validateModifiers(module, builder);
+     validateReferencedModules(module, moduleKind, builder);
+     validateReferencedSubcomponents(module, moduleKind, builder);
++    validateNestedMultibindingsTypes(module, builder);
+ 
+     return builder.build();
+   }
+ 
++  private void validateNestedMultibindingsTypes(
++      TypeElement module, ValidationReport.Builder<TypeElement> builder) {
++    for (TypeElement nestedType : typesIn(elements.getAllMembers(module))) {
++      if (isAnnotationPresent(nestedType, Multibindings.class)) {
++        builder.addSubreport(multibindingsValidator.validate(nestedType));
++      }
++    }
++  }
++
+   private void validateReferencedSubcomponents(
+       final TypeElement subject,
+       ModuleDescriptor.Kind moduleKind,
+diff --git a/compiler/src/main/java/dagger/internal/codegen/MultibindingsProcessingStep.java b/compiler/src/main/java/dagger/internal/codegen/MultibindingsProcessingStep.java
+index 24d72a262..a52d5cd7b 100644
+--- a/compiler/src/main/java/dagger/internal/codegen/MultibindingsProcessingStep.java
++++ b/compiler/src/main/java/dagger/internal/codegen/MultibindingsProcessingStep.java
+@@ -29,7 +29,8 @@
+ import javax.lang.model.element.TypeElement;
+ 
+ /**
+- * Processes elements annotated with {@link Multibindings @Multibindings}.
++ * Valdiates types annotated with {@link Multibindings @Multibindings} that haven't already been
++ * validated while processing their enclosing modules.
+  */
+ class MultibindingsProcessingStep implements ProcessingStep {
+   private final Messager messager;
+@@ -49,7 +50,9 @@
+   public Set<Element> process(
+       SetMultimap<Class<? extends Annotation>, Element> elementsByAnnotation) {
+     for (TypeElement element : typesIn(elementsByAnnotation.values())) {
+-      multibindingsValidator.validate(element).printMessagesTo(messager);
++      if (!multibindingsValidator.wasAlreadyValidated(element)) {
++        multibindingsValidator.validate(element).printMessagesTo(messager);
++      }
+     }
+     return ImmutableSet.of();
+   }
+diff --git a/compiler/src/main/java/dagger/internal/codegen/MultibindingsValidator.java b/compiler/src/main/java/dagger/internal/codegen/MultibindingsValidator.java
+index 48c81f53a..09f528705 100644
+--- a/compiler/src/main/java/dagger/internal/codegen/MultibindingsValidator.java
++++ b/compiler/src/main/java/dagger/internal/codegen/MultibindingsValidator.java
+@@ -32,6 +32,7 @@
+ import dagger.Multibindings;
+ import dagger.producers.ProducerModule;
+ import java.util.Collection;
++import java.util.HashMap;
+ import java.util.Map;
+ import javax.lang.model.element.ExecutableElement;
+ import javax.lang.model.element.TypeElement;
+@@ -50,6 +51,7 @@
+   private final MethodSignatureFormatter methodSignatureFormatter;
+   private final TypeElement objectElement;
+   private final MultibindingsMethodValidator multibindingsMethodValidator;
++  private final Map<TypeElement, ValidationReport<TypeElement>> reports = new HashMap<>();
+ 
+   MultibindingsValidator(
+       Elements elements,
+@@ -66,12 +68,24 @@
+     this.multibindingsMethodValidator = multibindingsMethodValidator;
+     this.objectElement = elements.getTypeElement(Object.class.getCanonicalName());
+   }
+-
++  
+   /**
+-   * Returns a report containing validation errors for a
+-   * {@link Multibindings @Multibindings}-annotated type.
++   * Returns a report containing validation errors for a {@link
++   * Multibindings @Multibindings}-annotated type.
+    */
+   public ValidationReport<TypeElement> validate(TypeElement multibindingsType) {
++    return reports.computeIfAbsent(multibindingsType, this::validateUncached);
++  }
++
++  /**
++   * Returns {@code true} if {@code multibindingsType} was already {@linkplain
++   * #validate(TypeElement) validated}.
++   */
++  boolean wasAlreadyValidated(TypeElement multibindingsType) {
++    return reports.containsKey(multibindingsType);
++  }
++
++  private ValidationReport<TypeElement> validateUncached(TypeElement multibindingsType) {
+     ValidationReport.Builder<TypeElement> validation = ValidationReport.about(multibindingsType);
+     if (!multibindingsType.getKind().equals(INTERFACE)) {
+       validation.addError(MUST_BE_INTERFACE, multibindingsType);
+diff --git a/compiler/src/test/java/dagger/internal/codegen/ModuleValidatorTest.java b/compiler/src/test/java/dagger/internal/codegen/ModuleValidatorTest.java
+index 34ab495a6..e3b1a2ebb 100644
+--- a/compiler/src/test/java/dagger/internal/codegen/ModuleValidatorTest.java
++++ b/compiler/src/test/java/dagger/internal/codegen/ModuleValidatorTest.java
+@@ -35,7 +35,7 @@
+ @RunWith(Parameterized.class)
+ public final class ModuleValidatorTest {
+ 
+-  @Parameterized.Parameters
++  @Parameterized.Parameters(name = "{0}")
+   public static Collection<Object[]> parameters() {
+     return Arrays.asList(new Object[][] {{ModuleType.MODULE}, {ModuleType.PRODUCER_MODULE}});
+   }
+@@ -279,4 +279,40 @@ public void invalidIncludedModule() {
+         .inFile(module)
+         .onLine(5);
+   }
++
++  @Test
++  public void invalidNestedMultibindingsType() {
++    JavaFileObject module =
++        JavaFileObjects.forSourceLines(
++            "test.IncludesBadMultibindings",
++            "package test;",
++            "",
++            "import dagger.Module;",
++            "import dagger.Multibindings;",
++            "import dagger.Provides;",
++            "",
++            "@Module",
++            "abstract class IncludesBadMultibindings {",
++            "  @Provides static String string() { return \"a string\"; }",
++            "",
++            "  @Multibindings interface BadMultibindings {",
++            "    String notASetOrMap();",
++            "  }",
++            "}");
++    JavaFileObject component =
++        JavaFileObjects.forSourceLines(
++            "test.TestComponent",
++            "package test;",
++            "",
++            "import dagger.Component;",
++            "",
++            "@Component(modules = IncludesBadMultibindings.class)",
++            "interface TestComponent {",
++            "  String aString();",
++            "}");
++    assertThat(daggerCompiler().compile(module, component))
++        .hadErrorContaining("test.IncludesBadMultibindings has errors")
++        .inFile(component)
++        .onLine(5);
++  }
+ }

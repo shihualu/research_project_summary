@@ -1,0 +1,492 @@
+diff --git a/java/dagger/android/AndroidInjectionModule.java b/java/dagger/android/AndroidInjectionModule.java
+index 05f1adae3..58c162364 100644
+--- a/java/dagger/android/AndroidInjectionModule.java
++++ b/java/dagger/android/AndroidInjectionModule.java
+@@ -34,6 +34,12 @@
+ @Beta
+ @Module
+ public abstract class AndroidInjectionModule {
++  @Multibinds
++  abstract Map<Class<?>, AndroidInjector.Factory<?>> allInjectorFactories();
++
++  @Multibinds
++  abstract Map<String, AndroidInjector.Factory<?>> allInjectorFactoriesWithStringKeys();
++
+   @Multibinds
+   abstract Map<Class<? extends Activity>, AndroidInjector.Factory<? extends Activity>>
+       activityInjectorFactories();
+diff --git a/java/dagger/android/DispatchingAndroidInjector.java b/java/dagger/android/DispatchingAndroidInjector.java
+index 9b011dd13..86fddf511 100644
+--- a/java/dagger/android/DispatchingAndroidInjector.java
++++ b/java/dagger/android/DispatchingAndroidInjector.java
+@@ -49,13 +49,20 @@
+       "No injector factory bound for Class<%1$s>. Injector factories were bound for supertypes "
+           + "of %1$s: %2$s. Did you mean to bind an injector factory for the subtype?";
+ 
+-  private final Map<String, Provider<AndroidInjector.Factory<? extends T>>> injectorFactories;
++  private final Map<String, Provider<AndroidInjector.Factory<?>>> injectorFactories;
+ 
+   @Inject
+   DispatchingAndroidInjector(
+-      Map<Class<? extends T>, Provider<Factory<? extends T>>> injectorFactoriesWithClassKeys,
+-      Map<String, Provider<Factory<? extends T>>> injectorFactoriesWithStringKeys) {
+-    this.injectorFactories = merge(injectorFactoriesWithClassKeys, injectorFactoriesWithStringKeys);
++      Map<Class<?>, Provider<AndroidInjector.Factory<?>>> injectorFactoriesWithClassKeys,
++      Map<String, Provider<AndroidInjector.Factory<?>>> injectorFactoriesWithStringKeys,
++      Map<Class<? extends T>, Provider<AndroidInjector.Factory<? extends T>>>
++          boundedInjectorFactoriesWithClassKeys,
++      Map<String, Provider<AndroidInjector.Factory<? extends T>>>
++          boundedInjectorFactoriesWithStringKeys) {
++    this.injectorFactories =
++        secondaryMerge(
++            merge(injectorFactoriesWithClassKeys, injectorFactoriesWithStringKeys),
++            merge(boundedInjectorFactoriesWithClassKeys, boundedInjectorFactoriesWithStringKeys));
+   }
+ 
+   /**
+@@ -68,10 +75,12 @@
+    * <p>Ideally we could achieve this with a generic {@code @Provides} method, but we'd need to have
+    * <i>N</i> modules that each extend one base module.
+    */
+-  private static <C, V> Map<String, V> merge(
++  private static <C, V> Map<String, Provider<AndroidInjector.Factory<?>>> merge(
+       Map<Class<? extends C>, V> classKeyedMap, Map<String, V> stringKeyedMap) {
+     if (classKeyedMap.isEmpty()) {
+-      return stringKeyedMap;
++      @SuppressWarnings({"unchecked", "rawtypes"})
++      Map<String, Provider<AndroidInjector.Factory<?>>> safeCast = (Map) stringKeyedMap;
++      return safeCast;
+     }
+ 
+     Map<String, V> merged =
+@@ -81,7 +90,29 @@
+       merged.put(entry.getKey().getName(), entry.getValue());
+     }
+ 
+-    return Collections.unmodifiableMap(merged);
++    @SuppressWarnings({"unchecked", "rawtypes"})
++    Map<String, Provider<AndroidInjector.Factory<?>>> safeCast = (Map) merged;
++    return Collections.unmodifiableMap(safeCast);
++  }
++
++  /**
++   * Merges the results of {@link #merge(Map, Map)} calls into one map.
++   *
++   * <p>An SPI plugin verifies the logical uniqueness of the keysets of these two (merged) maps so
++   * we're assured there's no overlap.
++   */
++  private static <K, V> Map<K, V> secondaryMerge(Map<K, V> firstMap, Map<K, V> secondMap) {
++    if (firstMap.isEmpty()) {
++      return secondMap;
++    }
++    if (secondMap.isEmpty()) {
++      return firstMap;
++    }
++
++    Map<K, V> merged = newLinkedHashMapWithExpectedSize(firstMap.size() + secondMap.size());
++    merged.putAll(firstMap);
++    merged.putAll(secondMap);
++    return merged;
+   }
+ 
+   /**
+@@ -93,7 +124,7 @@
+    */
+   @CanIgnoreReturnValue
+   public boolean maybeInject(T instance) {
+-    Provider<AndroidInjector.Factory<? extends T>> factoryProvider =
++    Provider<AndroidInjector.Factory<?>> factoryProvider =
+         injectorFactories.get(instance.getClass().getName());
+     if (factoryProvider == null) {
+       return false;
+diff --git a/java/dagger/android/processor/AndroidInjectorDescriptor.java b/java/dagger/android/processor/AndroidInjectorDescriptor.java
+index 1e0d93f6a..094259561 100644
+--- a/java/dagger/android/processor/AndroidInjectorDescriptor.java
++++ b/java/dagger/android/processor/AndroidInjectorDescriptor.java
+@@ -20,7 +20,7 @@
+ import static com.google.auto.common.AnnotationMirrors.getAnnotationValue;
+ import static com.google.auto.common.MoreElements.getAnnotationMirror;
+ import static com.google.auto.common.MoreElements.isAnnotationPresent;
+-import static dagger.android.processor.AndroidMapKeys.annotationsAndFrameworkTypes;
++import static dagger.android.processor.AndroidMapKeys.frameworkTypesByMapKey;
+ import static java.util.stream.Collectors.toList;
+ import static javax.lang.model.element.Modifier.ABSTRACT;
+ 
+@@ -60,15 +60,6 @@
+   /** The type to be injected; the return type of the {@link ContributesAndroidInjector} method. */
+   abstract ClassName injectedType();
+ 
+-  /**
+-   * The base framework type of {@link #injectedType()}, e.g. {@code Activity}, {@code Fragment},
+-   * etc.
+-   */
+-  abstract ClassName frameworkType();
+-
+-  /** The {@link dagger.MapKey} type for the associated {@link #frameworkType()}. */
+-  abstract ClassName mapKeyType();
+-
+   /** Scopes to apply to the generated {@link dagger.Subcomponent}. */
+   abstract ImmutableSet<AnnotationSpec> scopes();
+ 
+@@ -89,10 +80,6 @@
+ 
+     abstract ImmutableSet.Builder<ClassName> modulesBuilder();
+ 
+-    abstract Builder frameworkType(ClassName frameworkType);
+-
+-    abstract Builder mapKeyType(ClassName mapKeyType);
+-
+     abstract Builder enclosingModule(ClassName enclosingModule);
+ 
+     abstract Builder method(ExecutableElement method);
+@@ -136,18 +123,13 @@
+ 
+       TypeMirror injectedType = method.getReturnType();
+       Optional<? extends Class<? extends Annotation>> maybeMapKeyAnnotation =
+-          annotationsAndFrameworkTypes(elements)
++          frameworkTypesByMapKey(elements)
+               .entrySet()
+               .stream()
+               .filter(entry -> types.isAssignable(injectedType, entry.getValue()))
+               .map(Map.Entry::getKey)
+               .findFirst();
+       if (maybeMapKeyAnnotation.isPresent()) {
+-        Class<? extends Annotation> mapKeyAnnotation = maybeMapKeyAnnotation.get();
+-        TypeMirror frameworkType = annotationsAndFrameworkTypes(elements).get(mapKeyAnnotation);
+-        builder
+-            .mapKeyType(ClassName.get(mapKeyAnnotation))
+-            .frameworkType((ClassName) TypeName.get(frameworkType));
+         if (MoreTypes.asDeclared(injectedType).getTypeArguments().isEmpty()) {
+           builder.injectedType(ClassName.get(MoreTypes.asTypeElement(injectedType)));
+         } else {
+diff --git a/java/dagger/android/processor/AndroidMapKeyValidator.java b/java/dagger/android/processor/AndroidMapKeyValidator.java
+index 4084ff4e2..653534e8a 100644
+--- a/java/dagger/android/processor/AndroidMapKeyValidator.java
++++ b/java/dagger/android/processor/AndroidMapKeyValidator.java
+@@ -20,7 +20,7 @@
+ import static com.google.auto.common.MoreElements.getAnnotationMirror;
+ import static com.google.auto.common.MoreElements.isAnnotationPresent;
+ import static com.google.common.collect.Iterables.getOnlyElement;
+-import static dagger.android.processor.AndroidMapKeys.annotationsAndFrameworkTypes;
++import static dagger.android.processor.AndroidMapKeys.frameworkTypesByMapKey;
+ import static dagger.android.processor.AndroidMapKeys.injectedTypeFromMapKey;
+ 
+ import com.google.auto.common.BasicAnnotationProcessor.ProcessingStep;
+@@ -29,8 +29,10 @@
+ import com.google.common.collect.ImmutableSet;
+ import com.google.common.collect.SetMultimap;
+ import dagger.Binds;
++import dagger.MapKey;
+ import dagger.android.AndroidInjectionKey;
+ import dagger.android.AndroidInjector;
++import dagger.multibindings.ClassKey;
+ import java.lang.annotation.Annotation;
+ import java.util.Set;
+ import javax.annotation.processing.Messager;
+@@ -64,8 +66,9 @@
+   @Override
+   public Set<? extends Class<? extends Annotation>> annotations() {
+     return ImmutableSet.<Class<? extends Annotation>>builder()
+-        .addAll(annotationsAndFrameworkTypes(elements).keySet())
++        .addAll(frameworkTypesByMapKey(elements).keySet())
+         .add(AndroidInjectionKey.class)
++        .add(ClassKey.class)
+         .build();
+   }
+ 
+@@ -88,8 +91,6 @@ private void validateMethod(Class<? extends Annotation> annotation, ExecutableEl
+       return;
+     }
+ 
+-    TypeMirror frameworkType = frameworkTypeForMapKey(method, annotation);
+-
+     if (!getAnnotatedAnnotations(method, Scope.class).isEmpty()) {
+       SuppressWarnings suppressedWarnings = method.getAnnotation(SuppressWarnings.class);
+       if (suppressedWarnings == null
+@@ -99,31 +100,68 @@ private void validateMethod(Class<? extends Annotation> annotation, ExecutableEl
+             Kind.ERROR,
+             String.format(
+                 "%s bindings should not be scoped. Scoping this method may leak instances of %s. ",
+-                AndroidInjector.Factory.class.getCanonicalName(), frameworkType),
++                AndroidInjector.Factory.class.getCanonicalName(), frameworkTypeForMapKey(method)),
+             method);
+       }
+     }
+ 
+-    DeclaredType intendedReturnType = injectorFactoryOf(types.getWildcardType(frameworkType, null));
+-    if (!MoreTypes.equivalence().equivalent(returnType, intendedReturnType)) {
++    validateReturnTypeMatchesMapKey(method, annotation);
++
++    // @Binds methods should only have one parameter, but we can't guarantee the order of Processors
++    // in javac, so do a basic check for valid form
++    if (isAnnotationPresent(method, Binds.class) && method.getParameters().size() == 1) {
++      validateMapKeyMatchesBindsParameter(annotation, method);
++    }
++  }
++
++  /**
++   * Report an error if the method's return type doesn't match the expectations for the map key
++   * annotation.
++   *
++   * <ul>
++   *   <li>Methods annotated with {@code @ClassKey} must return {@code AndroidInjector.Factory<?>}.
++   *   <li>Methods annotated with {@code @AndroidInjectionKey} must return either {@code
++   *       AndroidInjector.Factory<?>} or {@code AndroidInjector.Factory<? extends AndroidType>},
++   *       where {@code AndroidType} is the Android component type extended by the map key class.
++   *   <li>Methods annotated with {@code @ActivityKey}, {@code FragmentKey}, etc., must return
++   *       {@code AndroidInjector.Factory<? extends Activity>}, {@code AndroidInjector.Factory<?
++   *       extends Fragment>}, etc.
++   * </ul>
++   */
++  private void validateReturnTypeMatchesMapKey(
++      ExecutableElement method, Class<? extends Annotation> mapKeyType) {
++    TypeMirror returnType = method.getReturnType();
++    DeclaredType boundedInjectorFactoryType =
++        injectorFactoryOf(types.getWildcardType(frameworkTypeForMapKey(method), null));
++    DeclaredType unboundedInjectorFactoryType =
++        injectorFactoryOf(types.getWildcardType(null, null));
++
++    // first check the original return type format, AndroidInjector.Factory<? extends FRAMEWORK>.
++    // This should match all map keys besides ClassKey.
++    boolean isValidReturnType =
++        mapKeyType != ClassKey.class
++            && MoreTypes.equivalence().equivalent(returnType, boundedInjectorFactoryType);
++
++    // if the first check fails, check if the return type matches the new, all-encompassing
++    // multibindings: AndroidInjector.Factory<?>. This is only supported for ClassKey (which has an
++    // unbounded Class<?> return type) or AndroidInjectionKey
++    isValidReturnType |=
++        ((mapKeyType == ClassKey.class || mapKeyType == AndroidInjectionKey.class)
++            && MoreTypes.equivalence().equivalent(returnType, unboundedInjectorFactoryType));
++
++    if (!isValidReturnType) {
+       String subject =
+-          annotation.equals(AndroidInjectionKey.class)
++          mapKeyType.equals(AndroidInjectionKey.class)
+               ? method.toString()
+-              : String.format("@%s methods", annotation.getCanonicalName());
++              : String.format("@%s methods", mapKeyType.getCanonicalName());
+ 
+       messager.printMessage(
+           Kind.ERROR,
+           String.format(
+               "%s should bind %s, not %s. See https://google.github.io/dagger/android",
+-              subject, intendedReturnType, returnType),
++              subject, boundedInjectorFactoryType, returnType),
+           method);
+     }
+-
+-    // @Binds methods should only have one parameter, but we can't guarantee the order of Processors
+-    // in javac, so do a basic check for valid form
+-    if (isAnnotationPresent(method, Binds.class) && method.getParameters().size() == 1) {
+-      validateMapKeyMatchesBindsParameter(annotation, method);
+-    }
+   }
+ 
+   /**
+@@ -155,12 +193,13 @@ private void validateMapKeyMatchesBindsParameter(
+     }
+   }
+ 
+-  private TypeMirror frameworkTypeForMapKey(
+-      ExecutableElement method, Class<? extends Annotation> annotation) {
+-    AnnotationMirror annotationMirror = getAnnotationMirror(method, annotation).get();
++  /** Returns the framework type that {@code method}'s map key annotation represents. */
++  private TypeMirror frameworkTypeForMapKey(ExecutableElement method) {
++    AnnotationMirror mapKeyAnnotation =
++        getOnlyElement(getAnnotatedAnnotations(method, MapKey.class));
+     TypeMirror mapKeyType =
+-        elements.getTypeElement(injectedTypeFromMapKey(annotationMirror).get()).asType();
+-    return annotationsAndFrameworkTypes(elements)
++        elements.getTypeElement(injectedTypeFromMapKey(mapKeyAnnotation).get()).asType();
++    return frameworkTypesByMapKey(elements)
+         .values()
+         .stream()
+         .filter(frameworkType -> types.isAssignable(mapKeyType, frameworkType))
+diff --git a/java/dagger/android/processor/AndroidMapKeys.java b/java/dagger/android/processor/AndroidMapKeys.java
+index 64682070a..af011f8d0 100644
+--- a/java/dagger/android/processor/AndroidMapKeys.java
++++ b/java/dagger/android/processor/AndroidMapKeys.java
+@@ -46,7 +46,7 @@
+    * framework, and only contain the support library types if they are on the classpath of the
+    * current compilation.
+    */
+-  static ImmutableMap<Class<? extends Annotation>, TypeMirror> annotationsAndFrameworkTypes(
++  static ImmutableMap<Class<? extends Annotation>, TypeMirror> frameworkTypesByMapKey(
+       Elements elements) {
+     return ImmutableMap.copyOf(
+         Stream.of(
+diff --git a/java/dagger/android/processor/ContributesAndroidInjectorGenerator.java b/java/dagger/android/processor/ContributesAndroidInjectorGenerator.java
+index 4f022c229..46e40ff6a 100644
+--- a/java/dagger/android/processor/ContributesAndroidInjectorGenerator.java
++++ b/java/dagger/android/processor/ContributesAndroidInjectorGenerator.java
+@@ -50,6 +50,7 @@
+ import dagger.android.AndroidInjector;
+ import dagger.android.ContributesAndroidInjector;
+ import dagger.android.processor.AndroidInjectorDescriptor.Validator;
++import dagger.multibindings.ClassKey;
+ import dagger.multibindings.IntoMap;
+ import java.io.IOException;
+ import java.lang.annotation.Annotation;
+@@ -144,7 +145,7 @@ private MethodSpec bindAndroidInjectorFactory(
+         .returns(
+             parameterizedTypeName(
+                 AndroidInjector.Factory.class,
+-                WildcardTypeName.subtypeOf(descriptor.frameworkType())))
++                WildcardTypeName.subtypeOf(TypeName.OBJECT)))
+         .addParameter(subcomponentBuilderName, "builder")
+         .build();
+   }
+@@ -155,7 +156,7 @@ private AnnotationSpec androidInjectorMapKey(AndroidInjectorDescriptor descripto
+           .addMember("value", "$S", descriptor.injectedType().toString())
+           .build();
+     }
+-    return AnnotationSpec.builder(descriptor.mapKeyType())
++    return AnnotationSpec.builder(ClassKey.class)
+         .addMember("value", "$T.class", descriptor.injectedType())
+         .build();
+   }
+diff --git a/javatests/dagger/android/DispatchingAndroidInjectorTest.java b/javatests/dagger/android/DispatchingAndroidInjectorTest.java
+index 544565a37..bf4241245 100644
+--- a/javatests/dagger/android/DispatchingAndroidInjectorTest.java
++++ b/javatests/dagger/android/DispatchingAndroidInjectorTest.java
+@@ -35,7 +35,10 @@
+   public void withClassKeys() {
+     DispatchingAndroidInjector<Activity> dispatchingAndroidInjector =
+         new DispatchingAndroidInjector<>(
+-            ImmutableMap.of(FooActivity.class, FooInjector.Factory::new), ImmutableMap.of());
++            ImmutableMap.of(FooActivity.class, FooInjector.Factory::new),
++            ImmutableMap.of(),
++            ImmutableMap.of(),
++            ImmutableMap.of());
+ 
+     FooActivity activity = Robolectric.setupActivity(FooActivity.class);
+     assertThat(dispatchingAndroidInjector.maybeInject(activity)).isTrue();
+@@ -46,7 +49,9 @@ public void withStringKeys() {
+     DispatchingAndroidInjector<Activity> dispatchingAndroidInjector =
+         new DispatchingAndroidInjector<>(
+             ImmutableMap.of(),
+-            ImmutableMap.of(FooActivity.class.getName(), FooInjector.Factory::new));
++            ImmutableMap.of(FooActivity.class.getName(), FooInjector.Factory::new),
++            ImmutableMap.of(),
++            ImmutableMap.of());
+ 
+     FooActivity activity = Robolectric.setupActivity(FooActivity.class);
+     assertThat(dispatchingAndroidInjector.maybeInject(activity)).isTrue();
+@@ -57,7 +62,9 @@ public void withMixedKeys() {
+     DispatchingAndroidInjector<Activity> dispatchingAndroidInjector =
+         new DispatchingAndroidInjector<>(
+             ImmutableMap.of(FooActivity.class, FooInjector.Factory::new),
+-            ImmutableMap.of(BarActivity.class.getName(), BarInjector.Factory::new));
++            ImmutableMap.of(BarActivity.class.getName(), BarInjector.Factory::new),
++            ImmutableMap.of(),
++            ImmutableMap.of());
+ 
+     FooActivity fooActivity = Robolectric.setupActivity(FooActivity.class);
+     assertThat(dispatchingAndroidInjector.maybeInject(fooActivity)).isTrue();
+@@ -68,8 +75,9 @@ public void withMixedKeys() {
+   @Test
+   public void maybeInject_returnsFalse_ifNoMatchingInjectorExists() {
+     DispatchingAndroidInjector<Activity> dispatchingAndroidInjector =
+-        new DispatchingAndroidInjector<>(ImmutableMap.of(), ImmutableMap.of());
+-    
++        new DispatchingAndroidInjector<>(
++            ImmutableMap.of(), ImmutableMap.of(), ImmutableMap.of(), ImmutableMap.of());
++
+     BarActivity activity = Robolectric.setupActivity(BarActivity.class);
+     assertThat(dispatchingAndroidInjector.maybeInject(activity)).isFalse();
+   }
+@@ -79,6 +87,8 @@ public void throwsIfFactoryCreateReturnsNull() {
+     DispatchingAndroidInjector<Activity> dispatchingAndroidInjector =
+         new DispatchingAndroidInjector<>(
+             ImmutableMap.of(FooActivity.class, () -> null),
++            ImmutableMap.of(),
++            ImmutableMap.of(),
+             ImmutableMap.of());
+     FooActivity activity = Robolectric.setupActivity(FooActivity.class);
+ 
+@@ -93,7 +103,10 @@ public void throwsIfFactoryCreateReturnsNull() {
+   public void throwsIfClassMismatched() {
+     DispatchingAndroidInjector<Activity> dispatchingAndroidInjector =
+         new DispatchingAndroidInjector<>(
+-            ImmutableMap.of(FooActivity.class, BarInjector.Factory::new), ImmutableMap.of());
++            ImmutableMap.of(FooActivity.class, BarInjector.Factory::new),
++            ImmutableMap.of(),
++            ImmutableMap.of(),
++            ImmutableMap.of());
+     FooActivity activity = Robolectric.setupActivity(FooActivity.class);
+ 
+     try {
+diff --git a/javatests/dagger/android/processor/AndroidMapKeyValidatorTest.java b/javatests/dagger/android/processor/AndroidMapKeyValidatorTest.java
+index d08bf0b78..7e2199aec 100644
+--- a/javatests/dagger/android/processor/AndroidMapKeyValidatorTest.java
++++ b/javatests/dagger/android/processor/AndroidMapKeyValidatorTest.java
+@@ -69,7 +69,7 @@ private static JavaFileObject moduleWithMethod(String... lines) {
+         "import dagger.Module;",
+         "import dagger.*;",
+         "import dagger.android.*;",
+-        "import dagger.multibindings.IntoMap;",
++        "import dagger.multibindings.*;",
+         "import javax.inject.*;",
+         "",
+         "@Module",
+@@ -281,6 +281,18 @@ public void bindsCorrectType() {
+     assertThat(compilation).succeededWithoutWarnings();
+   }
+ 
++  @Test
++  public void bindsCorrectType_unbounded() {
++    JavaFileObject module =
++        moduleWithMethod(
++            "@Binds",
++            "@IntoMap",
++            "@ClassKey(FooActivity.class)",
++            "abstract AndroidInjector.Factory<?> bindCorrectType(FooActivity.Builder builder);");
++    Compilation compilation = compile(module, FOO_ACTIVITY);
++    assertThat(compilation).succeededWithoutWarnings();
++  }
++
+   @Test
+   public void bindsCorrectType_AndroidInjectionKey() {
+     JavaFileObject module =
+diff --git a/javatests/dagger/android/processor/DuplicateAndroidInjectorsCheckerTest.java b/javatests/dagger/android/processor/DuplicateAndroidInjectorsCheckerTest.java
+index 8cd1979ee..f0ef97eaf 100644
+--- a/javatests/dagger/android/processor/DuplicateAndroidInjectorsCheckerTest.java
++++ b/javatests/dagger/android/processor/DuplicateAndroidInjectorsCheckerTest.java
+@@ -68,13 +68,25 @@ public void conflictingMapKeys() {
+             "interface TestModule {",
+             "  @Binds",
+             "  @IntoMap",
++            "  @ClassKey(TestActivity.class)",
++            "  AndroidInjector.Factory<?> classKey(TestInjectorFactory factory);",
++            "",
++            "  @Binds",
++            "  @IntoMap",
++            "  @AndroidInjectionKey(\"test.TestActivity\")",
++            "  AndroidInjector.Factory<?> stringKey(TestInjectorFactory factory);",
++            "",
++            "  @Binds",
++            "  @IntoMap",
+             "  @ActivityKey(TestActivity.class)",
+-            "  AndroidInjector.Factory<? extends Activity> classKey(TestInjectorFactory factory);",
++            "  AndroidInjector.Factory<? extends Activity> boundedClassKey(",
++            "      TestInjectorFactory factory);",
+             "",
+             "  @Binds",
+             "  @IntoMap",
+             "  @AndroidInjectionKey(\"test.TestActivity\")",
+-            "  AndroidInjector.Factory<? extends Activity> stringKey(TestInjectorFactory factory);",
++            "  AndroidInjector.Factory<? extends Activity> boundedStringKey(",
++            "      TestInjectorFactory factory);",
+             "}");
+     JavaFileObject component =
+         JavaFileObjects.forSourceLines(
+@@ -101,6 +113,8 @@ public void conflictingMapKeys() {
+         .onLineContaining("interface TestComponent");
+     assertThat(compilation).hadErrorContaining("classKey(test.TestInjectorFactory)");
+     assertThat(compilation).hadErrorContaining("stringKey(test.TestInjectorFactory)");
++    assertThat(compilation).hadErrorContaining("boundedClassKey(test.TestInjectorFactory)");
++    assertThat(compilation).hadErrorContaining("boundedStringKey(test.TestInjectorFactory)");
+     assertThat(compilation).hadErrorCount(1);
+   }
+ }

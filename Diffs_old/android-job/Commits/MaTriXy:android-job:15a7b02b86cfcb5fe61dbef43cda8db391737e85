@@ -1,0 +1,776 @@
+diff --git a/demo/src/main/java/com/evernote/android/job/demo/MainActivity.java b/demo/src/main/java/com/evernote/android/job/demo/MainActivity.java
+index ebe4205..241a250 100644
+--- a/demo/src/main/java/com/evernote/android/job/demo/MainActivity.java
++++ b/demo/src/main/java/com/evernote/android/job/demo/MainActivity.java
+@@ -198,7 +198,7 @@ private void testAllImpl() {
+         for (JobApi api : JobApi.values()) {
+             if (api.isSupported(this)) {
+                 mJobManager.forceApi(api);
+-                testSimple();
++                testPeriodic();
+             } else {
+                 Cat.w("%s is not supported", api);
+             }
+@@ -209,7 +209,7 @@ private void testAllImpl() {
+ 
+     private void testPeriodic() {
+         mLastJobId = new JobRequest.Builder(DemoJob.TAG)
+-                .setPeriodic(60_000L)
++                .setPeriodic(60_000L, 20_000L)
+                 .setRequiresCharging(mRequiresCharging.isChecked())
+                 .setRequiresDeviceIdle(mRequiresDeviceIdle.isChecked())
+                 .setRequiredNetworkType(JobRequest.NetworkType.values()[mNetworkTypeSpinner.getSelectedItemPosition()])
+diff --git a/library/src/main/java/com/evernote/android/job/Job.java b/library/src/main/java/com/evernote/android/job/Job.java
+index 3339163..c9b67c3 100644
+--- a/library/src/main/java/com/evernote/android/job/Job.java
++++ b/library/src/main/java/com/evernote/android/job/Job.java
+@@ -407,6 +407,17 @@ public long getIntervalMs() {
+             return mRequest.getIntervalMs();
+         }
+ 
++        /**
++         * Flex time for this job. Only valid if this is a periodic job. The job can execute
++         * at any time in a window of flex length at the end of the period.
++         *
++         * @return How close to the end of an interval a periodic job is allowed to run.
++         * @see JobRequest#getFlexMs()
++         */
++        public long getFlexMs() {
++            return mRequest.getFlexMs();
++        }
++
+         /**
+          * Only valid if the job isn't periodic.
+          *
+diff --git a/library/src/main/java/com/evernote/android/job/JobExecutor.java b/library/src/main/java/com/evernote/android/job/JobExecutor.java
+index 390fdf3..a4825ab 100644
+--- a/library/src/main/java/com/evernote/android/job/JobExecutor.java
++++ b/library/src/main/java/com/evernote/android/job/JobExecutor.java
+@@ -174,7 +174,7 @@ private JobCallable(Job job) {
+         private void handleResult(Job.Result result) {
+             JobRequest request = mJob.getParams().getRequest();
+             if (!request.isPeriodic() && Job.Result.RESCHEDULE.equals(result)) {
+-                int newJobId = request.reschedule(true);
++                int newJobId = request.reschedule(true, true);
+                 mJob.onReschedule(newJobId);
+             } else if (request.isPeriodic() && !Job.Result.SUCCESS.equals(result)) {
+                 request.incNumFailures();
+diff --git a/library/src/main/java/com/evernote/android/job/JobManager.java b/library/src/main/java/com/evernote/android/job/JobManager.java
+index cb87815..4f78b09 100644
+--- a/library/src/main/java/com/evernote/android/job/JobManager.java
++++ b/library/src/main/java/com/evernote/android/job/JobManager.java
+@@ -193,7 +193,7 @@ protected void setJobProxy(JobApi api) {
+      *
+      * @param request The {@link JobRequest} which will be run in the future.
+      */
+-    public void schedule(JobRequest request) {
++    public void schedule(@NonNull JobRequest request) {
+         if (mJobCreatorHolder.isEmpty()) {
+             CAT.w("you haven't registered a JobCreator with addJobCreator(), it's likely that your job never will be executed");
+         }
+@@ -204,12 +204,21 @@ public void schedule(JobRequest request) {
+ 
+         JobProxy.Common.cleanUpOrphanedJob(mContext, request.getJobId());
+ 
++        JobApi jobApi = request.getJobApi();
++        boolean periodic = request.isPeriodic();
++        boolean flexSupport = periodic && jobApi.isFlexSupport() && request.getFlexMs() < request.getIntervalMs();
++
+         request.setScheduledAt(System.currentTimeMillis());
++        request.setFlexSupport(flexSupport);
+         mJobStorage.put(request);
+ 
+-        JobProxy proxy = getJobProxy(request);
+-        if (request.isPeriodic()) {
+-            proxy.plantPeriodic(request);
++        JobProxy proxy = getJobProxy(jobApi);
++        if (periodic) {
++            if (flexSupport) {
++                proxy.plantPeriodicFlexSupport(request);
++            } else {
++                proxy.plantPeriodic(request);
++            }
+         } else {
+             proxy.plantOneOff(request);
+         }
+@@ -430,7 +439,11 @@ public void removeJobCreator(JobCreator jobCreator) {
+     }
+ 
+     private JobProxy getJobProxy(JobRequest request) {
+-        return request.getJobApi().getCachedProxy(mContext);
++        return getJobProxy(request.getJobApi());
++    }
++
++    private JobProxy getJobProxy(JobApi api) {
++        return api.getCachedProxy(mContext);
+     }
+ 
+     private void rescheduleTasksIfNecessary() {
+diff --git a/library/src/main/java/com/evernote/android/job/JobProxy.java b/library/src/main/java/com/evernote/android/job/JobProxy.java
+index 2afb72d..f6a9789 100644
+--- a/library/src/main/java/com/evernote/android/job/JobProxy.java
++++ b/library/src/main/java/com/evernote/android/job/JobProxy.java
+@@ -51,6 +51,8 @@
+ 
+     void plantPeriodic(JobRequest request);
+ 
++    void plantPeriodicFlexSupport(JobRequest request);
++
+     void cancel(int jobId);
+ 
+     boolean isPlatformJobScheduled(JobRequest request);
+@@ -79,6 +81,18 @@ public static long getAverageDelayMs(JobRequest request) {
+             return checkedAdd(getStartMs(request), (getEndMs(request) - getStartMs(request)) / 2);
+         }
+ 
++        public static long getStartMsSupportFlex(JobRequest request) {
++            return Math.max(1, request.getIntervalMs() - request.getFlexMs());
++        }
++
++        public static long getEndMsSupportFlex(JobRequest request) {
++            return request.getIntervalMs();
++        }
++
++        public static long getAverageDelayMsSupportFlex(JobRequest request) {
++            return checkedAdd(getStartMsSupportFlex(request), (getEndMsSupportFlex(request) - getStartMsSupportFlex(request)) / 2);
++        }
++
+         private final Context mContext;
+         private final int mJobId;
+         private final CatLog mCat;
+@@ -107,7 +121,7 @@ public JobRequest getPendingRequest() {
+                 mCat.d("Job %d already finished, %s", mJobId, request);
+                 return null;
+ 
+-            } else if (job != null && System.currentTimeMillis() - job.getFinishedTimeStamp() < 2_000) {
++            } else if (job != null && System.currentTimeMillis() - job.getFinishedTimeStamp() < JobRequest.MIN_INTERVAL / 2) {
+                 mCat.d("Job %d is periodic and just finished, %s", mJobId, request);
+                 return null;
+ 
+@@ -128,7 +142,8 @@ public JobRequest getPendingRequest() {
+             long waited = System.currentTimeMillis() - request.getScheduledAt();
+             String timeWindow;
+             if (request.isPeriodic()) {
+-                timeWindow = "interval " + JobUtil.timeToString(request.getIntervalMs());
++                timeWindow = String.format(Locale.US, "interval %s, flex %s", JobUtil.timeToString(request.getIntervalMs()),
++                        JobUtil.timeToString(request.getFlexMs()));
+             } else if (request.getJobApi().supportsExecutionWindow()) {
+                 timeWindow = String.format(Locale.US, "start %s, end %s", JobUtil.timeToString(getStartMs(request)),
+                         JobUtil.timeToString(getEndMs(request)));
+@@ -175,6 +190,10 @@ public JobRequest getPendingRequest() {
+             } finally {
+                 if (!request.isPeriodic()) {
+                     mJobManager.getJobStorage().remove(request);
++
++                } else if (request.isFlexSupport()) {
++                    mJobManager.getJobStorage().remove(request); // remove, we store the new job in JobManager.schedule()
++                    request.reschedule(false, false);
+                 }
+             }
+         }
+diff --git a/library/src/main/java/com/evernote/android/job/JobRequest.java b/library/src/main/java/com/evernote/android/job/JobRequest.java
+index 3309246..bbb0222 100644
+--- a/library/src/main/java/com/evernote/android/job/JobRequest.java
++++ b/library/src/main/java/com/evernote/android/job/JobRequest.java
+@@ -71,6 +71,21 @@
+      */
+     public static final NetworkType DEFAULT_NETWORK_TYPE = NetworkType.ANY;
+ 
++    /**
++     * The minimum interval of a periodic job. Specifying a smaller interval will result in an exception.
++     * @see Builder#setPeriodic(long)
++     * @see Builder#setPeriodic(long, long)
++     */
++    public static final long MIN_INTERVAL = 60_000L;
++    // TODO: double check values with final N release, JobInfo.getMinPeriodMillis() returns 15min, kinda eh
++    // JobInfo.getMinFlexMillis() returns 5min, more eh
++
++    /**
++     * The minimum flex of a periodic job. Specifying a smaller flex will result in an exception.
++     * @see Builder#setPeriodic(long, long)
++     */
++    public static final long MIN_FLEX = 5_000L;
++
+     private static final long WINDOW_THRESHOLD_WARNING = Long.MAX_VALUE / 3;
+     private static final long WINDOW_THRESHOLD_MAX = (Long.MAX_VALUE / 3) * 2;
+ 
+@@ -82,6 +97,7 @@
+     private int mNumFailures;
+     private long mScheduledAt;
+     private boolean mTransient;
++    private boolean mFlexSupport;
+ 
+     private JobRequest(Builder builder) {
+         mBuilder = builder;
+@@ -156,6 +172,16 @@ public long getIntervalMs() {
+         return mBuilder.mIntervalMs;
+     }
+ 
++    /**
++     * Flex time for this job. Only valid if this is a periodic job. The job can execute
++     * at any time in a window of flex length at the end of the period.
++     *
++     * @return How close to the end of an interval a periodic job is allowed to run.
++     */
++    public long getFlexMs() {
++        return mBuilder.mFlexMs;
++    }
++
+     /**
+      * @return If {@code true}, then all requirements are checked before the job runs. If one requirement
+      * isn't met, then the job is rescheduled right away.
+@@ -262,6 +288,14 @@ public boolean isExact() {
+         return mTransient;
+     }
+ 
++    /*package*/ boolean isFlexSupport() {
++        return mFlexSupport;
++    }
++
++    /*package*/ void setFlexSupport(boolean flexSupport) {
++        mFlexSupport = flexSupport;
++    }
++
+     /**
+      * Convenience method. Internally it calls {@link JobManager#schedule(JobRequest)}
+      * and {@link #getJobId()} for this request.
+@@ -295,8 +329,8 @@ public Builder cancelAndEdit() {
+         return builder;
+     }
+ 
+-    /*package*/ int reschedule(boolean failure) {
+-        JobRequest newRequest = new Builder(this, true).build();
++    /*package*/ int reschedule(boolean failure, boolean newJob) {
++        JobRequest newRequest = new Builder(this, newJob).build();
+         if (failure) {
+             newRequest.mNumFailures = mNumFailures + 1;
+         }
+@@ -323,6 +357,7 @@ public Builder cancelAndEdit() {
+         contentValues.put(JobStorage.COLUMN_NUM_FAILURES, mNumFailures);
+         contentValues.put(JobStorage.COLUMN_SCHEDULED_AT, mScheduledAt);
+         contentValues.put(JobStorage.COLUMN_TRANSIENT, mTransient);
++        contentValues.put(JobStorage.COLUMN_FLEX_SUPPORT, mFlexSupport);
+         return contentValues;
+     }
+ 
+@@ -331,6 +366,7 @@ public Builder cancelAndEdit() {
+         request.mNumFailures = cursor.getInt(cursor.getColumnIndex(JobStorage.COLUMN_NUM_FAILURES));
+         request.mScheduledAt = cursor.getLong(cursor.getColumnIndex(JobStorage.COLUMN_SCHEDULED_AT));
+         request.mTransient = cursor.getInt(cursor.getColumnIndex(JobStorage.COLUMN_TRANSIENT)) > 0;
++        request.mFlexSupport = cursor.getInt(cursor.getColumnIndex(JobStorage.COLUMN_FLEX_SUPPORT)) > 0;
+ 
+         JobPreconditions.checkArgumentNonnegative(request.mNumFailures, "failure count can't be negative");
+         JobPreconditions.checkArgumentNonnegative(request.mScheduledAt, "scheduled at can't be negative");
+@@ -373,6 +409,7 @@ public String toString() {
+         private BackoffPolicy mBackoffPolicy;
+ 
+         private long mIntervalMs;
++        private long mFlexMs;
+ 
+         private boolean mRequirementsEnforced;
+         private boolean mRequiresCharging;
+@@ -424,6 +461,7 @@ private Builder(JobRequest request, boolean createId) {
+             mBackoffPolicy = request.getBackoffPolicy();
+ 
+             mIntervalMs = request.getIntervalMs();
++            mFlexMs = request.getFlexMs();
+ 
+             mRequirementsEnforced = request.requirementsEnforced();
+             mRequiresCharging = request.requiresCharging();
+@@ -453,6 +491,7 @@ private Builder(Cursor cursor) throws Exception {
+             }
+ 
+             mIntervalMs = cursor.getLong(cursor.getColumnIndex(JobStorage.COLUMN_INTERVAL_MS));
++            mFlexMs = cursor.getLong(cursor.getColumnIndex(JobStorage.COLUMN_FLEX_MS));
+ 
+             mRequirementsEnforced = cursor.getInt(cursor.getColumnIndex(JobStorage.COLUMN_REQUIREMENTS_ENFORCED)) > 0;
+             mRequiresCharging = cursor.getInt(cursor.getColumnIndex(JobStorage.COLUMN_REQUIRES_CHARGING)) > 0;
+@@ -481,6 +520,7 @@ private void fillContentValues(ContentValues contentValues) {
+             contentValues.put(JobStorage.COLUMN_BACKOFF_POLICY, mBackoffPolicy.toString());
+ 
+             contentValues.put(JobStorage.COLUMN_INTERVAL_MS, mIntervalMs);
++            contentValues.put(JobStorage.COLUMN_FLEX_MS, mFlexMs);
+ 
+             contentValues.put(JobStorage.COLUMN_REQUIREMENTS_ENFORCED, mRequirementsEnforced);
+             contentValues.put(JobStorage.COLUMN_REQUIRES_CHARGING, mRequiresCharging);
+@@ -696,7 +736,8 @@ public Builder setExact(long exactMs) {
+         }
+ 
+         /**
+-         * This job should run one time during each interval. As default a job isn't periodic.
++         * Specify that this job should recur with the provided interval, not more than once per period. As
++         * default a job isn't periodic.
+          *
+          * <br>
+          * <br>
+@@ -705,10 +746,33 @@ public Builder setExact(long exactMs) {
+          * with this function. Since {@link Job.Result#RESCHEDULE} is ignored for periodic jobs,
+          * setting a back-off criteria is illegal as well.
+          *
+-         * @param intervalMs The job should at most once every {@code intervalMs}.
++         * @param intervalMs The job should run at most once every {@code intervalMs}. The minimum value is {@code 60,000ms}.
+          */
+         public Builder setPeriodic(long intervalMs) {
+-            mIntervalMs = JobPreconditions.checkArgumentInRange(intervalMs, 60_000L, Long.MAX_VALUE, "intervalMs");
++            return setPeriodic(intervalMs, intervalMs);
++        }
++
++        /**
++         * Specify that this job should recur with the provided interval and flex, not more than once per period.
++         * The flex controls how close to the end of a period the job can run. For example, specifying an interval
++         * of 60 seconds and a flex of 15 seconds will allow the scheduler to determine the best moment between
++         * the 45th and 60th second at which to execute your job.
++         *
++         * <br>
++         * <br>
++         *
++         * As default a job isn't periodic. It isn't allowed to specify a time window for a periodic job.
++         * Instead you set an interval with this function. Since {@link Job.Result#RESCHEDULE} is ignored for
++         * periodic jobs, setting a back-off criteria is illegal as well.
++         *
++         * @param intervalMs The job should run at most once every {@code intervalMs}. The minimum value is {@code 60,000ms}.
++         * @param flexMs How close to the end of the period the job should run. The minimum value is {@code 5,000ms}.
++         * @see #MIN_INTERVAL
++         * @see #MIN_FLEX
++         */
++        public Builder setPeriodic(long intervalMs, long flexMs) {
++            mIntervalMs = JobPreconditions.checkArgumentInRange(intervalMs, MIN_INTERVAL, Long.MAX_VALUE, "intervalMs");
++            mFlexMs = JobPreconditions.checkArgumentInRange(flexMs, MIN_FLEX, mIntervalMs, "flexMs");
+             return this;
+         }
+ 
+@@ -773,7 +837,8 @@ public JobRequest build() {
+             JobPreconditions.checkNotNull(mNetworkType);
+ 
+             if (mIntervalMs > 0) {
+-                JobPreconditions.checkArgumentInRange(mIntervalMs, 60_000L, Long.MAX_VALUE, "intervalMs");
++                JobPreconditions.checkArgumentInRange(mIntervalMs, MIN_INTERVAL, Long.MAX_VALUE, "intervalMs");
++                JobPreconditions.checkArgumentInRange(mFlexMs, MIN_FLEX, mIntervalMs, "flexMs");
+             }
+ 
+             if (mExact && mIntervalMs > 0) {
+diff --git a/library/src/main/java/com/evernote/android/job/JobStorage.java b/library/src/main/java/com/evernote/android/job/JobStorage.java
+index 4cb2087..96e969e 100644
+--- a/library/src/main/java/com/evernote/android/job/JobStorage.java
++++ b/library/src/main/java/com/evernote/android/job/JobStorage.java
+@@ -56,7 +56,7 @@
+ 
+     public static final String PREF_FILE_NAME = "evernote_jobs";
+     public static final String DATABASE_NAME = PREF_FILE_NAME + ".db";
+-    public static final int DATABASE_VERSION = 2;
++    public static final int DATABASE_VERSION = 3;
+ 
+     public static final String JOB_TABLE_NAME = "jobs";
+ 
+@@ -77,6 +77,8 @@
+     public static final String COLUMN_NUM_FAILURES = "numFailures";
+     public static final String COLUMN_SCHEDULED_AT = "scheduledAt";
+     public static final String COLUMN_TRANSIENT = "isTransient";
++    public static final String COLUMN_FLEX_MS = "flexMs";
++    public static final String COLUMN_FLEX_SUPPORT = "flexSupport";
+ 
+     private static final int CACHE_SIZE = 30;
+ 
+@@ -252,9 +254,19 @@ public void onCreate(SQLiteDatabase db) {
+ 
+         @Override
+         public void onUpgrade(SQLiteDatabase db, int oldVersion, int newVersion) {
+-            // with newer versions there should be a smarter way
+-            if (oldVersion == 1 && newVersion == 2) {
+-                upgradeFrom1To2(db);
++            while (oldVersion < newVersion) {
++                switch (oldVersion) {
++                    case 1:
++                        upgradeFrom1To2(db);
++                        oldVersion++;
++                        break;
++                    case 2:
++                        upgradeFrom2To3(db);
++                        oldVersion++;
++                        break;
++                    default:
++                        throw new IllegalStateException("not implemented");
++                }
+             }
+         }
+ 
+@@ -276,11 +288,18 @@ private void createJobTable(SQLiteDatabase db) {
+                     + COLUMN_PERSISTED + " integer, "
+                     + COLUMN_NUM_FAILURES + " integer, "
+                     + COLUMN_SCHEDULED_AT + " integer, "
+-                    + COLUMN_TRANSIENT + " integer);");
++                    + COLUMN_TRANSIENT + " integer, "
++                    + COLUMN_FLEX_MS + " integer, "
++                    + COLUMN_FLEX_SUPPORT + " integer);");
+         }
+ 
+         private void upgradeFrom1To2(SQLiteDatabase db) {
+             db.execSQL("alter table " + JOB_TABLE_NAME + " add column " + COLUMN_TRANSIENT + " integer;");
+         }
++
++        private void upgradeFrom2To3(SQLiteDatabase db) {
++            db.execSQL("alter table " + JOB_TABLE_NAME + " add column " + COLUMN_FLEX_MS + " integer;");
++            db.execSQL("alter table " + JOB_TABLE_NAME + " add column " + COLUMN_FLEX_SUPPORT + " integer;");
++        }
+     }
+ }
+diff --git a/library/src/main/java/com/evernote/android/job/gcm/JobProxyGcm.java b/library/src/main/java/com/evernote/android/job/gcm/JobProxyGcm.java
+index 41c9bd2..4e9a6ee 100644
+--- a/library/src/main/java/com/evernote/android/job/gcm/JobProxyGcm.java
++++ b/library/src/main/java/com/evernote/android/job/gcm/JobProxyGcm.java
+@@ -60,37 +60,46 @@ public JobProxyGcm(Context context) {
+ 
+     @Override
+     public void plantOneOff(JobRequest request) {
+-        OneoffTask task = new OneoffTask.Builder()
+-                .setTag(createTag(request))
+-                .setService(PlatformGcmService.class)
+-                .setUpdateCurrent(true)
+-                .setExecutionWindow(Common.getStartMs(request) / 1_000, Common.getEndMs(request) / 1_000)
+-                .setRequiredNetwork(convertNetworkType(request.requiredNetworkType()))
+-                .setPersisted(request.isPersisted())
+-                .setRequiresCharging(request.requiresCharging())
++        long startMs = Common.getStartMs(request);
++        long endMs = Common.getEndMs(request);
++
++        OneoffTask task = prepareBuilder(new OneoffTask.Builder(), request)
++                .setExecutionWindow(startMs / 1_000, endMs / 1_000)
+                 .build();
+ 
+         mGcmNetworkManager.schedule(task);
+ 
+-        CAT.d("Scheduled OneoffTask, %s, start %s, end %s", request,
+-                JobUtil.timeToString(Common.getStartMs(request)), JobUtil.timeToString(Common.getEndMs(request)));
++        CAT.d("Scheduled OneoffTask, %s, start %s, end %s", request, JobUtil.timeToString(startMs), JobUtil.timeToString(endMs));
+     }
+ 
+     @Override
+     public void plantPeriodic(JobRequest request) {
+-        PeriodicTask task = new PeriodicTask.Builder()
+-                .setTag(createTag(request))
+-                .setService(PlatformGcmService.class)
+-                .setUpdateCurrent(true)
++        PeriodicTask task = prepareBuilder(new PeriodicTask.Builder(), request)
+                 .setPeriod(request.getIntervalMs() / 1_000)
+-                .setRequiredNetwork(convertNetworkType(request.requiredNetworkType()))
+-                .setPersisted(request.isPersisted())
+-                .setRequiresCharging(request.requiresCharging())
++                .setFlex(request.getFlexMs() / 1_000)
++                .build();
++
++        mGcmNetworkManager.schedule(task);
++
++        CAT.d("Scheduled PeriodicTask, %s, interval %s, flex %s", request, JobUtil.timeToString(request.getIntervalMs()),
++                JobUtil.timeToString(request.getFlexMs()));
++    }
++
++    @Override
++    public void plantPeriodicFlexSupport(JobRequest request) {
++        CAT.w("plantPeriodicFlexSupport called although flex is supported");
++
++        long startMs = Common.getStartMsSupportFlex(request);
++        long endMs = Common.getEndMsSupportFlex(request);
++
++        OneoffTask task = prepareBuilder(new OneoffTask.Builder(), request)
++                .setExecutionWindow(startMs / 1_000, endMs / 1_000)
+                 .build();
+ 
+         mGcmNetworkManager.schedule(task);
+ 
+-        CAT.d("Scheduled PeriodicTask, %s, interval %s", request, JobUtil.timeToString(request.getIntervalMs()));
++        CAT.d("Scheduled periodic (flex support), %s, start %s, end %s, flex %s", request, JobUtil.timeToString(startMs),
++                JobUtil.timeToString(endMs), JobUtil.timeToString(request.getFlexMs()));
+     }
+ 
+     @Override
+@@ -104,6 +113,16 @@ public boolean isPlatformJobScheduled(JobRequest request) {
+         return true;
+     }
+ 
++    protected <T extends Task.Builder> T prepareBuilder(T builder, JobRequest request) {
++        builder.setTag(createTag(request))
++                .setService(PlatformGcmService.class)
++                .setUpdateCurrent(true)
++                .setRequiredNetwork(convertNetworkType(request.requiredNetworkType()))
++                .setPersisted(request.isPersisted())
++                .setRequiresCharging(request.requiresCharging());
++        return builder;
++    }
++
+     protected String createTag(JobRequest request) {
+         return createTag(request.getJobId());
+     }
+diff --git a/library/src/main/java/com/evernote/android/job/util/JobApi.java b/library/src/main/java/com/evernote/android/job/util/JobApi.java
+index 50b588b..3efed8b 100644
+--- a/library/src/main/java/com/evernote/android/job/util/JobApi.java
++++ b/library/src/main/java/com/evernote/android/job/util/JobApi.java
+@@ -48,35 +48,42 @@
+     /**
+      * Uses the {@link JobScheduler} for scheduling jobs.
+      */
+-    V_24(true),
++    V_24(true, false),
+     /**
+      * Uses the {@link JobScheduler} for scheduling jobs.
+      */
+-    V_21(true),
++    V_21(true, true),
+     /**
+      * Uses the {@link AlarmManager} for scheduling jobs.
+      */
+-    V_19(true),
++    V_19(true, true),
+     /**
+      * Uses the {@link AlarmManager} for scheduling jobs.
+      */
+-    V_14(false),
++    V_14(false, true),
+     /**
+      * Uses the {@link GcmNetworkManager} for scheduling jobs.
+      */
+-    GCM(true);
++    GCM(true, false);
+ 
+     private JobProxy mCachedProxy;
++
+     private final boolean mSupportsExecutionWindow;
++    private final boolean mFlexSupport;
+ 
+-    JobApi(boolean supportsExecutionWindow) {
++    JobApi(boolean supportsExecutionWindow, boolean flexSupport) {
+         mSupportsExecutionWindow = supportsExecutionWindow;
++        mFlexSupport = flexSupport;
+     }
+ 
+     public boolean supportsExecutionWindow() {
+         return mSupportsExecutionWindow;
+     }
+ 
++    public boolean isFlexSupport() {
++        return mFlexSupport;
++    }
++
+     public boolean isSupported(Context context) {
+         switch (this) {
+             case V_24:
+diff --git a/library/src/main/java/com/evernote/android/job/v14/JobProxy14.java b/library/src/main/java/com/evernote/android/job/v14/JobProxy14.java
+index b5a2e90..7f823c1 100644
+--- a/library/src/main/java/com/evernote/android/job/v14/JobProxy14.java
++++ b/library/src/main/java/com/evernote/android/job/v14/JobProxy14.java
+@@ -98,6 +98,14 @@ protected void plantOneOffExact(JobRequest request, AlarmManager alarmManager, P
+         logScheduled(request);
+     }
+ 
++    protected void plantOneOffFlexSupport(JobRequest request, AlarmManager alarmManager, PendingIntent pendingIntent) {
++        long triggerAtMs = System.currentTimeMillis() + Common.getAverageDelayMsSupportFlex(request);
++        alarmManager.set(AlarmManager.RTC, triggerAtMs, pendingIntent);
++
++        mCat.d("Scheduled repeating alarm (flex support), %s, interval %s, flex %s", request,
++                JobUtil.timeToString(request.getIntervalMs()), JobUtil.timeToString(request.getFlexMs()));
++    }
++
+     protected long getTriggerAtMillis(JobRequest request) {
+         return System.currentTimeMillis() + Common.getAverageDelayMs(request);
+     }
+@@ -118,6 +126,23 @@ public void plantPeriodic(JobRequest request) {
+         mCat.d("Scheduled repeating alarm, %s, interval %s", request, JobUtil.timeToString(request.getIntervalMs()));
+     }
+ 
++    @Override
++    public void plantPeriodicFlexSupport(JobRequest request) {
++        PendingIntent pendingIntent = getPendingIntent(request, false);
++
++        AlarmManager alarmManager = getAlarmManager();
++        if (alarmManager == null) {
++            return;
++        }
++
++        try {
++            plantOneOffFlexSupport(request, alarmManager, pendingIntent);
++        } catch (Exception e) {
++            // https://gist.github.com/vRallev/621b0b76a14ddde8691c
++            mCat.e(e);
++        }
++    }
++
+     @Override
+     public void cancel(int jobId) {
+         AlarmManager alarmManager = getAlarmManager();
+diff --git a/library/src/main/java/com/evernote/android/job/v19/JobProxy19.java b/library/src/main/java/com/evernote/android/job/v19/JobProxy19.java
+index 2e3d16d..bf8df0f 100644
+--- a/library/src/main/java/com/evernote/android/job/v19/JobProxy19.java
++++ b/library/src/main/java/com/evernote/android/job/v19/JobProxy19.java
+@@ -53,9 +53,22 @@ protected void plantOneOffInexact(JobRequest request, AlarmManager alarmManager,
+         long startMs = currentTime + Common.getStartMs(request);
+         long lengthMs = Common.getEndMs(request) - Common.getStartMs(request);
+ 
+-        alarmManager.setWindow(AlarmManager.RTC, startMs ,lengthMs, pendingIntent);
++        alarmManager.setWindow(AlarmManager.RTC, startMs, lengthMs, pendingIntent);
+ 
+         mCat.d("Schedule alarm, %s, start %s, end %s", request,
+                 JobUtil.timeToString(Common.getStartMs(request)), JobUtil.timeToString(Common.getEndMs(request)));
+     }
++
++    @Override
++    protected void plantOneOffFlexSupport(JobRequest request, AlarmManager alarmManager, PendingIntent pendingIntent) {
++        long currentTime = System.currentTimeMillis();
++        long startMs = currentTime + Common.getStartMsSupportFlex(request);
++        long lengthMs = Common.getEndMsSupportFlex(request) - Common.getStartMsSupportFlex(request);
++
++        alarmManager.setWindow(AlarmManager.RTC, startMs, lengthMs, pendingIntent);
++
++        mCat.d("Scheduled repeating alarm (flex support), %s, start %s, end %s, flex %s", request,
++                JobUtil.timeToString(Common.getStartMsSupportFlex(request)), JobUtil.timeToString(Common.getEndMsSupportFlex(request)),
++                JobUtil.timeToString(request.getFlexMs()));
++    }
+ }
+diff --git a/library/src/main/java/com/evernote/android/job/v21/JobProxy21.java b/library/src/main/java/com/evernote/android/job/v21/JobProxy21.java
+index b3e737d..bcb22e6 100644
+--- a/library/src/main/java/com/evernote/android/job/v21/JobProxy21.java
++++ b/library/src/main/java/com/evernote/android/job/v21/JobProxy21.java
+@@ -65,47 +65,38 @@ protected JobProxy21(Context context, String logTag) {
+ 
+     @Override
+     public void plantOneOff(JobRequest request) {
+-        JobInfo jobInfo = createBaseBuilder(request)
+-                .setMinimumLatency(Common.getStartMs(request))
+-                .setOverrideDeadline(Common.getEndMs(request))
+-                .setRequiresCharging(request.requiresCharging())
+-                .setRequiresDeviceIdle(request.requiresDeviceIdle())
+-                .setRequiredNetworkType(convertNetworkType(request.requiredNetworkType()))
+-                .setPersisted(request.isPersisted())
+-                .build();
++        long startMs = Common.getStartMs(request);
++        long endMs = Common.getEndMs(request);
+ 
+-        int scheduleResult;
+-        try {
+-            scheduleResult = getJobScheduler().schedule(jobInfo);
+-        } catch (Exception e) {
+-            mCat.e(e);
+-            scheduleResult = JobScheduler.RESULT_FAILURE;
+-        }
++        JobInfo jobInfo = createBuilderOneOff(createBaseBuilder(request), startMs, endMs).build();
++        int scheduleResult = schedule(jobInfo);
+ 
+-        mCat.d("Schedule one-off jobInfo %s, %s, start %s, end %s", scheduleResult == JobScheduler.RESULT_SUCCESS ? "success" : "failure",
+-                request, JobUtil.timeToString(Common.getStartMs(request)), JobUtil.timeToString(Common.getEndMs(request)));
++        mCat.d("Schedule one-off jobInfo %s, %s, start %s, end %s", scheduleResultToString(scheduleResult),
++                request, JobUtil.timeToString(startMs), JobUtil.timeToString(endMs));
+     }
+ 
+     @Override
+     public void plantPeriodic(JobRequest request) {
+-        JobInfo jobInfo = createBaseBuilder(request)
+-                .setPeriodic(request.getIntervalMs())
+-                .setRequiresCharging(request.requiresCharging())
+-                .setRequiresDeviceIdle(request.requiresDeviceIdle())
+-                .setRequiredNetworkType(convertNetworkType(request.requiredNetworkType()))
+-                .setPersisted(request.isPersisted())
+-                .build();
++        long intervalMs = request.getIntervalMs();
++        long flexMs = request.getFlexMs();
+ 
+-        int scheduleResult;
+-        try {
+-            scheduleResult = getJobScheduler().schedule(jobInfo);
+-        } catch (Exception e) {
+-            mCat.e(e);
+-            scheduleResult = JobScheduler.RESULT_FAILURE;
+-        }
++        JobInfo jobInfo = createBuilderPeriodic(createBaseBuilder(request), intervalMs, flexMs).build();
++        int scheduleResult = schedule(jobInfo);
++
++        mCat.d("Schedule periodic jobInfo %s, %s, interval %s, flex %s", scheduleResultToString(scheduleResult),
++                request, JobUtil.timeToString(intervalMs), JobUtil.timeToString(flexMs));
++    }
++
++    @Override
++    public void plantPeriodicFlexSupport(JobRequest request) {
++        long startMs = Common.getStartMsSupportFlex(request);
++        long endMs = Common.getEndMsSupportFlex(request);
++
++        JobInfo jobInfo = createBuilderOneOff(createBaseBuilder(request), startMs, endMs).build();
++        int scheduleResult = schedule(jobInfo);
+ 
+-        mCat.d("Schedule periodic jobInfo %s, %s, interval %s", scheduleResult == JobScheduler.RESULT_SUCCESS ? "success" : "failure",
+-                request, JobUtil.timeToString(request.getIntervalMs()));
++        mCat.d("Schedule periodic (flex support) jobInfo %s, %s, start %s, end %s, flex %s", scheduleResultToString(scheduleResult),
++                request, JobUtil.timeToString(startMs), JobUtil.timeToString(endMs), JobUtil.timeToString(request.getFlexMs()));
+     }
+ 
+     @Override
+@@ -145,7 +136,19 @@ public boolean isPlatformJobScheduled(JobRequest request) {
+     }
+ 
+     protected JobInfo.Builder createBaseBuilder(JobRequest request) {
+-        return new JobInfo.Builder(request.getJobId(), new ComponentName(mContext, PlatformJobService.class));
++        return new JobInfo.Builder(request.getJobId(), new ComponentName(mContext, PlatformJobService.class))
++                .setRequiresCharging(request.requiresCharging())
++                .setRequiresDeviceIdle(request.requiresDeviceIdle())
++                .setRequiredNetworkType(convertNetworkType(request.requiredNetworkType()))
++                .setPersisted(request.isPersisted());
++    }
++
++    protected JobInfo.Builder createBuilderOneOff(JobInfo.Builder builder, long startMs, long endMs) {
++        return builder.setMinimumLatency(startMs).setOverrideDeadline(endMs);
++    }
++
++    protected JobInfo.Builder createBuilderPeriodic(JobInfo.Builder builder, long intervalMs, long flexMs) {
++        return builder.setPeriodic(intervalMs);
+     }
+ 
+     protected int convertNetworkType(@NonNull JobRequest.NetworkType networkType) {
+@@ -164,4 +167,17 @@ protected int convertNetworkType(@NonNull JobRequest.NetworkType networkType) {
+     protected final JobScheduler getJobScheduler() {
+         return (JobScheduler) mContext.getSystemService(Context.JOB_SCHEDULER_SERVICE);
+     }
++
++    protected final int schedule(JobInfo jobInfo) {
++        try {
++            return getJobScheduler().schedule(jobInfo);
++        } catch (Exception e) {
++            mCat.e(e);
++            return JobScheduler.RESULT_FAILURE;
++        }
++    }
++
++    protected static String scheduleResultToString(int scheduleResult) {
++        return scheduleResult == JobScheduler.RESULT_SUCCESS ? "success" : "failure";
++    }
+ }
+diff --git a/library/src/main/java/com/evernote/android/job/v24/JobProxy24.java b/library/src/main/java/com/evernote/android/job/v24/JobProxy24.java
+index eed70c4..a5eeb00 100644
+--- a/library/src/main/java/com/evernote/android/job/v24/JobProxy24.java
++++ b/library/src/main/java/com/evernote/android/job/v24/JobProxy24.java
+@@ -26,6 +26,7 @@
+ package com.evernote.android.job.v24;
+ 
+ import android.annotation.TargetApi;
++import android.app.job.JobInfo;
+ import android.content.Context;
+ import android.os.Build;
+ 
+@@ -45,6 +46,12 @@ public JobProxy24(Context context) {
+         super(context, TAG);
+     }
+ 
++    @Override
++    public void plantPeriodicFlexSupport(JobRequest request) {
++        mCat.w("plantPeriodicFlexSupport called although flex is supported");
++        super.plantPeriodicFlexSupport(request);
++    }
++
+     @Override
+     public boolean isPlatformJobScheduled(JobRequest request) {
+         try {
+@@ -54,4 +61,9 @@ public boolean isPlatformJobScheduled(JobRequest request) {
+             return false;
+         }
+     }
++
++    @Override
++    protected JobInfo.Builder createBuilderPeriodic(JobInfo.Builder builder, long intervalMs, long flexMs) {
++        return builder.setPeriodic(intervalMs, flexMs);
++    }
+ }

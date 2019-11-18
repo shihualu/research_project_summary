@@ -1,0 +1,338 @@
+diff --git a/java/dagger/internal/codegen/BindingGraphFactory.java b/java/dagger/internal/codegen/BindingGraphFactory.java
+index 92db37599..a89d64a3e 100644
+--- a/java/dagger/internal/codegen/BindingGraphFactory.java
++++ b/java/dagger/internal/codegen/BindingGraphFactory.java
+@@ -564,7 +564,8 @@ private boolean isResolvedInParent(Key requestKey, ContributionBinding binding)
+ 
+     private Optional<Resolver> getOwningResolver(ContributionBinding binding) {
+       // TODO(ronshapiro): extract the different pieces of this method into their own methods
+-      if (binding.scope().isPresent() && binding.scope().get().isProductionScope()) {
++      if ((binding.scope().isPresent() && binding.scope().get().isProductionScope())
++          || binding.bindingType().equals(BindingType.PRODUCTION)) {
+         for (Resolver requestResolver : getResolverLineage()) {
+           // Resolve @Inject @ProductionScope bindings at the highest production component.
+           if (binding.kind().equals(INJECTION)
+@@ -572,8 +573,8 @@ private boolean isResolvedInParent(Key requestKey, ContributionBinding binding)
+             return Optional.of(requestResolver);
+           }
+ 
+-          // Resolve explicit @ProductionScope bindings at the highest component that installs
+-          // the binding.
++          // Resolve explicit @Produces and @ProductionScope bindings at the highest component that
++          // installs the binding.
+           if (requestResolver.containsExplicitBinding(binding)) {
+             return Optional.of(requestResolver);
+           }
+diff --git a/java/dagger/internal/codegen/ModifiableBindingExpressions.java b/java/dagger/internal/codegen/ModifiableBindingExpressions.java
+index e8b840968..7cdcd4759 100644
+--- a/java/dagger/internal/codegen/ModifiableBindingExpressions.java
++++ b/java/dagger/internal/codegen/ModifiableBindingExpressions.java
+@@ -28,6 +28,7 @@
+ import dagger.internal.codegen.ComponentDescriptor.ComponentMethodDescriptor;
+ import dagger.internal.codegen.ModifiableBindingMethods.ModifiableBindingMethod;
+ import dagger.model.BindingKind;
++import dagger.model.Scope;
+ import java.util.Optional;
+ 
+ /**
+@@ -154,6 +155,13 @@ private boolean modifiableBindingWillBeFinalized(
+       case INJECTION:
+         // Once we modify any of the above a single time, then they are finalized.
+         return modifyingBinding;
++      case PRODUCTION:
++        // For production bindings, we know that the binding will be finalized if the parent is a
++        // non-production component, but for @ProductionScope bindings we don't ever know because an
++        // ancestor non-production component can apply @ProductionScope. We therefore return false
++        // always. If we wanted, we could create a separate ModifiableBindingType for production
++        // scope to allow us to make this distinction.
++        return false;
+       case MULTIBINDING:
+       case MODULE_INSTANCE:
+         return false;
+@@ -224,6 +232,7 @@ private BindingExpression createModifiableBindingExpression(
+       case MULTIBINDING:
+       case INJECTION:
+       case MODULE_INSTANCE:
++      case PRODUCTION:
+         return bindingExpressions.wrapInMethod(
+             resolvedBindings,
+             request,
+@@ -295,6 +304,12 @@ ModifiableBindingType getModifiableBindingType(BindingRequest request) {
+       if (binding.requiresModuleInstance()) {
+         return ModifiableBindingType.MODULE_INSTANCE;
+       }
++
++      if ((binding.scope().map(Scope::isProductionScope).orElse(false)
++              && componentImplementation.isAbstract())
++          || binding.bindingType().equals(BindingType.PRODUCTION)) {
++        return ModifiableBindingType.PRODUCTION;
++      }
+     } else if (!resolvableBinding(request)) {
+       return ModifiableBindingType.MISSING;
+     }
+@@ -387,6 +402,11 @@ private boolean shouldModifyImplementation(
+         // component.
+         return !componentImplementation.superclassImplementation().isPresent()
+             || !componentImplementation.isAbstract();
++      case PRODUCTION:
++        // TODO(b/117833324): Profile this to see if this check is slow
++        return !resolvedBindings
++            .owningComponent()
++            .equals(componentImplementation.componentDescriptor());
+       default:
+         throw new IllegalStateException(
+             String.format(
+diff --git a/java/dagger/internal/codegen/ModifiableBindingType.java b/java/dagger/internal/codegen/ModifiableBindingType.java
+index d015b3411..18a39b133 100644
+--- a/java/dagger/internal/codegen/ModifiableBindingType.java
++++ b/java/dagger/internal/codegen/ModifiableBindingType.java
+@@ -81,10 +81,32 @@
+    * overridden later on.
+    */
+   MODULE_INSTANCE,
++
++  /**
++   * {@link dagger.producers.ProductionScope} is a unique scope that is allowed on multiple
++   * components. In Ahead-of-Time mode, we don't actually know what component will end up owning the
++   * binding because a parent could install the same module or also be an @ProductionScoped @Inject
++   * constructor.
++   *
++   * <p>We don't apply the same logic to @Reusable, even though it can also be on multiple
++   * components, because it is by definition ok to be reimplemented across multiple components.
++   * Allowing @Reusable bindings to be redefined could only result in more code for subclass
++   * implementations.
++   *
++   * <p>All production bindings are also treated as modifiable since they are implicitly {@link
++   * dagger.producers.ProductionScope} in {@link dagger.producers.internal.AbstractProducer}. If an
++   * ancestor component includes the same module as a descendant component, the descendant's
++   * subclass implementation will need to be replaced with the ancestor's {@link
++   * dagger.producers.Producer} instance. beder@ believes this to be a bug and that, because
++   * {@code @Produces} methods are implicitly scoped, descendant components should not be allowed to
++   * redefine the same module as an ancestor. If we disallow that, we can stop treating all
++   * {@code @Produces} methods as modifiable.
++   */
++  PRODUCTION,
+   ;
+ 
+   private static final ImmutableSet<ModifiableBindingType> TYPES_WITH_BASE_CLASS_IMPLEMENTATIONS =
+-      ImmutableSet.of(NONE, MULTIBINDING, OPTIONAL, INJECTION, MODULE_INSTANCE);
++      ImmutableSet.of(NONE, INJECTION, MODULE_INSTANCE, MULTIBINDING, OPTIONAL, PRODUCTION);
+ 
+   boolean isModifiable() {
+     return !equals(NONE);
+diff --git a/javatests/dagger/internal/codegen/AheadOfTimeSubcomponentsTest.java b/javatests/dagger/internal/codegen/AheadOfTimeSubcomponentsTest.java
+index 5626dd471..00704b04e 100644
+--- a/javatests/dagger/internal/codegen/AheadOfTimeSubcomponentsTest.java
++++ b/javatests/dagger/internal/codegen/AheadOfTimeSubcomponentsTest.java
+@@ -4347,7 +4347,7 @@ public void productionSubcomponentAndModifiableFrameworkInstance() {
+             "            getResponseDependencyProducer());",
+             "    this.setOfResponseProducer =",
+             "        SetProducer.<Response>builder(1, 0)",
+-            "            .addProducer(responseProducer).build();",
++            "            .addProducer(getResponseProducer()).build();",
+             "    this.responsesEntryPoint =",
+             "        Producers.entryPointViewOf(getSetOfResponseProducer(), this);",
+             "  }",
+@@ -4365,6 +4365,10 @@ public void productionSubcomponentAndModifiableFrameworkInstance() {
+             "",
+             "  protected abstract Producer getResponseDependencyProducer();",
+             "",
++            "  protected Producer<Response> getResponseProducer() {",
++            "    return responseProducer;",
++            "  }",
++            "",
+             "  protected Producer<Set<Response>> getSetOfResponseProducer() {",
+             "    return setOfResponseProducer;",
+             "  }",
+@@ -4372,7 +4376,7 @@ public void productionSubcomponentAndModifiableFrameworkInstance() {
+             "  @Override",
+             "  public void onProducerFutureCancelled(boolean mayInterruptIfRunning) {",
+             "    Producers.cancel(getSetOfResponseProducer(), mayInterruptIfRunning);",
+-            "    Producers.cancel(responseProducer, mayInterruptIfRunning);",
++            "    Producers.cancel(getResponseProducer(), mayInterruptIfRunning);",
+             "  }",
+             "",
+             "  public abstract static class Builder implements Leaf.Builder {}",
+@@ -4599,6 +4603,182 @@ public void productionSubcomponentAndModifiableFrameworkInstance() {
+         .hasSourceEquivalentTo(generatedRoot);
+   }
+ 
++  @Test
++  public void producesMethodInstalledInLeafAndAncestor() {
++    ImmutableList.Builder<JavaFileObject> filesToCompile = ImmutableList.builder();
++    filesToCompile.add(
++        JavaFileObjects.forSourceLines(
++            "test.Leaf",
++            "package test;",
++            "",
++            "import dagger.producers.Producer;",
++            "import dagger.producers.ProductionSubcomponent;",
++            "",
++            "@ProductionSubcomponent(modules = InstalledInLeafAndAncestorModule.class)",
++            "interface Leaf {",
++            "  Producer<Object> producer();",
++            "}"),
++        JavaFileObjects.forSourceLines(
++            "test.InstalledInLeafAndAncestorModule",
++            "package test;",
++            "",
++            "import dagger.producers.ProducerModule;",
++            "import dagger.producers.Produces;",
++            "",
++            "@ProducerModule",
++            "final class InstalledInLeafAndAncestorModule {",
++            "  @Produces",
++            "  static Object producer() {",
++            "    return new Object();",
++            "  }",
++            "}"));
++    JavaFileObject generatedLeaf =
++        JavaFileObjects.forSourceLines(
++            "test.DaggerLeaf",
++            "package test;",
++            "",
++            "import dagger.producers.Producer;",
++            "import dagger.producers.internal.CancellationListener;",
++            "import dagger.producers.internal.Producers;",
++            "import dagger.producers.monitoring.ProductionComponentMonitor;",
++            "import java.util.concurrent.Executor;",
++            IMPORT_GENERATED_ANNOTATION,
++            "import javax.inject.Provider;",
++            "",
++            GENERATED_ANNOTATION,
++            "public abstract class DaggerLeaf implements Leaf, CancellationListener {",
++            "  private Producer<Object> producerEntryPoint;",
++            "",
++            "  private InstalledInLeafAndAncestorModule_ProducerFactory producerProducer;",
++            "",
++            "  protected DaggerLeaf() {}",
++            "",
++            "  protected void configureInitialization() {",
++            "    initialize();",
++            "  }",
++            "",
++            "  @SuppressWarnings(\"unchecked\")",
++            "  private void initialize() {",
++            "    this.producerProducer =",
++            "        InstalledInLeafAndAncestorModule_ProducerFactory.create(",
++            "            getProductionImplementationExecutorProvider(),",
++            "            getProductionComponentMonitorProvider());",
++            "    this.producerEntryPoint = Producers.entryPointViewOf(getObjectProducer(), this);",
++            "  }",
++            "",
++            "  @Override",
++            "  public Producer<Object> producer() {",
++            "    return producerEntryPoint;",
++            "  }",
++            "",
++            "  protected abstract Provider<Executor>",
++            "    getProductionImplementationExecutorProvider();",
++            "",
++            "  protected abstract Provider<ProductionComponentMonitor> ",
++            "      getProductionComponentMonitorProvider();",
++            "",
++            "  protected Producer<Object> getObjectProducer() {",
++            "    return producerProducer;",
++            "  }",
++            "",
++            "  @Override",
++            "  public void onProducerFutureCancelled(boolean mayInterruptIfRunning) {",
++            "    Producers.cancel(getObjectProducer(), mayInterruptIfRunning);",
++            "  }",
++            "}");
++
++    Compilation compilation = compile(filesToCompile.build());
++    assertThat(compilation).succeededWithoutWarnings();
++    assertThat(compilation)
++        .generatedSourceFile("test.DaggerLeaf")
++        .hasSourceEquivalentTo(generatedLeaf);
++
++    filesToCompile.add(
++        JavaFileObjects.forSourceLines(
++            "test.Ancestor",
++            "package test;",
++            "",
++            "import dagger.producers.ProductionSubcomponent;",
++            "",
++            "@ProductionSubcomponent(modules = InstalledInLeafAndAncestorModule.class)",
++            "interface Ancestor {",
++            "  Leaf leaf();",
++            "}"));
++    JavaFileObject generatedAncestor =
++        JavaFileObjects.forSourceLines(
++            "test.DaggerAncestor",
++            "package test;",
++            "",
++            "import dagger.producers.Producer;",
++            "import dagger.producers.internal.CancellationListener;",
++            "import dagger.producers.internal.Producers;",
++            "import dagger.producers.monitoring.ProductionComponentMonitor;",
++            "import java.util.concurrent.Executor;",
++            IMPORT_GENERATED_ANNOTATION,
++            "import javax.inject.Provider;",
++            "",
++            GENERATED_ANNOTATION,
++            "public abstract class DaggerAncestor implements Ancestor, CancellationListener {",
++            "  private InstalledInLeafAndAncestorModule_ProducerFactory producerProducer;",
++            "",
++            "  protected DaggerAncestor() {}",
++            "",
++            "  protected void configureInitialization() {",
++            "    initialize();",
++            "  }",
++            "",
++            "  @SuppressWarnings(\"unchecked\")",
++            "  private void initialize() {",
++            "    this.producerProducer =",
++            "        InstalledInLeafAndAncestorModule_ProducerFactory.create(",
++            "            getProductionImplementationExecutorProvider(),",
++            "            getProductionComponentMonitorProvider());",
++            "  }",
++            "",
++            "  protected abstract Provider<Executor>",
++            "    getProductionImplementationExecutorProvider();",
++            "",
++            "  protected abstract Provider<ProductionComponentMonitor>",
++            "      getProductionComponentMonitorProvider();",
++            "",
++            "  protected Producer<Object> getObjectProducer() {",
++            "    return producerProducer;",
++            "  }",
++            "",
++            "  protected Producer<Object> getObjectProducer2() {",
++            "    return getObjectProducer();",
++            "  }",
++            "",
++            "  @Override",
++            "  public void onProducerFutureCancelled(boolean mayInterruptIfRunning) {",
++            "    Producers.cancel(getObjectProducer(), mayInterruptIfRunning);",
++            "  }",
++            "",
++            "  protected abstract class LeafImpl extends DaggerLeaf ",
++            "      implements CancellationListener {",
++            "    protected LeafImpl() {",
++            "      super();",
++            "    }",
++            "",
++            "    @Override",
++            "    protected final Producer<Object> getObjectProducer() {",
++            "      return DaggerAncestor.this.getObjectProducer();",
++            "    }",
++            "",
++            "    @Override",
++            "    public final Producer<Object> producer() {",
++            "      return DaggerAncestor.this.getObjectProducer2();",
++            "    }",
++            "  }",
++            "}");
++
++    compilation = compile(filesToCompile.build());
++    assertThat(compilation).succeededWithoutWarnings();
++    assertThat(compilation)
++        .generatedSourceFile("test.DaggerAncestor")
++        .hasSourceEquivalentTo(generatedAncestor);
++  }
++
+   @Ignore // TODO(b/72748365): see if we can get this to work.
+   @Test
+   public void lazyOfModifiableBinding() {

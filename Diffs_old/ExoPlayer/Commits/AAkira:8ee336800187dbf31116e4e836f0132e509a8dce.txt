@@ -1,0 +1,183 @@
+diff --git a/demo/src/main/java/com/google/android/exoplayer/demo/player/DemoPlayer.java b/demo/src/main/java/com/google/android/exoplayer/demo/player/DemoPlayer.java
+index 6d3925f751..5bc5c9da1f 100644
+--- a/demo/src/main/java/com/google/android/exoplayer/demo/player/DemoPlayer.java
++++ b/demo/src/main/java/com/google/android/exoplayer/demo/player/DemoPlayer.java
+@@ -33,6 +33,7 @@
+ import com.google.android.exoplayer.dash.DashChunkSource;
+ import com.google.android.exoplayer.drm.StreamingDrmSessionManager;
+ import com.google.android.exoplayer.extractor.ExtractorSampleSource;
++import com.google.android.exoplayer.hls.HlsChunkSource;
+ import com.google.android.exoplayer.hls.HlsSampleSource;
+ import com.google.android.exoplayer.metadata.MetadataTrackRenderer.MetadataRenderer;
+ import com.google.android.exoplayer.metadata.id3.Id3Frame;
+@@ -59,7 +60,7 @@
+  * SmoothStreaming and so on).
+  */
+ public class DemoPlayer implements ExoPlayer.Listener, ChunkSampleSource.EventListener,
+-    HlsSampleSource.EventListener, ExtractorSampleSource.EventListener,
++    HlsSampleSource.EventListener, HlsChunkSource.EventListener, ExtractorSampleSource.EventListener,
+     SingleSampleSource.EventListener, DefaultBandwidthMeter.EventListener,
+     MediaCodecVideoTrackRenderer.EventListener, MediaCodecAudioTrackRenderer.EventListener,
+     StreamingDrmSessionManager.EventListener, DashChunkSource.EventListener, TextRenderer,
+@@ -573,6 +574,12 @@ public void onUpstreamDiscarded(int sourceId, long mediaStartTimeMs, long mediaE
+     // Do nothing.
+   }
+ 
++  @Override
++  public void onManifestLoadCompleted(byte[] rawResponse)
++  {
++    // Do nothing
++  }
++
+   private void maybeReportPlayerState() {
+     boolean playWhenReady = player.getPlayWhenReady();
+     int playbackState = getPlaybackState();
+diff --git a/demo/src/main/java/com/google/android/exoplayer/demo/player/HlsRendererBuilder.java b/demo/src/main/java/com/google/android/exoplayer/demo/player/HlsRendererBuilder.java
+index 198b37b9a3..58090efccb 100644
+--- a/demo/src/main/java/com/google/android/exoplayer/demo/player/HlsRendererBuilder.java
++++ b/demo/src/main/java/com/google/android/exoplayer/demo/player/HlsRendererBuilder.java
+@@ -145,7 +145,9 @@ public void onSingleManifest(HlsPlaylist manifest) {
+       DataSource dataSource = new DefaultUriDataSource(context, bandwidthMeter, userAgent);
+       HlsChunkSource chunkSource = new HlsChunkSource(true /* isMaster */, dataSource, manifest,
+           DefaultHlsTrackSelector.newDefaultInstance(context), bandwidthMeter,
+-          timestampAdjusterProvider, HlsChunkSource.ADAPTIVE_MODE_SPLICE);
++          timestampAdjusterProvider, HlsChunkSource.ADAPTIVE_MODE_SPLICE,
++          HlsChunkSource.DEFAULT_MIN_BUFFER_TO_SWITCH_UP_MS, HlsChunkSource.DEFAULT_MAX_BUFFER_TO_SWITCH_DOWN_MS,
++          mainHandler, player);
+       HlsSampleSource sampleSource = new HlsSampleSource(chunkSource, loadControl,
+           MAIN_BUFFER_SEGMENTS * BUFFER_SEGMENT_SIZE, mainHandler, player, DemoPlayer.TYPE_VIDEO);
+       MediaCodecVideoTrackRenderer videoRenderer = new MediaCodecVideoTrackRenderer(context,
+diff --git a/library/src/main/java/com/google/android/exoplayer/hls/HlsChunkSource.java b/library/src/main/java/com/google/android/exoplayer/hls/HlsChunkSource.java
+index fc9af7cd89..7a600873d4 100644
+--- a/library/src/main/java/com/google/android/exoplayer/hls/HlsChunkSource.java
++++ b/library/src/main/java/com/google/android/exoplayer/hls/HlsChunkSource.java
+@@ -15,6 +15,7 @@
+  */
+ package com.google.android.exoplayer.hls;
+ 
++import android.os.Handler;
+ import com.google.android.exoplayer.BehindLiveWindowException;
+ import com.google.android.exoplayer.C;
+ import com.google.android.exoplayer.MediaFormat;
+@@ -60,7 +61,14 @@
+   /**
+    * Interface definition for a callback to be notified of {@link HlsChunkSource} events.
+    */
+-  public interface EventListener extends BaseChunkSampleSourceEventListener {}
++  public interface EventListener extends BaseChunkSampleSourceEventListener {
++
++    /**
++     * Invoked when an HLS manifest is loaded
++     * @param rawResponse The raw data of the HLS manifest
++     */
++    void onManifestLoadCompleted(byte[] rawResponse);
++  }
+ 
+   /**
+    * Adaptive switching is disabled.
+@@ -158,6 +166,8 @@
+   private byte[] encryptionKey;
+   private String encryptionIvString;
+   private byte[] encryptionIv;
++  private final EventListener eventListener;
++  private final Handler eventHandler;
+ 
+   /**
+    * @param isMaster True if this is the master source for the playback. False otherwise. Each
+@@ -179,7 +189,7 @@ public HlsChunkSource(boolean isMaster, DataSource dataSource, HlsPlaylist playl
+       PtsTimestampAdjusterProvider timestampAdjusterProvider, int adaptiveMode) {
+     this(isMaster, dataSource, playlist, trackSelector, bandwidthMeter,
+         timestampAdjusterProvider, adaptiveMode, DEFAULT_MIN_BUFFER_TO_SWITCH_UP_MS,
+-        DEFAULT_MAX_BUFFER_TO_SWITCH_DOWN_MS);
++        DEFAULT_MAX_BUFFER_TO_SWITCH_DOWN_MS, null, null);
+   }
+ 
+   /**
+@@ -205,12 +215,46 @@ public HlsChunkSource(boolean isMaster, DataSource dataSource, HlsPlaylist playl
+       HlsTrackSelector trackSelector, BandwidthMeter bandwidthMeter,
+       PtsTimestampAdjusterProvider timestampAdjusterProvider, int adaptiveMode,
+       long minBufferDurationToSwitchUpMs, long maxBufferDurationToSwitchDownMs) {
++    this(isMaster, dataSource, playlist, trackSelector, bandwidthMeter,
++         timestampAdjusterProvider, adaptiveMode, minBufferDurationToSwitchUpMs,
++         maxBufferDurationToSwitchDownMs, null, null);
++  }
++
++  /**
++   * @param isMaster True if this is the master source for the playback. False otherwise. Each
++   *     playback must have exactly one master source, which should be the source providing video
++   *     chunks (or audio chunks for audio only playbacks).
++   * @param dataSource A {@link DataSource} suitable for loading the media data.
++   * @param playlist The HLS playlist.
++   * @param trackSelector Selects tracks to be exposed by this source.
++   * @param bandwidthMeter Provides an estimate of the currently available bandwidth.
++   * @param timestampAdjusterProvider A provider of {@link PtsTimestampAdjuster} instances. If
++   *     multiple {@link HlsChunkSource}s are used for a single playback, they should all share the
++   *     same provider.
++   * @param adaptiveMode The mode for switching from one variant to another. One of
++   *     {@link #ADAPTIVE_MODE_NONE}, {@link #ADAPTIVE_MODE_ABRUPT} and
++   *     {@link #ADAPTIVE_MODE_SPLICE}.
++   * @param minBufferDurationToSwitchUpMs The minimum duration of media that needs to be buffered
++   *     for a switch to a higher quality variant to be considered.
++   * @param maxBufferDurationToSwitchDownMs The maximum duration of media that needs to be buffered
++   *     for a switch to a lower quality variant to be considered.
++   * @param eventHandler A handler to use when delivering events to {@code eventListener}. May be
++   *     null if delivery of events is not required.
++   * @param eventListener A listener of events. May be null if delivery of events is not required.
++   */
++  public HlsChunkSource(boolean isMaster, DataSource dataSource, HlsPlaylist playlist,
++      HlsTrackSelector trackSelector, BandwidthMeter bandwidthMeter,
++      PtsTimestampAdjusterProvider timestampAdjusterProvider, int adaptiveMode,
++      long minBufferDurationToSwitchUpMs, long maxBufferDurationToSwitchDownMs,
++      Handler eventHandler, EventListener eventListener) {
+     this.isMaster = isMaster;
+     this.dataSource = dataSource;
+     this.trackSelector = trackSelector;
+     this.bandwidthMeter = bandwidthMeter;
+     this.timestampAdjusterProvider = timestampAdjusterProvider;
+     this.adaptiveMode = adaptiveMode;
++    this.eventListener = eventListener;
++    this.eventHandler = eventHandler;
+     minBufferDurationToSwitchUpUs = minBufferDurationToSwitchUpMs * 1000;
+     maxBufferDurationToSwitchDownUs = maxBufferDurationToSwitchDownMs * 1000;
+     baseUri = playlist.baseUri;
+@@ -552,6 +596,15 @@ public void onChunkLoadCompleted(Chunk chunk) {
+       MediaPlaylistChunk mediaPlaylistChunk = (MediaPlaylistChunk) chunk;
+       scratchSpace = mediaPlaylistChunk.getDataHolder();
+       setMediaPlaylist(mediaPlaylistChunk.variantIndex, mediaPlaylistChunk.getResult());
++      if (eventHandler != null && eventListener != null) {
++        final byte[] rawResponse = mediaPlaylistChunk.getRawResponse();
++        eventHandler.post(new Runnable()  {
++          @Override
++          public void run() {
++            eventListener.onManifestLoadCompleted(rawResponse);
++          }
++        });
++      }
+     } else if (chunk instanceof EncryptionKeyChunk) {
+       EncryptionKeyChunk encryptionKeyChunk = (EncryptionKeyChunk) chunk;
+       scratchSpace = encryptionKeyChunk.getDataHolder();
+@@ -844,6 +897,7 @@ public ExposedTrack(Variant[] adaptiveVariants, int defaultVariantIndex, int max
+     private final String playlistUrl;
+ 
+     private HlsMediaPlaylist result;
++    private byte[] rawResponse;
+ 
+     public MediaPlaylistChunk(DataSource dataSource, DataSpec dataSpec, byte[] scratchSpace,
+         HlsPlaylistParser playlistParser, int variantIndex, String playlistUrl) {
+@@ -858,12 +912,16 @@ public MediaPlaylistChunk(DataSource dataSource, DataSpec dataSpec, byte[] scrat
+     protected void consume(byte[] data, int limit) throws IOException {
+       result = (HlsMediaPlaylist) playlistParser.parse(playlistUrl,
+           new ByteArrayInputStream(data, 0, limit));
++      rawResponse = Arrays.copyOf(data, limit);
+     }
+ 
+     public HlsMediaPlaylist getResult() {
+       return result;
+     }
+ 
++    public byte[] getRawResponse() {
++      return rawResponse;
++    }
+   }
+ 
+   private static final class EncryptionKeyChunk extends DataChunk {

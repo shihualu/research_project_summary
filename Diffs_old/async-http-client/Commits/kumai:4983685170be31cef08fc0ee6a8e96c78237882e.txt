@@ -1,0 +1,309 @@
+diff --git a/pom.xml b/pom.xml
+index a87b9401d..25246398a 100644
+--- a/pom.xml
++++ b/pom.xml
+@@ -489,7 +489,7 @@
+                 <dependency>
+                     <groupId>org.glassfish.grizzly</groupId>
+                     <artifactId>grizzly-websockets</artifactId>
+-                    <version>2.3.4</version>
++                    <version>2.3.5</version>
+                     <optional>true</optional>
+                 </dependency>
+             </dependencies>
+@@ -585,8 +585,8 @@
+         <compiler.exclude>com/ning/http/client/providers/grizzly/*.java</compiler.exclude>
+         <test.compiler.exclude>com/ning/http/client/async/grizzly/*.java</test.compiler.exclude>
+         <javadoc.package.exclude>com.ning.http.client.providers.grizzly</javadoc.package.exclude>
+-        <source.property>1.5</source.property>
+-        <target.property>1.5</target.property>
++        <source.property>1.6</source.property>
++        <target.property>1.6</target.property>
+         <surefire.version>2.12</surefire.version>
+     </properties>
+ </project>
+diff --git a/src/main/java/com/ning/http/client/providers/grizzly/FeedableBodyGenerator.java b/src/main/java/com/ning/http/client/providers/grizzly/FeedableBodyGenerator.java
+index 4e509964d..509188552 100644
+--- a/src/main/java/com/ning/http/client/providers/grizzly/FeedableBodyGenerator.java
++++ b/src/main/java/com/ning/http/client/providers/grizzly/FeedableBodyGenerator.java
+@@ -18,11 +18,21 @@
+ import java.nio.ByteBuffer;
+ import java.util.Queue;
+ import java.util.concurrent.ConcurrentLinkedQueue;
++import java.util.concurrent.ExecutionException;
+ import java.util.concurrent.atomic.AtomicInteger;
+ import org.glassfish.grizzly.Buffer;
++import org.glassfish.grizzly.Connection;
++import org.glassfish.grizzly.WriteHandler;
+ import org.glassfish.grizzly.filterchain.FilterChainContext;
+ import org.glassfish.grizzly.http.HttpContent;
+ import org.glassfish.grizzly.http.HttpRequestPacket;
++import org.glassfish.grizzly.impl.FutureImpl;
++import org.glassfish.grizzly.utils.Futures;
++
++import static com.ning.http.client.providers.grizzly.GrizzlyAsyncHttpProvider.getHttpTransactionContext;
++import static java.lang.Boolean.TRUE;
++import static java.util.concurrent.TimeUnit.MILLISECONDS;
++import static org.glassfish.grizzly.utils.Exceptions.*;
+ 
+ /**
+  * {@link BodyGenerator} which may return just part of the payload at the time
+@@ -38,49 +48,151 @@
+     
+     private volatile HttpRequestPacket requestPacket;
+     private volatile FilterChainContext context;
+-    
++    private volatile HttpContent.Builder contentBuilder;
++
++    private final EmptyBody EMPTY_BODY = new EmptyBody();
++
++
++
++    // ---------------------------------------------- Methods from BodyGenerator
++
++
+     @Override
+     public Body createBody() throws IOException {
+-        return new EmptyBody();
++        return EMPTY_BODY;
+     }
+-    
+-    public void feed(final Buffer buffer, final boolean isLast)
+-            throws IOException {
+-        queue.offer(new BodyPart(buffer, isLast));
++
++
++    // ---------------------------------------------------------- Public Methods
++
++
++    /**
++     * Feeds the specified buffer.  This buffer may be queued to be sent later
++     * or sent immediately.  Note that this method may block if data is being
++     * fed faster than it is being consumed by the peer.
++     *
++     * The maximum duration that this method may block is dependent on
++     * the current value of {@link org.glassfish.grizzly.Transport#getWriteTimeout(java.util.concurrent.TimeUnit)}.
++     * This value can be customized by using a {@link TransportCustomizer} to
++     * fine-tune the transport used by the client instance.
++     *
++     * @param buffer the {@link Buffer} to feed.
++     * @param last flag indicating if this is the final buffer of the message.
++     * @throws IOException if an I/O error occurs.
++     *
++     * @see TransportCustomizer
++     * @see GrizzlyAsyncHttpProviderConfig#addProperty(com.ning.http.client.providers.grizzly.GrizzlyAsyncHttpProviderConfig.Property, Object)
++     * @see GrizzlyAsyncHttpProviderConfig.Property#TRANSPORT_CUSTOMIZER
++     */
++    @SuppressWarnings("UnusedDeclaration")
++    public void feed(final Buffer buffer, final boolean last)
++    throws IOException {
++        queue.offer(new BodyPart(buffer, last));
+         queueSize.incrementAndGet();
+         
+         if (context != null) {
+-            flushQueue();            
++            flushQueue(true);
+         }
+     }
++
++
++    // ------------------------------------------------- Package Private Methods
++
+     
+     void initializeAsynchronousTransfer(final FilterChainContext context, 
+-            final HttpRequestPacket requestPacket) throws IOException {
++                                        final HttpRequestPacket requestPacket)
++    throws IOException {
+         this.context = context;
+         this.requestPacket = requestPacket;
+-        flushQueue();
++        this.contentBuilder = HttpContent.builder(requestPacket);
++        // don't block here.  If queue is full at the time of the next feed()
++        // call, it will block.
++        flushQueue(false);
+     }
+ 
+-    private void flushQueue() throws IOException {
++
++    // --------------------------------------------------------- Private Methods
++
++
++    @SuppressWarnings("unchecked")
++    private void flushQueue(final boolean allowBlocking) throws IOException {
+         if (queueSize.get() > 0) {
+             synchronized(this) {
++                final Connection c = context.getConnection();
+                 while(queueSize.get() > 0) {
++                    if (allowBlocking) {
++                        blockUntilQueueFree(c);
++                    }
+                     final BodyPart bodyPart = queue.poll();
+                     queueSize.decrementAndGet();
+                     final HttpContent content =
+-                            requestPacket.httpContentBuilder()
+-                            .content(bodyPart.buffer)
+-                            .last(bodyPart.isLast)
++                            contentBuilder.content(bodyPart.buffer)
++                                    .last(bodyPart.isLast)
+                             .build();
+-                    context.write(content, ((!requestPacket.isCommitted()) ?
+-                            context.getTransportContext().getCompletionHandler() :
+-                            null));
+-                    
++                    context.write(content,
++                                  ((!requestPacket.isCommitted())
++                                          ? context.getTransportContext()
++                                                .getCompletionHandler()
++                                          : null));
+                 }
+             }
+         }
+     }
+-    
++
++    /**
++     * This method will block if the async write queue is currently larger
++     * than the configured maximum.  The amount of time that this method
++     * will block is dependent on the write timeout of the transport
++     * associated with the specified connection.
++     */
++    private void blockUntilQueueFree(final Connection c) {
++        if (!c.canWrite()) {
++            final FutureImpl<Boolean> future =
++                    Futures.createSafeFuture();
++
++            // Connection may be obtained by calling FilterChainContext.getConnection().
++            c.notifyCanWrite(new WriteHandler() {
++
++                @Override
++                public void onWritePossible() throws Exception {
++                    future.result(TRUE);
++                }
++
++                @Override
++                public void onError(Throwable t) {
++                    future.failure(makeIOException(t));
++                }
++            });
++
++            block(c, future);
++        }
++    }
++
++    private void block(final Connection c,
++                       final FutureImpl<Boolean> future) {
++        try {
++            final long writeTimeout =
++                    c.getTransport().getWriteTimeout(MILLISECONDS);
++            if (writeTimeout != -1) {
++                future.get(writeTimeout, MILLISECONDS);
++            } else {
++                future.get();
++            }
++        } catch (ExecutionException e) {
++            GrizzlyAsyncHttpProvider.HttpTransactionContext httpCtx =
++                    getHttpTransactionContext(c);
++            httpCtx.abort(e.getCause());
++        } catch (Exception e) {
++            GrizzlyAsyncHttpProvider.HttpTransactionContext httpCtx =
++                    getHttpTransactionContext(c);
++            httpCtx.abort(e);
++        }
++    }
++
++
++    // ----------------------------------------------------------- Inner Classes
++
++
+     private final class EmptyBody implements Body {
+ 
+         @Override
+@@ -98,9 +210,14 @@ public void close() throws IOException {
+             context.completeAndRecycle();
+             context = null;
+             requestPacket = null;
++            contentBuilder = null;
+         }
+     }
+-    
++
++
++    // ---------------------------------------------------------- Nested Classes
++
++
+     private final static class BodyPart {
+         private final boolean isLast;
+         private final Buffer buffer;
+diff --git a/src/main/java/com/ning/http/client/providers/grizzly/GrizzlyAsyncHttpProvider.java b/src/main/java/com/ning/http/client/providers/grizzly/GrizzlyAsyncHttpProvider.java
+index 3a7a440d3..3b7baa255 100644
+--- a/src/main/java/com/ning/http/client/providers/grizzly/GrizzlyAsyncHttpProvider.java
++++ b/src/main/java/com/ning/http/client/providers/grizzly/GrizzlyAsyncHttpProvider.java
+@@ -101,6 +101,7 @@
+ import org.glassfish.grizzly.utils.DelayedExecutor;
+ import org.glassfish.grizzly.utils.Futures;
+ import org.glassfish.grizzly.utils.IdleTimeoutFilter;
++import org.glassfish.grizzly.websockets.ClosingFrame;
+ import org.glassfish.grizzly.websockets.DataFrame;
+ import org.glassfish.grizzly.websockets.HandShake;
+ import org.glassfish.grizzly.websockets.HandshakeException;
+@@ -109,7 +110,6 @@
+ import org.glassfish.grizzly.websockets.Version;
+ import org.glassfish.grizzly.websockets.WebSocketFilter;
+ import org.glassfish.grizzly.websockets.WebSocketHolder;
+-import org.glassfish.grizzly.websockets.draft06.ClosingFrame;
+ import org.slf4j.Logger;
+ import org.slf4j.LoggerFactory;
+ 
+@@ -131,7 +131,6 @@
+ import java.util.List;
+ import java.util.Locale;
+ import java.util.Map;
+-import java.util.concurrent.Callable;
+ import java.util.concurrent.ExecutionException;
+ import java.util.concurrent.ExecutorService;
+ import java.util.concurrent.Semaphore;
+@@ -157,7 +156,7 @@
+     static {
+         SEND_FILE_SUPPORT = /*configSendFileSupport()*/ false;
+     }
+-    private final Attribute<HttpTransactionContext> REQUEST_STATE_ATTR =
++    private static final Attribute<HttpTransactionContext> REQUEST_STATE_ATTR =
+             Grizzly.DEFAULT_ATTRIBUTE_BUILDER.createAttribute(HttpTransactionContext.class.getName());
+ 
+     private final BodyHandlerFactory bodyHandlerFactory = new BodyHandlerFactory();
+@@ -263,7 +262,7 @@ public void close() {
+ 
+         try {
+             connectionManager.destroy();
+-            clientTransport.stop();
++            clientTransport.shutdownNow();
+             final ExecutorService service = clientConfig.executorService();
+             if (service != null) {
+                 service.shutdown();
+@@ -506,7 +505,7 @@ public void updated(WriteResult result) {
+     }
+ 
+ 
+-    void setHttpTransactionContext(final AttributeStorage storage,
++    static void setHttpTransactionContext(final AttributeStorage storage,
+                                            final HttpTransactionContext httpTransactionState) {
+ 
+         if (httpTransactionState == null) {
+@@ -517,7 +516,7 @@ void setHttpTransactionContext(final AttributeStorage storage,
+ 
+     }
+ 
+-    HttpTransactionContext getHttpTransactionContext(final AttributeStorage storage) {
++    static HttpTransactionContext getHttpTransactionContext(final AttributeStorage storage) {
+ 
+         return REQUEST_STATE_ATTR.get(storage);
+ 
+@@ -877,7 +876,7 @@ private boolean sendAsGrizzlyRequest(final Request request,
+             if (httpCtx.isWSRequest && !httpCtx.establishingTunnel) {
+                 try {
+                     final URI wsURI = new URI(httpCtx.wsRequestURI);
+-                    httpCtx.protocolHandler = Version.DRAFT17.createHandler(true);
++                    httpCtx.protocolHandler = Version.RFC6455.createHandler(true);
+                     httpCtx.handshake = httpCtx.protocolHandler.createHandShake(wsURI);
+                     requestPacket = (HttpRequestPacket)
+                             httpCtx.handshake.composeHeaders().getHttpHeader();

@@ -1,0 +1,176 @@
+diff --git a/jsprit-core/pom.xml b/jsprit-core/pom.xml
+index edb19ad32..1e4c3f70b 100644
+--- a/jsprit-core/pom.xml
++++ b/jsprit-core/pom.xml
+@@ -48,6 +48,11 @@
+             <version>2.9.0</version>
+         </dependency>
+ 
++        <dependency>
++            <groupId>com.google.maps</groupId>
++            <artifactId>google-maps-services</artifactId>
++            <version>0.2.6</version>
++        </dependency>
+     </dependencies>
+ 
+ 
+diff --git a/jsprit-core/src/main/java/com/graphhopper/jsprit/core/util/GoogleMapsCosts.java b/jsprit-core/src/main/java/com/graphhopper/jsprit/core/util/GoogleMapsCosts.java
+index 53c78a6fe..24d227652 100644
+--- a/jsprit-core/src/main/java/com/graphhopper/jsprit/core/util/GoogleMapsCosts.java
++++ b/jsprit-core/src/main/java/com/graphhopper/jsprit/core/util/GoogleMapsCosts.java
+@@ -20,6 +20,11 @@
+  */
+ package com.graphhopper.jsprit.core.util;
+ 
++import com.google.maps.DirectionsApi;
++import com.google.maps.GeoApiContext;
++import com.google.maps.model.DirectionsResult;
++import com.google.maps.model.TravelMode;
++import com.google.maps.model.Unit;
+ import com.graphhopper.jsprit.core.algorithm.VehicleRoutingAlgorithm;
+ import com.graphhopper.jsprit.core.problem.Location;
+ import com.graphhopper.jsprit.core.problem.cost.AbstractForwardVehicleRoutingTransportCosts;
+@@ -28,6 +33,8 @@
+ import redis.clients.jedis.Jedis;
+ import org.slf4j.Logger;
+ import org.slf4j.LoggerFactory;
++import redis.clients.jedis.JedisPool;
++import redis.clients.jedis.JedisPoolConfig;
+ 
+ import java.util.concurrent.atomic.AtomicInteger;
+ 
+@@ -46,13 +53,17 @@
+     private final static Logger logger = LoggerFactory.getLogger(GoogleMapsCosts.class);
+ 
+     private String redisURI = "redis://localhost:6379";
+-    private Jedis jedis;
++    private JedisPool pool;
++    private GeoApiContext context;
+ 
+-    public GoogleMapsCosts(Locations locations, String redisURI) {
++    public GoogleMapsCosts(Locations locations, String redisURI, String googleApiKey) {
+         super();
+         this.locations = locations;
+         this.redisURI = redisURI;
+-        this.jedis = new Jedis(this.redisURI);
++        this.pool = new JedisPool(new JedisPoolConfig(), this.redisURI);
++        this.context = new GeoApiContext.Builder()
++            .apiKey(googleApiKey)
++            .build();
+     }
+ 
+     @Override
+@@ -62,18 +73,11 @@ public String toString() {
+ 
+     @Override
+     public double getTransportCost(Location from, Location to, double time, Driver driver, Vehicle vehicle) {
+-        String cachedResponse = jedis.get("distances/" + from.getCoordinate().toString() + ":" + to.getCoordinate().toString());
+-        if (cachedResponse == null) {
+-            double distance = calculateDistance(from, to);
+-            if (vehicle != null && vehicle.getType() != null) {
+-                return distance * vehicle.getType().getVehicleCostParams().perDistanceUnit;
+-            }
+-            logger.info("calculate cost [{}] from {} to {}: {}", c.incrementAndGet(), from.getCoordinate().toString(), to.getCoordinate().toString(), distance);
+-            jedis.set("distances/" + from.getCoordinate().toString() + ":" + to.getCoordinate().toString(), Double.toString(distance));
+-            jedis.expire("distances/" + from.getCoordinate().toString() + ":" + to.getCoordinate().toString(), 900);
+-            return distance;
++        double distance = calculateDistance(from, to);
++        if (vehicle != null && vehicle.getType() != null) {
++            return distance * vehicle.getType().getVehicleCostParams().perDistanceUnit;
+         }
+-        return Double.parseDouble(cachedResponse);
++        return distance;
+     }
+ 
+     double calculateDistance(Location fromLocation, Location toLocation) {
+@@ -81,8 +85,8 @@ public double getTransportCost(Location from, Location to, double time, Driver d
+     }
+ 
+     double calculateDistance(Coordinate from, Coordinate to) {
+-        try {
+-            return GoogleMapsDistanceCalculator.calculateDistance(from, to) * detourFactor;
++        try (Jedis jedis = this.pool.getResource()) {
++            return GoogleMapsDistanceCalculator.calculateDistance(from, to, context, jedis, c) * detourFactor;
+         } catch (NullPointerException e) {
+             throw new NullPointerException("cannot calculate euclidean distance. coordinates are missing. either add coordinates or use another transport-cost-calculator.");
+         }
+diff --git a/jsprit-core/src/main/java/com/graphhopper/jsprit/core/util/GoogleMapsDistanceCalculator.java b/jsprit-core/src/main/java/com/graphhopper/jsprit/core/util/GoogleMapsDistanceCalculator.java
+index eef9b4cbc..e5b6c32eb 100644
+--- a/jsprit-core/src/main/java/com/graphhopper/jsprit/core/util/GoogleMapsDistanceCalculator.java
++++ b/jsprit-core/src/main/java/com/graphhopper/jsprit/core/util/GoogleMapsDistanceCalculator.java
+@@ -18,12 +18,49 @@
+ package com.graphhopper.jsprit.core.util;
+ 
+ 
++import com.google.maps.DirectionsApi;
++import com.google.maps.GeoApiContext;
++import com.google.maps.model.DirectionsResult;
++import com.google.maps.model.TravelMode;
++import com.google.maps.model.Unit;
++import org.slf4j.Logger;
++import org.slf4j.LoggerFactory;
++import redis.clients.jedis.Jedis;
++
++import java.util.concurrent.atomic.AtomicInteger;
++
+ public class GoogleMapsDistanceCalculator {
+ 
+-    public static double calculateDistance(Coordinate coord1, Coordinate coord2) {
+-        double xDiff = coord1.getX() - coord2.getX();
+-        double yDiff = coord1.getY() - coord2.getY();
+-        return Math.sqrt((xDiff * xDiff) + (yDiff * yDiff));
++    private final static Logger logger = LoggerFactory.getLogger(GoogleMapsDistanceCalculator.class);
++
++    public static double calculateDistance(Coordinate coord1, Coordinate coord2, GeoApiContext context, Jedis jedis, AtomicInteger c) {
++
++        String coordA = String.format("%f,%f", coord1.getX(), coord1.getY());
++        String coordB = String.format("%f,%f", coord2.getX(), coord2.getY());
++
++        if (coordA.equals(coordB)) {
++            return 0;
++        }
++
++        String cachedResponse = jedis.get("distances/" + coordA + ":" + coordB);
++        if (cachedResponse == null) {
++            System.out.println("Calculate google");
++            DirectionsResult result =
++                DirectionsApi.newRequest(context)
++                    .mode(TravelMode.DRIVING)
++                    .avoid(
++                        DirectionsApi.RouteRestriction.FERRIES)
++                    .units(Unit.METRIC)
++                    .origin(coordA)
++                    .destination(coordB)
++                    .awaitIgnoreError();
++            long duration = result.routes[0].legs[0].duration.inSeconds;
++            logger.info("calculate cost [{}] from {} to {}: {}", c.incrementAndGet(), coordA, coordB, duration, c);
++            jedis.set("distances/" + coordA + ":" + coordB, Long.toString(duration));
++            jedis.expire("distances/" + coordA + ":" + coordB, 900);
++            return (double)duration;
++        }
++        return Double.parseDouble(cachedResponse);
+     }
+ 
+ }
+diff --git a/jsprit-examples/src/main/java/com/graphhopper/jsprit/examples/GoogleMapsExample.java b/jsprit-examples/src/main/java/com/graphhopper/jsprit/examples/GoogleMapsExample.java
+index d39fa1b35..5413fc012 100644
+--- a/jsprit-examples/src/main/java/com/graphhopper/jsprit/examples/GoogleMapsExample.java
++++ b/jsprit-examples/src/main/java/com/graphhopper/jsprit/examples/GoogleMapsExample.java
+@@ -67,7 +67,7 @@ public static void main(String[] args) {
+         vrpBuilder.addVehicle(vehicle);
+         vrpBuilder.addJob(service1).addJob(service2).addJob(service3).addJob(service4);
+ 
+-        VehicleRoutingTransportCosts routingCosts = new GoogleMapsCosts(vrpBuilder.getLocations(), "redis://localhost:6379");
++        VehicleRoutingTransportCosts routingCosts = new GoogleMapsCosts(vrpBuilder.getLocations(), "localhost", "toto");
+         vrpBuilder.setRoutingCost(routingCosts);
+         VehicleRoutingProblem problem = vrpBuilder.build();
+ 
+@@ -76,7 +76,7 @@ public static void main(String[] args) {
+          */
+         VehicleRoutingAlgorithm algorithm  = Jsprit.Builder.newInstance(problem)
+             .setProperty(Jsprit.Parameter.FAST_REGRET, "true")
+-            .setProperty(Jsprit.Parameter.THREADS, "1")
++            .setProperty(Jsprit.Parameter.THREADS, "4")
+             .setProperty(Jsprit.Parameter.FIXED_COST_PARAM, "1.") //Increase weight of the fixed cost to enable the force all vehicle workaround
+             .buildAlgorithm();
+ 

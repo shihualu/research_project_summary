@@ -1,0 +1,2189 @@
+diff --git a/core/src/main/java/com/graphhopper/GraphHopper.java b/core/src/main/java/com/graphhopper/GraphHopper.java
+index 652481f07c..5889207ae5 100644
+--- a/core/src/main/java/com/graphhopper/GraphHopper.java
++++ b/core/src/main/java/com/graphhopper/GraphHopper.java
+@@ -28,6 +28,8 @@
+ import com.graphhopper.storage.index.LocationIndexTree;
+ import com.graphhopper.storage.index.QueryResult;
+ import com.graphhopper.util.*;
++import com.graphhopper.util.profiles.ProfileManager;
++import com.graphhopper.util.profiles.ProfileRepository;
+ import com.graphhopper.util.shapes.GHPoint;
+ 
+ import org.slf4j.Logger;
+@@ -92,6 +94,7 @@
+     // for OSM import
+     private String osmFile;
+     private double osmReaderWayPointMaxDistance = 1;
++    private String smoothingFilter = "";
+     private int workerThreads = -1;
+     private boolean calcPoints = true;
+     // utils
+@@ -633,6 +636,7 @@ public GraphHopper init( CmdArgs args )
+ 
+         // osm import
+         osmReaderWayPointMaxDistance = args.getDouble("osmreader.wayPointMaxDistance", osmReaderWayPointMaxDistance);
++        smoothingFilter = args.get("osmreader.smoothingFilter", smoothingFilter);
+ 
+         workerThreads = args.getInt("osmreader.workerThreads", workerThreads);
+         enableInstructions = args.getBool("osmreader.instructions", enableInstructions);
+@@ -742,7 +746,8 @@ protected OSMReader initOSMReader( OSMReader reader )
+                 setElevationProvider(eleProvider).
+                 setWorkerThreads(workerThreads).
+                 setEncodingManager(encodingManager).
+-                setWayPointMaxDistance(osmReaderWayPointMaxDistance);
++                setWayPointMaxDistance(osmReaderWayPointMaxDistance).
++                setElevationFilter(smoothingFilter);
+     }
+ 
+     /**
+@@ -928,6 +933,11 @@ private boolean isPrepared()
+      * @see WeightingMap
+      */
+     public Weighting createWeighting( WeightingMap weightingMap, FlagEncoder encoder )
++    {
++        return createWeighting(weightingMap, encoder, null);
++    }
++
++    public Weighting createWeighting( WeightingMap weightingMap, FlagEncoder encoder, ProfileManager profileManager )
+     {
+         String weighting = weightingMap.getWeighting().toLowerCase();
+ 
+@@ -942,7 +952,7 @@ public Weighting createWeighting( WeightingMap weightingMap, FlagEncoder encoder
+                 return new FastestWeighting(encoder, weightingMap);
+         } else if ("dynamic".equalsIgnoreCase(weighting))
+         {
+-            return new DynamicWeighting(encoder, weightingMap);
++            return new DynamicWeighting(encoder, weightingMap, profileManager);
+         }
+ 
+         throw new UnsupportedOperationException("weighting " + weighting + " not supported");
+@@ -977,7 +987,13 @@ public Weighting createTurnWeighting( Weighting weighting, Graph graph, FlagEnco
+     public GHResponse route( GHRequest request )
+     {
+         GHResponse response = new GHResponse();
+-        List<Path> paths = getPaths(request, response);
++        ProfileManager profileManager = null;
++
++        if(request.getVehicle().equals("genbike")) {
++            profileManager = initProfile(request.getHints().get("profile", ""), encodingManager.getEncoder(request.getVehicle()));
++        }
++
++        List<Path> paths = getPaths(request, response, profileManager);
+         if (response.hasErrors())
+             return response;
+ 
+@@ -996,7 +1012,11 @@ public GHResponse route( GHRequest request )
+         return response;
+     }
+ 
+-    protected List<Path> getPaths( GHRequest request, GHResponse rsp )
++    protected List<Path> getPaths( GHRequest request, GHResponse rsp) {
++        return getPaths(request, rsp, null);
++    }
++
++    protected List<Path> getPaths( GHRequest request, GHResponse rsp, ProfileManager profileManager)
+     {
+         if (ghStorage == null || !fullyLoaded)
+             throw new IllegalStateException("Call load or importOrLoad before routing");
+@@ -1065,7 +1085,7 @@ public GHResponse route( GHRequest request )
+             weighting = getWeightingForCH(request.getHints(), encoder);
+             routingGraph = ghStorage.getGraph(CHGraph.class, weighting);
+         } else
+-            weighting = createWeighting(request.getHints(), encoder);
++            weighting = createWeighting(request.getHints(), encoder, profileManager);
+ 
+         RoutingAlgorithmFactory tmpAlgoFactory = getAlgorithmFactory(weighting);
+         QueryGraph queryGraph = new QueryGraph(routingGraph);
+@@ -1108,9 +1128,8 @@ public GHResponse route( GHRequest request )
+ 
+             sw = new StopWatch().start();
+             Path path = algo.calcPath(fromQResult.getClosestNode(), toQResult.getClosestNode());
+-
+-            //Update time to profile of user
+-            path.updateTime(request.getHints());
++            path.initSpeedProvider(profileManager);
++            path.updateTime();
+ 
+             if (path.getTime() < 0)
+                 throw new RuntimeException("Time was negative. Please report as bug and include:" + request);
+@@ -1284,6 +1303,17 @@ private String formatDateTime( Date date )
+         return new SimpleDateFormat("yyyy-MM-dd'T'HH:mm:ssZ").format(date);
+     }
+ 
++    private ProfileManager initProfile(String profile, FlagEncoder encoder) {
++
++        ProfileManager profileManager = new ProfileManager(new ProfileRepository());
++
++        if(!profile.equals("")) {
++            profileManager.init(profile, (BikeGenericFlagEncoder) encoder);
++        }
++
++        return profileManager;
++    }
++
+     protected void ensureNotLoaded()
+     {
+         if (fullyLoaded)
+diff --git a/core/src/main/java/com/graphhopper/reader/OSMReader.java b/core/src/main/java/com/graphhopper/reader/OSMReader.java
+index fc4650df87..437ad39ff2 100644
+--- a/core/src/main/java/com/graphhopper/reader/OSMReader.java
++++ b/core/src/main/java/com/graphhopper/reader/OSMReader.java
+@@ -118,6 +118,7 @@
+     // negative but increasing to avoid clash with custom created OSM files
+     private long newUniqueOsmId = -Long.MAX_VALUE;
+     private ElevationProvider eleProvider = ElevationProvider.NOOP;
++    private String smoothingFilter = "";
+     private final boolean exitOnlyPillarNodeException = true;
+     private File osmFile;
+     private final Map<FlagEncoder, EdgeExplorer> outExplorerMap = new HashMap<FlagEncoder, EdgeExplorer>();
+@@ -370,19 +371,18 @@ void processWay( OSMWay way )
+                 way.setTag("estimated_center", new GHPoint((firstLat + lastLat) / 2, (firstLon + lastLon) / 2));
+             }
+ 
+-            //Kalman filter improves quality of elevation data - check for Kalman
+-            boolean kalman = true;
+-            if(kalman) {
++            //Smoothing filter for elevation on ways
++            if(smoothingFilter.equalsIgnoreCase("kalman") || smoothingFilter.equalsIgnoreCase("mean")) {
+ 
+                 double[] tmpElevations = new double[osmNodeIds.size()];
+                 double[] tmpDistances = new double[osmNodeIds.size()-1];
+ 
+                 int osmNodeId = getNodeMap().get(osmNodeIds.get(0));
+-                tmpElevations[0] = getTmpElevation(osmNodeId);
++                tmpElevations[0] = getElevation(osmNodeId);
+ 
+                 for (int i = 1; i < tmpElevations.length; i++) {
+                     osmNodeId = getNodeMap().get(osmNodeIds.get(i));
+-                    tmpElevations[i] = getTmpElevation(osmNodeId);
++                    tmpElevations[i] = getElevation(osmNodeId);
+ 
+                     int firstNode = getNodeMap().get(osmNodeIds.get(i-1));
+                     int lastNode = getNodeMap().get(osmNodeIds.get(i));
+@@ -396,12 +396,18 @@ void processWay( OSMWay way )
+                     }
+                 }
+ 
+-                SmoothingFilter filter = new SimpleKalmanFilter(SimpleKalmanFilter.COMBINED, 6, tmpDistances, 40);
++                SmoothingFilter filter;
++
++                if(smoothingFilter.equalsIgnoreCase("mean"))
++                    filter = new MeanFilter(tmpDistances, 100);
++                else
++                    filter = new SimpleKalmanFilter(SimpleKalmanFilter.COMBINED, 6, tmpDistances, 60);
++
+                 double[] estimatedElevations = filter.smooth(tmpElevations);
+ 
+                 for (int i = 0; i < estimatedElevations.length; i++) {
+                     osmNodeId = getNodeMap().get(osmNodeIds.get(i));
+-                    updateTmpElevation(osmNodeId, estimatedElevations[i]);
++                    updateTmpElevation(osmNodeId, estimatedElevations[i], (i == 0 || i == estimatedElevations.length - 1));
+                 }
+             }
+         }
+@@ -614,11 +620,13 @@ public int getInternalNodeIdOfOsmNode( long nodeOsmId )
+ 
+     //TODO update elevation
+ 
+-    boolean updateTmpElevation( int id, double ele ){
++    boolean updateTmpElevation( int id, double ele, boolean average ){
+         if (id == EMPTY)
+             return false;
+         if(id < TOWER_NODE){
+-            ele = (getElevation(id) + ele) / 2;
++            if(average)
++                ele = (getTmpElevation(id) + ele) / 2;
++
+             id = -id -3;
+             nodeAccess.setElevation(id, ele);
+             return true;
+@@ -1101,6 +1109,12 @@ public OSMReader setElevationProvider( ElevationProvider eleProvider )
+         return this;
+     }
+ 
++    public OSMReader setElevationFilter( String filter )
++    {
++        this.smoothingFilter = filter;
++        return this;
++    }
++
+     public OSMReader setOSMFile( File osmFile )
+     {
+         this.osmFile = osmFile;
+diff --git a/core/src/main/java/com/graphhopper/reader/dem/CGIARProvider.java b/core/src/main/java/com/graphhopper/reader/dem/CGIARProvider.java
+index a0a939e2f6..fe3b14c004 100644
+--- a/core/src/main/java/com/graphhopper/reader/dem/CGIARProvider.java
++++ b/core/src/main/java/com/graphhopper/reader/dem/CGIARProvider.java
+@@ -255,6 +255,7 @@ public double getEle( double lat, double lon )
+                     }
+                     heights.flush();
+ 
++                    //demProvider.toImage("x" + name + ".png");
+                     // TODO remove tifName and zip?
+                 } catch (Exception ex)
+                 {
+@@ -355,5 +356,7 @@ public static void main( String[] args )
+         System.out.println(provider.getEle(29.840644, -42.890625));
+ 
+         System.out.println(provider.getEle(50.477121, 8.051915));
++
++        System.out.println(provider.getEle(45.975, 10.861359));
+     }
+ }
+diff --git a/core/src/main/java/com/graphhopper/reader/dem/HighPrecisionSRTMProvider.java b/core/src/main/java/com/graphhopper/reader/dem/HighPrecisionSRTMProvider.java
+index f29d040735..1e026f2c9e 100644
+--- a/core/src/main/java/com/graphhopper/reader/dem/HighPrecisionSRTMProvider.java
++++ b/core/src/main/java/com/graphhopper/reader/dem/HighPrecisionSRTMProvider.java
+@@ -50,6 +50,8 @@ public static void main(String[] args) throws IOException
+         // 1113 vs new:
+         provider.setCalcMean(true);
+         System.out.println(provider.getEle(47.467753, 14.573911));
++
++        System.out.println(provider.getEle(45.95115, 10.884705));
+     }
+ 
+ 
+diff --git a/core/src/main/java/com/graphhopper/reader/dem/LowPrecisionSRTMProvider.java b/core/src/main/java/com/graphhopper/reader/dem/LowPrecisionSRTMProvider.java
+index e4a4d2e636..7d7204347b 100644
+--- a/core/src/main/java/com/graphhopper/reader/dem/LowPrecisionSRTMProvider.java
++++ b/core/src/main/java/com/graphhopper/reader/dem/LowPrecisionSRTMProvider.java
+@@ -28,6 +28,8 @@ public static void main( String[] args ) throws IOException
+         // 1113 vs new:
+         provider.setCalcMean(true);
+         System.out.println(provider.getEle(47.467753, 14.573911));
++
++        System.out.println(provider.getEle(45.95115, 10.884705));
+     }
+ 
+     public LowPrecisionSRTMProvider()
+diff --git a/core/src/main/java/com/graphhopper/reader/dem/SRTMProvider.java b/core/src/main/java/com/graphhopper/reader/dem/SRTMProvider.java
+index 6f37a69292..9bbc15a092 100644
+--- a/core/src/main/java/com/graphhopper/reader/dem/SRTMProvider.java
++++ b/core/src/main/java/com/graphhopper/reader/dem/SRTMProvider.java
+@@ -167,7 +167,8 @@ public double getEle( double lat, double lon )
+ 
+                     processFile(heights, bytes, file);
+ 
+-                    // demProvider.toImage("x" + file.getName() + ".png");
++                    //demProvider.toImage("x" + file.getName() + ".png");
++                    //System.out.println("x" + file.getName() + ".png");
+                     // TODO remove hgt and zip?
+                 } catch (Exception ex)
+                 {
+diff --git a/core/src/main/java/com/graphhopper/routing/Path.java b/core/src/main/java/com/graphhopper/routing/Path.java
+index da743c3580..037159e49b 100644
+--- a/core/src/main/java/com/graphhopper/routing/Path.java
++++ b/core/src/main/java/com/graphhopper/routing/Path.java
+@@ -23,6 +23,7 @@
+ import com.graphhopper.storage.NodeAccess;
+ import com.graphhopper.util.*;
+ import com.graphhopper.util.profiles.ProfileManager;
++import com.graphhopper.util.profiles.ProfileRepository;
+ import com.graphhopper.util.profiles.RidersProfile;
+ import gnu.trove.list.TIntList;
+ import gnu.trove.list.array.TIntArrayList;
+@@ -30,8 +31,6 @@
+ import java.util.ArrayList;
+ import java.util.List;
+ 
+-import static com.graphhopper.util.Helper.keepIn;
+-
+ /**
+  * Stores the nodes for the found path of an algorithm. It additionally needs the edgeIds to make
+  * edge determination faster and less complex as there could be several edges (u,v) especially for
+@@ -58,6 +57,8 @@
+     private TIntList edgeIds;
+     private double weight;
+     private NodeAccess nodeAccess;
++    private String profile;
++    private SpeedProvider speedProvider;
+ 
+     public Path( Graph graph, FlagEncoder encoder )
+     {
+@@ -175,6 +176,14 @@ public Path setWeight( double w )
+         return this;
+     }
+ 
++    public Path initSpeedProvider( final ProfileManager profileManager){
++        if(profileManager == null)
++            return this;
++
++        this.speedProvider = new ProfileSpeedProvider(encoder, profileManager);
++        return this;
++    }
++
+     /**
+      * Extracts the Path from the shortest-path-tree determined by edgeEntry.
+      */
+@@ -254,6 +263,24 @@ protected long calcMillis( double distance, long flags, boolean revert )
+         return (long) (distance * 3600 / speed);
+     }
+ 
++    protected long calcMillis( EdgeIteratorState edge, boolean revert) {
++
++        if (revert && !encoder.isBackward(edge.getFlags())
++                || !revert && !encoder.isForward(edge.getFlags()))
++            throw new IllegalStateException("Calculating time should not require to read speed from edge in wrong direction. "
++                    + "Reverse:" + revert + ", fwd:" + encoder.isForward(edge.getFlags()) + ", bwd:" + encoder.isBackward(edge.getFlags()));
++
++        double speed = speedProvider.calcSpeed(edge, revert);
++
++        if (Double.isInfinite(speed) || Double.isNaN(speed) || speed < 0)
++            throw new IllegalStateException("Invalid speed stored in edge! " + speed);
++
++        if (speed == 0)
++            throw new IllegalStateException("Speed cannot be 0 for unblocked edge, use access properties to mark edge blocked! Should only occur for shortest path calculation. See #242.");
++
++        return (long) (edge.getDistance() * 3600 / speed);
++    }
++
+     /**
+      * The callback used in forEveryEdge.
+      */
+@@ -369,38 +396,19 @@ public void next( EdgeIteratorState eb, int index )
+         return points;
+     }
+ 
+-    public void updateTime(PMap params){
++    public void updateTime(){
+ 
++        if(speedProvider == null)
++            return;
+         time = 0;
+-        String profileName = params.get("profile", "");
+-        RidersProfile ridersProfile = null;
+-
+-        if(!profileName.equals(""))
+-            ridersProfile = new ProfileManager().getProfile(profileName);
+-
+-        final SpeedProvider speedProvider = new ProfileSpeedProvider(encoder, ridersProfile);
+ 
+         forEveryEdge(new EdgeVisitor() {
+ 
+             @Override
+             public void next(EdgeIteratorState edgeBase, int index) {
+ 
+-                double speed = speedProvider.calcSpeed(edgeBase, false);
++                time += calcMillis(edgeBase, false);
+ 
+-                if (Double.isInfinite(speed) || Double.isNaN(speed) || speed < 0)
+-                    throw new IllegalStateException("Invalid speed stored in edge! " + speed);
+-
+-                if (speed == 0)
+-                    throw new IllegalStateException("Speed cannot be 0 for unblocked edge, use access properties to mark edge blocked! Should only occur for shortest path calculation. See #242.");
+-
+-                double edgeTime = edgeBase.getDistance() / speed * 3600;
+-
+-                // add direction penalties at start/stop/via points
+-                boolean penalizeEdge = edgeBase.getBoolean(EdgeIteratorState.K_UNFAVORED_EDGE, false, false);
+-                if (penalizeEdge)
+-                    edgeTime += 300; //pMap.getDouble("heading_penalty", DEFAULT_HEADING_PENALTY);
+-
+-                time += edgeTime;
+             }
+         });
+ 
+@@ -661,8 +669,12 @@ private void updatePointsAndInstruction( EdgeIteratorState edge, PointList pl )
+                 }
+                 double newDist = edge.getDistance();
+                 prevInstruction.setDistance(newDist + prevInstruction.getDistance());
+-                long flags = edge.getFlags();
+-                prevInstruction.setTime(calcMillis(newDist, flags, false) + prevInstruction.getTime());
++                if(speedProvider != null) {
++                    prevInstruction.setTime(calcMillis(edge, false) + prevInstruction.getTime());
++                } else {
++                    long flags = edge.getFlags();
++                    prevInstruction.setTime(calcMillis(newDist, flags, false) + prevInstruction.getTime());
++                }
+             }
+         });
+ 
+diff --git a/core/src/main/java/com/graphhopper/routing/util/BikeGenericFlagEncoder.java b/core/src/main/java/com/graphhopper/routing/util/BikeGenericFlagEncoder.java
+index 035cddb6e2..f1381d28b7 100644
+--- a/core/src/main/java/com/graphhopper/routing/util/BikeGenericFlagEncoder.java
++++ b/core/src/main/java/com/graphhopper/routing/util/BikeGenericFlagEncoder.java
+@@ -37,21 +37,16 @@
+ {
+ 
+     private final DistanceCalc distCalc = Helper.DIST_EARTH;
+-    /**
+-     * Reports wether this edge is unpaved.
+-     */
+     public static final int PUSHING_SECTION_SPEED = 4;
++
+     // Pushing section highways are parts where you need to get off your bike and push it (German: Schiebestrecke)
+     protected final HashSet<String> pushingSections = new HashSet<String>();
+     protected final HashSet<String> oppositeLanes = new HashSet<String>();
+     protected final Set<String> acceptedHighwayTags = new HashSet<String>();
+-    protected final Set<String> preferHighwayTags = new HashSet<String>();
+-    protected final Set<String> avoidHighwayTags = new HashSet<String>();
+ 
+     protected final Set<String> pavedSurfaceTags = new HashSet<String>();
+     protected final Set<String> unpavedSurfaceTags = new HashSet<String>();
+ 
+-    //private final Map<String, Integer> trackTypeSpeeds = new HashMap<String, Integer>();
+     private final Map<String, Float> surfaceSpeedFactors = new HashMap<String, Float>();
+     private final Map<Integer, Integer> wayTypeSpeeds = new HashMap<Integer, Integer>();
+     // convert network tag of bicycle routes into a way route code
+@@ -150,7 +145,7 @@ protected BikeGenericFlagEncoder(int speedBits, double speedFactor, int maxTurnC
+         unpavedSurfaceTags.add("salt");
+         unpavedSurfaceTags.add("sand");
+ 
+-        maxPossibleSpeed = 35;
++        maxPossibleSpeed = 34;
+ 
+         setSurfaceSpeedFactor("concrete:lanes", 0.9f);
+         setSurfaceSpeedFactor("concrete:plates", 0.9f);
+@@ -171,15 +166,15 @@ protected BikeGenericFlagEncoder(int speedBits, double speedFactor, int maxTurnC
+         setSurfaceSpeedFactor("ice", 0.5f);
+         setSurfaceSpeedFactor("mud", 0.6f);
+ 
+-        setWayTypeSpeed(WayType.PRIMARY_ROAD.getValue(), 18);
+-        setWayTypeSpeed(WayType.SECONDARY_ROAD.getValue(), 18);
++        setWayTypeSpeed(WayType.MOTORWAY.getValue(), 18);
++        setWayTypeSpeed(WayType.ROAD.getValue(), 18);
+         setWayTypeSpeed(WayType.TERTIARY_ROAD.getValue(), 18);
+-        setWayTypeSpeed(WayType.UNCLASSIFIED_PAVED.getValue(), 18);
++        setWayTypeSpeed(WayType.UNCLASSIFIED_PAVED.getValue(), 16);
+         setWayTypeSpeed(WayType.UNCLASSIFIED_UNPAVED.getValue(), 12);
+-        setWayTypeSpeed(WayType.SMALL_WAY_PAVED.getValue(), 18);
++        setWayTypeSpeed(WayType.SMALL_WAY_PAVED.getValue(), 16);
+         setWayTypeSpeed(WayType.SMALL_WAY_UNPAVED.getValue(), 10);
+-        setWayTypeSpeed(WayType.TRACK_EASY.getValue(), 14);
+-        setWayTypeSpeed(WayType.TRACK_MIDDLE.getValue(), 12);
++        setWayTypeSpeed(WayType.TRACK_EASY.getValue(), 12);
++        setWayTypeSpeed(WayType.TRACK_MIDDLE.getValue(), 10);
+         setWayTypeSpeed(WayType.TRACK_HARD.getValue(), 8);
+         setWayTypeSpeed(WayType.PATH_EASY.getValue(), 8);
+         setWayTypeSpeed(WayType.PATH_MIDDLE.getValue(), 6);
+@@ -198,6 +193,7 @@ protected BikeGenericFlagEncoder(int speedBits, double speedFactor, int maxTurnC
+         acceptedHighwayTags.add("track");
+         acceptedHighwayTags.add("service");
+         acceptedHighwayTags.add("residential");
++        acceptedHighwayTags.add("unclassified");
+         acceptedHighwayTags.add("road");
+         acceptedHighwayTags.add("trunk");
+         acceptedHighwayTags.add("trunk_link");
+@@ -207,6 +203,8 @@ protected BikeGenericFlagEncoder(int speedBits, double speedFactor, int maxTurnC
+         acceptedHighwayTags.add("secondary_link");
+         acceptedHighwayTags.add("tertiary");
+         acceptedHighwayTags.add("tertiary_link");
++        acceptedHighwayTags.add("trunk");
++        acceptedHighwayTags.add("trunk_link");
+         acceptedHighwayTags.add("motorway");
+         acceptedHighwayTags.add("motorway_link");
+ 
+@@ -214,17 +212,6 @@ protected BikeGenericFlagEncoder(int speedBits, double speedFactor, int maxTurnC
+         addPushingSection("pedestrian");
+         addPushingSection("steps");
+ 
+-        avoidHighwayTags.add("motorway");
+-        avoidHighwayTags.add("motorway_link");
+-
+-        /*setCyclingNetworkPreference("icn", 1);
+-        setCyclingNetworkPreference("ncn", 2);
+-        setCyclingNetworkPreference("rcn", 3);
+-        setCyclingNetworkPreference("lcn", 4);
+-        setCyclingNetworkPreference("mtb", PriorityCode.UNCHANGED.getValue());
+-
+-        setCyclingNetworkPreference("deprecated", PriorityCode.AVOID_AT_ALL_COSTS.getValue());*/
+-
+         setAvoidSpeedLimit(81);
+     }
+ 
+@@ -247,10 +234,6 @@ public int defineWayBits( int index, int shift )
+         wayTypeEncoder = new EncodedValue("WayType", shift, 4, 1, 0, 15, true);
+         shift += wayTypeEncoder.getBits();
+ 
+-        // 3 bits to store preference on specific ways
+-        //priorityWayEncoder = new EncodedValue("PreferWay", shift, 3, 1, 0, 7);
+-        //shift += priorityWayEncoder.getBits();
+-
+         // 6 bits to store incline
+         inclineSlopeEncoder = new EncodedDoubleValue("InclineSlope", shift, 6, 1, 0, 40, true);
+         shift += inclineSlopeEncoder.getBits();
+@@ -281,10 +264,12 @@ public long reverseFlags( long flags )
+ 
+         // swap slopes
+         double incValue = inclineSlopeEncoder.getDoubleValue(flags);
+-        flags = inclineSlopeEncoder.setDoubleValue(flags, declineSlopeEncoder.getDoubleValue(flags));
++        double decValue = declineSlopeEncoder.getDoubleValue(flags);
++        flags = inclineSlopeEncoder.setDoubleValue(flags, decValue);
+         double inclineDistPercentage = 100 - inclineDistancePercentageEncoder.getDoubleValue(flags);
+         flags = inclineDistancePercentageEncoder.setDoubleValue(flags, inclineDistPercentage);
+-        return declineSlopeEncoder.setDoubleValue(flags, incValue);
++        flags = declineSlopeEncoder.setDoubleValue(flags, incValue);
++        return flags;
+     }
+ 
+     @Override
+@@ -316,7 +301,7 @@ public long acceptWay( OSMWay way )
+             return acceptBit;
+ 
+         // accept only if explicitely tagged for bike usage
+-        if ("motorway".equals(highwayValue) || "motorway_link".equals(highwayValue))
++        if ("motorway".equals(highwayValue) || "motorway_link".equals(highwayValue) || "trunk".equals(highwayValue) || "trunk_link".equals(highwayValue))
+             return 0;
+ 
+         if (way.hasTag("motorroad", "yes"))
+@@ -337,9 +322,6 @@ public long acceptWay( OSMWay way )
+         String sacScale = way.getTag("sac_scale");
+         if (sacScale != null)
+         {
+-            if ((way.hasTag("highway", "cycleway"))
+-                    && (way.hasTag("sac_scale", "hiking")))
+-                return acceptBit;
+             if (!allowedSacScale(sacScale))
+                 return 0;
+         }
+@@ -351,7 +333,7 @@ boolean allowedSacScale( String sacScale )
+         // other scales are nearly impossible by an ordinary bike, see http://wiki.openstreetmap.org/wiki/Key:sac_scale
+         // Mountainhiking may be possible for downhill racers
+         return "hiking".equals(sacScale) || "mountain_hiking".equals(sacScale)
+-                || "demanding_mountain_hiking".equals(sacScale) || "alpine_hiking".equals(sacScale);
++                || "demanding_mountain_hiking".equals(sacScale);
+     }
+ 
+     @Override
+@@ -373,8 +355,6 @@ else if (network.equalsIgnoreCase("rcn"))
+                     code = BicycleNetworkCode.REGIONAL_CYCLING_ROUTES.getValue();
+                 else if (network.equalsIgnoreCase("lcn"))
+                     code = BicycleNetworkCode.LOCAL_CYCLING_ROUTES.getValue();
+-                else if (network.equalsIgnoreCase("mtb"))
+-                    code = BicycleNetworkCode.MOUNTAIN_BIKE_ROUTE.getValue();
+                 else if (network.equalsIgnoreCase("deprecated"))
+                     code = BicycleNetworkCode.DEPRECATED.getValue();
+             }
+@@ -420,7 +400,7 @@ public long handleWayTags( OSMWay way, long allowed, long relationFlags )
+             encoded = handleFerryTags(way,
+                     getWayTypeSpeed(WayType.SMALL_WAY_UNPAVED.getValue()),
+                     getWayTypeSpeed(WayType.SMALL_WAY_PAVED.getValue()),
+-                    getWayTypeSpeed(WayType.PRIMARY_ROAD.getValue()));
++                    getWayTypeSpeed(WayType.ROAD.getValue()));
+             encoded |= directionBitMask;
+         }
+         /*int priorityFromRelation = 0;
+@@ -493,117 +473,6 @@ String getWayName(int wayType, Translation tr )
+         return wayTypeName;
+     }
+ 
+-    /**
+-     * In this method we prefer cycleways or roads with designated bike access and avoid big roads
+-     * or roads with trams or pedestrian.
+-     * <p>
+-     * @return new priority based on priorityFromRelation and on the tags in OSMWay.
+-     */
+-    protected int handlePriority( OSMWay way, int priorityFromRelation )
+-    {
+-        TreeMap<Double, Integer> weightToPrioMap = new TreeMap<Double, Integer>();
+-        if (priorityFromRelation == 0)
+-            weightToPrioMap.put(0d, UNCHANGED.getValue());
+-        else
+-            weightToPrioMap.put(110d, priorityFromRelation);
+-
+-        collect(way, weightToPrioMap);
+-
+-        // pick priority with biggest order value
+-        return weightToPrioMap.lastEntry().getValue();
+-    }
+-
+-    // Conversion of class value to priority. See http://wiki.openstreetmap.org/wiki/Class:bicycle
+-    private PriorityCode convertCallValueToPriority( String tagvalue )
+-    {
+-        int classvalue;
+-        try
+-        {
+-            classvalue = Integer.parseInt(tagvalue);
+-        } catch (NumberFormatException e)
+-        {
+-            return PriorityCode.UNCHANGED;
+-        }
+-
+-        switch (classvalue)
+-        {
+-            case 3:
+-                return PriorityCode.BEST;
+-            case 2:
+-                return PriorityCode.VERY_NICE;
+-            case 1:
+-                return PriorityCode.PREFER;
+-            case 0:
+-                return PriorityCode.UNCHANGED;
+-            case -1:
+-                return PriorityCode.AVOID_IF_POSSIBLE;
+-            case -2:
+-                return PriorityCode.REACH_DEST;
+-            case -3:
+-                return PriorityCode.AVOID_AT_ALL_COSTS;
+-            default:
+-                return PriorityCode.UNCHANGED;
+-        }
+-    }
+-
+-    /**
+-     * @param weightToPrioMap associate a weight with every priority. This sorted map allows
+-     * subclasses to 'insert' more important priorities as well as overwrite determined priorities.
+-     */
+-    void collect( OSMWay way, TreeMap<Double, Integer> weightToPrioMap )
+-    {
+-        String service = way.getTag("service");
+-        String highway = way.getTag("highway");
+-        if (way.hasTag("bicycle", "designated"))
+-            weightToPrioMap.put(100d, PREFER.getValue());
+-        if ("cycleway".equals(highway))
+-            weightToPrioMap.put(100d, VERY_NICE.getValue());
+-
+-        double maxSpeed = getMaxSpeed(way);
+-        if (preferHighwayTags.contains(highway) || maxSpeed > 0 && maxSpeed <= 30)
+-        {
+-            if (maxSpeed < avoidSpeedLimit)
+-            {
+-                weightToPrioMap.put(40d, PREFER.getValue());
+-                if (way.hasTag("tunnel", intendedValues))
+-                    weightToPrioMap.put(40d, UNCHANGED.getValue());
+-            }
+-        } else
+-        {
+-            if (avoidHighwayTags.contains(highway)
+-                    || maxSpeed >= avoidSpeedLimit && !"track".equals(highway))
+-            {
+-                weightToPrioMap.put(50d, REACH_DEST.getValue());
+-                if (way.hasTag("tunnel", intendedValues))
+-                    weightToPrioMap.put(50d, AVOID_AT_ALL_COSTS.getValue());
+-            }
+-        }
+-
+-        if (pushingSections.contains(highway)
+-                || way.hasTag("bicycle", "use_sidepath")
+-                || "parking_aisle".equals(service))
+-        {
+-            if (way.hasTag("bicycle", "yes"))
+-                weightToPrioMap.put(100d, UNCHANGED.getValue());
+-            else
+-                weightToPrioMap.put(50d, AVOID_IF_POSSIBLE.getValue());
+-        }
+-
+-        if (way.hasTag("railway", "tram"))
+-            weightToPrioMap.put(50d, AVOID_AT_ALL_COSTS.getValue());
+-
+-        String classBicycleSpecific = way.getTag(specificBicycleClass);
+-        if (classBicycleSpecific != null)
+-        {
+-            // We assume that humans are better in classifying preferences compared to our algorithm above -> weight = 100
+-            weightToPrioMap.put(100d, convertCallValueToPriority(classBicycleSpecific).getValue());
+-        } else
+-        {
+-            String classBicycle = way.getTag("class:bicycle");
+-            if (classBicycle != null)
+-                weightToPrioMap.put(100d, convertCallValueToPriority(classBicycle).getValue());
+-        }
+-    }
+ 
+     /**
+      * Handle surface and wayType encoding
+@@ -621,23 +490,23 @@ long handleBikeRelated( OSMWay way, long encoded, long partOfCycleRelation )
+         WayType wayType = WayType.SMALL_WAY_PAVED;
+         boolean isPushingSection = isPushingSection(way);
+ 
+-        if (isPushingSection && !(partOfCycleRelation > BicycleNetworkCode.FERRY.getValue()) || "steps".equals(highway) || "ice".equals(surfaceTag))
++        if (isPushingSection && !(partOfCycleRelation > BicycleNetworkCode.FERRY.getValue()) || "ice".equals(surfaceTag))
+             wayType = WayType.PUSHING_SECTION;
+-        else if ("primary".equals(highway) || "primary_link".equals(highway))
+-            wayType = WayType.PRIMARY_ROAD;
+-        else if ("secondary".equals(highway) || "secondary_link".equals(highway))
+-            wayType = WayType.SECONDARY_ROAD;
++        else if ("motorway".equals(highway) || "motorway_link".equals(highway) || "trunk".equals(highway) || "trunk_link".equals(highway))
++            wayType = WayType.MOTORWAY;
++        else if ("primary".equals(highway) || "primary_link".equals(highway) || "secondary".equals(highway) || "secondary_link".equals(highway))
++            wayType = WayType.ROAD;
+         else if ("tertiary".equals(highway) || "tertiary_link".equals(highway))
+             wayType = WayType.TERTIARY_ROAD;
+         else if ("unclassified".equals(highway)) {
+-            if (!pavedSurfaceTags.contains(surfaceTag))
++            if (unpavedSurfaceTags.contains(surfaceTag) || (trackType != null && !trackType.equals("grade1")))
+                 wayType = WayType.UNCLASSIFIED_UNPAVED;
+             else
+                 wayType = WayType.UNCLASSIFIED_PAVED;
+         }
+         else if ("residential".equals(highway) || "living_street".equals(highway) || "service".equals(highway)){
+ 
+-            if(unpavedSurfaceTags.contains(surfaceTag))
++            if(unpavedSurfaceTags.contains(surfaceTag) || (trackType != null && !trackType.equals("grade1")))
+                 wayType = WayType.SMALL_WAY_UNPAVED;
+             else
+                 wayType = WayType.SMALL_WAY_PAVED;
+@@ -651,17 +520,17 @@ else if (("grade2".equals(trackType) || "grade3".equals(trackType)) && (surfaceT
+                 wayType = WayType.TRACK_EASY;
+         }
+         else if ("path".equals(highway)) {
+-            if("horrible".equals(smoothness) || "very_horrible".equals(smoothness) || "mountain_hiking".equals(sacScale) || "4".equals(mtbScale) || "5".equals(mtbScale))
++            if("horrible".equals(smoothness) || "very_horrible".equals(smoothness) || "demanding_mountain_hiking".equals(sacScale) || "mountain_hiking".equals(sacScale) || "4".equals(mtbScale) || "5".equals(mtbScale))
+                 wayType = WayType.PATH_HARD;
+-            else if("bad".equals(smoothness) || "very_bad".equals(smoothness) || "hiking".equals(sacScale) || "1".equals(mtbScale) || "3".equals(mtbScale) && !pavedSurfaceTags.contains(surfaceTag) && !way.hasTag("bicycle", intendedValues))
++            else if("bad".equals(smoothness) || "very_bad".equals(smoothness) || "hiking".equals(sacScale) || "1".equals(mtbScale) || "2".equals(mtbScale) || "3".equals(mtbScale) && !pavedSurfaceTags.contains(surfaceTag) && !way.hasTag("bicycle", intendedValues))
+                 wayType = WayType.PATH_MIDDLE;
+             else
+                 wayType = WayType.PATH_EASY;
+         }
+ 
+-        if(partOfCycleRelation == BicycleNetworkCode.MOUNTAIN_BIKE_ROUTE.getValue()){
++        if(partOfCycleRelation == BicycleNetworkCode.MOUNTAIN_BIKE_ROUTE.getValue() || (way.hasTag("bicycle", "designated") && !pavedSurfaceTags.contains(surfaceTag))){
+             wayType = WayType.MTB_CYCLEWAY;
+-        } else if ("cycleway".equals(highway) || (partOfCycleRelation > BicycleNetworkCode.FERRY.getValue()))
++        } else if ("cycleway".equals(highway) || way.hasTag("bicycle", "designated") || (partOfCycleRelation > BicycleNetworkCode.FERRY.getValue()))
+         {
+             wayType = WayType.CYCLEWAY;
+         }
+@@ -806,12 +675,12 @@ protected long handleSpeed( OSMWay way, double speed, long encoded )
+ 
+     protected enum WayType
+     {
+-        PRIMARY_ROAD(0),
+-        SECONDARY_ROAD(1),
++        MOTORWAY(0),
++        ROAD(1),
+         TERTIARY_ROAD(2),
+         UNCLASSIFIED_PAVED(3),
+-        UNCLASSIFIED_UNPAVED(4),
+-        SMALL_WAY_PAVED(5),
++        SMALL_WAY_PAVED(4),
++        UNCLASSIFIED_UNPAVED(5),
+         SMALL_WAY_UNPAVED(6),
+         TRACK_EASY(7),
+         TRACK_MIDDLE(8),
+@@ -841,7 +710,7 @@ protected void setWayTypeSpeed(int wayType, int speed)
+         wayTypeSpeeds.put(wayType, speed);
+     }
+ 
+-    protected int getWayTypeSpeed( int wayType )
++    public int getWayTypeSpeed( int wayType )
+     {
+         return wayTypeSpeeds.get(wayType);
+     }
+@@ -867,7 +736,7 @@ public boolean supports( Class<?> feature )
+         if (super.supports(feature))
+             return true;
+ 
+-        return PriorityWeighting.class.isAssignableFrom(feature);
++        return DynamicWeighting.class.isAssignableFrom(feature);
+     }
+ 
+     public void setAvoidSpeedLimit( int limit )
+@@ -887,6 +756,6 @@ public double getWayType( long flags) {
+     @Override
+     public String toString()
+     {
+-        return "generic_bike";
++        return "genbike";
+     }
+ }
+diff --git a/core/src/main/java/com/graphhopper/routing/util/DynamicWeighting.java b/core/src/main/java/com/graphhopper/routing/util/DynamicWeighting.java
+index 8e599ec7e0..83162676dd 100644
+--- a/core/src/main/java/com/graphhopper/routing/util/DynamicWeighting.java
++++ b/core/src/main/java/com/graphhopper/routing/util/DynamicWeighting.java
+@@ -22,11 +22,8 @@
+ import com.graphhopper.util.Helper;
+ import com.graphhopper.util.PMap;
+ import com.graphhopper.util.profiles.ProfileManager;
+-import com.graphhopper.util.profiles.RidersProfile;
+ 
+-import java.util.Map;
+-
+-import static com.graphhopper.util.Helper.keepIn;
++import java.util.Set;
+ 
+ /**
+  * Special weighting for (motor)bike
+@@ -40,7 +37,9 @@
+     final static double DEFAULT_HEADING_PENALTY = 300; //[s]
+     private final double heading_penalty;
+     protected final FlagEncoder flagEncoder;
+-    protected RidersProfile profile;
++    protected SpeedProvider speedProvider;
++    protected PreferenceProvider preferenceProvider;
++    protected ProfileManager profileManager;
+ 
+     /**
+      * For now used only in BikeGenericFlagEncoder
+@@ -51,28 +50,33 @@
+     public static final int WAY_TYPE_KEY = 105;
+ 
+ 
+-    public DynamicWeighting(FlagEncoder encoder, PMap pMap)
++    public DynamicWeighting(FlagEncoder encoder, PMap pMap, ProfileManager profileManager)
+     {
+         if (!encoder.isRegistered())
+             throw new IllegalStateException("Make sure you add the FlagEncoder " + encoder + " to an EncodingManager before using it elsewhere");
+ 
+         this.flagEncoder = encoder;
+         heading_penalty = pMap.getDouble("heading_penalty", DEFAULT_HEADING_PENALTY);
+-        String user = pMap.get("profile", "");
+-        profile = new ProfileManager().getProfile(user);
+ 
++        this.profileManager = profileManager;
++
++        if(profileManager != null && profileManager.hasProfile()) {
++            this.speedProvider = new ProfileSpeedProvider(encoder, profileManager);
++            this.preferenceProvider = new ProfilePreferenceProvider(profileManager);
++        } else {
++            this.speedProvider = new EncoderSpeedProvider(encoder);
++            this.preferenceProvider = new GenericPreferenceProvider();
++        }
+     }
+ 
+     public DynamicWeighting(FlagEncoder encoder)
+     {
+-        this(encoder, new PMap(0));
++        this(encoder, new PMap(0), null);
+     }
+ 
+     @Override
+     public double calcWeight( EdgeIteratorState edgeState, boolean reverse, int prevOrNextEdgeId )
+     {
+-        SpeedProvider speedProvider = new ProfileSpeedProvider(flagEncoder, profile);
+-
+         double speed = speedProvider.calcSpeed(edgeState, reverse);
+ 
+         if (speed == 0)
+@@ -85,39 +89,42 @@ public double calcWeight( EdgeIteratorState edgeState, boolean reverse, int prev
+         if (penalizeEdge)
+             time += heading_penalty;
+ 
+-        return time / (0.5 + getUserPreference(edgeState));
++        System.out.println("ID: " + edgeState.getEdge() + ", REVERSE: " + reverse + ", TIME: " + time);
++
++        return time / Math.pow((0.5 + getEdgePreference(edgeState, reverse)), 2);
+     }
+ 
+-    private double getUserPreference(EdgeIteratorState edgeState) {
++    protected double getEdgePreference(EdgeIteratorState edgeState, boolean reverse) {
+ 
+         int wayType = (int) flagEncoder.getDouble(edgeState.getFlags(), DynamicWeighting.WAY_TYPE_KEY);
+         int priority = PriorityCode.UNCHANGED.getValue();
+-
+-        double incElevation = flagEncoder.getDouble(edgeState.getFlags(), DynamicWeighting.INC_SLOPE_KEY) / 100;
+         double incDistPercentage = flagEncoder.getDouble(edgeState.getFlags(), DynamicWeighting.INC_DIST_PERCENTAGE_KEY) / 100;
+-        double incDist2DSum = edgeState.getDistance() * incDistPercentage;
+-
+-        if(wayType == 13 || wayType == 14)
+-            priority = PriorityCode.BEST.getValue();
+-        else if(wayType >= 10 && wayType <= 12) {
+-
+-            priority = PriorityCode.AVOID_IF_POSSIBLE.getValue();
+-
+-            if(incDist2DSum > 10 && incElevation > 0.02) {
+-                priority = PriorityCode.AVOID_AT_ALL_COSTS.getValue();
+-                //System.out.println(wayType + ": elevation: " + incElevation + ": " + incDist2DSum);
+-
+-                if(incElevation > 0.1){
+-                    priority = PriorityCode.WORST.getValue();
+-                }
+-            }
+-        } else if (wayType >= 2 && wayType <= 6){
+-            priority = PriorityCode.PREFER.getValue();
+-        } else if (wayType == 15){
+-            priority = PriorityCode.WORST.getValue();
++        boolean pavedSurface = ((wayType >= 1 && wayType <= 4) || wayType == 7 || wayType == 13);
++
++        double incSlope;
++        double incDist2DSum;
++        double decSlope;
++        double decDist2DSum;
++
++        if(reverse){
++            incSlope = flagEncoder.getDouble(edgeState.getFlags(), DynamicWeighting.DEC_SLOPE_KEY) / 100;
++            decSlope = flagEncoder.getDouble(edgeState.getFlags(), DynamicWeighting.INC_SLOPE_KEY) / 100;
++            incDistPercentage = 1.0 - incDistPercentage;
++        } else {
++            incSlope = flagEncoder.getDouble(edgeState.getFlags(), DynamicWeighting.INC_SLOPE_KEY) / 100;
++            decSlope = flagEncoder.getDouble(edgeState.getFlags(), DynamicWeighting.DEC_SLOPE_KEY) / 100;
+         }
+ 
+-        return (double) priority / PriorityCode.BEST.getValue();
++        incDist2DSum = edgeState.getDistance() * incDistPercentage;
++        decDist2DSum = edgeState.getDistance() - incDist2DSum;
++
++        priority += preferenceProvider.calcWayTypePreference(wayType);
++        priority += preferenceProvider.calcSurfacePreference(pavedSurface);
++        priority += preferenceProvider.calcSlopePreference(wayType, incSlope, incDist2DSum, decSlope, decDist2DSum);
++
++        //System.out.println("ID: " + edgeState.getEdge() + ", REVERSE: " + reverse +", WAYTYPE: " + wayType + ", INC SLOPE: " + incSlope + ", DEC SLOPE: " + decSlope +", PRIORITY: " + Helper.keepIn(priority, PriorityCode.WORST.getValue(), PriorityCode.BEST.getValue()));
++
++        return Helper.keepIn(priority, PriorityCode.WORST.getValue(), PriorityCode.BEST.getValue()) / PriorityCode.BEST.getValue();
+ 
+     }
+ 
+diff --git a/core/src/main/java/com/graphhopper/routing/util/EncoderSpeedProvider.java b/core/src/main/java/com/graphhopper/routing/util/EncoderSpeedProvider.java
+new file mode 100644
+index 0000000000..31c6450710
+--- /dev/null
++++ b/core/src/main/java/com/graphhopper/routing/util/EncoderSpeedProvider.java
+@@ -0,0 +1,57 @@
++package com.graphhopper.routing.util;
++
++import com.graphhopper.util.EdgeIteratorState;
++import com.graphhopper.util.Helper;
++
++import static com.graphhopper.util.Helper.keepIn;
++
++public class EncoderSpeedProvider implements SpeedProvider {
++
++    protected FlagEncoder encoder;
++
++    public EncoderSpeedProvider(FlagEncoder encoder){
++        this.encoder = encoder;
++    }
++
++    @Override
++    public double calcSpeed(EdgeIteratorState edgeIteratorState, boolean reverse) {
++        double speed = encoder.getSpeed(edgeIteratorState.getFlags());
++
++        if (speed == 0)
++            return 0;
++
++        return adjustSpeed(speed, edgeIteratorState, reverse);
++    }
++
++    protected double adjustSpeed(double speed, EdgeIteratorState edgeState, boolean reverse) {
++
++        double incElevation = encoder.getDouble(edgeState.getFlags(), DynamicWeighting.INC_SLOPE_KEY) / 100;
++        double decElevation = encoder.getDouble(edgeState.getFlags(), DynamicWeighting.DEC_SLOPE_KEY) / 100;
++        double incDistPercentage = encoder.getDouble(edgeState.getFlags(), DynamicWeighting.INC_DIST_PERCENTAGE_KEY) / 100;
++
++        double adjustedSpeed = speed;
++
++        if(reverse)
++        {
++            incElevation = decElevation;
++            decElevation = encoder.getDouble(edgeState.getFlags(), DynamicWeighting.INC_SLOPE_KEY) / 100;
++            incDistPercentage = 1.0 - incDistPercentage;
++        }
++
++        //System.out.println("ID: " + edgeState.getEdge() + ", REVERSE: " + reverse + ", INC SLOPE: " + incElevation + ", DEC SLOPE: " + decElevation);
++
++        // use weighted mean so that longer incline infuences speed more than shorter
++        double fwdFaster = 1 + 30 * keepIn(decElevation, 0, 0.2);
++        fwdFaster = Math.sqrt(fwdFaster);
++        double fwdSlower = 1 - 5 * keepIn(incElevation, 0, 0.2);
++        fwdSlower = fwdSlower * fwdSlower;
++        double incDist2DSum = edgeState.getDistance() * incDistPercentage;
++        double decDist2DSum = edgeState.getDistance() - incDist2DSum;
++        adjustedSpeed = keepIn(speed * (fwdSlower * incDist2DSum + fwdFaster * decDist2DSum) / edgeState.getDistance(), BikeGenericFlagEncoder.PUSHING_SECTION_SPEED / 2, 50);
++
++        //System.out.println("NEW SPEED: " + Helper.round2(adjustedSpeed) + ", SPEED: " + speed + ", INC ELE: " + incElevation + ", DEC ELE: " + decElevation + ", PERCENTAGE: " + incDistPercentage + " CORRECT:");
++
++        return adjustedSpeed;
++    }
++
++}
+diff --git a/core/src/main/java/com/graphhopper/routing/util/GenericPreferenceProvider.java b/core/src/main/java/com/graphhopper/routing/util/GenericPreferenceProvider.java
+new file mode 100644
+index 0000000000..9422e72b1f
+--- /dev/null
++++ b/core/src/main/java/com/graphhopper/routing/util/GenericPreferenceProvider.java
+@@ -0,0 +1,96 @@
++package com.graphhopper.routing.util;
++
++
++public class GenericPreferenceProvider implements PreferenceProvider {
++
++    @Override
++    public int calcWayTypePreference(int wayType) {
++        int preference = 0;
++
++        switch (wayType) {
++
++            case 0:
++                preference = -4;
++                break;
++            case 1:
++                preference = 0;
++                break;
++            case 2:
++                preference = 1;
++                break;
++            case 3:
++                preference = 1;
++                break;
++            case 4:
++                preference = 1;
++                break;
++            case 5:
++                preference = 1;
++                break;
++            case 6:
++                preference = 1;
++                break;
++            case 7:
++                preference = 0;
++                break;
++            case 8:
++                preference = -1;
++                break;
++            case 9:
++                preference = -1;
++                break;
++            case 10:
++                preference = -1;
++                break;
++            case 11:
++                preference = -2;
++                break;
++            case 12:
++                preference = -2;
++                break;
++            case 13:
++                preference = 3;
++                break;
++            case 14:
++                preference = 3;
++                break;
++            case 15:
++                preference = -4;
++                break;
++        }
++
++        return preference;
++    }
++
++    @Override
++    public int calcSurfacePreference(boolean pavedSurface) {
++        int preference = -2;
++
++        //Paved surface way types
++        if(pavedSurface)
++            preference = 0;
++
++        return preference;
++    }
++
++    @Override
++    public int calcSlopePreference(int wayType, double incSlope, double incDist, double decSlope, double decDist) {
++        int preference = 0;
++
++        if(wayType >= 8 && wayType <=12){
++            if(incDist > 10 && incSlope > 0.03) {
++                preference = -2;
++            }
++
++            if(decDist > 10 && decSlope > 0.2) {
++                preference = -2;
++            }
++        }
++
++        if(incDist > 10 && incSlope > 0.2) {
++            preference = -2;
++        }
++
++        return preference;
++    }
++}
+diff --git a/core/src/main/java/com/graphhopper/routing/util/PreferenceProvider.java b/core/src/main/java/com/graphhopper/routing/util/PreferenceProvider.java
+new file mode 100644
+index 0000000000..ae9bedce59
+--- /dev/null
++++ b/core/src/main/java/com/graphhopper/routing/util/PreferenceProvider.java
+@@ -0,0 +1,12 @@
++package com.graphhopper.routing.util;
++
++
++public interface PreferenceProvider {
++
++    int calcWayTypePreference(int wayType);
++
++    int calcSurfacePreference(boolean pavedSurface);
++
++    int calcSlopePreference(int wayType, double incSlope, double incDist, double decSlope, double decDist);
++
++}
+\ No newline at end of file
+diff --git a/core/src/main/java/com/graphhopper/routing/util/ProfilePreferenceProvider.java b/core/src/main/java/com/graphhopper/routing/util/ProfilePreferenceProvider.java
+new file mode 100644
+index 0000000000..19536eb039
+--- /dev/null
++++ b/core/src/main/java/com/graphhopper/routing/util/ProfilePreferenceProvider.java
+@@ -0,0 +1,50 @@
++package com.graphhopper.routing.util;
++
++
++import com.graphhopper.util.profiles.ProfileManager;
++
++public class ProfilePreferenceProvider extends GenericPreferenceProvider {
++
++    ProfileManager profileManager;
++
++    public ProfilePreferenceProvider(ProfileManager profileManager){
++        this.profileManager = profileManager;
++    }
++
++    @Override
++    public int calcWayTypePreference(int wayType) {
++        int preference = 0;
++
++        //Special treatment for nogos and bike tracks
++        if(wayType == 0 || wayType == 15)
++            return -4;
++        else if(wayType == 13 || wayType == 14)
++            return 3;
++
++        if(profileManager.getWayTypePreference(wayType) >= 0.5)
++            preference = 2;
++        else if(profileManager.getWayTypePreference(wayType) >= 0.2)
++            preference = 1;
++        else if(profileManager.getWayTypePreference(wayType) >= 0.05)
++            preference = 0;
++        else
++            preference = -1;
++
++        return preference;
++    }
++
++    @Override
++    public int calcSurfacePreference(boolean pavedSurface) {
++        int preference = 0;
++
++        if(profileManager.prefersPavedSurface() && !pavedSurface)
++            preference = -2;
++        else if(!profileManager.prefersPavedSurface() && pavedSurface)
++            preference = -2;
++
++        //System.out.println("PREFERENCE: " + preference + ", profileManager: " + profileManager.prefersPavedSurface());
++
++        return preference;
++    }
++
++}
+diff --git a/core/src/main/java/com/graphhopper/routing/util/ProfileSpeedProvider.java b/core/src/main/java/com/graphhopper/routing/util/ProfileSpeedProvider.java
+index a5994af5a8..a00971a5ef 100644
+--- a/core/src/main/java/com/graphhopper/routing/util/ProfileSpeedProvider.java
++++ b/core/src/main/java/com/graphhopper/routing/util/ProfileSpeedProvider.java
+@@ -1,26 +1,18 @@
+ package com.graphhopper.routing.util;
+ 
+ import com.graphhopper.util.EdgeIteratorState;
++import com.graphhopper.util.profiles.ProfileManager;
+ import com.graphhopper.util.profiles.RidersProfile;
+ 
+-import java.util.Map;
+-
+ import static com.graphhopper.util.Helper.keepIn;
+ 
+-public class ProfileSpeedProvider implements SpeedProvider {
+-
+-    protected final static double SPEED_CONV = 3.6;
+-    protected final FlagEncoder encoder;
+-    private final double maxSpeed;
+-    private Map<Integer, double[]> userSpeeds;
++public class ProfileSpeedProvider extends EncoderSpeedProvider {
+ 
++    private ProfileManager profileManager;
+ 
+-    public ProfileSpeedProvider(FlagEncoder flagEncoder, RidersProfile ridersProfile){
+-        this.encoder = flagEncoder;
+-        maxSpeed = encoder.getMaxSpeed() / SPEED_CONV;
+-
+-        if(ridersProfile != null)
+-            this.userSpeeds = ridersProfile.getFilterSpeeds();
++    public ProfileSpeedProvider(FlagEncoder flagEncoder, ProfileManager profileManager){
++        super(flagEncoder);
++        this.profileManager = profileManager;
+     }
+ 
+     @Override
+@@ -33,76 +25,39 @@ private double getUserSpeed(EdgeIteratorState edgeState, boolean reverse){
+         double speed = 0;
+         int wayType = (int) encoder.getDouble(edgeState.getFlags(), DynamicWeighting.WAY_TYPE_KEY);
+ 
+-        if(userSpeeds != null){
+-            double[] speeds = userSpeeds.get(wayType);
+-            if(speeds != null){
+-
+-                int incElevation = (int)encoder.getDouble(edgeState.getFlags(), DynamicWeighting.INC_SLOPE_KEY);
+-                int decElevation = (int)encoder.getDouble(edgeState.getFlags(), DynamicWeighting.DEC_SLOPE_KEY);
+-                double incDistPercentage = encoder.getDouble(edgeState.getFlags(), DynamicWeighting.INC_DIST_PERCENTAGE_KEY) / 100;
++        if(profileManager.hasFilteredSpeeds()){
+ 
+-                int incIndex = incElevation > RidersProfile.SLOPES / 2 ? RidersProfile.SLOPES : RidersProfile.SLOPES / 2 + incElevation;
+-                int decIndex = decElevation > RidersProfile.SLOPES / 2 ? 0 : RidersProfile.SLOPES / 2 - decElevation;
++            int incElevation;
++            int decElevation;
++            double incDistPercentage;
+ 
+-                double incSpeed = speeds[incIndex];
+-                double decSpeed = speeds[decIndex];
++            if(reverse){
++                incElevation = (int) encoder.getDouble(edgeState.getFlags(), DynamicWeighting.DEC_SLOPE_KEY);
++                decElevation = (int) encoder.getDouble(edgeState.getFlags(), DynamicWeighting.INC_SLOPE_KEY);
++                incDistPercentage =  1 - (encoder.getDouble(edgeState.getFlags(), DynamicWeighting.INC_DIST_PERCENTAGE_KEY) / 100);
++            } else {
++                incElevation = (int) encoder.getDouble(edgeState.getFlags(), DynamicWeighting.INC_SLOPE_KEY);
++                decElevation = (int) encoder.getDouble(edgeState.getFlags(), DynamicWeighting.DEC_SLOPE_KEY);
++                incDistPercentage = encoder.getDouble(edgeState.getFlags(), DynamicWeighting.INC_DIST_PERCENTAGE_KEY) / 100;
++            }
+ 
+-                double incDist2DSum = edgeState.getDistance() * incDistPercentage;
+-                double decDist2DSum = edgeState.getDistance() - incDist2DSum;
++            int incIndex = incElevation > RidersProfile.SLOPES / 2 ? RidersProfile.SLOPES : RidersProfile.SLOPES / 2 + incElevation;
++            int decIndex = decElevation > RidersProfile.SLOPES / 2 ? 0 : RidersProfile.SLOPES / 2 - decElevation;
+ 
+-                if (!reverse)
+-                {
+-                    speed = keepIn((incSpeed * incDist2DSum + decSpeed * decDist2DSum) / edgeState.getDistance(), BikeGenericFlagEncoder.PUSHING_SECTION_SPEED / 2, 50);
+-                } else {
+-                    speed = keepIn((decSpeed * incDist2DSum + incSpeed * decDist2DSum) / edgeState.getDistance(), BikeGenericFlagEncoder.PUSHING_SECTION_SPEED / 2, 50);
+-                }
++            double incSpeed = profileManager.getSpeedPerSlope(wayType, incIndex, encoder.getSpeed(edgeState.getFlags()), (BikeGenericFlagEncoder) encoder);
++            double decSpeed = profileManager.getSpeedPerSlope(wayType, decIndex, encoder.getSpeed(edgeState.getFlags()), (BikeGenericFlagEncoder) encoder);
++            double incDist2DSum = edgeState.getDistance() * incDistPercentage;
++            double decDist2DSum = edgeState.getDistance() - incDist2DSum;
+ 
+-            }
++            speed = keepIn((incSpeed * incDist2DSum + decSpeed * decDist2DSum) / edgeState.getDistance(), BikeGenericFlagEncoder.PUSHING_SECTION_SPEED / 2, 50);
+ 
+         }
+ 
+         if(speed == 0){
+-            speed = encoder.getSpeed(edgeState.getFlags());
+-
+-            if (speed == 0)
+-                return 0;
+-
+-            speed = adjustSpeed(speed, edgeState, reverse);
++            speed = super.calcSpeed(edgeState, reverse);
+         }
+ 
+         return speed;
+     }
+ 
+-    private double adjustSpeed(double speed, EdgeIteratorState edgeState, boolean reverse) {
+-
+-        double incElevation = encoder.getDouble(edgeState.getFlags(), DynamicWeighting.INC_SLOPE_KEY) / 100;
+-        double decElevation = encoder.getDouble(edgeState.getFlags(), DynamicWeighting.DEC_SLOPE_KEY) / 100;
+-        double incDistPercentage = encoder.getDouble(edgeState.getFlags(), DynamicWeighting.INC_DIST_PERCENTAGE_KEY) / 100;
+-
+-        double incDist2DSum = edgeState.getDistance() * incDistPercentage;
+-        double decDist2DSum = edgeState.getDistance() - incDist2DSum;
+-
+-        double adjustedSpeed = speed;
+-
+-        if (!reverse)
+-        {
+-            // use weighted mean so that longer incline infuences speed more than shorter
+-            double fwdFaster = 1 + 30 * keepIn(decElevation, 0, 0.1);
+-            fwdFaster = Math.sqrt(fwdFaster);
+-            double fwdSlower = 1 - 5 * keepIn(incElevation, 0, 0.2);
+-            fwdSlower = fwdSlower * fwdSlower;
+-            adjustedSpeed = keepIn(speed * (fwdSlower * incDist2DSum + fwdFaster * decDist2DSum) / edgeState.getDistance(), BikeGenericFlagEncoder.PUSHING_SECTION_SPEED / 2, 50);
+-        } else {
+-            double fwdFaster = 1 + 30 * keepIn(incElevation, 0, 0.1);
+-            fwdFaster = Math.sqrt(fwdFaster);
+-            double fwdSlower = 1 - 5 * keepIn(decElevation, 0, 0.2);
+-            fwdSlower = fwdSlower * fwdSlower;
+-            adjustedSpeed = keepIn(speed * (fwdSlower * decDist2DSum + fwdFaster * incDist2DSum) / edgeState.getDistance(), BikeGenericFlagEncoder.PUSHING_SECTION_SPEED / 2, 50);
+-        }
+-
+-        //System.out.println("NEW SPEED: " + Helper.round2(adjustedSpeed) + ", SPEED: " + speed + ", INC ELE: " + incElevation + ", DEC ELE: " + decElevation + ", PERCENTAGE: " + incDistPercentage);
+-
+-        return adjustedSpeed;
+-    }
+-
+ }
+diff --git a/core/src/main/java/com/graphhopper/util/SimpleKalmanFilter.java b/core/src/main/java/com/graphhopper/util/SimpleKalmanFilter.java
+index fbed3f55ea..8e23664515 100644
+--- a/core/src/main/java/com/graphhopper/util/SimpleKalmanFilter.java
++++ b/core/src/main/java/com/graphhopper/util/SimpleKalmanFilter.java
+@@ -86,6 +86,8 @@ private void kalman(final double[] originalMeasurements, int estimatesIndex, int
+         double xPrior = 1 * estimates[estimatesIndex];
+         double pPrior = error[estimatesIndex] + getQ(originalIndex, originalMeasurements.length);
+ 
++        //System.out.println(getQ(originalIndex, originalMeasurements.length));
++
+         // Measurement update
+         double kalmanGain = pPrior / (pPrior + r);
+ 
+@@ -94,6 +96,8 @@ private void kalman(final double[] originalMeasurements, int estimatesIndex, int
+ 
+         double error = (1 - kalmanGain) * pPrior;
+         this.error[followIndex] = error;
++
++        //System.out.println(Helper.round2(originalMeasurements[originalIndex]) + " & " + Helper.round2(xPrior) + " & " + Helper.round2(pPrior) + " & " + Helper.round2(kalmanGain) + " & " + Helper.round2(estimate) + " & " + Helper.round2(error) + " \\\\");
+     }
+ 
+     @Override
+@@ -142,7 +146,13 @@ public static void main(String[] args) {
+         //double data2[] = {0.45, 0.41, 0.48, 0.34, 0.320, 0.25, 0.29, 0.48, 0.5, 0.390};
+         //double data[] = {1009.0, 1009.0, 1009.0, 1009.0, 1009.0, 1009.0, 1012.0, 1017.0, 1017.0, 1024.0, 1024.0, 1023.0, 1022.0, 1026.0, 1028.0, 1029.0, 1031.0, 1031.0, 1033.0, 1038.0, 1041.0, 1041.0, 1041.0, 1041.0, 1043.0, 1048.0, 1056.0, 1061.0, 1061.0, 1067.0, 1071.0, 1071.0, 1070.0, 1070.0, 1069.0, 1072.0, 1075.0, 1080.0, 1076.0, 1076.0, 1076.0, 1076.0, 1076.0, 1081.0, 1085.0, 1085.0, 1085.0, 1088.0, 1088.0, 1088.0, 1088.0, 1091.0, 1091.0, 1091.0, 1090.0, 1090.0, 1090.0, 1090.0, 1090.0, 1090.0, 1090.0, 1091.0, 1092.0, 1092.0, 1092.0, 1095.0, 1098.0, 1098.0, 1098.0, 1098.0, 1098.0, 1098.0, 1098.0, 1100.0, 1102.0, 1103.0, 1104.0, 1108.0, 1109.0, 1109.0, 1111.0, 1114.0, 1116.0, 1119.0, 1119.0, 1119.0, 1127.0, 1132.0, 1132.0, 1132.0, 1132.0, 1139.0, 1150.0, 1150.0, 1150.0, 1154.0, 1154.0, 1154.0, 1158.0, 1158.0, 1158.0, 1158.0, 1158.0, 1158.0, 1158.0, 1160.0, 1159.0, 1160.0, 1162.0, 1162.0, 1162.0, 1162.0, 1162.0, 1159.0, 1159.0, 1159.0, 1159.0, 1159.0, 1166.0, 1166.0, 1166.0, 1166.0, 1175.0, 1175.0, 1175.0, 1175.0, 1175.0, 1175.0, 1172.0, 1172.0, 1182.0, 1181.0, 1188.0, 1193.0, 1192.0, 1192.0, 1192.0, 1198.0, 1195.0, 1195.0, 1200.0, 1197.0, 1202.0, 1199.0, 1206.0, 1203.0, 1204.0, 1204.0, 1204.0, 1204.0, 1209.0, 1209.0, 1209.0, 1209.0, 1209.0, 1206.0, 1206.0, 1206.0, 1211.0, 1213.0, 1210.0, 1206.0, 1208.0, 1206.0, 1210.0, 1210.0, 1214.0, 1220.0, 1226.0, 1230.0, 1230.0, 1228.0, 1228.0, 1229.0, 1229.0, 1234.0, 1234.0, 1232.0, 1238.0, 1237.0, 1243.0, 1248.0, 1245.0, 1250.0, 1254.0, 1254.0, 1258.0, 1266.0, 1264.0, 1270.0, 1266.0, 1273.0, 1280.0, 1292.0, 1292.0, 1292.0, 1292.0, 1292.0, 1292.0, 1292.0, 1297.0, 1303.0, 1303.0, 1299.0, 1308.0, 1306.0, 1306.0, 1309.0, 1311.0, 1317.0, 1317.0, 1319.0, 1330.0, 1330.0, 1330.0, 1330.0, 1330.0, 1330.0, 1325.0, 1319.0, 1330.0, 1330.0, 1330.0, 1330.0, 1330.0, 1330.0, 1322.0, 1322.0, 1322.0, 1335.0, 1333.0, 1343.0, 1341.0, 1340.0, 1340.0, 1343.0, 1348.0, 1346.0, 1355.0, 1355.0, 1356.0, 1363.0, 1362.0, 1362.0, 1365.0, 1365.0, 1368.0, 1368.0, 1372.0, 1372.0, 1376.0, 1376.0, 1390.0, 1383.0, 1383.0, 1383.0, 1383.0, 1383.0, 1380.0, 1380.0, 1380.0, 1380.0, 1379.0, 1379.0, 1379.0, 1379.0, 1379.0, 1379.0, 1379.0, 1379.0, 1379.0, 1384.0, 1382.0, 1382.0, 1382.0, 1382.0, 1374.0, 1394.0, 1399.0, 1387.0, 1388.0, 1378.0, 1393.0, 1391.0, 1391.0, 1388.0, 1388.0, 1393.0, 1398.0, 1408.0, 1408.0, 1408.0, 1408.0, 1408.0, 1408.0, 1408.0, 1422.0, 1400.0, 1412.0, 1412.0, 1426.0, 1400.0, 1415.0, 1428.0, 1429.0, 1429.0, 1439.0, 1439.0, 1439.0, 1425.0, 1425.0, 1425.0, 1434.0, 1434.0, 1432.0, 1432.0, 1432.0, 1428.0, 1428.0, 1438.0, 1428.0, 1424.0, 1436.0, 1445.0, 1443.0, 1451.0, 1455.0, 1451.0, 1451.0, 1443.0, 1443.0, 1452.0, 1468.0, 1475.0, 1464.0, 1472.0, 1465.0, 1465.0, 1465.0, 1465.0, 1475.0, 1469.0, 1476.0, 1478.0, 1478.0, 1479.0, 1489.0, 1489.0, 1488.0, 1489.0, 1489.0, 1498.0, 1498.0, 1498.0, 1503.0, 1502.0, 1501.0, 1490.0, 1498.0, 1502.0, 1510.0, 1527.0, 1510.0, 1524.0, 1513.0, 1513.0, 1519.0, 1501.0, 1506.0, 1506.0, 1506.0, 1501.0, 1504.0, 1511.0, 1530.0, 1537.0, 1537.0, 1537.0, 1540.0, 1540.0, 1540.0, 1540.0, 1540.0, 1540.0, 1539.0, 1539.0, 1539.0, 1539.0, 1539.0, 1539.0, 1539.0, 1539.0, 1525.0, 1524.0, 1524.0, 1535.0, 1558.0, 1564.0, 1552.0, 1552.0, 1558.0, 1565.0, 1560.0, 1560.0, 1560.0, 1560.0, 1560.0, 1567.0, 1567.0, 1567.0, 1572.0, 1557.0, 1559.0, 1559.0, 1559.0, 1563.0, 1563.0, 1563.0, 1580.0, 1578.0, 1578.0, 1578.0, 1578.0, 1578.0, 1587.0, 1586.0, 1580.0, 1587.0, 1581.0, 1585.0, 1579.0, 1592.0, 1589.0, 1589.0, 1589.0, 1589.0, 1575.0, 1597.0, 1597.0, 1597.0, 1597.0, 1597.0, 1597.0, 1595.0, 1595.0, 1595.0, 1607.0, 1607.0, 1607.0, 1599.0, 1593.0, 1601.0, 1597.0, 1601.0, 1610.0, 1612.0, 1615.0, 1617.0, 1609.0, 1609.0, 1609.0, 1620.0, 1626.0, 1631.0, 1631.0, 1635.0, 1635.0, 1635.0, 1635.0, 1635.0, 1635.0, 1635.0, 1635.0, 1635.0, 1635.0, 1635.0, 1640.0, 1640.0, 1640.0, 1630.0, 1635.0, 1637.0, 1638.0, 1640.0, 1630.0, 1636.0, 1644.0, 1652.0, 1655.0, 1648.0, 1656.0, 1656.0, 1670.0, 1675.0, 1672.0, 1672.0, 1679.0, 1681.0, 1681.0, 1681.0, 1683.0, 1685.0, 1694.0, 1681.0, 1681.0, 1681.0, 1687.0, 1673.0, 1684.0, 1697.0, 1697.0, 1702.0, 1701.0, 1703.0, 1702.0, 1705.0, 1706.0, 1715.0, 1718.0, 1713.0, 1716.0, 1723.0, 1723.0, 1724.0, 1724.0, 1727.0, 1729.0, 1729.0, 1739.0, 1739.0, 1734.0, 1734.0, 1736.0, 1741.0, 1741.0, 1743.0, 1745.0, 1745.0, 1745.0, 1745.0, 1745.0, 1745.0, 1745.0, 1745.0, 1745.0, 1745.0, 1745.0, 1753.0, 1751.0, 1756.0, 1763.0, 1764.0, 1765.0, 1765.0, 1767.0, 1768.0, 1769.0, 1775.0, 1775.0, 1777.0, 1783.0, 1785.0, 1790.0, 1790.0, 1795.0, 1789.0, 1791.0, 1792.0, 1795.0, 1799.0, 1800.0, 1805.0, 1804.0, 1804.0, 1806.0, 1812.0, 1815.0, 1812.0, 1818.0, 1821.0, 1825.0, 1830.0, 1834.0, 1836.0, 1838.0, 1838.0, 1842.0, 1842.0};
+ 
+-        SimpleKalmanFilter skf = new SimpleKalmanFilter(SimpleKalmanFilter.BACKWARD, 0.1, 0.05);
++        double thesisExample[] = {1009.0, 1009.0, 1009.0, 1012.0, 1017.0, 1017.0, 1024.0, 1024.0, 1023.0, 1022.0};
++
++
++        SimpleKalmanFilter filter = new SimpleKalmanFilter(SimpleKalmanFilter.FORWARD, 6, 1);
++        double[] result = filter.smooth(thesisExample);
++
++        /*SimpleKalmanFilter skf = new SimpleKalmanFilter(SimpleKalmanFilter.BACKWARD, 0.1, 0.05);
+         double[] result = skf.smooth(data1);
+ 
+         SimpleKalmanFilter skf2 = new SimpleKalmanFilter(SimpleKalmanFilter.FORWARD, 0.1, 0.05);
+@@ -158,7 +168,7 @@ public static void main(String[] args) {
+         for(int i = 0; i < data1.length; i++){
+             System.out.println("ORIGINAL: " + data1[i] + ", ESTIMATE: " + result3[i]);
+         }
+-
++        */
+ 
+     }
+ }
+diff --git a/core/src/main/java/com/graphhopper/util/profiles/GPXDataExtractor.java b/core/src/main/java/com/graphhopper/util/profiles/GPXDataExtractor.java
+index 043d2e7d78..91bc1d432c 100644
+--- a/core/src/main/java/com/graphhopper/util/profiles/GPXDataExtractor.java
++++ b/core/src/main/java/com/graphhopper/util/profiles/GPXDataExtractor.java
+@@ -27,8 +27,8 @@
+     private List<TrackPart> trackParts;
+     private MapMatching mapMatching;
+     private BikeGenericFlagEncoder encoder;
+-    private int filterType = FILTER_KALMAN_FORWARD;
+-    private int filterDistance = 100;
++    private int filterType = FILTER_KALMAN_COMBINED;
++    private int filterDistance = 60;
+ 
+     private double[] distances;
+     private double[] elevations;
+@@ -67,7 +67,7 @@ public void setupMapMatching(GraphHopper hopper){
+         // create MapMatching object, can and should be shared accross threads
+         GraphHopperStorage graph = hopper.getGraphHopperStorage();
+         LocationIndexMatch locationIndex = new LocationIndexMatch(graph, (LocationIndexTree) hopper.getLocationIndex());
+-        encoder = (BikeGenericFlagEncoder) hopper.getEncodingManager().getEncoder("generic_bike");
++        encoder = (BikeGenericFlagEncoder) hopper.getEncodingManager().getEncoder("genbike");
+ 
+         mapMatching = new MapMatching(graph, locationIndex, encoder);
+         mapMatching.setForceRepair(true);
+@@ -134,7 +134,6 @@ private void processGPXData(){
+             double secondLon = inputGPXEntries.get(i).getLon();
+ 
+             distances[i-1] = distCalc.calcDist(firstLat, firstLon, secondLat, secondLon);
+-            System.out.print(", " + distances[i-1]);
+             elevations[i] = inputGPXEntries.get(i).getEle();
+ 
+         }
+diff --git a/core/src/main/java/com/graphhopper/util/profiles/ProfileManager.java b/core/src/main/java/com/graphhopper/util/profiles/ProfileManager.java
+index 86d8c274cd..b0d81b44f5 100644
+--- a/core/src/main/java/com/graphhopper/util/profiles/ProfileManager.java
++++ b/core/src/main/java/com/graphhopper/util/profiles/ProfileManager.java
+@@ -1,124 +1,178 @@
+ package com.graphhopper.util.profiles;
+ 
+-import java.io.FileInputStream;
+-import java.io.FileNotFoundException;
+-import java.io.FileOutputStream;
+-import java.io.IOException;
+-import java.io.ObjectInputStream;
+-import java.io.ObjectOutputStream;
+-import java.lang.ClassNotFoundException;
+-import java.lang.Object;
+-import java.lang.String;
+ 
++import com.graphhopper.routing.util.BikeGenericFlagEncoder;
++import com.graphhopper.util.EdgeIteratorState;
++import org.apache.commons.math3.fitting.WeightedObservedPoint;
+ 
+-public class ProfileManager {
++import java.util.ArrayList;
++import java.util.HashMap;
++import java.util.Map;
+ 
++import static com.graphhopper.util.Helper.keepIn;
+ 
+-    private RidersProfile ridersProfile;
+-    private final String base = "profiles/";
++public class ProfileManager {
+ 
+-    public ProfileManager(){}
++    private ProfileRepository profileRepository;
++    private RidersProfile ridersProfile;
+ 
+-    public void createProfile(String name) {
+-        ridersProfile = new RidersProfile();
++    private double totalDistance;
++    private int bestFit = -1;
++    private short[] counts = new short[RidersProfile.WAY_TYPES];
++    private double[] distances = new double[RidersProfile.WAY_TYPES];
++    private Map<Integer, double[]> userSpeeds;
++    private boolean pavedSurfacePerferred;
+ 
+-        saveProfile(name);
++    public ProfileManager(ProfileRepository profileRepository){
++        this.profileRepository = profileRepository;
+     }
+ 
+-    public void readProfile(String name){
++    public ProfileManager init(String name, BikeGenericFlagEncoder flagEncoder){
++        this.ridersProfile = profileRepository.getProfile(name);
+ 
+-        FileInputStream fileInputStream = null;
+-        ObjectInputStream inputStream = null;
+-        Object obj = null;
++        if(hasProfile()){
+ 
+-        try {
++            this.userSpeeds = new HashMap<Integer, double[]>();
++            double availableData = 0;
+ 
+-            fileInputStream = new FileInputStream(base + name);
+-            inputStream = new ObjectInputStream (fileInputStream);
+-            obj = inputStream.readObject();
++            for(int i = 0; i < RidersProfile.WAY_TYPES; i++){
+ 
++                RidersEntry[] tmpEntries = this.ridersProfile.getEntries(i);
+ 
+-        } catch (FileNotFoundException e) {
+-            e.printStackTrace();
+-        } catch (ClassNotFoundException e) {
+-            e.printStackTrace();
+-        } catch (IOException e) {
+-            e.printStackTrace();
+-        } finally {
++                for (int j = 0; j < RidersProfile.SLOPES+1; j++) {
++
++                    if(tmpEntries[j] != null) {
++                        counts[i]++;
++                        distances[i] += tmpEntries[j].getDistance();
++                        totalDistance += tmpEntries[j].getDistance();
++                    }
+ 
+-            if(inputStream != null){
+-                try {
+-                    inputStream.close();
+-                } catch (IOException e) {
+-                    e.printStackTrace();
+                 }
+-            }
+ 
+-            if(fileInputStream != null){
+-                try {
+-                    fileInputStream.close();
+-                } catch (IOException e) {
+-                    e.printStackTrace();
++
++                if(hasSpeedProfile(i)) {
++
++                    if(counts[i] * distances[i] > availableData){
++                        bestFit = i;
++                        availableData = counts[i] * distances[i];
++                    }
++
++                    this.userSpeeds.put(i, filterSpeeds(tmpEntries, i, flagEncoder));
+                 }
++
+             }
+ 
++            initSurfacePreference();
++
++        }
++
++        return this;
++
++    }
++
++    public boolean hasProfile(){
++        return this.ridersProfile != null;
++    }
++
++    public boolean hasSpeedProfile(int wayType){
++        return distances[wayType] > 10000 && counts[wayType] > 5;
++    }
++
++    public boolean hasFilteredSpeeds(){
++        return bestFit > 0;
++    }
++
++    public double getWayTypePreference(int wayType){
++        return distances[wayType] / totalDistance;
++    }
++
++    public boolean prefersPavedSurface(){
++        return pavedSurfacePerferred;
++    }
++
++    private void initSurfacePreference(){
++
++        double distance = 0;
++        int[] pavedSurfaceTypes = new int[]{0,1,2,3,4,7,13};
++
++        for(int i = 0; i < pavedSurfaceTypes.length; i++){
++            distance += distances[pavedSurfaceTypes[i]];
+         }
+ 
++        pavedSurfacePerferred = (distance / totalDistance) >= 0.5 ? true : false;
++    }
+ 
+-        if (obj instanceof RidersProfile)
+-        {
+-            ridersProfile = (RidersProfile) obj;
++    public double getSpeedPerSlope(int wayType, int slopeIndex, double baseSpeed, BikeGenericFlagEncoder flagEncoder) {
++
++        if(!hasProfile())
++            return Double.NaN;
++
++        if(hasSpeedProfile(wayType)) {
++            double adjustment = baseSpeed / flagEncoder.getWayTypeSpeed(wayType);
++            return userSpeeds.get(wayType)[slopeIndex] * adjustment;
+         }
++
++        if(bestFit > 0){
++            double adjustment = baseSpeed / flagEncoder.getWayTypeSpeed(bestFit);
++            return userSpeeds.get(bestFit)[slopeIndex] * adjustment;
++        }
++
++        return Double.NaN;
++
+     }
+ 
++    private double[] filterSpeeds(RidersEntry[] ridersEntries, int wayType, BikeGenericFlagEncoder flagEncoder) {
+ 
+-    public void saveProfile(String name){
+-        if (ridersProfile == null)
+-            return;
+-
+-        FileOutputStream fileOutputStream = null;
+-        ObjectOutputStream outputStream = null;
+-
+-        try {
+-            fileOutputStream = new FileOutputStream(base + name);
+-            outputStream = new ObjectOutputStream(fileOutputStream);
+-            outputStream.writeObject(ridersProfile);
+-        } catch (FileNotFoundException e) {
+-            e.printStackTrace();
+-        } catch (IOException e) {
+-            e.printStackTrace();
+-        } finally {
+-            if(outputStream != null) {
+-                try {
+-                    outputStream.close();
+-                } catch (IOException e) {
+-                    e.printStackTrace();
+-                }
+-            }
++        ArrayList<WeightedObservedPoint> points = new ArrayList<WeightedObservedPoint>();
+ 
+-            if(fileOutputStream != null) {
+-                try {
+-                    fileOutputStream.close();
+-                } catch (IOException e) {
+-                    e.printStackTrace();
+-                }
++        double maxSpeed = ridersProfile.maxSpeed(wayType, flagEncoder.getWayTypeSpeed(wayType));
++
++        //addControlPoints(points, wayType, flagEncoder.getWayTypeSpeed(wayType), maxSpeed);
++
++        for ( int i = 0; i < ridersEntries.length; i++){
++            if(ridersEntries[i] != null) {
++                double weight = ridersEntries[i].getDistance();
++                int slope = i - (RidersProfile.SLOPES / 2);
++                double speed = ridersEntries[i].getSpeed() / maxSpeed;
++                points.add(new WeightedObservedPoint(weight, slope, speed));
+             }
+         }
+-    }
+ 
++        addControlPoints(points, flagEncoder.getWayTypeSpeed(wayType), maxSpeed);
+ 
+-    public RidersProfile getProfile(String name){
++        final double[] coef = new SigmoidalFitter(new double[]{1, 0.5, -1}).fit(points);
++        SigmoidFunction sigF = new SigmoidFunction();
+ 
+-        if(name == null || name.equals(""))
+-            return null;
++        double[] result = new double[RidersProfile.SLOPES + 1];
+ 
+-        if (ridersProfile == null) {
+-            readProfile(name);
++        int offset = RidersProfile.SLOPES / 2;
++
++        for( int i = - offset; i < offset + 1; i++){
++            result[i + offset] = sigF.value(i, coef) * maxSpeed;
+         }
+ 
+-        return ridersProfile;
++        return result;
+     }
+ 
++    private void addControlPoints(ArrayList<WeightedObservedPoint> points, double baseSpeed, double maxSpeed) {
++
++        double weight = 50;
++
++        //Add control points from +12 to -12 (this is the critical zone)
++
++        for (int i = 12; i > 0; i--) {
++            double fwdFaster = Math.sqrt(1 + 30 * ((double)i / 100));
++            double speed = keepIn(fwdFaster * baseSpeed, baseSpeed, maxSpeed);
++            points.add(new WeightedObservedPoint(weight, -i, speed / maxSpeed));
++        }
++
++        for (int i = 0; i <= 12; i++) {
++            double fwdSlower = Math.pow(1 - 5 * ((double)i/100), 2);
++            double speed = keepIn(fwdSlower * baseSpeed, 2, baseSpeed);
++            points.add(new WeightedObservedPoint(weight, i, speed / maxSpeed));
++        }
++
++    }
+ 
+ 
+ }
+diff --git a/core/src/main/java/com/graphhopper/util/profiles/ProfileRepository.java b/core/src/main/java/com/graphhopper/util/profiles/ProfileRepository.java
+new file mode 100644
+index 0000000000..003e595639
+--- /dev/null
++++ b/core/src/main/java/com/graphhopper/util/profiles/ProfileRepository.java
+@@ -0,0 +1,124 @@
++package com.graphhopper.util.profiles;
++
++import java.io.FileInputStream;
++import java.io.FileNotFoundException;
++import java.io.FileOutputStream;
++import java.io.IOException;
++import java.io.ObjectInputStream;
++import java.io.ObjectOutputStream;
++import java.lang.ClassNotFoundException;
++import java.lang.Object;
++import java.lang.String;
++
++
++public class ProfileRepository {
++
++
++    private RidersProfile ridersProfile;
++    private final String base = "profiles/";
++
++    public ProfileRepository(){}
++
++    public void createProfile(String name) {
++        ridersProfile = new RidersProfile();
++
++        saveProfile(name);
++    }
++
++    public void readProfile(String name){
++
++        FileInputStream fileInputStream = null;
++        ObjectInputStream inputStream = null;
++        Object obj = null;
++
++        try {
++
++            fileInputStream = new FileInputStream(base + name);
++            inputStream = new ObjectInputStream (fileInputStream);
++            obj = inputStream.readObject();
++
++
++        } catch (FileNotFoundException e) {
++            e.printStackTrace();
++        } catch (ClassNotFoundException e) {
++            e.printStackTrace();
++        } catch (IOException e) {
++            e.printStackTrace();
++        } finally {
++
++            if(inputStream != null){
++                try {
++                    inputStream.close();
++                } catch (IOException e) {
++                    e.printStackTrace();
++                }
++            }
++
++            if(fileInputStream != null){
++                try {
++                    fileInputStream.close();
++                } catch (IOException e) {
++                    e.printStackTrace();
++                }
++            }
++
++        }
++
++
++        if (obj instanceof RidersProfile)
++        {
++            ridersProfile = (RidersProfile) obj;
++        }
++    }
++
++
++    public void saveProfile(String name){
++        if (ridersProfile == null)
++            return;
++
++        FileOutputStream fileOutputStream = null;
++        ObjectOutputStream outputStream = null;
++
++        try {
++            fileOutputStream = new FileOutputStream(base + name);
++            outputStream = new ObjectOutputStream(fileOutputStream);
++            outputStream.writeObject(ridersProfile);
++        } catch (FileNotFoundException e) {
++            e.printStackTrace();
++        } catch (IOException e) {
++            e.printStackTrace();
++        } finally {
++            if(outputStream != null) {
++                try {
++                    outputStream.close();
++                } catch (IOException e) {
++                    e.printStackTrace();
++                }
++            }
++
++            if(fileOutputStream != null) {
++                try {
++                    fileOutputStream.close();
++                } catch (IOException e) {
++                    e.printStackTrace();
++                }
++            }
++        }
++    }
++
++
++    public RidersProfile getProfile(String name){
++
++        if(name == null || name.equals(""))
++            return null;
++
++        if (ridersProfile == null) {
++            readProfile(name);
++        }
++
++        return ridersProfile;
++    }
++
++
++
++}
+diff --git a/core/src/main/java/com/graphhopper/util/profiles/RidersProfile.java b/core/src/main/java/com/graphhopper/util/profiles/RidersProfile.java
+index a7296fbdee..9a5c1aa101 100644
+--- a/core/src/main/java/com/graphhopper/util/profiles/RidersProfile.java
++++ b/core/src/main/java/com/graphhopper/util/profiles/RidersProfile.java
+@@ -1,12 +1,8 @@
+ package com.graphhopper.util.profiles;
+ 
+-import org.apache.commons.math3.fitting.WeightedObservedPoint;
+ 
+ import java.io.Serializable;
+-import java.util.ArrayList;
+-import java.util.HashMap;
+ import java.util.List;
+-import java.util.Map;
+ 
+ public class RidersProfile implements Serializable{
+ 
+@@ -14,8 +10,6 @@
+     public transient final static int SLOPES = 60;
+ 
+     private RidersEntry[][] speedMatrix = new RidersEntry[WAY_TYPES][SLOPES+1]; // 16 Way types, Steigung von -30 % bis + 30 %
+-    private double totalDistance;
+-
+ 
+     public RidersProfile(){};
+ 
+@@ -27,50 +21,9 @@ public RidersEntry getEntry(int wayType, int slope){
+         return speedMatrix[wayType];
+     }
+ 
+-    public Map<Integer, double[]> getFilterSpeeds(){
+-
+-        Map<Integer, double[]> speedMap = new HashMap<Integer, double[]>();
+-
+-        for( int i = 0; i < WAY_TYPES; i++ ){
+-
+-            if(getDistance(i) > 10000) {
+-                speedMap.put(i, filterSpeeds(getEntries(i), i));
+-            }
+-
+-        }
+-
+-        return speedMap;
+-    }
+-
+-    private double[] filterSpeeds(RidersEntry[] ridersEntries, int wayType) {
+-
+-        ArrayList<WeightedObservedPoint> points = new ArrayList<WeightedObservedPoint>();
+-
+-        double maxSpeed = maxSpeed(wayType);
+-
+-        for ( int i = 0; i < ridersEntries.length; i++){
+-            if(ridersEntries[i] != null) {
+-                points.add(new WeightedObservedPoint(ridersEntries[i].getDistance(), i - SLOPES / 2, ridersEntries[i].getSpeed() / maxSpeed));
+-            }
+-        }
+-
+-        final double[] coef = new SigmoidalFitter(new double[]{1, 0.5, -1}).fit(points);
+-        SigmoidFunction sigF = new SigmoidFunction();
+-
+-        double[] result = new double[SLOPES + 1];
+-
+-        int offset = SLOPES / 2;
+-
+-        for( int i = - offset; i < offset + 1; i++){
+-            result[i + offset] = sigF.value(i, coef) * maxSpeed;
+-        }
+-
+-        return result;
+-    }
+-
+-    public double maxSpeed(int wayType){
++    public double maxSpeed(int wayType, double wayTypeSpeed){
+ 
+-        double max = 0.0;
++        double max = wayTypeSpeed * 2;
+ 
+         for (RidersEntry r : speedMatrix[wayType]){
+             if(r != null && r.getSpeed() > max)
+@@ -101,36 +54,6 @@ public double getDistance(int wayType, int slope){
+         return getEntry(wayType, slope).getDistance();
+     }
+ 
+-    public double getDistance(int wayType){
+-        double totalDist = 0;
+-
+-        for(int i = 0; i < speedMatrix[wayType].length; i++) {
+-            if(speedMatrix[wayType][i] != null)
+-                totalDist += speedMatrix[wayType][i].getDistance();
+-        }
+-
+-        return totalDist;
+-    }
+-
+-    public double getTotalDistance(){
+-        return totalDistance;
+-    }
+-
+-    public double[] getWayTypePriority(){
+-
+-        double[] distancesPerWayType = new double[WAY_TYPES];
+-
+-        for (int i = 0; i < speedMatrix.length; i++) {
+-            for (int j = 0; j < speedMatrix[i].length; j++) {
+-                distancesPerWayType[i] += getDistance(i, j - (SLOPES / 2));
+-            }
+-
+-            distancesPerWayType[i] = distancesPerWayType[i] / totalDistance * 100;
+-        }
+-
+-        return distancesPerWayType;
+-
+-    }
+ 
+     public void update(TrackPart trackPart) {
+ 
+@@ -157,7 +80,6 @@ public void update(TrackPart trackPart) {
+         }
+ 
+         ridersEntry.updateEntry(trackPart.getSpeed(), trackPart.getDistance());
+-        totalDistance += trackPart.getDistance();
+ 
+     }
+ 
+diff --git a/core/src/main/java/com/graphhopper/util/profiles/SigmoidalFitter.java b/core/src/main/java/com/graphhopper/util/profiles/SigmoidalFitter.java
+index 00f7ea0fef..56e0f72b8b 100644
+--- a/core/src/main/java/com/graphhopper/util/profiles/SigmoidalFitter.java
++++ b/core/src/main/java/com/graphhopper/util/profiles/SigmoidalFitter.java
+@@ -51,22 +51,105 @@ protected LeastSquaresProblem getProblem(Collection<WeightedObservedPoint> point
+                 build();
+     }
+ 
++
++    private static double setupTestSet(ArrayList<WeightedObservedPoint> points, String name, int wayType){
++        ProfileRepository profileRepository = new ProfileRepository();
++        RidersProfile ridersProfile = profileRepository.getProfile(name);
++
++        RidersEntry[] entries = ridersProfile.getEntries(wayType);
++
++        double maxSpeed = 0;
++
++        for(RidersEntry entry : entries){
++            if (entry != null && maxSpeed < entry.getSpeed())
++                maxSpeed = entry.getSpeed();
++        }
++
++        for(int i = 0; i < entries.length; i++) {
++            if (entries[i] != null) {
++                double weight = entries[i].getDistance();
++                int slope = i - (RidersProfile.SLOPES / 2);
++                double speed = entries[i].getSpeed() / maxSpeed;
++                points.add(new WeightedObservedPoint(weight, slope, speed));
++            }
++        }
++
++        addData(points, maxSpeed, 40);
++        return maxSpeed;
++    }
++
++    private static void addData(ArrayList<WeightedObservedPoint> points, double maxSpeed, double weight) {
++        points.add(new WeightedObservedPoint(weight, 0, 18 / maxSpeed));
++        points.add(new WeightedObservedPoint(weight, 1, 16.245 / maxSpeed));
++        points.add(new WeightedObservedPoint(weight, 2, 14.58 / maxSpeed));
++        points.add(new WeightedObservedPoint(weight, 3, 13.005 / maxSpeed));
++        points.add(new WeightedObservedPoint(weight, 4, 11.52 / maxSpeed));
++        points.add(new WeightedObservedPoint(weight, 5, 10.125 / maxSpeed));
++        points.add(new WeightedObservedPoint(weight, 6, 8.82 / maxSpeed));
++        points.add(new WeightedObservedPoint(weight, 7, 7.605 / maxSpeed));
++        points.add(new WeightedObservedPoint(weight, 8, 6.48 / maxSpeed));
++        points.add(new WeightedObservedPoint(weight, 9, 5.445 / maxSpeed));
++        points.add(new WeightedObservedPoint(weight, 10, 4.5 / maxSpeed));
++        points.add(new WeightedObservedPoint(weight, 11, 3.645 / maxSpeed));
++        points.add(new WeightedObservedPoint(weight, 12, 2.88 / maxSpeed));
++        points.add(new WeightedObservedPoint(weight, -1, 20.1364009575 / maxSpeed));
++        points.add(new WeightedObservedPoint(weight, -2, 21.8959271841 / maxSpeed));
++        points.add(new WeightedObservedPoint(weight, -3, 23.4106460433 / maxSpeed));
++        points.add(new WeightedObservedPoint(weight, -4, 24.7512396073 / maxSpeed));
++        points.add(new WeightedObservedPoint(weight, -5, 25.9604922655 / maxSpeed));
++        points.add(new WeightedObservedPoint(weight, -6, 27.0665027317 / maxSpeed));
++        points.add(new WeightedObservedPoint(weight, -7, 28.0888335127 / maxSpeed));
++        points.add(new WeightedObservedPoint(weight, -8, 29.0417156284 / maxSpeed));
++        points.add(new WeightedObservedPoint(weight, -9, 29.9358629791 / maxSpeed));
++        points.add(new WeightedObservedPoint(weight, -10, 30.7795670402 / maxSpeed));
++        points.add(new WeightedObservedPoint(weight, -11, 31.5793915727 / maxSpeed));
++    }
++
+     public static void main(String[] args) {
+         SigmoidalFitter fitter = new SigmoidalFitter(new double[] {1, 0.5, -1});
+         ArrayList<WeightedObservedPoint> points = new ArrayList<WeightedObservedPoint>();
+ 
++        /*double maxSpeed = 37.36653;
++        double weight = 10;
++
++        points.add(new WeightedObservedPoint(weight, 0, 18 / maxSpeed));
++        points.add(new WeightedObservedPoint(weight, 1, 16.245 / maxSpeed));
++        points.add(new WeightedObservedPoint(weight, 2, 14.58 / maxSpeed));
++        points.add(new WeightedObservedPoint(weight, 3, 13.005 / maxSpeed));
++        points.add(new WeightedObservedPoint(weight, 4, 11.52 / maxSpeed));
++        points.add(new WeightedObservedPoint(weight, 5, 10.125 / maxSpeed));
++        points.add(new WeightedObservedPoint(weight, 6, 8.82 / maxSpeed));
++        points.add(new WeightedObservedPoint(weight, 7, 7.605 / maxSpeed));
++        points.add(new WeightedObservedPoint(weight, 8, 6.48 / maxSpeed));
++        points.add(new WeightedObservedPoint(weight, 9, 5.445 / maxSpeed));
++        points.add(new WeightedObservedPoint(weight, 10, 4.5 / maxSpeed));
++        points.add(new WeightedObservedPoint(weight, 11, 3.645 / maxSpeed));
++        points.add(new WeightedObservedPoint(weight, 12, 2.88 / maxSpeed));
++        points.add(new WeightedObservedPoint(weight, 30, 2 / maxSpeed));
++        points.add(new WeightedObservedPoint(weight, -1, 20.1364009575 / maxSpeed));
++        points.add(new WeightedObservedPoint(weight, -2, 21.8959271841 / maxSpeed));
++        points.add(new WeightedObservedPoint(weight, -3, 23.4106460433 / maxSpeed));
++        points.add(new WeightedObservedPoint(weight, -4, 24.7512396073 / maxSpeed));
++        points.add(new WeightedObservedPoint(weight, -5, 25.9604922655 / maxSpeed));
++        points.add(new WeightedObservedPoint(weight, -6, 27.0665027317 / maxSpeed));
++        points.add(new WeightedObservedPoint(weight, -7, 28.0888335127 / maxSpeed));
++        points.add(new WeightedObservedPoint(weight, -8, 29.0417156284 / maxSpeed));
++        points.add(new WeightedObservedPoint(weight, -9, 29.9358629791 / maxSpeed));
++        points.add(new WeightedObservedPoint(weight, -10, 30.7795670402 / maxSpeed));
++        points.add(new WeightedObservedPoint(weight, -11, 31.5793915727 / maxSpeed));
++
+         // Add points here; for instance,
+-        WeightedObservedPoint point1 = new WeightedObservedPoint(222.0084, -11, 33.30126 / 37.36653);
+-        WeightedObservedPoint point2 = new WeightedObservedPoint(409.9835, -10, 35.188465 / 37.36653);
+-        WeightedObservedPoint point3 = new WeightedObservedPoint(1675.1172, -9, 35.625652 / 37.36653);
+-        WeightedObservedPoint point4 = new WeightedObservedPoint(1075.3177, -8, 37.36653 / 37.36653);
+-        WeightedObservedPoint point5 = new WeightedObservedPoint(60.274113, -7, 6.7808375 / 37.36653);
+-        WeightedObservedPoint point6 = new WeightedObservedPoint(651.5845, -6, 28.758934 / 37.36653);
+-        WeightedObservedPoint point7 = new WeightedObservedPoint(205.16458, -5, 30.774687 / 37.36653);
+-        WeightedObservedPoint point8 = new WeightedObservedPoint(171.65067, -4, 30.89712 / 37.36653);
+-        WeightedObservedPoint point9 = new WeightedObservedPoint(389.28305, -3, 24.898178 / 37.36653);
+-        WeightedObservedPoint point10 = new WeightedObservedPoint(204.34619, -2, 13.880118 / 37.36653);
+-        WeightedObservedPoint point11 = new WeightedObservedPoint(209.81961, -1, 11.989692 / 37.36653);
++        /*WeightedObservedPoint point1 = new WeightedObservedPoint(222.0084, -11, 33.30126 / maxSpeed);
++        WeightedObservedPoint point2 = new WeightedObservedPoint(409.9835, -10, 35.188465 / maxSpeed);
++        WeightedObservedPoint point3 = new WeightedObservedPoint(1675.1172, -9, 35.625652 / maxSpeed);
++        WeightedObservedPoint point4 = new WeightedObservedPoint(1075.3177, -8, 37.36653 / maxSpeed);
++        WeightedObservedPoint point5 = new WeightedObservedPoint(60.274113, -7, 6.7808375 / maxSpeed);
++        WeightedObservedPoint point6 = new WeightedObservedPoint(651.5845, -6, 28.758934 / maxSpeed);
++        WeightedObservedPoint point7 = new WeightedObservedPoint(205.16458, -5, 30.774687 / maxSpeed);
++        WeightedObservedPoint point8 = new WeightedObservedPoint(171.65067, -4, 30.89712 / maxSpeed);
++        WeightedObservedPoint point9 = new WeightedObservedPoint(389.28305, -3, 24.898178 / maxSpeed);
++        WeightedObservedPoint point10 = new WeightedObservedPoint(204.34619, -2, 13.880118 / maxSpeed);
++        WeightedObservedPoint point11 = new WeightedObservedPoint(209.81961, -1, 11.989692 / maxSpeed);
+         WeightedObservedPoint point12 = new WeightedObservedPoint(203.6042, 0, 15.595216 / 37.36653);
+         WeightedObservedPoint point13 = new WeightedObservedPoint(619.88995, 1, 14.0128 / 37.36653);
+         WeightedObservedPoint point14 = new WeightedObservedPoint(455.45798, 2, 10.182568 / 37.36653);
+@@ -81,9 +164,9 @@ public static void main(String[] args) {
+         WeightedObservedPoint point23 = new WeightedObservedPoint(617.08203, 11, 7.3262196 / 37.36653);
+         WeightedObservedPoint point24 = new WeightedObservedPoint(219.78712, 12, 5.733577 / 37.36653);
+         WeightedObservedPoint point25 = new WeightedObservedPoint(202.69017, 13, 6.0807056 / 37.36653);
+-        WeightedObservedPoint point26 = new WeightedObservedPoint(216.81699, 30, 6.7873144 / 37.36653);
++        WeightedObservedPoint point26 = new WeightedObservedPoint(216.81699, 29, 6.7873144 / 37.36653);
+ 
+-        points.add(point1);
++        /*points.add(point1);
+         points.add(point2);
+         points.add(point3);
+         points.add(point4);
+@@ -108,9 +191,18 @@ public static void main(String[] args) {
+         points.add(point23);
+         points.add(point24);
+         points.add(point25);
+-        points.add(point26);
++        points.add(point26);*/
++
++        double maxSpeed = setupTestSet(points, "sellaronda", 1);
+ 
+         final double coeffs[] = fitter.fit(points);
+         System.out.println(Arrays.toString(coeffs));
++        SigmoidFunction sigF = new SigmoidFunction();
++
++        System.out.print("\n");
++
++        for(int i = -30; i <= 30; i++){
++            System.out.print(i + ", " + (sigF.value(i, coeffs) * maxSpeed) + "\n");
++        }
+     }
+ }
+diff --git a/core/src/main/java/com/graphhopper/util/profiles/operations/AddToProfileOperation.java b/core/src/main/java/com/graphhopper/util/profiles/operations/AddToProfileOperation.java
+index 2473976de5..741e3c9033 100644
+--- a/core/src/main/java/com/graphhopper/util/profiles/operations/AddToProfileOperation.java
++++ b/core/src/main/java/com/graphhopper/util/profiles/operations/AddToProfileOperation.java
+@@ -2,10 +2,9 @@
+ 
+ 
+ import com.graphhopper.GraphHopper;
+-import com.graphhopper.matching.LocationIndexMatch;
+ import com.graphhopper.util.CmdArgs;
+ import com.graphhopper.util.profiles.GPXDataExtractor;
+-import com.graphhopper.util.profiles.ProfileManager;
++import com.graphhopper.util.profiles.ProfileRepository;
+ import com.graphhopper.util.profiles.RidersProfile;
+ import com.graphhopper.matching.GPXFile;
+ 
+@@ -30,9 +29,9 @@ public AddToProfileOperation(String[] args) {
+     @Override
+     public void run() {
+ 
+-        ProfileManager profileManager = new ProfileManager();
++        ProfileRepository profileRepository = new ProfileRepository();
+ 
+-        RidersProfile ridersProfile = profileManager.getProfile(name);
++        RidersProfile ridersProfile = profileRepository.getProfile(name);
+ 
+         if(ridersProfile == null) {
+             System.err.println("Could not load profile " + name + ". Please check your profile name.");
+@@ -47,7 +46,7 @@ public void run() {
+         gpxDataExtractor.setFile(gpxFile);
+         ridersProfile.update(gpxDataExtractor.extract());
+ 
+-        profileManager.saveProfile(name);
++        profileRepository.saveProfile(name);
+ 
+     }
+ }
+diff --git a/core/src/main/java/com/graphhopper/util/profiles/operations/CreateProfileOperation.java b/core/src/main/java/com/graphhopper/util/profiles/operations/CreateProfileOperation.java
+index e95e1fefff..489d17fbd5 100644
+--- a/core/src/main/java/com/graphhopper/util/profiles/operations/CreateProfileOperation.java
++++ b/core/src/main/java/com/graphhopper/util/profiles/operations/CreateProfileOperation.java
+@@ -1,6 +1,6 @@
+ package com.graphhopper.util.profiles.operations;
+ 
+-import com.graphhopper.util.profiles.ProfileManager;
++import com.graphhopper.util.profiles.ProfileRepository;
+ 
+ public class CreateProfileOperation implements Operation {
+ 
+@@ -12,7 +12,7 @@ public CreateProfileOperation(String[] args){
+ 
+     @Override
+     public void run() {
+-        ProfileManager aProfileManager = new ProfileManager();
+-        aProfileManager.createProfile(name);
++        ProfileRepository profileRepository = new ProfileRepository();
++        profileRepository.createProfile(name);
+     }
+ }
+diff --git a/core/src/main/java/com/graphhopper/util/profiles/operations/PrintProfileOperation.java b/core/src/main/java/com/graphhopper/util/profiles/operations/PrintProfileOperation.java
+index 4e60346f80..606ae104fa 100644
+--- a/core/src/main/java/com/graphhopper/util/profiles/operations/PrintProfileOperation.java
++++ b/core/src/main/java/com/graphhopper/util/profiles/operations/PrintProfileOperation.java
+@@ -1,6 +1,6 @@
+ package com.graphhopper.util.profiles.operations;
+ 
+-import com.graphhopper.util.profiles.ProfileManager;
++import com.graphhopper.util.profiles.ProfileRepository;
+ import com.graphhopper.util.profiles.RidersProfile;
+ 
+ public class PrintProfileOperation implements Operation {
+@@ -14,13 +14,13 @@ public PrintProfileOperation(String[] args) {
+     @Override
+     public void run() {
+ 
+-        ProfileManager profileManager = new ProfileManager();
+-        RidersProfile ridersProfile = profileManager.getProfile(name);
++        ProfileRepository profileRepository = new ProfileRepository();
++        RidersProfile ridersProfile = profileRepository.getProfile(name);
+ 
+         System.out.println("Profile of: " + name);
+ 
+         if(ridersProfile != null){
+-            System.out.println(ridersProfile.getFilterSpeeds());
++            System.out.println(ridersProfile);
+         }
+ 
+     }
+diff --git a/graphhopper.sh b/graphhopper.sh
+index 31444a70fd..7fb81f4320 100755
+--- a/graphhopper.sh
++++ b/graphhopper.sh
+@@ -206,7 +206,7 @@ else
+ fi
+ 
+ if [ "$JAVA_OPTS" = "" ]; then
+-  JAVA_OPTS="-Xmx2000m -Xms2000m -server"
++  JAVA_OPTS="-Xmx3000m -Xms3000m -server"
+ fi
+ 
+ 
+diff --git a/profiles.sh b/profiles.sh
+index 9f978cebd7..e38e9d2d97 100755
+--- a/profiles.sh
++++ b/profiles.sh
+@@ -1,14 +1,19 @@
+ #!/usr/bin/env bash
+ 
+ GH_CLASS=com.graphhopper.util.profiles.Profiles
++CONFIG=config.properties
++VERSION=$(grep  "<name>" -A 1 pom.xml | grep version | cut -d'>' -f2 | cut -d'<' -f1)
++JAR=tools/target/graphhopper-tools-$VERSION-jar-with-dependencies.jar
+ 
+ ACTION=$1
+ USER=$2
+-FILE=$3
+-LOCATION=$4
+ 
+-CONFIG=config.properties
+-VERSION=$(grep  "<name>" -A 1 pom.xml | grep version | cut -d'>' -f2 | cut -d'<' -f1)
+-JAR=tools/target/graphhopper-tools-$VERSION-jar-with-dependencies.jar
++if [ "$ACTION" == "create" ] || [ "$ACTION" == "print" ]; then
++  java -cp "$JAR" "$GH_CLASS" "$ACTION" "$USER"
++elif [ "$ACTION" == "add" ]; then
++  FILE=$3
++  OSM=$4
++  java -cp "$JAR" "$GH_CLASS" "$ACTION" "$USER" "$FILE" config="$CONFIG" osmreader.osm="$OSM"
++fi
++
+ 
+-java -cp "$JAR" "$GH_CLASS" "$ACTION" "$USER" config="$CONFIG" graph.location="$GRAPH" osmreader.osm="$LOCATION"
+\ No newline at end of file
+diff --git a/web/src/main/java/com/graphhopper/http/InfoServlet.java b/web/src/main/java/com/graphhopper/http/InfoServlet.java
+index e3ed435810..b0d3605dcb 100644
+--- a/web/src/main/java/com/graphhopper/http/InfoServlet.java
++++ b/web/src/main/java/com/graphhopper/http/InfoServlet.java
+@@ -83,7 +83,7 @@ private String getPreferredWeighting(String v) {
+ 
+         String w = "fastest";
+ 
+-        if(v.equalsIgnoreCase("generic_bike"))
++        if(v.equalsIgnoreCase("genbike"))
+             w = "dynamic";
+ 
+         return w;
+diff --git a/web/src/main/webapp/img/generic_bike.png b/web/src/main/webapp/img/genbike.png
+similarity index 100%
+rename from web/src/main/webapp/img/generic_bike.png
+rename to web/src/main/webapp/img/genbike.png

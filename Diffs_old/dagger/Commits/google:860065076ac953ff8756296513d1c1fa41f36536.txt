@@ -1,0 +1,268 @@
+diff --git a/compiler/src/it/producers-functional-tests/src/test/java/producerstest/monitoring/MonitoringTest.java b/compiler/src/it/producers-functional-tests/src/test/java/producerstest/monitoring/MonitoringTest.java
+index ee7414570..921464a47 100644
+--- a/compiler/src/it/producers-functional-tests/src/test/java/producerstest/monitoring/MonitoringTest.java
++++ b/compiler/src/it/producers-functional-tests/src/test/java/producerstest/monitoring/MonitoringTest.java
+@@ -89,15 +89,18 @@ public void basicMonitoring() throws Exception {
+     inOrder.verify(callServer2Monitor).requested();
+     inOrder.verify(callServer1Monitor).requested();
+     inOrder.verify(requestDataMonitor).requested();
++    inOrder.verify(requestDataMonitor).ready();
+     inOrder.verify(requestDataMonitor).methodStarting();
+     inOrder.verify(requestDataMonitor).methodFinished();
+     inOrder.verify(requestDataMonitor).succeeded("Hello, World!");
++    inOrder.verify(callServer1Monitor).ready();
+     inOrder.verify(callServer1Monitor).methodStarting();
+     inOrder.verify(callServer1Monitor).methodFinished();
+     verifyNoMoreInteractions(requestDataMonitor, callServer1Monitor, callServer2Monitor);
+ 
+     server1Future.set("server 1 response");
+     inOrder.verify(callServer1Monitor).succeeded("server 1 response");
++    inOrder.verify(callServer2Monitor).ready();
+     inOrder.verify(callServer2Monitor).methodStarting();
+     inOrder.verify(callServer2Monitor).methodFinished();
+     verifyNoMoreInteractions(requestDataMonitor, callServer1Monitor, callServer2Monitor);
+@@ -131,9 +134,11 @@ public void basicMonitoringWithFailure() throws Exception {
+     inOrder.verify(callServer2Monitor).requested();
+     inOrder.verify(callServer1Monitor).requested();
+     inOrder.verify(requestDataMonitor).requested();
++    inOrder.verify(requestDataMonitor).ready();
+     inOrder.verify(requestDataMonitor).methodStarting();
+     inOrder.verify(requestDataMonitor).methodFinished();
+     inOrder.verify(requestDataMonitor).succeeded("Hello, World!");
++    inOrder.verify(callServer1Monitor).ready();
+     inOrder.verify(callServer1Monitor).methodStarting();
+     inOrder.verify(callServer1Monitor).methodFinished();
+     verifyNoMoreInteractions(requestDataMonitor, callServer1Monitor, callServer2Monitor);
+@@ -141,6 +146,7 @@ public void basicMonitoringWithFailure() throws Exception {
+     RuntimeException cause = new RuntimeException("monkey");
+     server1Future.setException(cause);
+     inOrder.verify(callServer1Monitor).failed(cause);
++    inOrder.verify(callServer2Monitor).ready();
+     inOrder.verify(callServer2Monitor).failed(any(Throwable.class));
+     verifyNoMoreInteractions(requestDataMonitor, callServer1Monitor, callServer2Monitor);
+     try {
+diff --git a/compiler/src/main/java/dagger/internal/codegen/ProducerFactoryGenerator.java b/compiler/src/main/java/dagger/internal/codegen/ProducerFactoryGenerator.java
+index 485f95cf6..4e5cdf4c4 100644
+--- a/compiler/src/main/java/dagger/internal/codegen/ProducerFactoryGenerator.java
++++ b/compiler/src/main/java/dagger/internal/codegen/ProducerFactoryGenerator.java
+@@ -27,9 +27,11 @@
+ import static dagger.internal.codegen.SourceFiles.generateBindingFieldsForDependencies;
+ import static dagger.internal.codegen.SourceFiles.generatedClassNameForBinding;
+ import static dagger.internal.codegen.TypeNames.ASYNC_FUNCTION;
++import static dagger.internal.codegen.TypeNames.EXECUTOR;
+ import static dagger.internal.codegen.TypeNames.FUTURES;
+ import static dagger.internal.codegen.TypeNames.PRODUCERS;
+ import static dagger.internal.codegen.TypeNames.PRODUCER_TOKEN;
++import static dagger.internal.codegen.TypeNames.RUNNABLE;
+ import static dagger.internal.codegen.TypeNames.VOID_CLASS;
+ import static dagger.internal.codegen.TypeNames.abstractProducerOf;
+ import static dagger.internal.codegen.TypeNames.listOf;
+@@ -160,13 +162,15 @@ ClassName nameGeneratedType(ProductionBinding binding) {
+     FutureTransform futureTransform = FutureTransform.create(fields, binding, asyncDependencies);
+ 
+     computeMethodBuilder.addStatement(
+-        "return $T.transformAsync($L, this, executorProvider.get())",
++        "return $T.transformAsync($L, this, this)",
+         FUTURES,
+         futureTransform.futureCodeBlock());
+ 
+-    factoryBuilder.addSuperinterface(
+-        ParameterizedTypeName.get(
+-            ASYNC_FUNCTION, futureTransform.applyArgType(), providedTypeName));
++    factoryBuilder
++        .addSuperinterface(
++            ParameterizedTypeName.get(
++                ASYNC_FUNCTION, futureTransform.applyArgType(), providedTypeName))
++        .addSuperinterface(EXECUTOR);
+ 
+     MethodSpec.Builder applyMethodBuilder =
+         methodBuilder("apply")
+@@ -191,9 +195,24 @@ ClassName nameGeneratedType(ProductionBinding binding) {
+       applyMethodBuilder.addAnnotation(AnnotationSpecs.suppressWarnings(UNCHECKED));
+     }
+ 
++    MethodSpec.Builder executeMethodBuilder =
++        methodBuilder("execute")
++            .addModifiers(PUBLIC)
++            .addJavadoc("@deprecated this may only be called from the internal {@link #compute()}")
++            .addAnnotation(Deprecated.class)
++            .addAnnotation(Override.class)
++            .addParameter(RUNNABLE, "runnable")
++            .addStatement(
++                "assert monitor != null : $S",
++                "execute() may only be called internally from compute(); "
++                    + "if it's called explicitly, the monitor might be null")
++            .addStatement("monitor.ready()")
++            .addStatement("executorProvider.get().execute(runnable)");
++
+     factoryBuilder.addMethod(constructorBuilder.build());
+     factoryBuilder.addMethod(computeMethodBuilder.build());
+     factoryBuilder.addMethod(applyMethodBuilder.build());
++    factoryBuilder.addMethod(executeMethodBuilder.build());
+ 
+     // TODO(gak): write a sensible toString
+     return Optional.of(factoryBuilder);
+diff --git a/compiler/src/main/java/dagger/internal/codegen/TypeNames.java b/compiler/src/main/java/dagger/internal/codegen/TypeNames.java
+index 3c427b0bb..4276bf2d2 100644
+--- a/compiler/src/main/java/dagger/internal/codegen/TypeNames.java
++++ b/compiler/src/main/java/dagger/internal/codegen/TypeNames.java
+@@ -53,6 +53,7 @@
+ import dagger.releasablereferences.TypedReleasableReferenceManager;
+ import java.util.List;
+ import java.util.Set;
++import java.util.concurrent.Executor;
+ import javax.inject.Provider;
+ 
+ /**
+@@ -64,6 +65,7 @@
+   static final ClassName ASYNC_FUNCTION = ClassName.get(AsyncFunction.class);
+   static final ClassName DELEGATE_FACTORY = ClassName.get(DelegateFactory.class);
+   static final ClassName DOUBLE_CHECK = ClassName.get(DoubleCheck.class);
++  static final ClassName EXECUTOR = ClassName.get(Executor.class);
+   static final ClassName FACTORY = ClassName.get(Factory.class);
+   static final ClassName FUTURES = ClassName.get(Futures.class);
+   static final ClassName ILLEGAL_STATE_EXCEPTION = ClassName.get(IllegalStateException.class);
+@@ -87,6 +89,7 @@
+       ClassName.get(ProductionComponentMonitor.Factory.class);
+   static final ClassName PROVIDER = ClassName.get(Provider.class);
+   static final ClassName PROVIDER_OF_LAZY = ClassName.get(ProviderOfLazy.class);
++  static final ClassName RUNNABLE = ClassName.get(Runnable.class);
+   static final ClassName REFERENCE_RELEASING_PROVIDER =
+       ClassName.get(ReferenceReleasingProvider.class);
+   static final ClassName REFERENCE_RELEASING_PROVIDER_MANAGER =
+diff --git a/compiler/src/test/java/dagger/internal/codegen/ProducerModuleFactoryGeneratorTest.java b/compiler/src/test/java/dagger/internal/codegen/ProducerModuleFactoryGeneratorTest.java
+index 0a979bce3..ce65429c3 100644
+--- a/compiler/src/test/java/dagger/internal/codegen/ProducerModuleFactoryGeneratorTest.java
++++ b/compiler/src/test/java/dagger/internal/codegen/ProducerModuleFactoryGeneratorTest.java
+@@ -366,7 +366,8 @@ public void publicModuleNonPublicIncludes() {
+             "",
+             GENERATED_ANNOTATION,
+             "public final class TestModule_ProduceStringFactory",
+-            "    extends AbstractProducer<String> implements AsyncFunction<Void, String> {",
++            "    extends AbstractProducer<String>",
++            "    implements AsyncFunction<Void, String>, Executor {",
+             "  private final TestModule module;",
+             "  private final Provider<Executor> executorProvider;",
+             "  private final Provider<ProductionComponentMonitor> monitorProvider;",
+@@ -388,7 +389,7 @@ public void publicModuleNonPublicIncludes() {
+             "",
+             "  @Override protected ListenableFuture<String> compute() {",
+             "    return Futures.transformAsync(",
+-            "        Futures.<Void>immediateFuture(null), this, executorProvider.get());",
++            "        Futures.<Void>immediateFuture(null), this, this);",
+             "  }",
+             "",
+             "  @Deprecated",
+@@ -403,6 +404,15 @@ public void publicModuleNonPublicIncludes() {
+             "      monitor.methodFinished();",
+             "    }",
+             "  }",
++            "",
++            "  @Deprecated",
++            "  @Override public void execute(Runnable runnable) {",
++            "    assert monitor != null :",
++            "        \"execute() may only be called internally from compute(); \"",
++            "        + \"if it's called explicitly, the monitor might be null\";",
++            "    monitor.ready();",
++            "    executorProvider.get().execute(runnable);",
++            "  }",
+             "}");
+     assertAbout(javaSource())
+         .that(moduleFile)
+@@ -447,7 +457,8 @@ public void singleProducesMethodNoArgsFutureWithProducerName() {
+             "",
+             GENERATED_ANNOTATION,
+             "public final class TestModule_ProduceStringFactory",
+-            "    extends AbstractProducer<String> implements AsyncFunction<Void, String> {",
++            "    extends AbstractProducer<String>",
++            "    implements AsyncFunction<Void, String>, Executor {",
+             "  private final TestModule module;",
+             "  private final Provider<Executor> executorProvider;",
+             "  private final Provider<ProductionComponentMonitor> monitorProvider;",
+@@ -469,7 +480,7 @@ public void singleProducesMethodNoArgsFutureWithProducerName() {
+             "",
+             "  @Override protected ListenableFuture<String> compute() {",
+             "    return Futures.transformAsync(",
+-            "      Futures.<Void>immediateFuture(null), this, executorProvider.get());",
++            "      Futures.<Void>immediateFuture(null), this, this);",
+             "  }",
+             "",
+             "  @Deprecated",
+@@ -484,6 +495,15 @@ public void singleProducesMethodNoArgsFutureWithProducerName() {
+             "      monitor.methodFinished();",
+             "    }",
+             "  }",
++            "",
++            "  @Deprecated",
++            "  @Override public void execute(Runnable runnable) {",
++            "    assert monitor != null :",
++            "        \"execute() may only be called internally from compute(); \"",
++            "        + \"if it's called explicitly, the monitor might be null\";",
++            "    monitor.ready();",
++            "    executorProvider.get().execute(runnable);",
++            "  }",
+             "}");
+     assertAbout(javaSource())
+         .that(moduleFile)
+diff --git a/producers/src/main/java/dagger/producers/monitoring/ProducerMonitor.java b/producers/src/main/java/dagger/producers/monitoring/ProducerMonitor.java
+index 6b29e1f56..6a3ad1148 100644
+--- a/producers/src/main/java/dagger/producers/monitoring/ProducerMonitor.java
++++ b/producers/src/main/java/dagger/producers/monitoring/ProducerMonitor.java
+@@ -100,6 +100,19 @@
+    */
+   public void requested() {}
+ 
++  /**
++   * Called when all of the producer's inputs are available. This is called regardless of whether
++   * the inputs have succeeded or not; when the inputs have succeeded, this is called prior to
++   * scheduling the method on the executor, and if an input has failed and the producer will be
++   * skipped, this method will be called before {@link #failed(Throwable)} is called.
++   *
++   * <p>When multiple monitors are installed, the order that each monitor will call this method is
++   * unspecified, but will remain consistent throughout the course of the execution of a component.
++   *
++   * <p>This implementation is a no-op.
++   */
++  public void ready() {}
++
+   /**
+    * Called when the producer method is about to start executing. This will be called from the same
+    * thread as the producer method itself.
+diff --git a/producers/src/main/java/dagger/producers/monitoring/internal/Monitors.java b/producers/src/main/java/dagger/producers/monitoring/internal/Monitors.java
+index bc17a0795..24b1f4dea 100644
+--- a/producers/src/main/java/dagger/producers/monitoring/internal/Monitors.java
++++ b/producers/src/main/java/dagger/producers/monitoring/internal/Monitors.java
+@@ -137,6 +137,15 @@ public void requested() {
+       }
+     }
+ 
++    @Override
++    public void ready() {
++      try {
++        delegate.ready();
++      } catch (RuntimeException e) {
++        logProducerMonitorMethodException(e, delegate, "ready");
++      }
++    }
++
+     @Override
+     public void methodStarting() {
+       try {
+@@ -263,6 +272,17 @@ public void requested() {
+       }
+     }
+ 
++    @Override
++    public void ready() {
++      for (ProducerMonitor delegate : delegates) {
++        try {
++          delegate.ready();
++        } catch (RuntimeException e) {
++          logProducerMonitorMethodException(e, delegate, "ready");
++        }
++      }
++    }
++
+     @Override
+     public void methodStarting() {
+       for (ProducerMonitor delegate : delegates) {

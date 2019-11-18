@@ -1,0 +1,613 @@
+diff --git a/compiler/src/main/java/dagger/internal/codegen/AbstractComponentWriter.java b/compiler/src/main/java/dagger/internal/codegen/AbstractComponentWriter.java
+index e5d0316e5..8dab11e34 100644
+--- a/compiler/src/main/java/dagger/internal/codegen/AbstractComponentWriter.java
++++ b/compiler/src/main/java/dagger/internal/codegen/AbstractComponentWriter.java
+@@ -124,6 +124,7 @@
+   protected final Set<JavaWriter> javaWriters = new LinkedHashSet<>();
+   protected final ClassName name;
+   protected final BindingGraph graph;
++  protected final ImmutableMap<ComponentDescriptor, String> subcomponentImplNames;
+   private final Map<BindingKey, InitializationState> initializationStates = new HashMap<>();
+   private final Map<Binding, InitializationState> contributionInitializationStates =
+       new HashMap<>();
+@@ -154,13 +155,15 @@
+       Key.Factory keyFactory,
+       Diagnostic.Kind nullableValidationType,
+       ClassName name,
+-      BindingGraph graph) {
++      BindingGraph graph,
++      ImmutableMap<ComponentDescriptor, String> subcomponentImplNames) {
+     this.types = types;
+     this.elements = elements;
+     this.keyFactory = keyFactory;
+     this.nullableValidationType = nullableValidationType;
+     this.name = name;
+     this.graph = graph;
++    this.subcomponentImplNames = subcomponentImplNames;
+   }
+ 
+   protected final TypeElement componentDefinitionType() {
+diff --git a/compiler/src/main/java/dagger/internal/codegen/BindingGraph.java b/compiler/src/main/java/dagger/internal/codegen/BindingGraph.java
+index e8a1e8f8b..d790bb510 100644
+--- a/compiler/src/main/java/dagger/internal/codegen/BindingGraph.java
++++ b/compiler/src/main/java/dagger/internal/codegen/BindingGraph.java
+@@ -139,6 +139,22 @@
+         .toSet();
+   }
+ 
++  /**
++   * Returns the {@link ComponentDescriptor}s for this component and its subcomponents.
++   */
++  ImmutableSet<ComponentDescriptor> componentDescriptors() {
++    return SUBGRAPH_TRAVERSER
++        .preOrderTraversal(this)
++        .transform(
++            new Function<BindingGraph, ComponentDescriptor>() {
++              @Override
++              public ComponentDescriptor apply(BindingGraph graph) {
++                return graph.componentDescriptor();
++              }
++            })
++        .toSet();
++  }
++
+   ImmutableSet<TypeElement> availableDependencies() {
+     return new ImmutableSet.Builder<TypeElement>()
+         .addAll(componentDescriptor().transitiveModuleTypes())
+diff --git a/compiler/src/main/java/dagger/internal/codegen/ComponentWriter.java b/compiler/src/main/java/dagger/internal/codegen/ComponentWriter.java
+index 5221cf0a2..10704c9ad 100644
+--- a/compiler/src/main/java/dagger/internal/codegen/ComponentWriter.java
++++ b/compiler/src/main/java/dagger/internal/codegen/ComponentWriter.java
+@@ -15,13 +15,25 @@
+  */
+ package dagger.internal.codegen;
+ 
++import com.google.common.base.Function;
++import com.google.common.base.Joiner;
+ import com.google.common.base.Predicate;
++import com.google.common.base.Splitter;
++import com.google.common.collect.ImmutableBiMap;
++import com.google.common.collect.ImmutableListMultimap;
+ import com.google.common.collect.Iterables;
++import com.google.common.collect.Multimaps;
+ import dagger.internal.codegen.writer.ClassName;
+ import dagger.internal.codegen.writer.ClassWriter;
+ import dagger.internal.codegen.writer.JavaWriter;
+ import dagger.internal.codegen.writer.MethodWriter;
++import java.util.Collection;
++import java.util.LinkedHashMap;
++import java.util.List;
++import java.util.Map;
++import java.util.Map.Entry;
+ import javax.annotation.Generated;
++import javax.lang.model.element.Name;
+ import javax.lang.model.element.TypeElement;
+ import javax.lang.model.util.Elements;
+ import javax.lang.model.util.Types;
+@@ -35,7 +47,7 @@
+ /**
+  * Creates the implementation class for a component.
+  */
+-class ComponentWriter extends AbstractComponentWriter {
++final class ComponentWriter extends AbstractComponentWriter {
+ 
+   ComponentWriter(
+       Types types,
+@@ -44,7 +56,89 @@
+       Kind nullableValidationType,
+       ClassName name,
+       BindingGraph graph) {
+-    super(types, elements, keyFactory, nullableValidationType, name, graph);
++    super(
++        types,
++        elements,
++        keyFactory,
++        nullableValidationType,
++        name,
++        graph,
++        new UniqueSubcomponentNamesGenerator(graph).generate());
++  }
++
++  /**
++   * Generates a map of unique simple names for all subcomponents, keyed by their {@link
++   * ComponentDescriptor}.
++   */
++  private static class UniqueSubcomponentNamesGenerator {
++
++    private static final Splitter QUALIFIED_NAME_SPLITTER = Splitter.on('.');
++    private static final Joiner QUALIFIED_NAME_JOINER = Joiner.on('_');
++
++    private final BindingGraph graph;
++    private final ImmutableListMultimap<String, ComponentDescriptor>
++        componentDescriptorsBySimpleName;
++    private final ImmutableListMultimap<ComponentDescriptor, String> componentQualifiedNamePieces;
++
++    private UniqueSubcomponentNamesGenerator(BindingGraph graph) {
++      this.graph = graph;
++      componentDescriptorsBySimpleName =
++          Multimaps.index(
++              graph.componentDescriptors(),
++              new Function<ComponentDescriptor, String>() {
++                @Override
++                public String apply(ComponentDescriptor componentDescriptor) {
++                  return componentDescriptor.componentDefinitionType().getSimpleName().toString();
++                }
++              });
++      componentQualifiedNamePieces = qualifiedNames(graph.componentDescriptors());
++    }
++
++    private ImmutableBiMap<ComponentDescriptor, String> generate() {
++      Map<ComponentDescriptor, String> subcomponentImplSimpleNames = new LinkedHashMap<>();
++      for (Entry<String, Collection<ComponentDescriptor>> componentEntry :
++          componentDescriptorsBySimpleName.asMap().entrySet()) {
++        Collection<ComponentDescriptor> components = componentEntry.getValue();
++        subcomponentImplSimpleNames.putAll(disambiguateConflictingSimpleNames(components));
++      }
++      subcomponentImplSimpleNames.remove(graph.componentDescriptor());
++      return ImmutableBiMap.copyOf(subcomponentImplSimpleNames);
++    }
++
++    private ImmutableBiMap<ComponentDescriptor, String> disambiguateConflictingSimpleNames(
++        Collection<ComponentDescriptor> components) {
++      Map<String, ComponentDescriptor> generatedSimpleNames = new LinkedHashMap<>();
++      // The ending condition is when there is a unique simple name generated for every element
++      // in components. The sizes should be equivalent (with one generated name per component).
++      for (int levels = 0; generatedSimpleNames.size() != components.size(); levels++) {
++        generatedSimpleNames.clear();
++        for (ComponentDescriptor component : components) {
++          List<String> pieces = componentQualifiedNamePieces.get(component);
++          String simpleName =
++              QUALIFIED_NAME_JOINER.join(
++                      pieces.subList(Math.max(0, pieces.size() - levels - 1), pieces.size()))
++                  + "Impl";
++          ComponentDescriptor conflict = generatedSimpleNames.put(simpleName, component);
++          if (conflict != null) {
++            // if the map previously contained an entry for the same simple name, stop early since
++            // 2+ subcomponent descriptors will have the same simple name
++            break;
++          }
++        }
++      }
++      return ImmutableBiMap.copyOf(generatedSimpleNames).inverse();
++    }
++
++    private static ImmutableListMultimap<ComponentDescriptor, String> qualifiedNames(
++        Iterable<ComponentDescriptor> componentDescriptors) {
++      ImmutableListMultimap.Builder<ComponentDescriptor, String> builder =
++          ImmutableListMultimap.builder();
++      for (ComponentDescriptor component : componentDescriptors) {
++        Name qualifiedName = component.componentDefinitionType().getQualifiedName();
++        builder.putAll(component, QUALIFIED_NAME_SPLITTER.split(qualifiedName));
++      }
++      return builder.build();
++    }
+   }
+ 
+   @Override
+diff --git a/compiler/src/main/java/dagger/internal/codegen/SubcomponentWriter.java b/compiler/src/main/java/dagger/internal/codegen/SubcomponentWriter.java
+index 128766872..507e4aaf1 100644
+--- a/compiler/src/main/java/dagger/internal/codegen/SubcomponentWriter.java
++++ b/compiler/src/main/java/dagger/internal/codegen/SubcomponentWriter.java
+@@ -47,7 +47,7 @@
+ /**
+  * Creates the nested implementation class for a subcomponent.
+  */
+-class SubcomponentWriter extends AbstractComponentWriter {
++final class SubcomponentWriter extends AbstractComponentWriter {
+ 
+   private AbstractComponentWriter parent;
+   private ExecutableElement subcomponentFactoryMethod;
+@@ -61,16 +61,18 @@ public SubcomponentWriter(
+         parent.elements,
+         parent.keyFactory,
+         parent.nullableValidationType,
+-        parent.name.nestedClassNamed(subcomponentSimpleName(subgraph)),
+-        subgraph);
++        subcomponentName(parent, subgraph),
++        subgraph,
++        parent.subcomponentImplNames);
+     this.parent = parent;
+     this.subcomponentFactoryMethod = subcomponentFactoryMethod;
+   }
+ 
+-  private static String subcomponentSimpleName(BindingGraph subgraph) {
+-    return subgraph.componentDescriptor().componentDefinitionType().getSimpleName() + "Impl";
++  private static ClassName subcomponentName(AbstractComponentWriter parent, BindingGraph subgraph) {
++    return parent.name.nestedClassNamed(
++        parent.subcomponentImplNames.get(subgraph.componentDescriptor()));
+   }
+-  
++
+   @Override
+   protected InitializationState getInitializationState(BindingKey bindingKey) {
+     InitializationState initializationState = super.getInitializationState(bindingKey);
+diff --git a/compiler/src/test/java/dagger/internal/codegen/SubcomponentValidationTest.java b/compiler/src/test/java/dagger/internal/codegen/SubcomponentValidationTest.java
+index d47c32839..c395ad13a 100644
+--- a/compiler/src/test/java/dagger/internal/codegen/SubcomponentValidationTest.java
++++ b/compiler/src/test/java/dagger/internal/codegen/SubcomponentValidationTest.java
+@@ -340,7 +340,7 @@ public void delegateFactoryNotCreatedForSubcomponentWhenProviderExistsInParent()
+ 
+     JavaFileObject componentGeneratedFile =
+         JavaFileObjects.forSourceLines(
+-            "DaggerParentComponent",
++            "test.DaggerParentComponent",
+             "package test;",
+             "",
+             "import dagger.MembersInjector;",
+@@ -446,4 +446,376 @@ public void delegateFactoryNotCreatedForSubcomponentWhenProviderExistsInParent()
+         .and()
+         .generatesSources(componentGeneratedFile);
+   }
++
++  @Test
++  public void multipleSubcomponentsWithSameSimpleNamesCanExistInSameComponent() {
++    JavaFileObject parent =
++        JavaFileObjects.forSourceLines(
++            "test.ParentComponent",
++            "package test;",
++            "",
++            "import dagger.Component;",
++            "",
++            "@Component",
++            "interface ParentComponent {",
++            "  Foo.Sub newFooSubcomponent();",
++            "  NoConflict newNoConflictSubcomponent();",
++            "}");
++    JavaFileObject foo =
++        JavaFileObjects.forSourceLines(
++            "test.Foo",
++            "package test;",
++            "",
++            "import dagger.Subcomponent;",
++            "",
++            "interface Foo {",
++            "  @Subcomponent interface Sub {",
++            "    Bar.Sub newBarSubcomponent();",
++            "  }",
++            "}");
++    JavaFileObject bar =
++        JavaFileObjects.forSourceLines(
++            "test.Bar",
++            "package test;",
++            "",
++            "import dagger.Subcomponent;",
++            "",
++            "interface Bar {",
++            "  @Subcomponent interface Sub {",
++            "    test.subpackage.Sub newSubcomponentInSubpackage();",
++            "  }",
++            "}");
++    JavaFileObject baz =
++        JavaFileObjects.forSourceLines(
++            "test.subpackage.Sub",
++            "package test.subpackage;",
++            "",
++            "import dagger.Subcomponent;",
++            "",
++            "@Subcomponent public interface Sub {}");
++    JavaFileObject noConflict =
++        JavaFileObjects.forSourceLines(
++            "test.NoConflict",
++            "package test;",
++            "",
++            "import dagger.Subcomponent;",
++            "",
++            "@Subcomponent interface NoConflict {}");
++
++    JavaFileObject componentGeneratedFile =
++        JavaFileObjects.forSourceLines(
++            "test.DaggerParentComponent",
++            "package test;",
++            "",
++            "import javax.annotation.Generated;",
++            "import test.Bar.Sub;",
++            "import test.Foo;",
++            "",
++            "@Generated(\"dagger.internal.codegen.ComponentProcessor\")",
++            "public final class DaggerParentComponent implements ParentComponent {",
++            "  private DaggerParentComponent(Builder builder) {",
++            "    assert builder != null;",
++            "  }",
++            "",
++            "  public static Builder builder() {",
++            "    return new Builder();",
++            "  }",
++            "",
++            "  public static ParentComponent create() {",
++            "    return builder().build();",
++            "  }",
++            "",
++            "  @Override",
++            "  public Foo.Sub newFooSubcomponent() {",
++            "    return new Foo_SubImpl();",
++            "  }",
++            "",
++            "  @Override",
++            "  public NoConflict newNoConflictSubcomponent() {",
++            "    return new NoConflictImpl();",
++            "  }",
++            "",
++            "  public static final class Builder {",
++            "    private Builder() {}",
++            "",
++            "    public ParentComponent build() {",
++            "      return new DaggerParentComponent(this);",
++            "    }",
++            "  }",
++            "",
++            "  private final class Foo_SubImpl implements Foo.Sub {",
++            "",
++            "    @Override",
++            "    public Sub newBarSubcomponent() {",
++            "      return new Bar_SubImpl();",
++            "    }",
++            "",
++            "    private final class Bar_SubImpl implements Sub {",
++            "",
++            "      @Override",
++            "      public test.subpackage.Sub newSubcomponentInSubpackage() {",
++            "        return new subpackage_SubImpl();",
++            "      }",
++            "",
++            "      private final class subpackage_SubImpl implements test.subpackage.Sub {}",
++            "    }",
++            "  }",
++            "  private final class NoConflictImpl implements NoConflict {}",
++            "}");
++
++    assertAbout(javaSources())
++        .that(ImmutableList.of(parent, foo, bar, baz, noConflict))
++        .processedWith(new ComponentProcessor())
++        .compilesWithoutError()
++        .and()
++        .generatesSources(componentGeneratedFile);
++  }
++
++  @Test
++  public void subcomponentSimpleNamesDisambiguated() {
++    JavaFileObject parent =
++        JavaFileObjects.forSourceLines(
++            "test.ParentComponent",
++            "package test;",
++            "",
++            "import dagger.Component;",
++            "",
++            "@Component",
++            "interface ParentComponent {",
++            "  Sub newSubcomponent();",
++            "}");
++    JavaFileObject sub =
++        JavaFileObjects.forSourceLines(
++            "test.Sub",
++            "package test;",
++            "",
++            "import dagger.Subcomponent;",
++            "",
++            "@Subcomponent interface Sub {",
++            "  test.deep.many.levels.that.match.test.Sub newDeepSubcomponent();",
++            "}");
++    JavaFileObject deepSub =
++        JavaFileObjects.forSourceLines(
++            "test.deep.many.levels.that.match.test.Sub",
++            "package test.deep.many.levels.that.match.test;",
++            "",
++            "import dagger.Subcomponent;",
++            "",
++            "@Subcomponent public interface Sub {}");
++
++    JavaFileObject componentGeneratedFile =
++        JavaFileObjects.forSourceLines(
++            "test.DaggerParentComponent",
++            "package test;",
++            "",
++            "import javax.annotation.Generated;",
++            "import test.deep.many.levels.that.match.test.Sub;",
++            "",
++            "@Generated(\"dagger.internal.codegen.ComponentProcessor\")",
++            "public final class DaggerParentComponent implements ParentComponent {",
++            "  private DaggerParentComponent(Builder builder) {",
++            "    assert builder != null;",
++            "  }",
++            "",
++            "  public static Builder builder() {",
++            "    return new Builder();",
++            "  }",
++            "",
++            "  public static ParentComponent create() {",
++            "    return builder().build();",
++            "  }",
++            "",
++            "  @Override",
++            "  public test.Sub newSubcomponent() {",
++            "    return new test_SubImpl();",
++            "  }",
++            "",
++            "  public static final class Builder {",
++            "    private Builder() {}",
++            "",
++            "    public ParentComponent build() {",
++            "      return new DaggerParentComponent(this);",
++            "    }",
++            "  }",
++            "",
++            "  private final class test_SubImpl implements test.Sub {",
++            "",
++            "    @Override",
++            "    public Sub newDeepSubcomponent() {",
++            "      return new match_test_SubImpl();",
++            "    }",
++            "",
++            "    private final class match_test_SubImpl implements Sub {}",
++            "  }",
++            "}");
++
++    assertAbout(javaSources())
++        .that(ImmutableList.of(parent, sub, deepSub))
++        .processedWith(new ComponentProcessor())
++        .compilesWithoutError()
++        .and()
++        .generatesSources(componentGeneratedFile);
++  }
++
++  @Test
++  public void subcomponentImplNameUsesFullyQualifiedClassNameIfNecessary() {
++    JavaFileObject parent =
++        JavaFileObjects.forSourceLines(
++            "test.ParentComponent",
++            "package test;",
++            "",
++            "import dagger.Component;",
++            "",
++            "@Component",
++            "interface ParentComponent {",
++            "  top1.a.b.c.d.E.F.Sub top1();",
++            "  top2.a.b.c.d.E.F.Sub top2();",
++            "}");
++    JavaFileObject top1 =
++        JavaFileObjects.forSourceLines(
++            "top1.a.b.c.d.E",
++            "package top1.a.b.c.d;",
++            "",
++            "import dagger.Subcomponent;",
++            "",
++            "public interface E {",
++            "  interface F {",
++            "    @Subcomponent interface Sub {}",
++            "  }",
++            "}");
++    JavaFileObject top2 =
++        JavaFileObjects.forSourceLines(
++            "top2.a.b.c.d.E",
++            "package top2.a.b.c.d;",
++            "",
++            "import dagger.Subcomponent;",
++            "",
++            "public interface E {",
++            "  interface F {",
++            "    @Subcomponent interface Sub {}",
++            "  }",
++            "}");
++
++    JavaFileObject componentGeneratedFile =
++        JavaFileObjects.forSourceLines(
++            "test.DaggerParentComponent",
++            "package test;",
++            "",
++            "import javax.annotation.Generated;",
++            "import top1.a.b.c.d.E.F.Sub;",
++            "import top2.a.b.c.d.E.F;",
++            "",
++            "@Generated(\"dagger.internal.codegen.ComponentProcessor\")",
++            "public final class DaggerParentComponent implements ParentComponent {",
++            "  private DaggerParentComponent(Builder builder) {",
++            "    assert builder != null;",
++            "  }",
++            "",
++            "  public static Builder builder() {",
++            "    return new Builder();",
++            "  }",
++            "",
++            "  public static ParentComponent create() {",
++            "    return builder().build();",
++            "  }",
++            "",
++            "  @Override",
++            "  public Sub top1() {",
++            "    return new top1_a_b_c_d_E_F_SubImpl();",
++            "  }",
++            "",
++            "  @Override",
++            "  public F.Sub top2() {",
++            "    return new top2_a_b_c_d_E_F_SubImpl();",
++            "  }",
++            "",
++            "  public static final class Builder {",
++            "    private Builder() {}",
++            "",
++            "    public ParentComponent build() {",
++            "      return new DaggerParentComponent(this);",
++            "    }",
++            "  }",
++            "",
++            "  private final class top1_a_b_c_d_E_F_SubImpl implements Sub {}",
++            "  private final class top2_a_b_c_d_E_F_SubImpl implements F.Sub {}",
++            "}");
++
++    assertAbout(javaSources())
++        .that(ImmutableList.of(parent, top1, top2))
++        .processedWith(new ComponentProcessor())
++        .compilesWithoutError()
++        .and()
++        .generatesSources(componentGeneratedFile);
++  }
++
++  @Test
++  public void parentComponentNameShouldNotBeDisambiguatedWhenItConflictsWithASubcomponent() {
++    JavaFileObject parent =
++        JavaFileObjects.forSourceLines(
++            "test.ParentComponent",
++            "package test;",
++            "",
++            "import dagger.Component;",
++            "",
++            "@Component",
++            "interface C {",
++            "  test.Foo.C newFooC();",
++            "}");
++    JavaFileObject subcomponentWithSameSimpleNameAsParent =
++        JavaFileObjects.forSourceLines(
++            "test.Foo",
++            "package test;",
++            "",
++            "import dagger.Subcomponent;",
++            "",
++            "interface Foo {",
++            "  @Subcomponent interface C {}",
++            "}");
++
++    JavaFileObject componentGeneratedFile =
++        JavaFileObjects.forSourceLines(
++            "test.DaggerParentComponent",
++            "package test;",
++            "",
++            "import javax.annotation.Generated;",
++            "import test.Foo.C;",
++            "",
++            "@Generated(\"dagger.internal.codegen.ComponentProcessor\")",
++            "public final class DaggerC implements test.C {",
++            "  private DaggerC(Builder builder) {",
++            "    assert builder != null;",
++            "  }",
++            "",
++            "  public static Builder builder() {",
++            "    return new Builder();",
++            "  }",
++            "",
++            "  public static test.C create() {",
++            "    return builder().build();",
++            "  }",
++            "",
++            "  @Override",
++            "  public C newFooC() {",
++            "    return new Foo_CImpl();",
++            "  }",
++            "",
++            "  public static final class Builder {",
++            "    private Builder() {}",
++            "",
++            "    public test.C build() {",
++            "      return new DaggerC(this);",
++            "    }",
++            "  }",
++            "",
++            "  private final class Foo_CImpl implements C {}",
++            "}");
++
++    assertAbout(javaSources())
++        .that(ImmutableList.of(parent, subcomponentWithSameSimpleNameAsParent))
++        .processedWith(new ComponentProcessor())
++        .compilesWithoutError()
++        .and()
++        .generatesSources(componentGeneratedFile);
++  }
+ }

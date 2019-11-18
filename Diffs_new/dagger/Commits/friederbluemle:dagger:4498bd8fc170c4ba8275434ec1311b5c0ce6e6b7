@@ -1,0 +1,572 @@
+diff --git a/java/dagger/internal/codegen/BUILD b/java/dagger/internal/codegen/BUILD
+index aeec8e2ff..78dff19f9 100644
+--- a/java/dagger/internal/codegen/BUILD
++++ b/java/dagger/internal/codegen/BUILD
+@@ -201,6 +201,7 @@ java_library(
+         "BindingGraphValidationModule.java",
+         "DuplicateBindingsValidation.java",
+         "IncompatiblyScopedBindingsValidation.java",
++        "IncorrectlyInstalledBindsMethodsValidator.java",
+         "InjectBindingValidation.java",
+         "MapMultibindingValidation.java",
+         "MembersInjectionBindingValidation.java",
+@@ -209,6 +210,7 @@ java_library(
+         "ProvisionDependencyOnProducerBindingValidation.java",
+         "Validation.java",
+     ],
++    plugins = CODEGEN_PLUGINS,
+     tags = ["maven:merged"],
+     deps = CODEGEN_DEPS + [
+         ":base",
+@@ -347,6 +349,7 @@ java_library(
+     deps = [
+         ":base",
+         ":binding",
++        ":internal_validation",
+         ":kythe_plugin",
+         ":processor",
+         ":validation",
+diff --git a/java/dagger/internal/codegen/BindingGraphFactory.java b/java/dagger/internal/codegen/BindingGraphFactory.java
+index 6647eb6c2..533f8c129 100644
+--- a/java/dagger/internal/codegen/BindingGraphFactory.java
++++ b/java/dagger/internal/codegen/BindingGraphFactory.java
+@@ -27,6 +27,7 @@
+ import static dagger.internal.codegen.DaggerStreams.toImmutableSet;
+ import static dagger.internal.codegen.RequestKinds.getRequestKind;
+ import static dagger.internal.codegen.Util.reentrantComputeIfAbsent;
++import static dagger.model.BindingKind.DELEGATE;
+ import static dagger.model.BindingKind.OPTIONAL;
+ import static dagger.model.BindingKind.SUBCOMPONENT_BUILDER;
+ import static java.util.function.Predicate.isEqual;
+@@ -47,6 +48,7 @@
+ import dagger.internal.codegen.ComponentDescriptor.BuilderRequirementMethod;
+ import dagger.internal.codegen.ComponentDescriptor.ComponentMethodDescriptor;
+ import dagger.internal.codegen.ComponentDescriptor.ComponentMethodKind;
++import dagger.model.ComponentPath;
+ import dagger.model.DependencyRequest;
+ import dagger.model.Key;
+ import dagger.model.Scope;
+@@ -79,17 +81,23 @@
+   private final InjectBindingRegistry injectBindingRegistry;
+   private final KeyFactory keyFactory;
+   private final BindingFactory bindingFactory;
++  private final IncorrectlyInstalledBindsMethodsValidator incorrectlyInstalledBindsMethodsValidator;
++  private final CompilerOptions compilerOptions;
+ 
+   @Inject
+   BindingGraphFactory(
+       DaggerElements elements,
+       InjectBindingRegistry injectBindingRegistry,
+       KeyFactory keyFactory,
+-      BindingFactory bindingFactory) {
++      BindingFactory bindingFactory,
++      IncorrectlyInstalledBindsMethodsValidator incorrectlyInstalledBindsMethodsValidator,
++      CompilerOptions compilerOptions) {
+     this.elements = elements;
+     this.injectBindingRegistry = injectBindingRegistry;
+     this.keyFactory = keyFactory;
+     this.bindingFactory = bindingFactory;
++    this.incorrectlyInstalledBindsMethodsValidator = incorrectlyInstalledBindsMethodsValidator;
++    this.compilerOptions = compilerOptions;
+   }
+ 
+   /** Creates a binding graph for a root component. */
+@@ -593,7 +601,9 @@ private boolean isResolvedInParent(Key requestKey, ContributionBinding binding)
+       if (binding.scope().isPresent() && binding.scope().get().isReusable()) {
+         for (Resolver requestResolver : getResolverLineage().reverse()) {
+           // If a @Reusable binding was resolved in an ancestor, use that component.
+-          if (requestResolver.resolvedContributionBindings.containsKey(binding.key())) {
++          ResolvedBindings resolvedBindings =
++              requestResolver.resolvedContributionBindings.get(binding.key());
++          if (resolvedBindings != null && resolvedBindings.bindings().contains(binding)) {
+             return Optional.of(requestResolver);
+           }
+         }
+@@ -603,6 +613,7 @@ private boolean isResolvedInParent(Key requestKey, ContributionBinding binding)
+ 
+       for (Resolver requestResolver : getResolverLineage().reverse()) {
+         if (requestResolver.explicitBindingsSet.contains(binding)
++            || resolverContainsDelegateDeclarationForBinding(requestResolver, binding)
+             || requestResolver.subcomponentDeclarations.containsKey(binding.key())) {
+           return Optional.of(requestResolver);
+         }
+@@ -621,6 +632,71 @@ private boolean isResolvedInParent(Key requestKey, ContributionBinding binding)
+       return Optional.empty();
+     }
+ 
++    /**
++     * Returns true if {@code binding} was installed in a module in this resolver's component. If
++     * {@link CompilerOptions#floatingBindsMethods()} is enabled, calls {@link
++     * #recordFloatingBindsMethod(Resolver, ContributionBinding)} and returns false.
++     */
++    private boolean resolverContainsDelegateDeclarationForBinding(
++        Resolver resolver, ContributionBinding binding) {
++      // TODO(ronshapiro): remove the flag once we feel enough time has passed, and return this
++      // value directly. At that point, this can be remove the resolver parameter and become a
++      // method invoked on a particular resolver
++      boolean resolverContainsDeclaration =
++          binding.kind().equals(DELEGATE)
++              && resolver
++                  .delegateDeclarations
++                  .get(binding.key())
++                  .stream()
++                  .anyMatch(
++                      declaration ->
++                          declaration.contributingModule().equals(binding.contributingModule())
++                              && declaration.bindingElement().equals(binding.bindingElement()));
++      if (resolverContainsDeclaration && compilerOptions.floatingBindsMethods()) {
++        recordFloatingBindsMethod(resolver, binding);
++        return false;
++      }
++      return resolverContainsDeclaration;
++    }
++
++    /**
++     * Records binds methods that are resolved in the wrong component due to b/79859714. These will
++     * be reported later on in {@link IncorrectlyInstalledBindsMethodsValidator}.
++     */
++    private void recordFloatingBindsMethod(Resolver idealResolver, ContributionBinding binding) {
++      Resolver actualResolver = this;
++      if (binding.scope().isPresent()) {
++        for (Resolver requestResolver : getResolverLineage().reverse()) {
++          if (requestResolver.componentDescriptor.scopes().contains(binding.scope().get())) {
++            actualResolver = requestResolver;
++            break;
++          }
++        }
++      }
++      if (actualResolver != idealResolver) {
++        incorrectlyInstalledBindsMethodsValidator.recordBinding(
++            componentPath(idealResolver), binding);
++      }
++    }
++
++    /**
++     * Constructs a {@link ComponentPath} from the root component of this resolver to a {@code
++     * destination}.
++     */
++    private ComponentPath componentPath(Resolver destination) {
++      ImmutableList.Builder<TypeElement> path = ImmutableList.builder();
++      for (Resolver resolver : getResolverLineage()) {
++        path.add(resolver.componentDescriptor.componentDefinitionType());
++        if (resolver == destination) {
++          return ComponentPath.create(path.build());
++        }
++      }
++      throw new AssertionError(
++          String.format(
++              "%s not found in %s",
++              destination.componentDescriptor.componentDefinitionType(), path.build()));
++    }
++
+     /** Returns the resolver lineage from parent to child. */
+     private ImmutableList<Resolver> getResolverLineage() {
+       List<Resolver> resolverList = Lists.newArrayList();
+@@ -806,8 +882,8 @@ void resolve(Key key) {
+       cycleStack.push(key);
+       try {
+         ResolvedBindings bindings = lookUpBindings(key);
+-        resolveDependencies(bindings);
+         resolvedContributionBindings.put(key, bindings);
++        resolveDependencies(bindings);
+       } finally {
+         cycleStack.pop();
+       }
+diff --git a/java/dagger/internal/codegen/CompilerOptions.java b/java/dagger/internal/codegen/CompilerOptions.java
+index af450bc0a..ab41936e2 100644
+--- a/java/dagger/internal/codegen/CompilerOptions.java
++++ b/java/dagger/internal/codegen/CompilerOptions.java
+@@ -79,6 +79,9 @@ boolean doCheckForNulls() {
+ 
+   abstract boolean aheadOfTimeComponents();
+ 
++  /** See b/79859714 */
++  abstract boolean floatingBindsMethods();
++
+   static Builder builder() {
+     return new AutoValue_CompilerOptions.Builder().headerCompilation(false);
+   }
+@@ -111,6 +114,8 @@ static CompilerOptions create(ProcessingEnvironment processingEnv, DaggerElement
+                 .equals(FeatureStatus.ENABLED))
+         .aheadOfTimeComponents(
+             aheadOfTimeComponentsFeatureStatus(processingEnv).equals(FeatureStatus.ENABLED))
++        .floatingBindsMethods(
++            floatingBindsMethodsFeatureStatus(processingEnv).equals(FeatureStatus.ENABLED))
+         .build();
+   }
+ 
+@@ -142,6 +147,8 @@ Builder warnIfInjectionFactoryNotGeneratedUpstream(
+ 
+     Builder aheadOfTimeComponents(boolean aheadOfTimeComponents);
+ 
++    Builder floatingBindsMethods(boolean enabled);
++
+     CompilerOptions build();
+   }
+ 
+@@ -180,6 +187,8 @@ Builder warnIfInjectionFactoryNotGeneratedUpstream(
+ 
+   static final String AHEAD_OF_TIME_COMPONENTS_KEY = "dagger.experimentalAheadOfTimeComponents";
+ 
++  static final String FLOATING_BINDS_METHODS_KEY = "dagger.floatingBindsMethods";
++
+   static final ImmutableSet<String> SUPPORTED_OPTIONS =
+       ImmutableSet.of(
+           FAST_INIT,
+@@ -192,7 +201,8 @@ Builder warnIfInjectionFactoryNotGeneratedUpstream(
+           STATIC_MEMBER_VALIDATION_TYPE_KEY,
+           WARN_IF_INJECTION_FACTORY_NOT_GENERATED_UPSTREAM_KEY,
+           IGNORE_PRIVATE_AND_STATIC_INJECTION_FOR_COMPONENT,
+-          AHEAD_OF_TIME_COMPONENTS_KEY);
++          AHEAD_OF_TIME_COMPONENTS_KEY,
++          FLOATING_BINDS_METHODS_KEY);
+ 
+   private static boolean fastInitEnabled(ProcessingEnvironment processingEnv) {
+     return valueOf(
+@@ -286,6 +296,15 @@ private static FeatureStatus aheadOfTimeComponentsFeatureStatus(
+         EnumSet.allOf(FeatureStatus.class));
+   }
+ 
++  private static FeatureStatus floatingBindsMethodsFeatureStatus(
++      ProcessingEnvironment processingEnv) {
++    return valueOf(
++        processingEnv,
++        FLOATING_BINDS_METHODS_KEY,
++        FeatureStatus.DISABLED,
++        EnumSet.allOf(FeatureStatus.class));
++  }
++
+   private static <T extends Enum<T>> T valueOf(
+       ProcessingEnvironment processingEnv, String key, T defaultValue, Set<T> validValues) {
+     Map<String, String> options = processingEnv.getOptions();
+diff --git a/java/dagger/internal/codegen/ComponentProcessor.java b/java/dagger/internal/codegen/ComponentProcessor.java
+index a77509fc5..bd3a9129b 100644
+--- a/java/dagger/internal/codegen/ComponentProcessor.java
++++ b/java/dagger/internal/codegen/ComponentProcessor.java
+@@ -116,6 +116,7 @@ public SourceVersion getSupportedSourceVersion() {
+         BindingGraphPluginsModule.class,
+         BindingGraphValidationModule.class,
+         BindingMethodValidatorsModule.class,
++        IncorrectlyInstalledBindsMethodsValidator.Module.class,
+         ProcessingStepsModule.class,
+       })
+   interface ProcessorComponent {
+diff --git a/java/dagger/internal/codegen/IncorrectlyInstalledBindsMethodsValidator.java b/java/dagger/internal/codegen/IncorrectlyInstalledBindsMethodsValidator.java
+new file mode 100644
+index 000000000..5df3b9a2f
+--- /dev/null
++++ b/java/dagger/internal/codegen/IncorrectlyInstalledBindsMethodsValidator.java
+@@ -0,0 +1,145 @@
++/*
++ * Copyright (C) 2018 The Dagger Authors.
++ *
++ * Licensed under the Apache License, Version 2.0 (the "License");
++ * you may not use this file except in compliance with the License.
++ * You may obtain a copy of the License at
++ *
++ * http://www.apache.org/licenses/LICENSE-2.0
++ *
++ * Unless required by applicable law or agreed to in writing, software
++ * distributed under the License is distributed on an "AS IS" BASIS,
++ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++ * See the License for the specific language governing permissions and
++ * limitations under the License.
++ */
++
++package dagger.internal.codegen;
++
++import static com.google.common.base.Preconditions.checkState;
++import static java.util.stream.Collectors.toCollection;
++import static javax.tools.Diagnostic.Kind.WARNING;
++
++import com.google.common.collect.Iterables;
++import com.google.common.collect.MultimapBuilder;
++import com.google.common.collect.SetMultimap;
++import com.google.common.graph.EndpointPair;
++import com.google.common.graph.Graphs;
++import com.google.common.graph.ImmutableGraph;
++import com.google.common.graph.ImmutableNetwork;
++import com.google.common.graph.MutableNetwork;
++import com.google.common.graph.NetworkBuilder;
++import dagger.Binds;
++import dagger.model.BindingGraph;
++import dagger.model.BindingGraph.BindingNode;
++import dagger.model.BindingGraph.DependencyEdge;
++import dagger.model.BindingGraph.Edge;
++import dagger.model.BindingGraph.Node;
++import dagger.model.ComponentPath;
++import dagger.multibindings.IntoSet;
++import dagger.spi.BindingGraphPlugin;
++import dagger.spi.DiagnosticReporter;
++import java.util.LinkedHashSet;
++import java.util.Map.Entry;
++import java.util.Set;
++import javax.inject.Inject;
++import javax.inject.Singleton;
++
++/**
++ * Prints warnings to help users debug <a
++ * href="https://github.com/google/dagger/wiki/Dagger-2.17-@Binds-bugs">the floating {@code @Binds}
++ * bug</a>.
++ */
++@Singleton
++final class IncorrectlyInstalledBindsMethodsValidator implements BindingGraphPlugin {
++  private final SetMultimap<ComponentPath, ContributionBinding> incorrectlyInstalledBindingsCache =
++      MultimapBuilder.hashKeys().linkedHashSetValues().build();
++  private final CompilerOptions compilerOptions;
++
++  @Inject
++  IncorrectlyInstalledBindsMethodsValidator(CompilerOptions compilerOptions) {
++    this.compilerOptions = compilerOptions;
++  }
++
++  @Override
++  public void visitGraph(BindingGraph graph, DiagnosticReporter diagnosticReporter) {
++    checkState(
++        compilerOptions.floatingBindsMethods() || incorrectlyInstalledBindingsCache.isEmpty());
++    for (Entry<ComponentPath, ContributionBinding> entry :
++        incorrectlyInstalledBindingsCache.entries()) {
++      ComponentPath idealComponentPath = entry.getKey();
++      ContributionBinding incorrectlyInstalledBinding = entry.getValue();
++      graph
++          .bindingNodes(incorrectlyInstalledBinding.key())
++          .stream()
++          .filter(bindingNode -> bindingNode.binding().equals(incorrectlyInstalledBinding))
++          .forEach(
++              bindingNode -> report(bindingNode, idealComponentPath, graph, diagnosticReporter));
++    }
++  }
++
++  private void report(
++      BindingNode incompatiblyInstalledBinding,
++      ComponentPath idealComponentPath,
++      BindingGraph graph,
++      DiagnosticReporter diagnosticReporter) {
++    // TODO(dpb): consider creating this once per visitGraph()
++    ImmutableGraph<Node> dependencyGraph = dependencyGraph(graph).asGraph();
++    Set<Node> culpableDependencies =
++        Graphs.reachableNodes(dependencyGraph, incompatiblyInstalledBinding)
++            .stream()
++            .filter(node -> isChild(idealComponentPath, node.componentPath()))
++            .filter(node -> !node.equals(incompatiblyInstalledBinding))
++            .collect(toCollection(LinkedHashSet::new));
++    if (culpableDependencies.isEmpty()) {
++      return;
++    }
++    StringBuilder warning =
++        new StringBuilder()
++            .append("Floating @Binds method detected:\n  ")
++            .append(incompatiblyInstalledBinding)
++            .append("\n  It is installed in:       ")
++            .append(idealComponentPath)
++            .append("\n  But is being resolved in: ")
++            .append(incompatiblyInstalledBinding.componentPath())
++            .append("\n  This is because it depends transitively on:");
++
++    while (!culpableDependencies.isEmpty()) {
++      BindingNode culpableDependency = (BindingNode) Iterables.get(culpableDependencies, 0);
++      warning
++          .append("\n      ")
++          .append(culpableDependency)
++          .append(", resolved in: ")
++          .append(culpableDependency.componentPath());
++      culpableDependencies.removeAll(Graphs.reachableNodes(dependencyGraph, culpableDependency));
++    }
++
++    diagnosticReporter.reportComponent(WARNING, graph.rootComponentNode(), warning.toString());
++  }
++
++  private boolean isChild(ComponentPath possibleParent, ComponentPath possibleChild) {
++    return !possibleParent.equals(possibleChild)
++        && possibleChild.components().containsAll(possibleParent.components());
++  }
++
++  private ImmutableNetwork<Node, Edge> dependencyGraph(BindingGraph graph) {
++    MutableNetwork<Node, Edge> dependencyGraph = NetworkBuilder.from(graph).build();
++    for (DependencyEdge dependencyEdge : graph.dependencyEdges()) {
++      EndpointPair<Node> endpoint = graph.incidentNodes(dependencyEdge);
++      dependencyGraph.addEdge(endpoint.source(), endpoint.target(), dependencyEdge);
++    }
++    return ImmutableNetwork.copyOf(dependencyGraph);
++  }
++
++  void recordBinding(ComponentPath componentPath, ContributionBinding binding) {
++    incorrectlyInstalledBindingsCache.put(componentPath, binding);
++  }
++
++  @dagger.Module
++  interface Module {
++    @Binds
++    @IntoSet
++    @Validation
++    BindingGraphPlugin validator(IncorrectlyInstalledBindsMethodsValidator validator);
++  }
++}
+diff --git a/java/dagger/internal/codegen/KytheBindingGraphFactory.java b/java/dagger/internal/codegen/KytheBindingGraphFactory.java
+index 9380285e8..4a16aa922 100644
+--- a/java/dagger/internal/codegen/KytheBindingGraphFactory.java
++++ b/java/dagger/internal/codegen/KytheBindingGraphFactory.java
+@@ -107,6 +107,7 @@ private static BindingGraphFactory createBindingGraphFactory(
+             .fastInit(false)
+             .experimentalAndroidMode2(false)
+             .aheadOfTimeComponents(false)
++            .floatingBindsMethods(false)
+             .build();
+ 
+     BindingFactory bindingFactory =
+@@ -124,7 +125,13 @@ private static BindingGraphFactory createBindingGraphFactory(
+             bindingFactory,
+             compilerOptions);
+ 
+-    return new BindingGraphFactory(elements, injectBindingRegistry, keyFactory, bindingFactory);
++    return new BindingGraphFactory(
++        elements,
++        injectBindingRegistry,
++        keyFactory,
++        bindingFactory,
++        new IncorrectlyInstalledBindsMethodsValidator(compilerOptions),
++        compilerOptions);
+   }
+ 
+   private static class NullMessager implements Messager {
+diff --git a/javatests/dagger/internal/codegen/GraphValidationScopingTest.java b/javatests/dagger/internal/codegen/GraphValidationScopingTest.java
+index c11d04fbc..bd7ccb744 100644
+--- a/javatests/dagger/internal/codegen/GraphValidationScopingTest.java
++++ b/javatests/dagger/internal/codegen/GraphValidationScopingTest.java
+@@ -71,6 +71,85 @@
+     assertThat(compilation).hadErrorContaining(errorMessage);
+   }
+ 
++  @Test // b/79859714
++  public void bindsWithChildScope_inParentModule_notAllowed() {
++    JavaFileObject childScope =
++        JavaFileObjects.forSourceLines(
++            "test.ChildScope",
++            "package test;",
++            "",
++            "import javax.inject.Scope;",
++            "",
++            "@Scope",
++            "@interface ChildScope {}");
++
++    JavaFileObject foo =
++        JavaFileObjects.forSourceLines(
++            "test.Foo",
++            "package test;",
++            "", //
++            "interface Foo {}");
++
++    JavaFileObject fooImpl =
++        JavaFileObjects.forSourceLines(
++            "test.ChildModule",
++            "package test;",
++            "",
++            "import javax.inject.Inject;",
++            "",
++            "class FooImpl implements Foo {",
++            "  @Inject FooImpl() {}",
++            "}");
++
++    JavaFileObject parentModule =
++        JavaFileObjects.forSourceLines(
++            "test.ParentModule",
++            "package test;",
++            "",
++            "import dagger.Binds;",
++            "import dagger.Module;",
++            "",
++            "@Module",
++            "interface ParentModule {",
++            "  @Binds @ChildScope Foo bind(FooImpl fooImpl);",
++            "}");
++
++    JavaFileObject parent =
++        JavaFileObjects.forSourceLines(
++            "test.ParentComponent",
++            "package test;",
++            "",
++            "import dagger.Component;",
++            "import javax.inject.Singleton;",
++            "",
++            "@Singleton",
++            "@Component(modules = ParentModule.class)",
++            "interface Parent {",
++            "  Child child();",
++            "}");
++
++    JavaFileObject child =
++        JavaFileObjects.forSourceLines(
++            "test.Child",
++            "package test;",
++            "",
++            "import dagger.Subcomponent;",
++            "",
++            "@ChildScope",
++            "@Subcomponent",
++            "interface Child {",
++            "  Foo foo();",
++            "}");
++
++    Compilation compilation =
++        daggerCompiler().compile(childScope, foo, fooImpl, parentModule, parent, child);
++    assertThat(compilation).failed();
++    assertThat(compilation)
++        .hadErrorContaining(
++            "test.Parent scoped with @Singleton may not reference bindings with different scopes:\n"
++                + "      @Binds @test.ChildScope test.Foo test.ParentModule.bind(test.FooImpl)");
++  }
++
+   @Test public void componentWithScopeIncludesIncompatiblyScopedBindings_Fail() {
+     JavaFileObject componentFile = JavaFileObjects.forSourceLines("test.MyComponent",
+         "package test;",
+diff --git a/javatests/dagger/internal/codegen/ProductionComponentProcessorTest.java b/javatests/dagger/internal/codegen/ProductionComponentProcessorTest.java
+index 8c3299960..4486dd733 100644
+--- a/javatests/dagger/internal/codegen/ProductionComponentProcessorTest.java
++++ b/javatests/dagger/internal/codegen/ProductionComponentProcessorTest.java
+@@ -351,19 +351,18 @@ public void simpleComponent() {
+                 "  }",
+                 "",
+                 "  public static final class Builder {",
+-                "    private TestClass.BModule bModule;",
+-                "",
+                 "    private TestClass.AModule aModule;",
++                "    private TestClass.BModule bModule;",
+                 "",
+                 "    private Builder() {}",
+                 "",
+                 "    public TestClass.SimpleComponent build() {",
+-                "      if (bModule == null) {",
+-                "        this.bModule = new TestClass.BModule();",
+-                "      }",
+                 "      if (aModule == null) {",
+                 "        this.aModule = new TestClass.AModule();",
+                 "      }",
++                "      if (bModule == null) {",
++                "        this.bModule = new TestClass.BModule();",
++                "      }",
+                 "      return new DaggerTestClass_SimpleComponent(this);",
+                 "    }",
+                 "",
+@@ -479,18 +478,18 @@ public void simpleComponent() {
+                 "  }",
+                 "",
+                 "  public static final class Builder {",
+-                "    private TestClass.BModule bModule;",
+                 "    private TestClass.AModule aModule;",
++                "    private TestClass.BModule bModule;",
+                 "",
+                 "    private Builder() {}",
+                 "",
+                 "    public TestClass.SimpleComponent build() {",
+-                "      if (bModule == null) {",
+-                "        this.bModule = new TestClass.BModule();",
+-                "      }",
+                 "      if (aModule == null) {",
+                 "        this.aModule = new TestClass.AModule();",
+                 "      }",
++                "      if (bModule == null) {",
++                "        this.bModule = new TestClass.BModule();",
++                "      }",
+                 "      return new DaggerTestClass_SimpleComponent(this);",
+                 "    }",
+                 "",

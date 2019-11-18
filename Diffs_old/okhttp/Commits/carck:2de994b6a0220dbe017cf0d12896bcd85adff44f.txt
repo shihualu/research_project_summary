@@ -1,0 +1,2299 @@
+diff --git a/concurrency.md b/concurrency.md
+new file mode 100644
+index 0000000000..0858133a31
+--- /dev/null
++++ b/concurrency.md
+@@ -0,0 +1,63 @@
++# Concurrency in OkHttp
++
++The HttpURLConnection API is a blocking API. You make a blocking write to send a request, and a blocking read to receive the response.
++
++#### Blocking APIs
++
++Blocking APIs are convenient because you get top-to-bottom procedural code without indirection. Network calls work like regular method calls: ask for data and it is returned. If the request fails, you get a stacktrace right were the call was made.
++
++Blocking APIs may be inefficient because you hold a thread idle while waiting on the network. Threads are expensive because they have both a memory overhead and a context-switching overhead.
++
++#### Framed protocols
++
++Framed protocols like spdy/3 and http/2 don't lend themselves to blocking APIs. Each application-layer thread wants to do blocking I/O for a specific stream, but the streams are multiplexed on the socket. You can't just talk to the socket, you need to cooperate with the other application-layer threads that you're sharing it with.
++
++Framing rules make it impractical to implement spdy/3 or http/2 correctly on a single blocking thread. The flow-control features introduce feedback between reads and writes, requiring writes to acknowledge reads and reads to throttle writes.
++
++In OkHttp we expose a blocking API over a framed protocol. This document explains the code and policy that makes that work.
++
++## Threads
++
++#### Application's calling thread
++
++The application-layer must block on writing I/O. We can't return from a write until we've pushed its bytes onto the socket. Otherwise, if the write fails we are unable to deliver its IOException to the application. We would have told the application layer that the write succeeded, but it didn't!
++
++The application-layer can also do blocking reads. If the application asks to read and there's nothing available, we need to hold that thread until either the bytes arrive, the stream is closed, or a timeout elapses. If we get bytes but there's nobody asking for them, we buffer them. We don't consider bytes as delivered for flow control until they're consumed by the application.
++
++Consider an application streaming a video over http/2. Perhaps the user pauses the video and the application stops reading bytes from this stream. The buffer will fill up, and flow control prevents the server from sending more data on this stream. When the user unpauses her video the buffer drains, the read is acknowledged, and the server proceeds to stream data.
++
++#### Shared reader thread
++
++We can't rely on application threads to read data from the socket. Application threads are transient: sometimes they're reading and writing and sometimes they're off doing application-layer things. But the socket is permanent, and it needs constant attention: we dispatch all incoming frames so the connection is good-to-go when the application layer needs it.
++
++So we have a dedicated thread for every socket that just reads frames and dispatches them.
++
++The reader thread must never run application-layer code. Otherwise one slow stream can hold up the entire connection.
++
++Similarly, the reader thread must never block on writing because this can deadlock the connection. Consider a client and server that both violate this rule. If you get unlucky, they could fill up their TCP buffers (so that writes block) and then use their reader threads to write a frame. Nobody is reading on either end, and the buffers are never drained.
++
++#### Do-stuff-later pool
++
++Sometimes there's an action required like calling the application layer or responding to a ping, and the thread discovering the action is not the thread that should do the work. We enqueue a runnable on this executor and it gets handled by one of the executor's threads.
++
++## Locks
++
++We have 3 different things that we synchronize on.
++
++#### SpdyConnection
++
++This lock guards internal state of each connection. This lock is never held for blocking operations. That means that we acquire the lock, read or write a few fields and release the lock. No I/O and no application-layer callbacks.
++
++#### SpdyStream
++
++This lock guards the internal state of each stream. As above, it is never held for blocking operations. When we need to hold an application thread to block a read, we use wait/notify on this lock. This works because the lock is released while `wait()` is waiting.
++
++#### FrameWriter
++
++Socket writes are guarded by the FrameWriter. Only one stream can write at a time so that messages are not interleaved. Writes are either made by application-layer threads or the do-stuff-later pool.
++
++### Holding multiple locks
++
++You're allowed to take the SpdyConnection lock while holding the FrameWriter lock. But not vice-versa. Because taking the FrameWriter lock can block.
++
++This is necessary for bookkeeping when creating new streams. Correct framing requires that stream IDs are sequential on the socket, so we need to bundle assigning the ID with sending the `SYN_STREAM` frame.
+diff --git a/okhttp-protocols/src/main/java/com/squareup/okhttp/internal/spdy/FrameReader.java b/okhttp-protocols/src/main/java/com/squareup/okhttp/internal/spdy/FrameReader.java
+index 20b03171e6..36e2e152a4 100644
+--- a/okhttp-protocols/src/main/java/com/squareup/okhttp/internal/spdy/FrameReader.java
++++ b/okhttp-protocols/src/main/java/com/squareup/okhttp/internal/spdy/FrameReader.java
+@@ -61,8 +61,25 @@ void headers(boolean outFinished, boolean inFinished, int streamId, int associat
+      *  set. The data is opaque binary, and there are no rules on the content.
+      */
+     void ping(boolean ack, int payload1, int payload2);
+-    void goAway(int lastGoodStreamId, ErrorCode errorCode);
+-    void windowUpdate(int streamId, int deltaWindowSize, boolean endFlowControl);
++
++    /**
++     * The peer tells us to stop creating streams.  It is safe to replay
++     * streams with {@code ID > lastGoodStreamId} on a new connection.  In-
++     * flight streams with {@code ID <= lastGoodStreamId} can only be replayed
++     * on a new connection if they are idempotent.
++     *
++     * @param lastGoodStreamId the last stream ID the peer processed before
++     * sending this message. If {@lastGoodStreamId} is zero, the peer processed no frames.
++     * @param errorCode reason for closing the connection.
++     * @param debugData only valid for http/2; opaque debug data to send.
++     */
++    void goAway(int lastGoodStreamId, ErrorCode errorCode, byte[] debugData);
++
++    /**
++     * Notifies that an additional {@code windowSizeIncrement} bytes can be
++     * sent on {@code streamId}, or the connection if {@code streamId} is zero.
++     */
++    void windowUpdate(int streamId, long windowSizeIncrement);
+     void priority(int streamId, int priority);
+ 
+     /**
+diff --git a/okhttp-protocols/src/main/java/com/squareup/okhttp/internal/spdy/FrameWriter.java b/okhttp-protocols/src/main/java/com/squareup/okhttp/internal/spdy/FrameWriter.java
+index ab90db69dc..e508c96f14 100644
+--- a/okhttp-protocols/src/main/java/com/squareup/okhttp/internal/spdy/FrameWriter.java
++++ b/okhttp-protocols/src/main/java/com/squareup/okhttp/internal/spdy/FrameWriter.java
+@@ -65,6 +65,7 @@ void synReply(boolean outFinished, int streamId, List<Header> headerBlock)
+    */
+   void data(boolean outFinished, int streamId, byte[] data, int offset, int byteCount)
+       throws IOException;
++
+   /** Write okhttp's settings to the peer. */
+   void settings(Settings okHttpSettings) throws IOException;
+   void noop() throws IOException;
+@@ -81,6 +82,21 @@ void data(boolean outFinished, int streamId, byte[] data, int offset, int byteCo
+    *  sent.  The data is opaque binary, and there are no rules on the content.
+    */
+   void ping(boolean ack, int payload1, int payload2) throws IOException;
+-  void goAway(int lastGoodStreamId, ErrorCode errorCode) throws IOException;
+-  void windowUpdate(int streamId, int deltaWindowSize) throws IOException;
++
++  /**
++   * Tell the peer to stop creating streams and that we last processed
++   * {@code lastGoodStreamId}, or zero if no streams were processed.
++   *
++   * @param lastGoodStreamId the last stream ID processed, or zero if no
++   * streams were processed.
++   * @param errorCode reason for closing the connection.
++   * @param debugData only valid for http/2; opaque debug data to send.
++   */
++  void goAway(int lastGoodStreamId, ErrorCode errorCode, byte[] debugData) throws IOException;
++
++  /**
++   * Inform peer that an additional {@code windowSizeIncrement} bytes can be
++   * sent on {@code streamId}, or the connection if {@code streamId} is zero.
++   */
++  void windowUpdate(int streamId, long windowSizeIncrement) throws IOException;
+ }
+diff --git a/okhttp-protocols/src/main/java/com/squareup/okhttp/internal/spdy/HpackDraft05.java b/okhttp-protocols/src/main/java/com/squareup/okhttp/internal/spdy/HpackDraft05.java
+index 8a3941e33d..87ba091d7e 100644
+--- a/okhttp-protocols/src/main/java/com/squareup/okhttp/internal/spdy/HpackDraft05.java
++++ b/okhttp-protocols/src/main/java/com/squareup/okhttp/internal/spdy/HpackDraft05.java
+@@ -178,9 +178,8 @@ private int evictToRecoverBytes(int bytesToRecover) {
+      * set of emitted headers.
+      */
+     void readHeaders() throws IOException {
+-      int b;
+-      while ((b = in.read()) != -1) {
+-        b &= 0xff;
++      while (in.available() > 0) {
++        int b = in.read() & 0xff;
+         if (b == 0x80) { // 10000000
+           clearReferenceSet();
+         } else if ((b & 0x80) == 0x80) { // 1NNNNNNN
+diff --git a/okhttp-protocols/src/main/java/com/squareup/okhttp/internal/spdy/Http20Draft09.java b/okhttp-protocols/src/main/java/com/squareup/okhttp/internal/spdy/Http20Draft09.java
+index 4589788c11..ada0d6b2f7 100644
+--- a/okhttp-protocols/src/main/java/com/squareup/okhttp/internal/spdy/Http20Draft09.java
++++ b/okhttp-protocols/src/main/java/com/squareup/okhttp/internal/spdy/Http20Draft09.java
+@@ -38,11 +38,7 @@
+   }
+ 
+   // http://tools.ietf.org/html/draft-ietf-httpbis-http2-09#section-6.5
+-  @Override public Settings defaultOkHttpSettings(boolean client) {
+-    return initialPeerSettings(client);
+-  }
+-
+-  @Override public Settings initialPeerSettings(boolean client) {
++  static Settings defaultSettings(boolean client) {
+     Settings settings = new Settings();
+     settings.set(Settings.HEADER_TABLE_SIZE, 0, 4096);
+     if (client) { // client specifies whether or not it accepts push.
+@@ -55,31 +51,29 @@
+   private static final byte[] CONNECTION_HEADER =
+       "PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n".getBytes(Util.UTF_8);
+ 
+-  static final int TYPE_DATA = 0x0;
+-  static final int TYPE_HEADERS = 0x1;
+-  static final int TYPE_PRIORITY = 0x2;
+-  static final int TYPE_RST_STREAM = 0x3;
+-  static final int TYPE_SETTINGS = 0x4;
+-  static final int TYPE_PUSH_PROMISE = 0x5;
+-  static final int TYPE_PING = 0x6;
+-  static final int TYPE_GOAWAY = 0x7;
+-  static final int TYPE_WINDOW_UPDATE = 0x9;
+-  static final int TYPE_CONTINUATION = 0xa;
+-
+-  static final int FLAG_END_STREAM = 0x1;
+-
+-  /** Used for headers and continuation. */
+-  static final int FLAG_END_HEADERS = 0x4;
+-  static final int FLAG_END_PUSH_PROMISE = 0x4;
+-  static final int FLAG_PRIORITY = 0x8;
+-  static final int FLAG_ACK = 0x1;
+-  static final int FLAG_END_FLOW_CONTROL = 0x1;
+-
+-  @Override public FrameReader newReader(InputStream in, Settings peerSettings, boolean client) {
+-    return new Reader(in, peerSettings.getHeaderTableSize(), client);
++  static final byte TYPE_DATA = 0x0;
++  static final byte TYPE_HEADERS = 0x1;
++  static final byte TYPE_PRIORITY = 0x2;
++  static final byte TYPE_RST_STREAM = 0x3;
++  static final byte TYPE_SETTINGS = 0x4;
++  static final byte TYPE_PUSH_PROMISE = 0x5;
++  static final byte TYPE_PING = 0x6;
++  static final byte TYPE_GOAWAY = 0x7;
++  static final byte TYPE_WINDOW_UPDATE = 0x9;
++  static final byte TYPE_CONTINUATION = 0xa;
++
++  static final byte FLAG_NONE = 0x0;
++  static final byte FLAG_ACK = 0x1;
++  static final byte FLAG_END_STREAM = 0x1;
++  static final byte FLAG_END_HEADERS = 0x4; // Used for headers and continuation.
++  static final byte FLAG_END_PUSH_PROMISE = 0x4;
++  static final byte FLAG_PRIORITY = 0x8;
++
++  @Override public FrameReader newReader(InputStream in, boolean client) {
++    return new Reader(in, 4096, client);
+   }
+ 
+-  @Override public FrameWriter newWriter(OutputStream out, Settings ignored, boolean client) {
++  @Override public FrameWriter newWriter(OutputStream out, boolean client) {
+     return new Writer(out, client);
+   }
+ 
+@@ -93,18 +87,18 @@
+ 
+     Reader(InputStream in, int headerTableSize, boolean client) {
+       this.in = new DataInputStream(in);
+-      this.continuation = new ContinuationInputStream(this.in);
+       this.client = client;
++      this.continuation = new ContinuationInputStream(this.in);
+       this.hpackReader = new HpackDraft05.Reader(client, headerTableSize, continuation);
+     }
+ 
+     @Override public void readConnectionHeader() throws IOException {
+       if (client) return; // Nothing to read; servers don't send connection headers!
+       byte[] connectionHeader = new byte[CONNECTION_HEADER.length];
+-      in.readFully(connectionHeader);
++      Util.readFully(in, connectionHeader);
+       if (!Arrays.equals(connectionHeader, CONNECTION_HEADER)) {
+-        throw ioException("Expected a connection header but was "
+-            + Arrays.toString(connectionHeader));
++        throw ioException("Expected a connection header but was %s",
++            Arrays.toString(connectionHeader));
+       }
+     }
+ 
+@@ -115,74 +109,82 @@
+       } catch (IOException e) {
+         return false; // This might be a normal socket close.
+       }
++
+       int w2 = in.readInt();
+ 
+-      // boolean r = (w1 & 0xc0000000) != 0; // Reserved.
+-      int length = (w1 & 0x3fff0000) >> 16; // 14-bit unsigned.
+-      int type = (w1 & 0xff00) >> 8;
+-      int flags = w1 & 0xff;
+-      // boolean r = (w2 & 0x80000000) != 0; // Reserved.
+-      int streamId = (w2 & 0x7fffffff);
++      // boolean r = (w1 & 0xc0000000) != 0; // Reserved: Ignore first 2 bits.
++      short length = (short) ((w1 & 0x3fff0000) >> 16); // 14-bit unsigned == max 16383
++      byte type = (byte) ((w1 & 0xff00) >> 8);
++      byte flags = (byte) (w1 & 0xff);
++      // boolean r = (w2 & 0x80000000) != 0; // Reserved: Ignore first bit.
++      int streamId = (w2 & 0x7fffffff); // 31-bit opaque identifier.
+ 
+       switch (type) {
+         case TYPE_DATA:
+-          readData(handler, flags, length, streamId);
+-          return true;
++          readData(handler, length, flags, streamId);
++          break;
+ 
+         case TYPE_HEADERS:
+-          readHeaders(handler, flags, length, streamId);
+-          return true;
++          readHeaders(handler, length, flags, streamId);
++          break;
+ 
+         case TYPE_PRIORITY:
+-          readPriority(handler, flags, length, streamId);
+-          return true;
++          readPriority(handler, length, flags, streamId);
++          break;
+ 
+         case TYPE_RST_STREAM:
+-          readRstStream(handler, flags, length, streamId);
+-          return true;
++          readRstStream(handler, length, flags, streamId);
++          break;
+ 
+         case TYPE_SETTINGS:
+-          readSettings(handler, flags, length, streamId);
+-          return true;
++          readSettings(handler, length, flags, streamId);
++          break;
+ 
+         case TYPE_PUSH_PROMISE:
+-          readPushPromise(handler, flags, length, streamId);
+-          return true;
++          readPushPromise(handler, length, flags, streamId);
++          break;
+ 
+         case TYPE_PING:
+-          readPing(handler, flags, length, streamId);
+-          return true;
++          readPing(handler, length, flags, streamId);
++          break;
+ 
+         case TYPE_GOAWAY:
+-          readGoAway(handler, flags, length, streamId);
+-          return true;
++          readGoAway(handler, length, flags, streamId);
++          break;
+ 
+         case TYPE_WINDOW_UPDATE:
+-          readWindowUpdate(handler, flags, length, streamId);
+-          return true;
+-      }
++          readWindowUpdate(handler, length, flags, streamId);
++          break;
+ 
+-      throw new UnsupportedOperationException(Integer.toBinaryString(type));
++        default:
++          // Implementations MUST ignore frames of unsupported or unrecognized types.
++          Util.skipByReading(in, length);
++      }
++      return true;
+     }
+ 
+-    private void readHeaders(Handler handler, int flags, int length, int streamId)
++    private void readHeaders(Handler handler, short length, byte flags, int streamId)
+         throws IOException {
+       if (streamId == 0) throw ioException("PROTOCOL_ERROR: TYPE_HEADERS streamId == 0");
+ 
+-      boolean endHeaders = (flags & FLAG_END_HEADERS) != 0;
+       boolean endStream = (flags & FLAG_END_STREAM) != 0;
+-      int priority = ((flags & FLAG_PRIORITY) != 0) ? in.readInt() & 0x7fffffff : -1;
+ 
+-      List<Header> headerBlock = readHeaderBlock(length, endHeaders, streamId);
++      int priority = -1;
++      if ((flags & FLAG_PRIORITY) != 0) {
++        priority = in.readInt() & 0x7fffffff;
++        length -= 4; // account for above read.
++      }
++
++      List<Header> headerBlock = readHeaderBlock(length, flags, streamId);
+ 
+       handler.headers(false, endStream, streamId, -1, priority, headerBlock,
+           HeadersMode.HTTP_20_HEADERS);
+     }
+ 
+-    private List<Header> readHeaderBlock(int length, boolean endHeaders, int streamId)
++    private List<Header> readHeaderBlock(short length, byte flags, int streamId)
+         throws IOException {
+-      continuation.bytesLeft = length;
+-      continuation.endHeaders = endHeaders;
++      continuation.length = continuation.left = length;
++      continuation.flags = flags;
+       continuation.streamId = streamId;
+ 
+       hpackReader.readHeaders();
+@@ -192,13 +194,14 @@ private void readHeaders(Handler handler, int flags, int length, int streamId)
+       return hpackReader.getAndReset();
+     }
+ 
+-    private void readData(Handler handler, int flags, int length, int streamId) throws IOException {
++    private void readData(Handler handler, short length, byte flags, int streamId)
++        throws IOException {
+       boolean inFinished = (flags & FLAG_END_STREAM) != 0;
+       // TODO: checkState open or half-closed (local) or raise STREAM_CLOSED
+       handler.data(inFinished, streamId, in, length);
+     }
+ 
+-    private void readPriority(Handler handler, int flags, int length, int streamId)
++    private void readPriority(Handler handler, short length, byte flags, int streamId)
+         throws IOException {
+       if (length != 4) throw ioException("TYPE_PRIORITY length: %d != 4", length);
+       if (streamId == 0) throw ioException("TYPE_PRIORITY streamId == 0");
+@@ -208,7 +211,7 @@ private void readPriority(Handler handler, int flags, int length, int streamId)
+       handler.priority(streamId, priority);
+     }
+ 
+-    private void readRstStream(Handler handler, int flags, int length, int streamId)
++    private void readRstStream(Handler handler, short length, byte flags, int streamId)
+         throws IOException {
+       if (length != 4) throw ioException("TYPE_RST_STREAM length: %d != 4", length);
+       if (streamId == 0) throw ioException("TYPE_RST_STREAM streamId == 0");
+@@ -220,7 +223,7 @@ private void readRstStream(Handler handler, int flags, int length, int streamId)
+       handler.rstStream(streamId, errorCode);
+     }
+ 
+-    private void readSettings(Handler handler, int flags, int length, int streamId)
++    private void readSettings(Handler handler, short length, byte flags, int streamId)
+         throws IOException {
+       if ((flags & FLAG_ACK) != 0) {
+         if (length != 0) throw ioException("FRAME_SIZE_ERROR ack frame should be empty!");
+@@ -242,20 +245,19 @@ private void readSettings(Handler handler, int flags, int length, int streamId)
+       }
+     }
+ 
+-    private void readPushPromise(Handler handler, int flags, int length, int streamId)
++    private void readPushPromise(Handler handler, short length, byte flags, int streamId)
+         throws IOException {
+       if (streamId == 0) {
+         throw ioException("PROTOCOL_ERROR: TYPE_PUSH_PROMISE streamId == 0");
+       }
+-      boolean endHeaders = (flags & FLAG_END_PUSH_PROMISE) != 0;
+-
+       int promisedStreamId = in.readInt() & 0x7fffffff;
+-      List<Header> headerBlock = readHeaderBlock(length, endHeaders, streamId);
+-
++      length -= 4; // account for above read.
++      List<Header> headerBlock = readHeaderBlock(length, flags, streamId);
+       handler.pushPromise(streamId, promisedStreamId, headerBlock);
+     }
+ 
+-    private void readPing(Handler handler, int flags, int length, int streamId) throws IOException {
++    private void readPing(Handler handler, short length, byte flags, int streamId)
++        throws IOException {
+       if (length != 8) throw ioException("TYPE_PING length != 8: %s", length);
+       if (streamId != 0) throw ioException("TYPE_PING streamId != 0");
+       int payload1 = in.readInt();
+@@ -264,29 +266,31 @@ private void readPing(Handler handler, int flags, int length, int streamId) thro
+       handler.ping(ack, payload1, payload2);
+     }
+ 
+-    private void readGoAway(Handler handler, int flags, int length, int streamId)
++    private void readGoAway(Handler handler, short length, byte flags, int streamId)
+         throws IOException {
+       if (length < 8) throw ioException("TYPE_GOAWAY length < 8: %s", length);
++      if (streamId != 0) throw ioException("TYPE_GOAWAY streamId != 0");
+       int lastStreamId = in.readInt();
+       int errorCodeInt = in.readInt();
+       int opaqueDataLength = length - 8;
+       ErrorCode errorCode = ErrorCode.fromHttp2(errorCodeInt);
+       if (errorCode == null) {
+-        throw ioException("TYPE_RST_STREAM unexpected error code: %d", errorCodeInt);
++        throw ioException("TYPE_GOAWAY unexpected error code: %d", errorCodeInt);
+       }
+-      if (Util.skipByReading(in, opaqueDataLength) != opaqueDataLength) {
+-        throw new IOException("TYPE_GOAWAY opaque data was truncated");
++      byte[] debugData = Util.EMPTY_BYTE_ARRAY;
++      if (opaqueDataLength > 0) { // Must read debug data in order to not corrupt the connection.
++        debugData = new byte[opaqueDataLength];
++        Util.readFully(in, debugData);
+       }
+-      handler.goAway(lastStreamId, errorCode);
++      handler.goAway(lastStreamId, errorCode, debugData);
+     }
+ 
+-    private void readWindowUpdate(Handler handler, int flags, int length, int streamId)
++    private void readWindowUpdate(Handler handler, short length, byte flags, int streamId)
+         throws IOException {
+-      int w1 = in.readInt();
+-      // boolean r = (w1 & 0x80000000) != 0; // Reserved.
+-      int windowSizeIncrement = (w1 & 0x7fffffff);
+-      boolean endFlowControl = (flags & FLAG_END_FLOW_CONTROL) != 0;
+-      handler.windowUpdate(streamId, windowSizeIncrement, endFlowControl);
++      if (length != 4) throw ioException("TYPE_WINDOW_UPDATE length !=4: %s", length);
++      long increment = (in.readInt() & 0x7fffffff);
++      if (increment == 0) throw ioException("windowSizeIncrement was 0", increment);
++      handler.windowUpdate(streamId, increment);
+     }
+ 
+     @Override public void close() throws IOException {
+@@ -312,9 +316,11 @@ private void readWindowUpdate(Handler handler, int flags, int length, int stream
+     }
+ 
+     @Override public synchronized void ackSettings() throws IOException {
+-      // ACK the settings frame.
+-      out.writeInt(0 | (TYPE_SETTINGS & 0xff) << 8 | (FLAG_ACK & 0xff));
+-      out.writeInt(0);
++      int length = 0;
++      byte type = TYPE_SETTINGS;
++      byte flags = FLAG_ACK;
++      int streamId = 0;
++      frameHeader(length, type, flags, streamId);
+     }
+ 
+     @Override public synchronized void connectionHeader() throws IOException {
+@@ -341,17 +347,16 @@ public synchronized void synStream(boolean outFinished, boolean inFinished, int
+     }
+ 
+     @Override
+-    public void pushPromise(int streamId, int promisedStreamId, List<Header> requestHeaders)
++    public synchronized void pushPromise(int streamId, int promisedStreamId,
++        List<Header> requestHeaders)
+         throws IOException {
+       hpackBuffer.reset();
+       hpackWriter.writeHeaders(requestHeaders);
+-      int type = TYPE_PUSH_PROMISE;
+-      // TODO: implement CONTINUATION
+-      int length = hpackBuffer.size();
+-      checkFrameSize(length);
+-      int flags = FLAG_END_HEADERS;
+-      out.writeInt((length & 0x3fff) << 16 | (type & 0xff) << 8 | (flags & 0xff));
+-      out.writeInt(streamId & 0x7fffffff);
++
++      int length = 4 + hpackBuffer.size();
++      byte type = TYPE_PUSH_PROMISE;
++      byte flags = FLAG_END_HEADERS;
++      frameHeader(length, type, flags, streamId); // TODO: CONTINUATION
+       out.writeInt(promisedStreamId & 0x7fffffff);
+       hpackBuffer.writeTo(out);
+     }
+@@ -360,15 +365,14 @@ private void headers(boolean outFinished, int streamId, int priority,
+         List<Header> headerBlock) throws IOException {
+       hpackBuffer.reset();
+       hpackWriter.writeHeaders(headerBlock);
+-      int type = TYPE_HEADERS;
+-      // TODO: implement CONTINUATION
++
+       int length = hpackBuffer.size();
+-      checkFrameSize(length);
+-      int flags = FLAG_END_HEADERS;
++      byte type = TYPE_HEADERS;
++      byte flags = FLAG_END_HEADERS;
+       if (outFinished) flags |= FLAG_END_STREAM;
+       if (priority != -1) flags |= FLAG_PRIORITY;
+-      out.writeInt((length & 0x3fff) << 16 | (type & 0xff) << 8 | (flags & 0xff));
+-      out.writeInt(streamId & 0x7fffffff);
++      if (priority != -1) length += 4;
++      frameHeader(length, type, flags, streamId); // TODO: CONTINUATION
+       if (priority != -1) out.writeInt(priority & 0x7fffffff);
+       hpackBuffer.writeTo(out);
+     }
+@@ -376,42 +380,40 @@ private void headers(boolean outFinished, int streamId, int priority,
+     @Override public synchronized void rstStream(int streamId, ErrorCode errorCode)
+         throws IOException {
+       if (errorCode.spdyRstCode == -1) throw new IllegalArgumentException();
+-      int flags = 0;
+-      int type = TYPE_RST_STREAM;
++
+       int length = 4;
+-      out.writeInt((length & 0x3fff) << 16 | (type & 0xff) << 8 | (flags & 0xff));
+-      out.writeInt(streamId & 0x7fffffff);
++      byte type = TYPE_RST_STREAM;
++      byte flags = FLAG_NONE;
++      frameHeader(length, type, flags, streamId);
+       out.writeInt(errorCode.httpCode);
+       out.flush();
+     }
+ 
+-    @Override public void data(boolean outFinished, int streamId, byte[] data) throws IOException {
++    @Override public synchronized void data(boolean outFinished, int streamId, byte[] data)
++        throws IOException {
+       data(outFinished, streamId, data, 0, data.length);
+     }
+ 
+     @Override public synchronized void data(boolean outFinished, int streamId, byte[] data,
+         int offset, int byteCount) throws IOException {
+-      int flags = 0;
++      byte flags = FLAG_NONE;
+       if (outFinished) flags |= FLAG_END_STREAM;
+-      // TODO: Implement looping strategy.
+-      sendDataFrame(streamId, flags, data, offset, byteCount);
++      dataFrame(streamId, flags, data, offset, byteCount); // TODO: Implement looping strategy
+     }
+ 
+-    void sendDataFrame(int streamId, int flags, byte[] data, int offset, int byteCount)
++    void dataFrame(int streamId, byte flags, byte[] data, int offset, int length)
+         throws IOException {
+-      checkFrameSize(byteCount);
+-      out.writeInt((byteCount & 0x3fff) << 16 | (TYPE_DATA & 0xff) << 8 | (flags & 0xff));
+-      out.writeInt(streamId & 0x7fffffff);
+-      out.write(data, offset, byteCount);
++      byte type = TYPE_DATA;
++      frameHeader(length, type, flags, streamId);
++      out.write(data, offset, length);
+     }
+ 
+     @Override public synchronized void settings(Settings settings) throws IOException {
+-      int type = TYPE_SETTINGS;
+       int length = settings.size() * 8;
+-      int flags = 0;
++      byte type = TYPE_SETTINGS;
++      byte flags = FLAG_NONE;
+       int streamId = 0;
+-      out.writeInt((length & 0x3fff) << 16 | (type & 0xff) << 8 | (flags & 0xff));
+-      out.writeInt(streamId & 0x7fffffff);
++      frameHeader(length, type, flags, streamId);
+       for (int i = 0; i < Settings.COUNT; i++) {
+         if (!settings.isSet(i)) continue;
+         out.writeInt(i & 0xffffff);
+@@ -425,29 +427,60 @@ void sendDataFrame(int streamId, int flags, byte[] data, int offset, int byteCou
+ 
+     @Override public synchronized void ping(boolean ack, int payload1, int payload2)
+         throws IOException {
+-      out.writeInt(8 << 16 | (TYPE_PING & 0xff) << 8 | ((ack ? FLAG_ACK : 0) & 0xff));
+-      out.writeInt(0); // connection-level
++      int length = 8;
++      byte type = TYPE_PING;
++      byte flags = ack ? FLAG_ACK : FLAG_NONE;
++      int streamId = 0;
++      frameHeader(length, type, flags, streamId);
+       out.writeInt(payload1);
+       out.writeInt(payload2);
+     }
+ 
+-    @Override public synchronized void goAway(int lastGoodStreamId, ErrorCode errorCode)
++    @Override
++    public synchronized void goAway(int lastGoodStreamId, ErrorCode errorCode, byte[] debugData)
+         throws IOException {
+-      // TODO
++      if (errorCode.httpCode == -1) throw illegalArgument("errorCode.httpCode == -1");
++      int length = 8 + debugData.length;
++      byte type = TYPE_GOAWAY;
++      byte flags = FLAG_NONE;
++      int streamId = 0;
++      frameHeader(length, type, flags, streamId);
++      out.writeInt(lastGoodStreamId);
++      out.writeInt(errorCode.httpCode);
++      if (debugData.length > 0) {
++        out.write(debugData);
++      }
+     }
+ 
+-    @Override public synchronized void windowUpdate(int streamId, int deltaWindowSize)
++    @Override public synchronized void windowUpdate(int streamId, long windowSizeIncrement)
+         throws IOException {
+-      // TODO
++      if (windowSizeIncrement == 0 || windowSizeIncrement > 0x7fffffffL) {
++        throw illegalArgument("windowSizeIncrement == 0 || windowSizeIncrement > 0x7fffffffL: %s",
++            windowSizeIncrement);
++      }
++      int length = 4;
++      byte type = TYPE_WINDOW_UPDATE;
++      byte flags = FLAG_NONE;
++      frameHeader(length, type, flags, streamId);
++      out.writeInt((int) windowSizeIncrement);
+     }
+ 
+     @Override public void close() throws IOException {
+       out.close();
+     }
++
++    private void frameHeader(int length, byte type, byte flags, int streamId)
++        throws IOException {
++      if (length > 16383) throw illegalArgument("FRAME_SIZE_ERROR length > 16383: %s", length);
++      if ((streamId & 0x80000000) == 1) throw illegalArgument("(streamId & 0x80000000) == 1: %s",
++          streamId);
++      out.writeInt((length & 0x3fff) << 16 | (type & 0xff) << 8 | (flags & 0xff));
++      out.writeInt(streamId & 0x7fffffff);
++    }
+   }
+ 
+-  private static void checkFrameSize(int bytes) throws IOException {
+-    if (bytes > 16383) throw ioException("FRAME_SIZE_ERROR max size is 16383: %s", bytes);
++  private static IllegalArgumentException illegalArgument(String message, Object... args) {
++    throw new IllegalArgumentException(String.format(message, args));
+   }
+ 
+   private static IOException ioException(String message, Object... args) throws IOException {
+@@ -455,73 +488,87 @@ private static IOException ioException(String message, Object... args) throws IO
+   }
+ 
+   /**
+-   * Decompression of the header block occurs above the framing layer.  This
+-   * class lazily reads continuation frames as they are needed by
+-   * {@link HpackDraft05.Reader#readHeaders()}.
++   * Decompression of the header block occurs above the framing layer.  This class lazily reads
++   * continuation frames as they are needed by {@link HpackDraft05.Reader#readHeaders()}.
+    */
+   static final class ContinuationInputStream extends InputStream {
+     private final DataInputStream in;
+ 
+-    int bytesLeft;
+-    boolean endHeaders;
++    int length;
++    byte flags;
+     int streamId;
+ 
++    int left;
++
+     ContinuationInputStream(DataInputStream in) {
+       this.in = in;
+     }
+ 
+     @Override public int read() throws IOException {
+-      if (bytesLeft == 0) {
+-        if (endHeaders) {
+-          return -1;
++      if (left == 0) {
++        if (endHeaders()) {
++          throw eofReading(1);
++        } else {
++          readContinuationHeader();
++        }
++      }
++      left--;
++      return in.read();
++    }
++
++    @Override public int available() throws IOException {
++      if (left == 0) {
++        if (endHeaders()) {
++          return 0;
+         } else {
+           readContinuationHeader();
+         }
+       }
+-      bytesLeft--;
+-      int result = in.read();
+-      if (result == -1) throw new EOFException();
+-      return result;
++      return left;
+     }
+ 
+     @Override public int read(byte[] dst, int offset, int byteCount) throws IOException {
+-      if (byteCount > bytesLeft) {
+-        if (endHeaders) {
+-          throw new EOFException(
+-              String.format("Attempted to read %s bytes, when only %s left", byteCount, bytesLeft));
++      if (byteCount > left) {
++        if (endHeaders()) {
++          throw eofReading(byteCount);
+         } else {
+-          int beforeContinuation = bytesLeft;
+-          Util.readFully(in, dst, offset, bytesLeft);
++          int beforeContinuation = left;
++          Util.readFully(in, dst, offset, beforeContinuation);
+           readContinuationHeader();
+           int afterContinuation = byteCount - beforeContinuation;
+           offset += beforeContinuation;
+-          bytesLeft -= afterContinuation;
+           Util.readFully(in, dst, offset, afterContinuation);
++          left -= afterContinuation;
+           return byteCount;
+         }
+       } else {
+-        bytesLeft -= byteCount;
+         Util.readFully(in, dst, offset, byteCount);
++        left -= byteCount;
+         return byteCount;
+       }
+     }
+ 
++    private EOFException eofReading(int byteCount) throws EOFException {
++      int read = length - left;
++      throw new EOFException(
++          String.format("EOF reading %s more bytes; read %s/%s of frame.", byteCount, read,
++              length));
++    }
++
+     private void readContinuationHeader() throws IOException {
++      int previousStreamId = streamId;
+       int w1 = in.readInt();
+       int w2 = in.readInt();
++      length = left = (short) ((w1 & 0x3fff0000) >> 16);
++      byte type = (byte) ((w1 & 0xff00) >> 8);
++      flags = (byte) (w1 & 0xff);
++      streamId = (w2 & 0x7fffffff);
++      if (type != TYPE_CONTINUATION) throw ioException("%s != TYPE_CONTINUATION", type);
++      if (streamId != previousStreamId) throw ioException("TYPE_CONTINUATION streamId changed");
++    }
+ 
+-      // boolean r = (w1 & 0xc0000000) != 0; // Reserved.
+-      bytesLeft = (w1 & 0x3fff0000) >> 16; // 14-bit unsigned.
+-      int newType = (w1 & 0xff00) >> 8;
+-      endHeaders = (w1 & 0xff & FLAG_END_HEADERS) != 0;
+-
+-      // boolean u = (w2 & 0x80000000) != 0; // Unused.
+-      int newStreamId = (w2 & 0x7fffffff);
+-
+-      if (newType != TYPE_CONTINUATION) {
+-        throw ioException("TYPE_CONTINUATION didn't have FLAG_END_HEADERS");
+-      }
+-      if (newStreamId != streamId) throw ioException("TYPE_CONTINUATION streamId changed");
++    private boolean endHeaders() {
++      return (flags & FLAG_END_HEADERS) != 0;
+     }
+   }
+ }
+diff --git a/okhttp-protocols/src/main/java/com/squareup/okhttp/internal/spdy/Spdy3.java b/okhttp-protocols/src/main/java/com/squareup/okhttp/internal/spdy/Spdy3.java
+index 4d0bf84556..e20c9d7103 100644
+--- a/okhttp-protocols/src/main/java/com/squareup/okhttp/internal/spdy/Spdy3.java
++++ b/okhttp-protocols/src/main/java/com/squareup/okhttp/internal/spdy/Spdy3.java
+@@ -36,11 +36,7 @@
+     return Protocol.SPDY_3;
+   }
+ 
+-  @Override public Settings defaultOkHttpSettings(boolean client) {
+-    return initialPeerSettings(client); // no difference in defaults.
+-  }
+-
+-  @Override public Settings initialPeerSettings(boolean client) {
++  static Settings defaultSettings(boolean client) {
+     Settings settings = new Settings();
+     settings.set(Settings.INITIAL_WINDOW_SIZE, 0, 65535);
+     return settings;
+@@ -104,11 +100,11 @@
+     }
+   }
+ 
+-  @Override public FrameReader newReader(InputStream in, Settings ignored, boolean client) {
++  @Override public FrameReader newReader(InputStream in, boolean client) {
+     return new Reader(in, client);
+   }
+ 
+-  @Override public FrameWriter newWriter(OutputStream out, Settings ignored, boolean client) {
++  @Override public FrameWriter newWriter(OutputStream out, boolean client) {
+     return new Writer(out, client);
+   }
+ 
+@@ -252,8 +248,9 @@ private void readWindowUpdate(Handler handler, int flags, int length) throws IOE
+       int w1 = in.readInt();
+       int w2 = in.readInt();
+       int streamId = w1 & 0x7fffffff;
+-      int deltaWindowSize = w2 & 0x7fffffff;
+-      handler.windowUpdate(streamId, deltaWindowSize, false);
++      long increment = w2 & 0x7fffffff;
++      if (increment == 0) throw ioException("windowSizeIncrement was 0", increment);
++      handler.windowUpdate(streamId, increment);
+     }
+ 
+     private void readPing(Handler handler, int flags, int length) throws IOException {
+@@ -271,7 +268,7 @@ private void readGoAway(Handler handler, int flags, int length) throws IOExcepti
+       if (errorCode == null) {
+         throw ioException("TYPE_GOAWAY unexpected error code: %d", errorCodeInt);
+       }
+-      handler.goAway(lastGoodStreamId, errorCode);
++      handler.goAway(lastGoodStreamId, errorCode, Util.EMPTY_BYTE_ARRAY);
+     }
+ 
+     private void readSettings(Handler handler, int flags, int length) throws IOException {
+@@ -410,8 +407,8 @@ public synchronized void synStream(boolean outFinished, boolean inFinished, int
+ 
+     void sendDataFrame(int streamId, int flags, byte[] data, int offset, int byteCount)
+         throws IOException {
+-      if (byteCount > 0xffffff) {
+-        throw new IOException("FRAME_TOO_LARGE max size is 16Mib: " + byteCount);
++      if (byteCount > 0xffffffL) {
++        throw new IllegalArgumentException("FRAME_TOO_LARGE max size is 16Mib: " + byteCount);
+       }
+       out.writeInt(streamId & 0x7fffffff);
+       out.writeInt((flags & 0xff) << 24 | byteCount & 0xffffff);
+@@ -471,9 +468,12 @@ private void writeNameValueBlockToBuffer(List<Header> headerBlock) throws IOExce
+       out.flush();
+     }
+ 
+-    @Override public synchronized void goAway(int lastGoodStreamId, ErrorCode errorCode)
++    @Override
++    public synchronized void goAway(int lastGoodStreamId, ErrorCode errorCode, byte[] ignored)
+         throws IOException {
+-      if (errorCode.spdyGoAwayCode == -1) throw new IllegalArgumentException();
++      if (errorCode.spdyGoAwayCode == -1) {
++        throw new IllegalArgumentException("errorCode.spdyGoAwayCode == -1");
++      }
+       int type = TYPE_GOAWAY;
+       int flags = 0;
+       int length = 8;
+@@ -484,15 +484,19 @@ private void writeNameValueBlockToBuffer(List<Header> headerBlock) throws IOExce
+       out.flush();
+     }
+ 
+-    @Override public synchronized void windowUpdate(int streamId, int deltaWindowSize)
++    @Override public synchronized void windowUpdate(int streamId, long increment)
+         throws IOException {
++      if (increment == 0 || increment > 0x7fffffffL) {
++        throw new IllegalArgumentException(
++            "windowSizeIncrement must be between 1 and 0x7fffffff: " + increment);
++      }
+       int type = TYPE_WINDOW_UPDATE;
+       int flags = 0;
+       int length = 8;
+       out.writeInt(0x80000000 | (VERSION & 0x7fff) << 16 | type & 0xffff);
+       out.writeInt((flags & 0xff) << 24 | length & 0xffffff);
+       out.writeInt(streamId);
+-      out.writeInt(deltaWindowSize);
++      out.writeInt((int) increment);
+       out.flush();
+     }
+ 
+diff --git a/okhttp-protocols/src/main/java/com/squareup/okhttp/internal/spdy/SpdyConnection.java b/okhttp-protocols/src/main/java/com/squareup/okhttp/internal/spdy/SpdyConnection.java
+index 504d49fc0c..b5e143a1cf 100644
+--- a/okhttp-protocols/src/main/java/com/squareup/okhttp/internal/spdy/SpdyConnection.java
++++ b/okhttp-protocols/src/main/java/com/squareup/okhttp/internal/spdy/SpdyConnection.java
+@@ -13,7 +13,6 @@
+  * See the License for the specific language governing permissions and
+  * limitations under the License.
+  */
+-
+ package com.squareup.okhttp.internal.spdy;
+ 
+ import com.squareup.okhttp.Protocol;
+@@ -61,7 +60,7 @@
+       Util.threadFactory("OkHttp SpdyConnection", true));
+ 
+   /** The protocol variant, like {@link com.squareup.okhttp.internal.spdy.Spdy3}. */
+-  final Variant variant;
++  final Protocol protocol;
+ 
+   /** True if this peer initiated the connection. */
+   final boolean client;
+@@ -93,27 +92,37 @@
+   final ByteArrayPool bufferPool;
+ 
+   private SpdyConnection(Builder builder) {
+-    variant = builder.variant;
++    protocol = builder.protocol;
+     client = builder.client;
+-    okHttpSettings = variant.defaultOkHttpSettings(client);
+-    // TODO: implement stream limit
+-    // okHttpSettings.set(Settings.MAX_CONCURRENT_STREAMS, 0, max);
+-    peerSettings = variant.initialPeerSettings(client);
+-    bufferPool = new ByteArrayPool(peerSettings.getInitialWindowSize() * 8);
+     handler = builder.handler;
+-    frameReader = variant.newReader(builder.in, peerSettings, client);
+-    frameWriter = variant.newWriter(builder.out, okHttpSettings, client);
+     nextStreamId = builder.client ? 1 : 2;
+     nextPingId = builder.client ? 1 : 2;
+-
+     hostName = builder.hostName;
+ 
++    Variant variant;
++    if (protocol == Protocol.HTTP_2) {
++      okHttpSettings = Http20Draft09.defaultSettings(client);
++      variant = new Http20Draft09(); // connection-specific settings here!
++    } else if (protocol == Protocol.SPDY_3) {
++      okHttpSettings = Spdy3.defaultSettings(client);
++      variant = new Spdy3(); // connection-specific settings here!
++    } else {
++      throw new AssertionError(protocol);
++    }
++
++    // TODO: implement stream limit
++    // okHttpSettings.set(Settings.MAX_CONCURRENT_STREAMS, 0, max);
++    peerSettings = okHttpSettings;
++    bufferPool = new ByteArrayPool(peerSettings.getInitialWindowSize() * 8);
++    frameReader = variant.newReader(builder.in, client);
++    frameWriter = variant.newWriter(builder.out, client);
++
+     new Thread(new Reader()).start(); // Not a daemon thread.
+   }
+ 
+   /** The protocol as selected using NPN or ALPN. */
+   public Protocol getProtocol() {
+-     return variant.getProtocol();
++     return protocol;
+   }
+ 
+   /**
+@@ -218,19 +227,19 @@ void writeSynReset(int streamId, ErrorCode statusCode) throws IOException {
+     frameWriter.rstStream(streamId, statusCode);
+   }
+ 
+-  void writeWindowUpdateLater(final int streamId, final int deltaWindowSize) {
++  void writeWindowUpdateLater(final int streamId, final int windowSizeIncrement) {
+     executor.submit(new NamedRunnable("OkHttp %s stream %d", hostName, streamId) {
+       @Override public void execute() {
+         try {
+-          writeWindowUpdate(streamId, deltaWindowSize);
++          writeWindowUpdate(streamId, windowSizeIncrement);
+         } catch (IOException ignored) {
+         }
+       }
+     });
+   }
+ 
+-  void writeWindowUpdate(int streamId, int deltaWindowSize) throws IOException {
+-    frameWriter.windowUpdate(streamId, deltaWindowSize);
++  void writeWindowUpdate(int streamId, int windowSizeIncrement) throws IOException {
++    frameWriter.windowUpdate(streamId, windowSizeIncrement);
+   }
+ 
+   /**
+@@ -303,7 +312,8 @@ public void shutdown(ErrorCode statusCode) throws IOException {
+         shutdown = true;
+         lastGoodStreamId = this.lastGoodStreamId;
+       }
+-      frameWriter.goAway(lastGoodStreamId, statusCode);
++      // TODO: propagate exception message into debugData
++      frameWriter.goAway(lastGoodStreamId, statusCode, Util.EMPTY_BYTE_ARRAY);
+     }
+   }
+ 
+@@ -391,7 +401,7 @@ public void readConnectionHeader() throws IOException {
+     private InputStream in;
+     private OutputStream out;
+     private IncomingStreamHandler handler = IncomingStreamHandler.REFUSE_INCOMING_STREAMS;
+-    private Variant variant = Variant.SPDY3;
++    private Protocol protocol = Protocol.SPDY_3;
+     private boolean client;
+ 
+     public Builder(boolean client, Socket socket) throws IOException {
+@@ -427,14 +437,7 @@ public Builder handler(IncomingStreamHandler handler) {
+     }
+ 
+     public Builder protocol(Protocol protocol) {
+-      // TODO: protocol == variant.getProtocol, so we could map this.
+-      if (protocol == Protocol.HTTP_2) {
+-        this.variant = Variant.HTTP_20_DRAFT_09;
+-      } else if (protocol == Protocol.SPDY_3) {
+-        this.variant = Variant.SPDY3;
+-      } else {
+-        throw new AssertionError(protocol);
+-      }
++      this.protocol = protocol;
+       return this;
+     }
+ 
+@@ -549,7 +552,7 @@ private Reader() {
+         } else {
+           peerSettings.merge(newSettings);
+         }
+-        if (SpdyConnection.this.variant.getProtocol() == Protocol.HTTP_2) {
++        if (getProtocol() == Protocol.HTTP_2) {
+           ackSettingsLater();
+         }
+         if (!streams.isEmpty()) {
+@@ -597,7 +600,10 @@ private void ackSettingsLater() {
+       }
+     }
+ 
+-    @Override public void goAway(int lastGoodStreamId, ErrorCode errorCode) {
++    @Override
++    public void goAway(int lastGoodStreamId, ErrorCode errorCode, byte[] debugData) {
++      if (debugData.length > 0) { // TODO: log the debugData
++      }
+       synchronized (SpdyConnection.this) {
+         shutdown = true;
+ 
+@@ -614,16 +620,16 @@ private void ackSettingsLater() {
+       }
+     }
+ 
+-    @Override public void windowUpdate(int streamId, int deltaWindowSize, boolean endFlowControl) {
++    @Override public void windowUpdate(int streamId, long windowSizeIncrement) {
+       if (streamId == 0) {
+-        // TODO: honor whole-stream flow control
++        // TODO: honor connection-level flow control
+         return;
+       }
+ 
+       // TODO: honor endFlowControl
+       SpdyStream stream = getStream(streamId);
+       if (stream != null) {
+-        stream.receiveWindowUpdate(deltaWindowSize);
++        stream.receiveWindowUpdate(windowSizeIncrement);
+       }
+     }
+ 
+diff --git a/okhttp-protocols/src/main/java/com/squareup/okhttp/internal/spdy/SpdyStream.java b/okhttp-protocols/src/main/java/com/squareup/okhttp/internal/spdy/SpdyStream.java
+index ba14dbe45a..68ab921d60 100644
+--- a/okhttp-protocols/src/main/java/com/squareup/okhttp/internal/spdy/SpdyStream.java
++++ b/okhttp-protocols/src/main/java/com/squareup/okhttp/internal/spdy/SpdyStream.java
+@@ -325,8 +325,8 @@ void receiveSettings(Settings peerSettings) {
+     notifyAll();
+   }
+ 
+-  synchronized void receiveWindowUpdate(int deltaWindowSize) {
+-    out.unacknowledgedBytes -= deltaWindowSize;
++  synchronized void receiveWindowUpdate(long windowSizeIncrement) {
++    out.unacknowledgedBytes -= windowSizeIncrement;
+     notifyAll();
+   }
+ 
+@@ -594,7 +594,7 @@ private void cancelStreamIfNecessary() throws IOException {
+      * acknowledged with an incoming {@code WINDOW_UPDATE} frame. Writes
+      * block if they cause this to exceed the {@code WINDOW_SIZE}.
+      */
+-    private int unacknowledgedBytes = 0;
++    private long unacknowledgedBytes = 0;
+ 
+     @Override public void write(int b) throws IOException {
+       Util.writeSingleByte(this, b);
+diff --git a/okhttp-protocols/src/main/java/com/squareup/okhttp/internal/spdy/Variant.java b/okhttp-protocols/src/main/java/com/squareup/okhttp/internal/spdy/Variant.java
+index f7367302cc..784d02ef26 100644
+--- a/okhttp-protocols/src/main/java/com/squareup/okhttp/internal/spdy/Variant.java
++++ b/okhttp-protocols/src/main/java/com/squareup/okhttp/internal/spdy/Variant.java
+@@ -21,34 +21,17 @@
+ 
+ /** A version and dialect of the framed socket protocol. */
+ interface Variant {
+-  Variant SPDY3 = new Spdy3();
+-  Variant HTTP_20_DRAFT_09 = new Http20Draft09();
+ 
+   /** The protocol as selected using NPN or ALPN. */
+   Protocol getProtocol();
+ 
+   /**
+-   * Default settings used for reading or writing frames to the peer.
+-   * @param client true if these settings apply to writing requests, false if responses.
+-   */
+-  Settings defaultOkHttpSettings(boolean client);
+-
+-  /**
+-   * Initial settings used for reading frames from the peer until we are sent
+-   * a Settings frame.
+-   * @param client true if these settings apply to reading responses, false if requests.
+-   */
+-  Settings initialPeerSettings(boolean client);
+-
+-  /**
+-   * @param peerSettings potentially stale settings that reflect the remote peer.
+    * @param client true if this is the HTTP client's reader, reading frames from a server.
+    */
+-  FrameReader newReader(InputStream in, Settings peerSettings, boolean client);
++  FrameReader newReader(InputStream in, boolean client);
+ 
+   /**
+-   * @param okHttpSettings settings sent to the peer, such compression header table size.
+    * @param client true if this is the HTTP client's writer, writing frames to a server.
+    */
+-  FrameWriter newWriter(OutputStream out, Settings okHttpSettings, boolean client);
++  FrameWriter newWriter(OutputStream out, boolean client);
+ }
+diff --git a/okhttp-protocols/src/test/java/com/squareup/okhttp/internal/spdy/BaseTestHandler.java b/okhttp-protocols/src/test/java/com/squareup/okhttp/internal/spdy/BaseTestHandler.java
+index cbb6eac507..dc08d2f6f4 100644
+--- a/okhttp-protocols/src/test/java/com/squareup/okhttp/internal/spdy/BaseTestHandler.java
++++ b/okhttp-protocols/src/test/java/com/squareup/okhttp/internal/spdy/BaseTestHandler.java
+@@ -49,12 +49,13 @@ public void headers(boolean outFinished, boolean inFinished, int streamId, int a
+     fail();
+   }
+ 
+-  @Override public void goAway(int lastGoodStreamId, ErrorCode errorCode) {
++  @Override
++  public void goAway(int lastGoodStreamId, ErrorCode errorCode, byte[] debugData) {
+     fail();
+   }
+ 
+   @Override
+-  public void windowUpdate(int streamId, int deltaWindowSize, boolean endFlowControl) {
++  public void windowUpdate(int streamId, long windowSizeIncrement) {
+     fail();
+   }
+ 
+diff --git a/okhttp-protocols/src/test/java/com/squareup/okhttp/internal/spdy/ContinuationInputStreamTest.java b/okhttp-protocols/src/test/java/com/squareup/okhttp/internal/spdy/ContinuationInputStreamTest.java
+index 0ed247d34d..67b53223de 100644
+--- a/okhttp-protocols/src/test/java/com/squareup/okhttp/internal/spdy/ContinuationInputStreamTest.java
++++ b/okhttp-protocols/src/test/java/com/squareup/okhttp/internal/spdy/ContinuationInputStreamTest.java
+@@ -25,6 +25,8 @@
+ 
+ import static com.squareup.okhttp.internal.spdy.HpackDraft05Test.MutableByteArrayInputStream;
+ import static com.squareup.okhttp.internal.spdy.Http20Draft09.ContinuationInputStream;
++import static com.squareup.okhttp.internal.spdy.Http20Draft09.FLAG_END_STREAM;
++import static com.squareup.okhttp.internal.spdy.Http20Draft09.TYPE_DATA;
+ import static org.junit.Assert.assertEquals;
+ import static org.junit.Assert.assertTrue;
+ import static org.junit.Assert.fail;
+@@ -34,77 +36,130 @@
+   private final ContinuationInputStream continuation =
+       new ContinuationInputStream(new DataInputStream(bytesIn));
+ 
+-  @Test public void read() throws IOException {
++  @Test public void readCantOverrunHeaderPayload() throws IOException {
++    bytesIn.set(onlyHeadersPayloadFollowedByData());
++
++    continuation.length = continuation.left = 3;
++    continuation.flags = Http20Draft09.FLAG_END_HEADERS;
++    continuation.streamId = 12345;
+ 
+-    // When there are bytes left this frame, read one.
+-    continuation.bytesLeft = 2;
+-    bytesIn.set(new byte[] {1, 2});
+     assertEquals(1, continuation.read());
+-    assertEquals(1, continuation.bytesLeft);
++    assertEquals(2, continuation.read());
++    assertEquals(3, continuation.read());
+ 
+-    // When there are bytes left this frame, but none on the remote stream, EOF!
+-    continuation.bytesLeft = 2;
+-    bytesIn.set(new byte[] {});
+     try {
+       continuation.read();
+       fail();
+     } catch (EOFException expected) {
+     }
++  }
++
++  @Test public void readCantOverrunHeaderContinuationPayload() throws IOException {
++    bytesIn.set(headersPayloadWithContinuationFollowedByData());
+ 
+-    // When there are no bytes left in the last header frame, return -1.
+-    continuation.bytesLeft = 0;
+-    continuation.endHeaders = true;
+-    assertEquals(-1, continuation.read());
+-    assertEquals(0, continuation.bytesLeft);
++    continuation.length = continuation.left = 2;
++    continuation.flags = Http20Draft09.FLAG_NONE;
++    continuation.streamId = 12345;
+ 
+-    // When there are no bytes left in this frame, but it isn't the last, read continuation.
+-    continuation.bytesLeft = 0;
+-    continuation.endHeaders = false; // Read continuation.
+-    bytesIn.set(lastContinuationFrame(new byte[] {1}));
+     assertEquals(1, continuation.read());
+-    assertEquals(0, continuation.bytesLeft);
++    assertEquals(2, continuation.read());
++    assertEquals(3, continuation.read());
++    assertEquals(0, continuation.available());
++
++    try {
++      continuation.read();
++      fail();
++    } catch (EOFException expected) {
++    }
+   }
+ 
+-  @Test public void readArray() throws IOException {
+-    byte[] buff = new byte[3];
++  @Test public void availableWithContinuation() throws IOException {
++    bytesIn.set(headersPayloadWithContinuationFollowedByData());
++
++    continuation.length = continuation.left = 2;
++    continuation.flags = Http20Draft09.FLAG_NONE;
++    continuation.streamId = 12345;
+ 
+-    // When there are bytes left this frame, read them.
+-    continuation.bytesLeft = 3;
+-    continuation.endHeaders = true;
+-    bytesIn.set(new byte[] {1, 2, 3});
++    assertEquals(1, continuation.read());
++    assertEquals(2, continuation.read()); // exhaust frame one
++
++    assertEquals(0, continuation.left);
++    assertEquals(1, continuation.available()); // lazy reads next
++
++    assertEquals(1, continuation.length);
++    assertEquals(1, continuation.left);
++    assertEquals(3, continuation.read());
++
++    assertEquals(0, continuation.available());
++    assertEquals(0, continuation.left);
++
++    try {
++      continuation.read();
++      fail();
++    } catch (EOFException expected) {
++    }
++  }
++
++  @Test public void readArrayCantOverrunHeaderPayload() throws IOException {
++    bytesIn.set(onlyHeadersPayloadFollowedByData());
++
++    continuation.length = continuation.left = 3;
++    continuation.flags = Http20Draft09.FLAG_END_HEADERS;
++    continuation.streamId = 12345;
++
++    byte[] buff = new byte[3];
+     assertEquals(3, continuation.read(buff));
+-    assertEquals(0, continuation.bytesLeft);
+     assertTrue(Arrays.equals(buff, new byte[] {1, 2, 3}));
+ 
+-    // When there are no bytes left in the last header frame, EOF.
+-    Arrays.fill(buff, (byte) -1);
+-    continuation.bytesLeft = 0;
+-    continuation.endHeaders = true;
+-    bytesIn.set(new byte[] {});
+     try {
+       continuation.read(buff);
+       fail();
+     } catch (EOFException expected) {
+     }
++  }
++
++  @Test public void readArrayCantOverrunHeaderContinuationPayload() throws IOException {
++    bytesIn.set(headersPayloadWithContinuationFollowedByData());
++
++    continuation.length = continuation.left = 2;
++    continuation.flags = Http20Draft09.FLAG_NONE;
++    continuation.streamId = 12345;
+ 
+-    // When there are no bytes left in this frame, but it isn't the last, read continuation.
+-    Arrays.fill(buff, (byte) -1);
+-    continuation.bytesLeft = 0;
+-    continuation.endHeaders = false; // Read continuation.
+-    bytesIn.set(lastContinuationFrame(new byte[] {1, 2, 3}));
++    byte[] buff = new byte[3];
+     assertEquals(3, continuation.read(buff));
+     assertTrue(Arrays.equals(buff, new byte[] {1, 2, 3}));
+-    assertEquals(0, continuation.bytesLeft);
++
++    try {
++      continuation.read(buff);
++      fail();
++    } catch (EOFException expected) {
++    }
++  }
++
++  static byte[] onlyHeadersPayloadFollowedByData() throws IOException {
++    ByteArrayOutputStream out = new ByteArrayOutputStream();
++    DataOutputStream dataOut = new DataOutputStream(out);
++    dataOut.write(new byte[] {1, 2, 3});
++    dataOut.writeShort(0);
++    dataOut.write(TYPE_DATA);
++    dataOut.write(FLAG_END_STREAM);
++    dataOut.writeInt(0xFFFFFFFF);
++    return out.toByteArray();
+   }
+ 
+-  static byte[] lastContinuationFrame(byte[] headerBlock) throws IOException {
++  static byte[] headersPayloadWithContinuationFollowedByData() throws IOException {
+     ByteArrayOutputStream out = new ByteArrayOutputStream();
+     DataOutputStream dataOut = new DataOutputStream(out);
+-    dataOut.writeShort(headerBlock.length);
++    dataOut.write(new byte[] {1, 2});
++    dataOut.writeShort(1);
+     dataOut.write(Http20Draft09.TYPE_CONTINUATION);
+     dataOut.write(Http20Draft09.FLAG_END_HEADERS);
+-    dataOut.writeInt(0);
+-    dataOut.write(headerBlock);
++    dataOut.writeInt(12345);
++    dataOut.write(3);
++    dataOut.writeShort(0);
++    dataOut.write(TYPE_DATA);
++    dataOut.write(FLAG_END_STREAM);
++    dataOut.writeInt(0xFFFFFFFF);
+     return out.toByteArray();
+   }
+ }
+diff --git a/okhttp-protocols/src/test/java/com/squareup/okhttp/internal/spdy/Http20Draft09Test.java b/okhttp-protocols/src/test/java/com/squareup/okhttp/internal/spdy/Http20Draft09Test.java
+index 31d08421a2..8a8aaedfc7 100644
+--- a/okhttp-protocols/src/test/java/com/squareup/okhttp/internal/spdy/Http20Draft09Test.java
++++ b/okhttp-protocols/src/test/java/com/squareup/okhttp/internal/spdy/Http20Draft09Test.java
+@@ -35,6 +35,22 @@
+ public class Http20Draft09Test {
+   static final int expectedStreamId = 15;
+ 
++  @Test public void unknownFrameTypeIgnored() throws IOException {
++    ByteArrayOutputStream out = new ByteArrayOutputStream();
++    DataOutputStream dataOut = new DataOutputStream(out);
++
++    dataOut.writeShort(4); // has a 4-byte field
++    dataOut.write(99); // type 99
++    dataOut.write(0); // no flags
++    dataOut.writeInt(expectedStreamId);
++    dataOut.writeInt(111111111); // custom data
++
++    FrameReader fr = newReader(out);
++
++    // Consume the unknown frame.
++    fr.nextFrame(new BaseTestHandler());
++  }
++
+   @Test public void onlyOneLiteralHeadersFrame() throws IOException {
+     final List<Header> sentHeaders = headerEntries("name", "value");
+ 
+@@ -47,7 +63,7 @@
+       dataOut.writeShort(headerBytes.length);
+       dataOut.write(Http20Draft09.TYPE_HEADERS);
+       dataOut.write(Http20Draft09.FLAG_END_HEADERS | Http20Draft09.FLAG_END_STREAM);
+-      dataOut.writeInt(expectedStreamId & 0x7fffffff); // stream with reserved bit set
++      dataOut.writeInt(expectedStreamId & 0x7fffffff);
+       dataOut.write(headerBytes);
+     }
+ 
+@@ -79,10 +95,10 @@ public void headers(boolean outFinished, boolean inFinished, int streamId,
+ 
+     { // Write the headers frame, specifying priority flag and value.
+       byte[] headerBytes = literalHeaders(sentHeaders);
+-      dataOut.writeShort(headerBytes.length);
++      dataOut.writeShort(headerBytes.length + 4);
+       dataOut.write(Http20Draft09.TYPE_HEADERS);
+       dataOut.write(Http20Draft09.FLAG_END_HEADERS | Http20Draft09.FLAG_PRIORITY);
+-      dataOut.writeInt(expectedStreamId & 0x7fffffff); // stream with reserved bit set
++      dataOut.writeInt(expectedStreamId & 0x7fffffff);
+       dataOut.writeInt(0); // Highest priority is 0.
+       dataOut.write(headerBytes);
+     }
+@@ -119,7 +135,7 @@ public void headers(boolean outFinished, boolean inFinished, int streamId,
+       dataOut.writeShort(headerBlock.length / 2);
+       dataOut.write(Http20Draft09.TYPE_HEADERS);
+       dataOut.write(0); // no flags
+-      dataOut.writeInt(expectedStreamId & 0x7fffffff); // stream with reserved bit set
++      dataOut.writeInt(expectedStreamId & 0x7fffffff);
+       dataOut.write(headerBlock, 0, headerBlock.length / 2);
+     }
+ 
+@@ -127,7 +143,7 @@ public void headers(boolean outFinished, boolean inFinished, int streamId,
+       dataOut.writeShort(headerBlock.length / 2);
+       dataOut.write(Http20Draft09.TYPE_CONTINUATION);
+       dataOut.write(Http20Draft09.FLAG_END_HEADERS);
+-      dataOut.writeInt(expectedStreamId & 0x7fffffff); // stream with reserved bit set
++      dataOut.writeInt(expectedStreamId & 0x7fffffff);
+       dataOut.write(headerBlock, headerBlock.length / 2, headerBlock.length / 2);
+     }
+ 
+@@ -166,7 +182,7 @@ public void headers(boolean outFinished, boolean inFinished, int streamId,
+ 
+     { // Write the push promise frame, specifying the associated stream ID.
+       byte[] headerBytes = literalHeaders(pushPromise);
+-      dataOut.writeShort(headerBytes.length);
++      dataOut.writeShort(headerBytes.length + 4);
+       dataOut.write(Http20Draft09.TYPE_PUSH_PROMISE);
+       dataOut.write(Http20Draft09.FLAG_END_PUSH_PROMISE);
+       dataOut.writeInt(expectedStreamId & 0x7fffffff);
+@@ -204,7 +220,7 @@ public void pushPromise(int streamId, int promisedStreamId, List<Header> headerB
+     // Decoding the first header will cross frame boundaries.
+     byte[] headerBlock = literalHeaders(pushPromise);
+     { // Write the first headers frame.
+-      dataOut.writeShort(headerBlock.length / 2);
++      dataOut.writeShort((headerBlock.length / 2) + 4);
+       dataOut.write(Http20Draft09.TYPE_PUSH_PROMISE);
+       dataOut.write(0); // no flags
+       dataOut.writeInt(expectedStreamId & 0x7fffffff);
+@@ -240,7 +256,7 @@ public void pushPromise(int streamId, int promisedStreamId, List<Header> headerB
+     dataOut.writeShort(4);
+     dataOut.write(Http20Draft09.TYPE_RST_STREAM);
+     dataOut.write(0); // No flags
+-    dataOut.writeInt(expectedStreamId & 0x7fffffff); // stream with reserved bit set
++    dataOut.writeInt(expectedStreamId & 0x7fffffff);
+     dataOut.writeInt(ErrorCode.COMPRESSION_ERROR.httpCode);
+ 
+     FrameReader fr = newReader(out);
+@@ -348,14 +364,116 @@ public void pushPromise(int streamId, int promisedStreamId, List<Header> headerB
+     try {
+       sendDataFrame(new byte[0x1000000]);
+       fail();
+-    } catch (IOException e) {
+-      assertEquals("FRAME_SIZE_ERROR max size is 16383: 16777216", e.getMessage());
++    } catch (IllegalArgumentException e) {
++      assertEquals("FRAME_SIZE_ERROR length > 16383: 16777216", e.getMessage());
+     }
+   }
+ 
++  @Test public void windowUpdateRoundTrip() throws IOException {
++    ByteArrayOutputStream out = new ByteArrayOutputStream();
++    DataOutputStream dataOut = new DataOutputStream(out);
++
++    final long expectedWindowSizeIncrement = 0x7fffffff;
++
++    // Compose the expected window update frame.
++    dataOut.writeShort(4); // length
++    dataOut.write(Http20Draft09.TYPE_WINDOW_UPDATE);
++    dataOut.write(0); // No flags.
++    dataOut.writeInt(expectedStreamId);
++    dataOut.writeInt((int) expectedWindowSizeIncrement);
++
++    // Check writer sends the same bytes.
++    assertArrayEquals(out.toByteArray(), windowUpdate(expectedWindowSizeIncrement));
++
++    FrameReader fr = newReader(out);
++
++    fr.nextFrame(new BaseTestHandler() { // Consume the window update frame.
++      @Override public void windowUpdate(int streamId, long windowSizeIncrement) {
++        assertEquals(expectedStreamId, streamId);
++        assertEquals(expectedWindowSizeIncrement, windowSizeIncrement);
++      }
++    });
++  }
++
++  @Test public void badWindowSizeIncrement() throws IOException {
++    try {
++      windowUpdate(0);
++      fail();
++    } catch (IllegalArgumentException e) {
++      assertEquals("windowSizeIncrement == 0 || windowSizeIncrement > 0x7fffffffL: 0",
++          e.getMessage());
++    }
++    try {
++      windowUpdate(0x80000000L);
++      fail();
++    } catch (IllegalArgumentException e) {
++      assertEquals("windowSizeIncrement == 0 || windowSizeIncrement > 0x7fffffffL: 2147483648",
++          e.getMessage());
++    }
++  }
++
++  @Test public void goAwayWithoutDebugDataRoundTrip() throws IOException {
++    ByteArrayOutputStream out = new ByteArrayOutputStream();
++    DataOutputStream dataOut = new DataOutputStream(out);
++
++    final ErrorCode expectedError = ErrorCode.PROTOCOL_ERROR;
++
++    // Compose the expected GOAWAY frame without debug data.
++    dataOut.writeShort(8); // Without debug data there's only 2 32-bit fields.
++    dataOut.write(Http20Draft09.TYPE_GOAWAY);
++    dataOut.write(0); // no flags.
++    dataOut.writeInt(0); // connection-scope
++    dataOut.writeInt(expectedStreamId); // last good stream.
++    dataOut.writeInt(expectedError.httpCode);
++
++    // Check writer sends the same bytes.
++    assertArrayEquals(out.toByteArray(),
++        sendGoAway(expectedStreamId, expectedError, Util.EMPTY_BYTE_ARRAY));
++
++    FrameReader fr = newReader(out);
++
++    fr.nextFrame(new BaseTestHandler() { // Consume the go away frame.
++      @Override public void goAway(int lastGoodStreamId, ErrorCode errorCode, byte[] debugData) {
++        assertEquals(expectedStreamId, lastGoodStreamId);
++        assertEquals(expectedError, errorCode);
++        assertEquals(0, debugData.length);
++      }
++    });
++  }
++
++  @Test public void goAwayWithDebugDataRoundTrip() throws IOException {
++    ByteArrayOutputStream out = new ByteArrayOutputStream();
++    DataOutputStream dataOut = new DataOutputStream(out);
++
++    final ErrorCode expectedError = ErrorCode.PROTOCOL_ERROR;
++    final byte[] expectedData = new byte[8];
++    Arrays.fill(expectedData, (byte) '*');
++
++    // Compose the expected GOAWAY frame without debug data.
++    dataOut.writeShort(8 + expectedData.length);
++    dataOut.write(Http20Draft09.TYPE_GOAWAY);
++    dataOut.write(0); // no flags.
++    dataOut.writeInt(0); // connection-scope
++    dataOut.writeInt(0); // never read any stream!
++    dataOut.writeInt(expectedError.httpCode);
++    dataOut.write(expectedData);
++
++    // Check writer sends the same bytes.
++    assertArrayEquals(out.toByteArray(), sendGoAway(0, expectedError, expectedData));
++
++    FrameReader fr = newReader(out);
++
++    fr.nextFrame(new BaseTestHandler() { // Consume the go away frame.
++      @Override public void goAway(int lastGoodStreamId, ErrorCode errorCode, byte[] debugData) {
++        assertEquals(0, lastGoodStreamId);
++        assertEquals(expectedError, errorCode);
++        assertArrayEquals(expectedData, debugData);
++      }
++    });
++  }
++
+   private Http20Draft09.Reader newReader(ByteArrayOutputStream out) {
+-    return new Http20Draft09.Reader(new ByteArrayInputStream(out.toByteArray()),
+-        Variant.HTTP_20_DRAFT_09.initialPeerSettings(false).getHeaderTableSize(), false);
++    return new Http20Draft09.Reader(new ByteArrayInputStream(out.toByteArray()), 4096, false);
+   }
+ 
+   private byte[] literalHeaders(List<Header> sentHeaders) throws IOException {
+@@ -370,13 +488,27 @@ public void pushPromise(int streamId, int promisedStreamId, List<Header> headerB
+     return out.toByteArray();
+   }
+ 
++  private byte[] sendGoAway(int lastGoodStreamId, ErrorCode errorCode, byte[] debugData)
++      throws IOException {
++    ByteArrayOutputStream out = new ByteArrayOutputStream();
++    new Http20Draft09.Writer(out, true).goAway(lastGoodStreamId, errorCode, debugData);
++    return out.toByteArray();
++  }
++
+   private byte[] sendDataFrame(byte[] data) throws IOException {
+     return sendDataFrame(data, 0, data.length);
+   }
+ 
+   private byte[] sendDataFrame(byte[] data, int offset, int byteCount) throws IOException {
+     ByteArrayOutputStream out = new ByteArrayOutputStream();
+-    new Http20Draft09.Writer(out, true).sendDataFrame(expectedStreamId, 0, data, offset, byteCount);
++    new Http20Draft09.Writer(out, true).dataFrame(expectedStreamId, Http20Draft09.FLAG_NONE, data,
++        offset, byteCount);
++    return out.toByteArray();
++  }
++
++  private byte[] windowUpdate(long windowSizeIncrement) throws IOException {
++    ByteArrayOutputStream out = new ByteArrayOutputStream();
++    new Http20Draft09.Writer(out, true).windowUpdate(expectedStreamId, windowSizeIncrement);
+     return out.toByteArray();
+   }
+ }
+diff --git a/okhttp-protocols/src/test/java/com/squareup/okhttp/internal/spdy/MockSpdyPeer.java b/okhttp-protocols/src/test/java/com/squareup/okhttp/internal/spdy/MockSpdyPeer.java
+index 73a37e01dd..3675bb0866 100644
+--- a/okhttp-protocols/src/test/java/com/squareup/okhttp/internal/spdy/MockSpdyPeer.java
++++ b/okhttp-protocols/src/test/java/com/squareup/okhttp/internal/spdy/MockSpdyPeer.java
+@@ -50,13 +50,17 @@
+   public MockSpdyPeer(Variant variant, boolean client) {
+     this.client = client;
+     this.variant = variant;
+-    this.frameWriter = variant.newWriter(bytesOut, variant.defaultOkHttpSettings(client), client);
++    this.frameWriter = variant.newWriter(bytesOut, client);
+   }
+ 
+   public void acceptFrame() {
+     frameCount++;
+   }
+ 
++  public int frameCount() {
++    return frameCount;
++  }
++
+   public FrameWriter sendFrame() {
+     outFrames.add(new OutFrame(frameCount++, bytesOut.size(), Integer.MAX_VALUE));
+     return frameWriter;
+@@ -110,7 +114,7 @@ private void readAndWriteFrames() throws IOException {
+     socket = serverSocket.accept();
+     OutputStream out = socket.getOutputStream();
+     InputStream in = socket.getInputStream();
+-    FrameReader reader = variant.newReader(in, variant.initialPeerSettings(client), client);
++    FrameReader reader = variant.newReader(in, client);
+ 
+     Iterator<OutFrame> outFramesIterator = outFrames.iterator();
+     byte[] outBytes = bytesOut.toByteArray();
+@@ -185,7 +189,7 @@ private OutFrame(int sequence, int start, int truncateToLength) {
+     public int associatedStreamId;
+     public int priority;
+     public ErrorCode errorCode;
+-    public int deltaWindowSize;
++    public long windowSizeIncrement;
+     public List<Header> headerBlock;
+     public byte[] data;
+     public Settings settings;
+@@ -250,18 +254,20 @@ public InFrame(int sequence, FrameReader reader) {
+       this.type = Spdy3.TYPE_NOOP;
+     }
+ 
+-    @Override public void goAway(int lastGoodStreamId, ErrorCode errorCode) {
++    @Override
++    public void goAway(int lastGoodStreamId, ErrorCode errorCode, byte[] debugData) {
+       if (this.type != -1) throw new IllegalStateException();
+       this.type = Spdy3.TYPE_GOAWAY;
+       this.streamId = lastGoodStreamId;
+       this.errorCode = errorCode;
++      this.data = debugData;
+     }
+ 
+-    @Override public void windowUpdate(int streamId, int deltaWindowSize, boolean endFlowControl) {
++    @Override public void windowUpdate(int streamId, long windowSizeIncrement) {
+       if (this.type != -1) throw new IllegalStateException();
+       this.type = Spdy3.TYPE_WINDOW_UPDATE;
+       this.streamId = streamId;
+-      this.deltaWindowSize = deltaWindowSize;
++      this.windowSizeIncrement = windowSizeIncrement;
+     }
+ 
+     @Override public void priority(int streamId, int priority) {
+diff --git a/okhttp-protocols/src/test/java/com/squareup/okhttp/internal/spdy/Spdy3Test.java b/okhttp-protocols/src/test/java/com/squareup/okhttp/internal/spdy/Spdy3Test.java
+index 83d3fd2a48..c6adebb51a 100644
+--- a/okhttp-protocols/src/test/java/com/squareup/okhttp/internal/spdy/Spdy3Test.java
++++ b/okhttp-protocols/src/test/java/com/squareup/okhttp/internal/spdy/Spdy3Test.java
+@@ -15,10 +15,14 @@
+  */
+ package com.squareup.okhttp.internal.spdy;
+ 
++import com.squareup.okhttp.internal.Util;
++import java.io.ByteArrayInputStream;
+ import java.io.ByteArrayOutputStream;
++import java.io.DataOutputStream;
+ import java.io.IOException;
+ import org.junit.Test;
+ 
++import static org.junit.Assert.assertArrayEquals;
+ import static org.junit.Assert.assertEquals;
+ import static org.junit.Assert.fail;
+ 
+@@ -29,11 +33,63 @@
+     try {
+       sendDataFrame(new byte[0x1000000]);
+       fail();
+-    } catch (IOException e) {
+-      assertEquals("FRAME_TOO_LARGE max size is 16Mib: 16777216", e.getMessage());
++    } catch (IllegalArgumentException e) {
++      assertEquals("FRAME_TOO_LARGE max size is 16Mib: " + 0x1000000L, e.getMessage());
+     }
+   }
+ 
++  @Test public void badWindowSizeIncrement() throws IOException {
++    try {
++      windowUpdate(0);
++      fail();
++    } catch (IllegalArgumentException e) {
++      assertEquals("windowSizeIncrement must be between 1 and 0x7fffffff: 0", e.getMessage());
++    }
++    try {
++      windowUpdate(0x80000000L);
++      fail();
++    } catch (IllegalArgumentException e) {
++      assertEquals("windowSizeIncrement must be between 1 and 0x7fffffff: 2147483648",
++          e.getMessage());
++    }
++  }
++
++  @Test public void goAwayRoundTrip() throws IOException {
++    ByteArrayOutputStream out = new ByteArrayOutputStream();
++    DataOutputStream dataOut = new DataOutputStream(out);
++
++    final ErrorCode expectedError = ErrorCode.PROTOCOL_ERROR;
++
++    // Compose the expected GOAWAY frame without debug data
++    // |C| Version(15bits) | Type(16bits) |
++    dataOut.writeInt(0x80000000 | (Spdy3.VERSION & 0x7fff) << 16 | Spdy3.TYPE_GOAWAY & 0xffff);
++    // | Flags (8)  |  Length (24 bits)   |
++    dataOut.writeInt(8); // no flags and length is 8.
++    dataOut.writeInt(expectedStreamId); // last good stream.
++    dataOut.writeInt(expectedError.spdyGoAwayCode);
++
++    // Check writer sends the same bytes.
++    assertArrayEquals(out.toByteArray(),
++        sendGoAway(expectedStreamId, expectedError, Util.EMPTY_BYTE_ARRAY));
++
++    // SPDY/3 does not send debug data, so bytes should be same!
++    assertArrayEquals(out.toByteArray(), sendGoAway(expectedStreamId, expectedError, new byte[8]));
++
++    FrameReader fr = newReader(out);
++
++    fr.nextFrame(new BaseTestHandler() { // Consume the goAway frame.
++      @Override public void goAway(int lastGoodStreamId, ErrorCode errorCode, byte[] debugData) {
++        assertEquals(expectedStreamId, lastGoodStreamId);
++        assertEquals(expectedError, errorCode);
++        assertEquals(0, debugData.length);
++      }
++    });
++  }
++
++  private Spdy3.Reader newReader(ByteArrayOutputStream out) {
++    return new Spdy3.Reader(new ByteArrayInputStream(out.toByteArray()), false);
++  }
++
+   private byte[] sendDataFrame(byte[] data) throws IOException {
+     return sendDataFrame(data, 0, data.length);
+   }
+@@ -43,4 +99,17 @@
+     new Spdy3.Writer(out, true).sendDataFrame(expectedStreamId, 0, data, offset, byteCount);
+     return out.toByteArray();
+   }
++
++  private byte[] windowUpdate(long increment) throws IOException {
++    ByteArrayOutputStream out = new ByteArrayOutputStream();
++    new Spdy3.Writer(out, true).windowUpdate(expectedStreamId, increment);
++    return out.toByteArray();
++  }
++
++  private byte[] sendGoAway(int lastGoodStreamId, ErrorCode errorCode, byte[] debugData)
++      throws IOException {
++    ByteArrayOutputStream out = new ByteArrayOutputStream();
++    new Spdy3.Writer(out, true).goAway(lastGoodStreamId, errorCode, debugData);
++    return out.toByteArray();
++  }
+ }
+diff --git a/okhttp-protocols/src/test/java/com/squareup/okhttp/internal/spdy/SpdyConnectionTest.java b/okhttp-protocols/src/test/java/com/squareup/okhttp/internal/spdy/SpdyConnectionTest.java
+index 313bcbc74f..ceb68ddccc 100644
+--- a/okhttp-protocols/src/test/java/com/squareup/okhttp/internal/spdy/SpdyConnectionTest.java
++++ b/okhttp-protocols/src/test/java/com/squareup/okhttp/internal/spdy/SpdyConnectionTest.java
+@@ -15,7 +15,6 @@
+  */
+ package com.squareup.okhttp.internal.spdy;
+ 
+-import com.squareup.okhttp.Protocol;
+ import com.squareup.okhttp.internal.Base64;
+ import com.squareup.okhttp.internal.Util;
+ import java.io.ByteArrayOutputStream;
+@@ -27,6 +26,7 @@
+ import java.util.concurrent.TimeUnit;
+ import java.util.concurrent.atomic.AtomicInteger;
+ import org.junit.After;
++import org.junit.Ignore;
+ import org.junit.Test;
+ 
+ import static com.squareup.okhttp.internal.Util.UTF_8;
+@@ -53,12 +53,15 @@
+ import static org.junit.Assert.fail;
+ 
+ public final class SpdyConnectionTest {
++  private static final Variant SPDY3 = new Spdy3();
++  private static final Variant HTTP_20_DRAFT_09 = new Http20Draft09();
++
+   private static final IncomingStreamHandler REJECT_INCOMING_STREAMS = new IncomingStreamHandler() {
+     @Override public void receive(SpdyStream stream) throws IOException {
+       throw new AssertionError();
+     }
+   };
+-  private final MockSpdyPeer peer = new MockSpdyPeer(Variant.SPDY3, false);
++  private final MockSpdyPeer peer = new MockSpdyPeer(SPDY3, false);
+ 
+   @After public void tearDown() throws Exception {
+     peer.close();
+@@ -159,6 +162,17 @@
+   }
+ 
+   @Test public void replyWithNoData() throws Exception {
++    MockSpdyPeer.InFrame reply = replyWithNoData(SPDY3);
++    assertEquals(HeadersMode.SPDY_REPLY, reply.headersMode);
++  }
++
++  @Test public void replyWithNoDataHttp2() throws Exception {
++    MockSpdyPeer.InFrame reply = replyWithNoData(HTTP_20_DRAFT_09);
++    assertEquals(HeadersMode.HTTP_20_HEADERS, reply.headersMode);
++  }
++
++  private MockSpdyPeer.InFrame replyWithNoData(Variant variant) throws Exception {
++    MockSpdyPeer peer = new MockSpdyPeer(variant, false);
+     // write the mocking script
+     peer.sendFrame().synStream(false, false, 2, 0, 0, 0, headerEntries("a", "android"));
+     peer.acceptFrame(); // SYN_REPLY
+@@ -172,15 +186,15 @@
+         receiveCount.incrementAndGet();
+       }
+     };
+-    new SpdyConnection.Builder(true, peer.openSocket()).handler(handler).build();
++    connectionBuilder(peer, variant).handler(handler).build();
+ 
+     // verify the peer received what was expected
+     MockSpdyPeer.InFrame reply = peer.takeFrame();
+     assertEquals(TYPE_HEADERS, reply.type);
+-    assertEquals(HeadersMode.SPDY_REPLY, reply.headersMode);
+     assertTrue(reply.inFinished);
+     assertEquals(headerEntries("b", "banana"), reply.headerBlock);
+     assertEquals(1, receiveCount.get());
++    return reply;
+   }
+ 
+   @Test public void noop() throws Exception {
+@@ -189,9 +203,7 @@
+     peer.play();
+ 
+     // play it back
+-    SpdyConnection connection =
+-        new SpdyConnection.Builder(true, peer.openSocket()).handler(REJECT_INCOMING_STREAMS)
+-            .build();
++    SpdyConnection connection = connection(peer, SPDY3);
+     connection.noop();
+ 
+     // verify the peer received what was expected
+@@ -206,7 +218,7 @@
+     peer.play();
+ 
+     // play it back
+-    new SpdyConnection.Builder(true, peer.openSocket()).handler(REJECT_INCOMING_STREAMS).build();
++    connection(peer, SPDY3);
+ 
+     // verify the peer received what was expected
+     MockSpdyPeer.InFrame ping = peer.takeFrame();
+@@ -217,7 +229,7 @@
+   }
+ 
+   @Test public void serverPingsClientHttp2() throws Exception {
+-    MockSpdyPeer peer = new MockSpdyPeer(Variant.HTTP_20_DRAFT_09, false);
++    MockSpdyPeer peer = new MockSpdyPeer(HTTP_20_DRAFT_09, false);
+ 
+     // write the mocking script
+     peer.sendFrame().ping(false, 2, 3);
+@@ -225,7 +237,7 @@
+     peer.play();
+ 
+     // play it back
+-    http2Connection(peer);
++    connection(peer, HTTP_20_DRAFT_09);
+ 
+     // verify the peer received what was expected
+     MockSpdyPeer.InFrame ping = peer.takeFrame();
+@@ -243,9 +255,7 @@
+     peer.play();
+ 
+     // play it back
+-    SpdyConnection connection = new SpdyConnection.Builder(true, peer.openSocket())
+-        .handler(REJECT_INCOMING_STREAMS)
+-        .build();
++    SpdyConnection connection = connection(peer, SPDY3);
+     Ping ping = connection.ping();
+     assertTrue(ping.roundTripTime() > 0);
+     assertTrue(ping.roundTripTime() < TimeUnit.SECONDS.toNanos(1));
+@@ -259,7 +269,7 @@
+   }
+ 
+   @Test public void clientPingsServerHttp2() throws Exception {
+-    MockSpdyPeer peer = new MockSpdyPeer(Variant.HTTP_20_DRAFT_09, false);
++    MockSpdyPeer peer = new MockSpdyPeer(HTTP_20_DRAFT_09, false);
+ 
+     // write the mocking script
+     peer.acceptFrame(); // PING
+@@ -267,7 +277,7 @@
+     peer.play();
+ 
+     // play it back
+-    SpdyConnection connection = http2Connection(peer);
++    SpdyConnection connection = connection(peer, HTTP_20_DRAFT_09);
+     Ping ping = connection.ping();
+     assertTrue(ping.roundTripTime() > 0);
+     assertTrue(ping.roundTripTime() < TimeUnit.SECONDS.toNanos(1));
+@@ -290,7 +300,7 @@
+     peer.play();
+ 
+     // play it back
+-    new SpdyConnection.Builder(true, peer.openSocket()).handler(REJECT_INCOMING_STREAMS).build();
++    connection(peer, SPDY3);
+ 
+     // verify the peer received what was expected
+     MockSpdyPeer.InFrame ping2 = peer.takeFrame();
+@@ -301,7 +311,7 @@
+ 
+   @Test public void peerHttp2ServerZerosCompressionTable() throws Exception {
+     boolean client = false; // Peer is server, so we are client.
+-    Settings settings = Variant.HTTP_20_DRAFT_09.initialPeerSettings(client);
++    Settings settings = new Settings();
+     settings.set(Settings.HEADER_TABLE_SIZE, PERSIST_VALUE, 0);
+ 
+     SpdyConnection connection = sendHttp2SettingsAndCheckForAck(client, settings);
+@@ -317,7 +327,7 @@
+ 
+   @Test public void peerHttp2ClientDisablesPush() throws Exception {
+     boolean client = false; // Peer is client, so we are server.
+-    Settings settings = Variant.HTTP_20_DRAFT_09.initialPeerSettings(client);
++    Settings settings = Http20Draft09.defaultSettings(client);
+     settings.set(Settings.ENABLE_PUSH, 0, 0); // The peer client disables push.
+ 
+     SpdyConnection connection = sendHttp2SettingsAndCheckForAck(client, settings);
+@@ -338,9 +348,7 @@
+     peer.play();
+ 
+     // play it back
+-    SpdyConnection connection = new SpdyConnection.Builder(true, peer.openSocket())
+-        .handler(REJECT_INCOMING_STREAMS)
+-        .build();
++    SpdyConnection connection = connection(peer, SPDY3);
+ 
+     peer.takeFrame(); // Guarantees that the peer Settings frame has been processed.
+     synchronized (connection) {
+@@ -365,9 +373,7 @@
+     peer.play();
+ 
+     // play it back
+-    SpdyConnection connection = new SpdyConnection.Builder(true, peer.openSocket())
+-        .handler(REJECT_INCOMING_STREAMS)
+-        .build();
++    SpdyConnection connection = connection(peer, SPDY3);
+ 
+     peer.takeFrame(); // Guarantees that the Settings frame has been processed.
+     synchronized (connection) {
+@@ -391,7 +397,7 @@
+     peer.play();
+ 
+     // play it back
+-    new SpdyConnection.Builder(true, peer.openSocket()).handler(REJECT_INCOMING_STREAMS).build();
++    connection(peer, SPDY3);
+ 
+     // verify the peer received what was expected
+     MockSpdyPeer.InFrame rstStream = peer.takeFrame();
+@@ -411,7 +417,7 @@
+     peer.play();
+ 
+     // play it back
+-    new SpdyConnection.Builder(true, peer.openSocket()).handler(REJECT_INCOMING_STREAMS).build();
++    connection(peer, SPDY3);
+ 
+     // verify the peer received what was expected
+     MockSpdyPeer.InFrame rstStream = peer.takeFrame();
+@@ -433,9 +439,7 @@
+     peer.play();
+ 
+     // play it back
+-    SpdyConnection connection = new SpdyConnection.Builder(true, peer.openSocket())
+-        .handler(REJECT_INCOMING_STREAMS)
+-        .build();
++    SpdyConnection connection = connection(peer, SPDY3);
+     SpdyStream stream = connection.newStream(headerEntries("a", "android"), true, false);
+     OutputStream out = stream.getOutputStream();
+     out.write("square".getBytes(UTF_8));
+@@ -479,9 +483,7 @@
+     peer.play();
+ 
+     // play it back
+-    SpdyConnection connection = new SpdyConnection.Builder(true, peer.openSocket())
+-        .handler(REJECT_INCOMING_STREAMS)
+-        .build();
++    SpdyConnection connection = connection(peer, SPDY3);
+     SpdyStream stream = connection.newStream(headerEntries("a", "android"), true, true);
+     OutputStream out = stream.getOutputStream();
+     connection.ping().roundTripTime(); // Ensure that the RST_CANCEL has been received.
+@@ -521,9 +523,7 @@
+     peer.play();
+ 
+     // play it back
+-    SpdyConnection connection = new SpdyConnection.Builder(true, peer.openSocket())
+-        .handler(REJECT_INCOMING_STREAMS)
+-        .build();
++    SpdyConnection connection = connection(peer, SPDY3);
+     SpdyStream stream = connection.newStream(headerEntries("a", "android"), false, true);
+     InputStream in = stream.getInputStream();
+     OutputStream out = stream.getOutputStream();
+@@ -566,9 +566,7 @@
+     peer.play();
+ 
+     // play it back
+-    SpdyConnection connection = new SpdyConnection.Builder(true, peer.openSocket())
+-        .handler(REJECT_INCOMING_STREAMS)
+-        .build();
++    SpdyConnection connection = connection(peer, SPDY3);
+     SpdyStream stream = connection.newStream(headerEntries("a", "android"), true, true);
+     InputStream in = stream.getInputStream();
+     OutputStream out = stream.getOutputStream();
+@@ -610,9 +608,7 @@
+     peer.play();
+ 
+     // play it back
+-    SpdyConnection connection = new SpdyConnection.Builder(true, peer.openSocket())
+-        .handler(REJECT_INCOMING_STREAMS)
+-        .build();
++    SpdyConnection connection = connection(peer, SPDY3);
+     SpdyStream stream = connection.newStream(headerEntries("a", "android"), false, true);
+     InputStream in = stream.getInputStream();
+     assertStreamData("square", in);
+@@ -772,18 +768,29 @@
+     assertEquals(2, ping.payload1);
+   }
+ 
++
+   @Test public void receiveGoAway() throws Exception {
++    receiveGoAway(SPDY3);
++  }
++
++  @Test public void receiveGoAwayHttp2() throws Exception {
++    receiveGoAway(HTTP_20_DRAFT_09);
++  }
++
++  private void receiveGoAway(Variant variant) throws Exception {
++    MockSpdyPeer peer = new MockSpdyPeer(variant, false);
++
+     // write the mocking script
+     peer.acceptFrame(); // SYN_STREAM 1
+     peer.acceptFrame(); // SYN_STREAM 3
+-    peer.sendFrame().goAway(1, PROTOCOL_ERROR);
++    peer.sendFrame().goAway(1, PROTOCOL_ERROR, Util.EMPTY_BYTE_ARRAY);
+     peer.acceptFrame(); // PING
+     peer.sendFrame().ping(true, 1, 0);
+     peer.acceptFrame(); // DATA STREAM 1
+     peer.play();
+ 
+     // play it back
+-    SpdyConnection connection = new SpdyConnection.Builder(true, peer.openSocket()).build();
++    SpdyConnection connection = connection(peer, variant);
+     SpdyStream stream1 = connection.newStream(headerEntries("a", "android"), true, true);
+     SpdyStream stream2 = connection.newStream(headerEntries("b", "banana"), true, true);
+     connection.ping().roundTripTime(); // Ensure that the GO_AWAY has been received.
+@@ -1006,7 +1013,24 @@
+   }
+ 
+   @Test public void readSendsWindowUpdate() throws Exception {
+-    int windowUpdateThreshold = Variant.SPDY3.initialPeerSettings(true).getInitialWindowSize() / 2;
++    readSendsWindowUpdate(SPDY3);
++  }
++
++  /**
++   * This test fails on http/2 as it tries to send too large data frame.  In
++   * practice, {@link SpdyStream#OUTPUT_BUFFER_SIZE} prevents us from sending
++   * too large frames.  The test should probably be rewritten to take into
++   * account max frame size per variant.
++   */
++  @Test @Ignore public void readSendsWindowUpdateHttp2() throws Exception {
++    readSendsWindowUpdate(HTTP_20_DRAFT_09);
++  }
++
++  private void readSendsWindowUpdate(Variant variant)
++      throws IOException, InterruptedException {
++    MockSpdyPeer peer = new MockSpdyPeer(variant, false);
++    int windowUpdateThreshold = 65535 / 2;
++
+     // Write the mocking script.
+     peer.acceptFrame(); // SYN_STREAM
+     peer.sendFrame().synReply(false, 1, headerEntries("a", "android"));
+@@ -1018,7 +1042,7 @@
+     peer.play();
+ 
+     // Play it back.
+-    SpdyConnection connection = new SpdyConnection.Builder(true, peer.openSocket()).build();
++    SpdyConnection connection = connection(peer, variant);
+     SpdyStream stream = connection.newStream(headerEntries("b", "banana"), true, true);
+     assertEquals(windowUpdateThreshold, stream.windowUpdateThreshold);
+     assertEquals(headerEntries("a", "android"), stream.getResponseHeaders());
+@@ -1039,12 +1063,72 @@
+       MockSpdyPeer.InFrame windowUpdate = peer.takeFrame();
+       assertEquals(TYPE_WINDOW_UPDATE, windowUpdate.type);
+       assertEquals(1, windowUpdate.streamId);
+-      assertEquals(windowUpdateThreshold, windowUpdate.deltaWindowSize);
++      assertEquals(windowUpdateThreshold, windowUpdate.windowSizeIncrement);
+     }
+   }
+ 
++  @Test public void serverSendsEmptyDataClientDoesntSendWindowUpdate() throws Exception {
++    serverSendsEmptyDataClientDoesntSendWindowUpdate(SPDY3);
++  }
++
++  @Test public void serverSendsEmptyDataClientDoesntSendWindowUpdateHttp2() throws Exception {
++    serverSendsEmptyDataClientDoesntSendWindowUpdate(HTTP_20_DRAFT_09);
++  }
++
++  private void serverSendsEmptyDataClientDoesntSendWindowUpdate(Variant variant)
++      throws IOException, InterruptedException {
++    MockSpdyPeer peer = new MockSpdyPeer(variant, false);
++
++    // Write the mocking script.
++    peer.acceptFrame(); // SYN_STREAM
++    peer.sendFrame().synReply(false, 1, headerEntries("a", "android"));
++    peer.sendFrame().data(true, 1, new byte[0]);
++    peer.play();
++
++    // Play it back.
++    SpdyConnection connection = connection(peer, variant);
++    SpdyStream client = connection.newStream(headerEntries("b", "banana"), false, true);
++    assertEquals(-1, client.getInputStream().read());
++
++    // Verify the peer received what was expected.
++    MockSpdyPeer.InFrame synStream = peer.takeFrame();
++    assertEquals(TYPE_HEADERS, synStream.type);
++    assertEquals(3, peer.frameCount());
++  }
++
++  @Test public void clientSendsEmptyDataServerDoesntSendWindowUpdate() throws Exception {
++    clientSendsEmptyDataServerDoesntSendWindowUpdate(SPDY3);
++  }
++
++  @Test public void clientSendsEmptyDataServerDoesntSendWindowUpdateHttp2() throws Exception {
++    clientSendsEmptyDataServerDoesntSendWindowUpdate(HTTP_20_DRAFT_09);
++  }
++
++  private void clientSendsEmptyDataServerDoesntSendWindowUpdate(Variant variant)
++      throws IOException, InterruptedException {
++    MockSpdyPeer peer = new MockSpdyPeer(variant, false);
++
++    // Write the mocking script.
++    peer.acceptFrame(); // SYN_STREAM
++    peer.sendFrame().synReply(false, 1, headerEntries("a", "android"));
++    peer.play();
++
++    // Play it back.
++    SpdyConnection connection = connection(peer, variant);
++    SpdyStream client = connection.newStream(headerEntries("b", "banana"), true, true);
++    assertEquals(0, client.getInputStream().available());
++    client.getOutputStream().write(Util.EMPTY_BYTE_ARRAY);
++    client.getOutputStream().flush();
++    client.getOutputStream().close();
++
++    // Verify the peer received what was expected.
++    MockSpdyPeer.InFrame synStream = peer.takeFrame();
++    assertEquals(TYPE_HEADERS, synStream.type);
++    assertEquals(2, peer.frameCount());
++  }
++
+   @Test public void writeAwaitsWindowUpdate() throws Exception {
+-    int windowSize = Variant.SPDY3.initialPeerSettings(true).getInitialWindowSize();
++    int windowSize = 65535;
+ 
+     // Write the mocking script. This accepts more data frames than necessary!
+     peer.acceptFrame(); // SYN_STREAM
+@@ -1099,7 +1183,7 @@
+    * prevents us from overrunning the max frame size of SPDY/3 or HTTP/2.
+    */
+   @Test public void spdyStreamOutputBufferSizeLimitsDataFrameLength() throws Exception {
+-    MockSpdyPeer peer = new MockSpdyPeer(Variant.HTTP_20_DRAFT_09, false);
++    MockSpdyPeer peer = new MockSpdyPeer(HTTP_20_DRAFT_09, false);
+ 
+     byte[] buff = new byte[SpdyStream.OUTPUT_BUFFER_SIZE * 2];
+     Arrays.fill(buff, (byte) '*');
+@@ -1112,7 +1196,7 @@
+     peer.play();
+ 
+     // play it back
+-    SpdyConnection connection = http2Connection(peer);
++    SpdyConnection connection = connection(peer, HTTP_20_DRAFT_09);
+     SpdyStream stream = connection.newStream(headerEntries("b", "banana"), true, true);
+     OutputStream out = stream.getOutputStream();
+     out.write(buff);
+@@ -1156,7 +1240,7 @@
+ 
+   // TODO: change this to only cancel when local settings disable push
+   @Test public void pushPromiseStreamsAutomaticallyCancel() throws Exception {
+-    MockSpdyPeer peer = new MockSpdyPeer(Variant.HTTP_20_DRAFT_09, false);
++    MockSpdyPeer peer = new MockSpdyPeer(HTTP_20_DRAFT_09, false);
+ 
+     // write the mocking script
+     peer.sendFrame().pushPromise(1, 2, Arrays.asList(
+@@ -1172,7 +1256,7 @@
+     peer.play();
+ 
+     // play it back
+-    http2Connection(peer);
++    connection(peer, HTTP_20_DRAFT_09);
+ 
+     // verify the peer received what was expected
+     MockSpdyPeer.InFrame rstStream = peer.takeFrame();
+@@ -1183,13 +1267,13 @@
+ 
+   private SpdyConnection sendHttp2SettingsAndCheckForAck(boolean client, Settings settings)
+       throws IOException, InterruptedException {
+-    MockSpdyPeer peer = new MockSpdyPeer(Variant.HTTP_20_DRAFT_09, client);
++    MockSpdyPeer peer = new MockSpdyPeer(HTTP_20_DRAFT_09, client);
+     peer.sendFrame().settings(settings);
+     peer.acceptFrame(); // ACK
+     peer.play();
+ 
+     // play it back
+-    SpdyConnection connection = http2Connection(peer);
++    SpdyConnection connection = connection(peer, HTTP_20_DRAFT_09);
+ 
+     // verify the peer received the ACK
+     MockSpdyPeer.InFrame pingFrame = peer.takeFrame();
+@@ -1201,10 +1285,13 @@ private SpdyConnection sendHttp2SettingsAndCheckForAck(boolean client, Settings
+     return connection;
+   }
+ 
+-  private SpdyConnection http2Connection(MockSpdyPeer peer) throws IOException {
+-    return new SpdyConnection.Builder(true, peer.openSocket())
+-        .protocol(Protocol.HTTP_2)
+-        .handler(REJECT_INCOMING_STREAMS).build();
++  private SpdyConnection connection(MockSpdyPeer peer, Variant variant) throws IOException {
++    return connectionBuilder(peer, variant).handler(REJECT_INCOMING_STREAMS).build();
++  }
++
++  private SpdyConnection.Builder connectionBuilder(MockSpdyPeer peer, Variant variant)
++      throws IOException {
++    return new SpdyConnection.Builder(true, peer.openSocket()).protocol(variant.getProtocol());
+   }
+ 
+   private void writeAndClose(SpdyStream stream, String data) throws IOException {
+diff --git a/okhttp/src/test/java/com/squareup/okhttp/internal/http/URLConnectionTest.java b/okhttp/src/test/java/com/squareup/okhttp/internal/http/URLConnectionTest.java
+index 7b9eb8d09d..117970210a 100644
+--- a/okhttp/src/test/java/com/squareup/okhttp/internal/http/URLConnectionTest.java
++++ b/okhttp/src/test/java/com/squareup/okhttp/internal/http/URLConnectionTest.java
+@@ -76,6 +76,7 @@
+ import org.junit.Ignore;
+ import org.junit.Test;
+ 
++import static com.squareup.okhttp.internal.http.OkHeaders.SELECTED_PROTOCOL;
+ import static com.squareup.okhttp.internal.http.StatusLine.HTTP_TEMP_REDIRECT;
+ import static com.squareup.okhttp.mockwebserver.SocketPolicy.DISCONNECT_AT_END;
+ import static com.squareup.okhttp.mockwebserver.SocketPolicy.DISCONNECT_AT_START;
+@@ -2527,6 +2528,71 @@ private void reusedConnectionFailsWithPost(TransferKind transferKind, int reques
+     assertTrue(call, call.contains("challenges=[Basic realm=\"protected area\"]"));
+   }
+ 
++  @Test public void npnSetsProtocolHeader_SPDY_3() throws Exception {
++    npnSetsProtocolHeader(Protocol.SPDY_3);
++  }
++
++  @Test public void npnSetsProtocolHeader_HTTP_2() throws Exception {
++    npnSetsProtocolHeader(Protocol.HTTP_2);
++  }
++
++  private void npnSetsProtocolHeader(Protocol protocol) throws IOException {
++    enableNpn(protocol);
++    server.enqueue(new MockResponse().setBody("A"));
++    server.play();
++    client.setProtocols(Arrays.asList(Protocol.HTTP_11, protocol));
++    HttpURLConnection connection = client.open(server.getUrl("/"));
++    List<String> protocolValues = connection.getHeaderFields().get(SELECTED_PROTOCOL);
++    assertEquals(Arrays.asList(protocol.name.utf8()), protocolValues);
++    assertContent("A", connection);
++  }
++
++  /** For example, empty Protobuf RPC messages end up as a zero-length POST. */
++  @Test public void zeroLengthPost() throws IOException, InterruptedException {
++    zeroLengthPayload("POST");
++  }
++
++  @Test public void zeroLengthPost_SPDY_3() throws Exception {
++    enableNpn(Protocol.SPDY_3);
++    zeroLengthPost();
++  }
++
++  @Test public void zeroLengthPost_HTTP_2() throws Exception {
++    enableNpn(Protocol.HTTP_2);
++    zeroLengthPost();
++  }
++
++  /** For example, creating an Amazon S3 bucket ends up as a zero-length POST. */
++  @Test public void zeroLengthPut() throws IOException, InterruptedException {
++    zeroLengthPayload("PUT");
++  }
++
++  @Test public void zeroLengthPut_SPDY_3() throws Exception {
++    enableNpn(Protocol.SPDY_3);
++    zeroLengthPut();
++  }
++
++  @Test public void zeroLengthPut_HTTP_2() throws Exception {
++    enableNpn(Protocol.HTTP_2);
++    zeroLengthPut();
++  }
++
++  private void zeroLengthPayload(String method)
++      throws IOException, InterruptedException {
++    server.enqueue(new MockResponse());
++    server.play();
++    HttpURLConnection connection = client.open(server.getUrl("/"));
++    connection.setRequestProperty("Content-Length", "0");
++    connection.setRequestMethod(method);
++    connection.setFixedLengthStreamingMode(0);
++    connection.setDoOutput(true);
++    assertContent("", connection);
++    RecordedRequest zeroLengthPayload = server.takeRequest();
++    assertEquals(method, zeroLengthPayload.getMethod());
++    assertEquals("0", zeroLengthPayload.getHeader("content-length"));
++    assertEquals(0L, zeroLengthPayload.getBodySize());
++  }
++
+   @Test public void setProtocols() throws Exception {
+     server.enqueue(new MockResponse().setBody("A"));
+     server.play();
+@@ -2772,4 +2838,16 @@ private String certificatesToString(X509Certificate[] certificates) {
+     @Override public void connectFailed(URI uri, SocketAddress sa, IOException ioe) {
+     }
+   }
++
++  /**
++   * Tests that use this will fail unless boot classpath is set. Ex. {@code
++   * -Xbootclasspath/p:/tmp/npn-boot-8.1.2.v20120308.jar}
++   */
++  private void enableNpn(Protocol protocol) {
++    server.useHttps(sslContext.getSocketFactory(), false);
++    server.setNpnEnabled(true);
++    client.setSslSocketFactory(sslContext.getSocketFactory());
++    client.setHostnameVerifier(new RecordingHostnameVerifier());
++    client.setProtocols(Arrays.asList(protocol, Protocol.HTTP_11));
++  }
+ }

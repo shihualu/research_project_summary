@@ -1,0 +1,610 @@
+diff --git a/extensions/flac/src/main/java/com/google/android/exoplayer2/ext/flac/FlacDecoderJni.java b/extensions/flac/src/main/java/com/google/android/exoplayer2/ext/flac/FlacDecoderJni.java
+index 448e2a1b05..32ef22dab0 100644
+--- a/extensions/flac/src/main/java/com/google/android/exoplayer2/ext/flac/FlacDecoderJni.java
++++ b/extensions/flac/src/main/java/com/google/android/exoplayer2/ext/flac/FlacDecoderJni.java
+@@ -23,7 +23,6 @@
+ import com.google.android.exoplayer2.util.Util;
+ import java.io.IOException;
+ import java.nio.ByteBuffer;
+-import java.util.ArrayList;
+ 
+ /**
+  * JNI wrapper for the libflac Flac decoder.
+@@ -152,12 +151,6 @@ public FlacStreamInfo decodeStreamInfo() throws IOException, InterruptedExceptio
+     return streamInfo;
+   }
+ 
+-  /** Decodes and consumes the Vorbis Comment section from the FLAC stream. */
+-  @Nullable
+-  public ArrayList<String> decodeVorbisComment() throws IOException, InterruptedException {
+-    return flacDecodeVorbisComment(nativeDecoderContext);
+-  }
+-
+   /**
+    * Decodes and consumes the next frame from the FLAC stream into the given byte buffer. If any IO
+    * error occurs, resets the stream and input to the given {@code retryPosition}.
+@@ -276,9 +269,6 @@ private int readFromExtractorInput(
+   private native FlacStreamInfo flacDecodeMetadata(long context)
+       throws IOException, InterruptedException;
+ 
+-  private native ArrayList<String> flacDecodeVorbisComment(long context)
+-      throws IOException, InterruptedException;
+-
+   private native int flacDecodeToBuffer(long context, ByteBuffer outputBuffer)
+       throws IOException, InterruptedException;
+ 
+diff --git a/extensions/flac/src/main/java/com/google/android/exoplayer2/ext/flac/FlacExtractor.java b/extensions/flac/src/main/java/com/google/android/exoplayer2/ext/flac/FlacExtractor.java
+index 307cdfa8c8..50e0458fd7 100644
+--- a/extensions/flac/src/main/java/com/google/android/exoplayer2/ext/flac/FlacExtractor.java
++++ b/extensions/flac/src/main/java/com/google/android/exoplayer2/ext/flac/FlacExtractor.java
+@@ -33,7 +33,6 @@
+ import com.google.android.exoplayer2.extractor.TrackOutput;
+ import com.google.android.exoplayer2.metadata.Metadata;
+ import com.google.android.exoplayer2.metadata.id3.Id3Decoder;
+-import com.google.android.exoplayer2.metadata.vorbis.VorbisCommentDecoder;
+ import com.google.android.exoplayer2.util.Assertions;
+ import com.google.android.exoplayer2.util.FlacStreamInfo;
+ import com.google.android.exoplayer2.util.MimeTypes;
+@@ -43,7 +42,6 @@
+ import java.lang.annotation.Retention;
+ import java.lang.annotation.RetentionPolicy;
+ import java.nio.ByteBuffer;
+-import java.util.ArrayList;
+ import java.util.Arrays;
+ import org.checkerframework.checker.nullness.qual.EnsuresNonNull;
+ import org.checkerframework.checker.nullness.qual.MonotonicNonNull;
+@@ -93,7 +91,6 @@
+   private @MonotonicNonNull OutputFrameHolder outputFrameHolder;
+ 
+   @Nullable private Metadata id3Metadata;
+-  @Nullable private Metadata vorbisMetadata;
+   @Nullable private FlacBinarySearchSeeker binarySearchSeeker;
+ 
+   /** Constructs an instance with flags = 0. */
+@@ -227,14 +224,13 @@ private void decodeStreamInfo(ExtractorInput input) throws InterruptedException,
+     }
+ 
+     streamInfoDecoded = true;
+-    vorbisMetadata = decodeVorbisComment(input);
+     if (this.streamInfo == null) {
+       this.streamInfo = streamInfo;
+       binarySearchSeeker =
+           outputSeekMap(decoderJni, streamInfo, input.getLength(), extractorOutput);
+       Metadata metadata = id3MetadataDisabled ? null : id3Metadata;
+-      if (vorbisMetadata != null) {
+-          metadata = vorbisMetadata.copyWithAppendedEntriesFrom(metadata);
++      if (streamInfo.vorbisComments != null) {
++          metadata = streamInfo.vorbisComments.copyWithAppendedEntriesFrom(metadata);
+       }
+       outputFormat(streamInfo, metadata, trackOutput);
+       outputBuffer.reset(streamInfo.maxDecodedFrameSize());
+@@ -270,19 +266,6 @@ private static boolean peekFlacSignature(ExtractorInput input)
+     return Arrays.equals(header, FLAC_SIGNATURE);
+   }
+ 
+-  @Nullable
+-  private Metadata decodeVorbisComment(ExtractorInput input)
+-      throws InterruptedException, IOException {
+-    try {
+-      ArrayList<String> vorbisCommentList = decoderJni.decodeVorbisComment();
+-      return new VorbisCommentDecoder().decodeVorbisComments(vorbisCommentList);
+-    } catch (IOException e) {
+-      decoderJni.reset(0);
+-      input.setRetryPosition(0, e);
+-      throw e;
+-    }
+-  }
+-
+   /**
+    * Outputs a {@link SeekMap} and returns a {@link FlacBinarySearchSeeker} if one is required to
+    * handle seeks.
+diff --git a/extensions/flac/src/main/jni/flac_jni.cc b/extensions/flac/src/main/jni/flac_jni.cc
+index 0971ba5883..600f181890 100644
+--- a/extensions/flac/src/main/jni/flac_jni.cc
++++ b/extensions/flac/src/main/jni/flac_jni.cc
+@@ -17,6 +17,7 @@
+ #include <jni.h>
+ #include <android/log.h>
+ #include <cstdlib>
++#include <cstring>
+ #include "include/flac_parser.h"
+ 
+ #define LOG_TAG "flac_jni"
+@@ -90,50 +91,48 @@ DECODER_FUNC(jlong, flacInit) {
+ 
+ DECODER_FUNC(jobject, flacDecodeMetadata, jlong jContext) {
+   Context *context = reinterpret_cast<Context *>(jContext);
++  jobject commentArrayList = NULL;
+   context->source->setFlacDecoderJni(env, thiz);
+   if (!context->parser->decodeMetadata()) {
+     return NULL;
+   }
+ 
++  bool vorbisCommentValid = context->parser->isVorbisCommentValid();
++
++  if (vorbisCommentValid) {
++    std::vector<std::string> vorbisComments =
++                                context->parser->getVorbisComments();
++
++    jclass java_util_ArrayList = env->FindClass("java/util/ArrayList");
++    jmethodID java_util_ArrayList_ =
++        env->GetMethodID(java_util_ArrayList, "<init>", "(I)V");
++    jmethodID java_util_ArrayList_add =
++        env->GetMethodID(java_util_ArrayList, "add", "(Ljava/lang/Object;)Z");
++    commentArrayList = env->NewObject(java_util_ArrayList, java_util_ArrayList_,
++                                      vorbisComments.size());
++
++    for (std::vector<std::string>::const_iterator comment = vorbisComments.begin();
++         comment != vorbisComments.end(); ++comment) {
++      jstring element = env->NewStringUTF((*comment).c_str());
++      env->CallBooleanMethod(commentArrayList, java_util_ArrayList_add,
++                             element);
++      env->DeleteLocalRef(element);
++    }
++  }
++
+   const FLAC__StreamMetadata_StreamInfo &streamInfo =
+       context->parser->getStreamInfo();
+ 
+-  jclass cls = env->FindClass(
+-      "com/google/android/exoplayer2/util/"
+-      "FlacStreamInfo");
+-  jmethodID constructor = env->GetMethodID(cls, "<init>", "(IIIIIIIJ)V");
++  jclass cls = env->FindClass("com/google/android/exoplayer2/util/"
++                              "FlacStreamInfo");
++  jmethodID constructor = env->GetMethodID(cls, "<init>",
++                                           "(IIIIIIIJLjava/util/ArrayList;)V");
+ 
+   return env->NewObject(cls, constructor, streamInfo.min_blocksize,
+                         streamInfo.max_blocksize, streamInfo.min_framesize,
+                         streamInfo.max_framesize, streamInfo.sample_rate,
+                         streamInfo.channels, streamInfo.bits_per_sample,
+-                        streamInfo.total_samples);
+-}
+-
+-DECODER_FUNC(jobject, flacDecodeVorbisComment, jlong jContext) {
+-  Context *context = reinterpret_cast<Context *>(jContext);
+-  context->source->setFlacDecoderJni(env, thiz);
+-
+-  VorbisComment vorbisComment = context->parser->getVorbisComment();
+-
+-  if (vorbisComment.numComments == 0) {
+-    return NULL;
+-  } else {
+-    jclass java_util_ArrayList = env->FindClass("java/util/ArrayList");
+-
+-    jmethodID java_util_ArrayList_     = env->GetMethodID(java_util_ArrayList, "<init>", "(I)V");
+-    jmethodID java_util_ArrayList_add  = env->GetMethodID(java_util_ArrayList, "add",
+-                                                          "(Ljava/lang/Object;)Z");
+-
+-    jobject result = env->NewObject(java_util_ArrayList, java_util_ArrayList_,
+-                                    vorbisComment.numComments);
+-    for (FLAC__uint32 i = 0; i < vorbisComment.numComments; ++i) {
+-      jstring element = env->NewStringUTF(vorbisComment.metadataArray[i]);
+-      env->CallBooleanMethod(result, java_util_ArrayList_add, element);
+-      env->DeleteLocalRef(element);
+-    }
+-    return result;
+-  }
++                        streamInfo.total_samples, commentArrayList);
+ }
+ 
+ DECODER_FUNC(jint, flacDecodeToBuffer, jlong jContext, jobject jOutputBuffer) {
+diff --git a/extensions/flac/src/main/jni/flac_parser.cc b/extensions/flac/src/main/jni/flac_parser.cc
+index 06c98302fd..9af7ec5c8a 100644
+--- a/extensions/flac/src/main/jni/flac_parser.cc
++++ b/extensions/flac/src/main/jni/flac_parser.cc
+@@ -174,24 +174,16 @@ void FLACParser::metadataCallback(const FLAC__StreamMetadata *metadata) {
+       break;
+     case FLAC__METADATA_TYPE_VORBIS_COMMENT:
+       if (!mVorbisCommentValid) {
+-        FLAC__uint32 count = 0;
+-        const FLAC__StreamMetadata_VorbisComment *vc =
+-            &metadata->data.vorbis_comment;
+-        mVorbisCommentValid = true;
+-        mVorbisComment.metadataArray =
+-            (char **) malloc(vc->num_comments * sizeof(char *));
+-        for (FLAC__uint32 i = 0; i < vc->num_comments; ++i) {
+-          FLAC__StreamMetadata_VorbisComment_Entry *vce = &vc->comments[i];
+-          if (vce->entry != NULL) {
+-            mVorbisComment.metadataArray[count] =
+-                (char *) malloc((vce->length + 1) * sizeof(char));
+-            memcpy(mVorbisComment.metadataArray[count], vce->entry,
+-                vce->length);
+-            mVorbisComment.metadataArray[count][vce->length] = '\0';
+-            count++;
++        FLAC__StreamMetadata_VorbisComment vc = metadata->data.vorbis_comment;
++        for (FLAC__uint32 i = 0; i < vc.num_comments; ++i) {
++          FLAC__StreamMetadata_VorbisComment_Entry vce = vc.comments[i];
++          if (vce.entry != NULL) {
++            std::string comment(reinterpret_cast<char *>(vce.entry),
++                                vce.length);
++            mVorbisComments.push_back(comment);
+           }
+         }
+-        mVorbisComment.numComments = count;
++        mVorbisCommentValid = true;
+       } else {
+         ALOGE("FLACParser::metadataCallback unexpected VORBISCOMMENT");
+       }
+@@ -265,7 +257,6 @@ FLACParser::FLACParser(DataSource *source)
+   ALOGV("FLACParser::FLACParser");
+   memset(&mStreamInfo, 0, sizeof(mStreamInfo));
+   memset(&mWriteHeader, 0, sizeof(mWriteHeader));
+-  memset(&mVorbisComment, 0, sizeof(mVorbisComment));
+ }
+ 
+ FLACParser::~FLACParser() {
+diff --git a/extensions/flac/src/main/jni/include/flac_parser.h b/extensions/flac/src/main/jni/include/flac_parser.h
+index aec07d673e..8b70fea4cb 100644
+--- a/extensions/flac/src/main/jni/include/flac_parser.h
++++ b/extensions/flac/src/main/jni/include/flac_parser.h
+@@ -18,6 +18,9 @@
+ #define FLAC_PARSER_H_
+ 
+ #include <stdint.h>
++#include <cstdlib>
++#include <string>
++#include <vector>
+ 
+ // libFLAC parser
+ #include "FLAC/stream_decoder.h"
+@@ -26,11 +29,6 @@
+ 
+ typedef int status_t;
+ 
+-typedef struct VorbisComment_ {
+-  int numComments;
+-  char **metadataArray;
+-} VorbisComment;
+-
+ class FLACParser {
+  public:
+   FLACParser(DataSource *source);
+@@ -49,6 +47,14 @@ class FLACParser {
+     return mStreamInfo;
+   }
+ 
++  bool isVorbisCommentValid() {
++    return mVorbisCommentValid;
++  }
++
++  std::vector<std::string> getVorbisComments() {
++    return mVorbisComments;
++  }
++
+   int64_t getLastFrameTimestamp() const {
+     return (1000000LL * mWriteHeader.number.sample_number) / getSampleRate();
+   }
+@@ -77,6 +83,7 @@ class FLACParser {
+       if (newPosition == 0) {
+         mStreamInfoValid = false;
+         mVorbisCommentValid = false;
++        mVorbisComments.clear();
+         FLAC__stream_decoder_reset(mDecoder);
+       } else {
+         FLAC__stream_decoder_flush(mDecoder);
+@@ -102,10 +109,6 @@ class FLACParser {
+            FLAC__STREAM_DECODER_END_OF_STREAM;
+   }
+ 
+-  VorbisComment getVorbisComment() {
+-    return mVorbisComment;
+-  }
+-
+  private:
+   DataSource *mDataSource;
+ 
+@@ -126,6 +129,8 @@ class FLACParser {
+   const FLAC__StreamMetadata_SeekTable *mSeekTable;
+   uint64_t firstFrameOffset;
+ 
++  // cached when the VORBIS_COMMENT metadata is parsed by libFLAC
++  std::vector<std::string> mVorbisComments;
+   bool mVorbisCommentValid;
+ 
+   // cached when a decoded PCM block is "written" by libFLAC parser
+@@ -141,8 +146,6 @@ class FLACParser {
+   FLACParser(const FLACParser &);
+   FLACParser &operator=(const FLACParser &);
+ 
+-  VorbisComment mVorbisComment;
+-
+   // FLAC parser callbacks as C++ instance methods
+   FLAC__StreamDecoderReadStatus readCallback(FLAC__byte buffer[],
+                                              size_t *bytes);
+diff --git a/library/core/src/main/java/com/google/android/exoplayer2/metadata/vorbis/VorbisCommentDecoder.java b/library/core/src/main/java/com/google/android/exoplayer2/metadata/vorbis/VorbisCommentDecoder.java
+deleted file mode 100644
+index a212532685..0000000000
+--- a/library/core/src/main/java/com/google/android/exoplayer2/metadata/vorbis/VorbisCommentDecoder.java
++++ /dev/null
+@@ -1,59 +0,0 @@
+-/*
+- * Copyright (C) 2019 The Android Open Source Project
+- *
+- * Licensed under the Apache License, Version 2.0 (the "License");
+- * you may not use this file except in compliance with the License.
+- * You may obtain a copy of the License at
+- *
+- *      http://www.apache.org/licenses/LICENSE-2.0
+- *
+- * Unless required by applicable law or agreed to in writing, software
+- * distributed under the License is distributed on an "AS IS" BASIS,
+- * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+- * See the License for the specific language governing permissions and
+- * limitations under the License.
+- */
+-package com.google.android.exoplayer2.metadata.vorbis;
+-
+-import androidx.annotation.Nullable;
+-import com.google.android.exoplayer2.metadata.Metadata;
+-import java.util.ArrayList;
+-
+-/** Decodes vorbis comments */
+-public class VorbisCommentDecoder {
+-
+-  private static final String SEPARATOR = "=";
+-
+-  /**
+-   * Decodes an {@link ArrayList} of vorbis comments.
+-   *
+-   * @param metadataStringList An {@link ArrayList} containing vorbis comments as {@link String}
+-   * @return A {@link Metadata} structure with the vorbis comments as its entries.
+-   */
+-  public Metadata decodeVorbisComments(@Nullable ArrayList<String> metadataStringList) {
+-    if (metadataStringList == null || metadataStringList.size() == 0) {
+-      return null;
+-    }
+-
+-    ArrayList<VorbisCommentFrame> vorbisCommentFrames = new ArrayList<>();
+-    VorbisCommentFrame vorbisCommentFrame;
+-
+-    for (String commentEntry : metadataStringList) {
+-      String[] keyValue;
+-
+-      keyValue = commentEntry.split(SEPARATOR);
+-      if (keyValue.length != 2) {
+-        /* Could not parse this comment, no key value pair found */
+-        continue;
+-      }
+-      vorbisCommentFrame = new VorbisCommentFrame(keyValue[0], keyValue[1]);
+-      vorbisCommentFrames.add(vorbisCommentFrame);
+-    }
+-
+-    if (vorbisCommentFrames.size() > 0) {
+-      return new Metadata(vorbisCommentFrames);
+-    } else {
+-      return null;
+-    }
+-  }
+-}
+diff --git a/library/core/src/main/java/com/google/android/exoplayer2/metadata/vorbis/VorbisCommentFrame.java b/library/core/src/main/java/com/google/android/exoplayer2/metadata/vorbis/VorbisCommentFrame.java
+index 2deb5b1127..16bf333902 100644
+--- a/library/core/src/main/java/com/google/android/exoplayer2/metadata/vorbis/VorbisCommentFrame.java
++++ b/library/core/src/main/java/com/google/android/exoplayer2/metadata/vorbis/VorbisCommentFrame.java
+@@ -23,11 +23,12 @@
+ import com.google.android.exoplayer2.metadata.Metadata;
+ 
+ /** Base class for Vorbis Comment Frames. */
+-public class VorbisCommentFrame implements Metadata.Entry {
++public final class VorbisCommentFrame implements Metadata.Entry {
+ 
+-  /** The frame key and value */
++  /** The key for this vorbis comment */
+   public final String key;
+ 
++  /** The value corresponding to this vorbis comment's key */
+   public final String value;
+ 
+   /**
+diff --git a/library/core/src/main/java/com/google/android/exoplayer2/util/FlacStreamInfo.java b/library/core/src/main/java/com/google/android/exoplayer2/util/FlacStreamInfo.java
+index 0df39e103d..2d70402bdb 100644
+--- a/library/core/src/main/java/com/google/android/exoplayer2/util/FlacStreamInfo.java
++++ b/library/core/src/main/java/com/google/android/exoplayer2/util/FlacStreamInfo.java
+@@ -15,7 +15,11 @@
+  */
+ package com.google.android.exoplayer2.util;
+ 
++import androidx.annotation.Nullable;
+ import com.google.android.exoplayer2.C;
++import com.google.android.exoplayer2.metadata.Metadata;
++import com.google.android.exoplayer2.metadata.vorbis.VorbisCommentFrame;
++import java.util.ArrayList;
+ 
+ /**
+  * Holder for FLAC stream info.
+@@ -30,6 +34,10 @@
+   public final int channels;
+   public final int bitsPerSample;
+   public final long totalSamples;
++  @Nullable
++  public final Metadata vorbisComments;
++
++  private static final String SEPARATOR="=";
+ 
+   /**
+    * Constructs a FlacStreamInfo parsing the given binary FLAC stream info metadata structure.
+@@ -52,6 +60,7 @@ public FlacStreamInfo(byte[] data, int offset) {
+     this.totalSamples = ((scratch.readBits(4) & 0xFL) << 32)
+         | (scratch.readBits(32) & 0xFFFFFFFFL);
+     // Remaining 16 bytes is md5 value
++    this.vorbisComments = null;
+   }
+ 
+   /**
+@@ -85,6 +94,78 @@ public FlacStreamInfo(
+     this.channels = channels;
+     this.bitsPerSample = bitsPerSample;
+     this.totalSamples = totalSamples;
++    this.vorbisComments = null;
++  }
++
++  /**
++   * Constructs a FlacStreamInfo given the parameters.
++   *
++   * @param minBlockSize Minimum block size of the FLAC stream.
++   * @param maxBlockSize Maximum block size of the FLAC stream.
++   * @param minFrameSize Minimum frame size of the FLAC stream.
++   * @param maxFrameSize Maximum frame size of the FLAC stream.
++   * @param sampleRate Sample rate of the FLAC stream.
++   * @param channels Number of channels of the FLAC stream.
++   * @param bitsPerSample Number of bits per sample of the FLAC stream.
++   * @param totalSamples Total samples of the FLAC stream.
++   * @param vorbisCommentList An {@link ArrayList<String>} that contains vorbis comments, which will
++   *     be converted and stored as metadata in {@link FlacStreamInfo#vorbisComments}
++   * @see <a href="https://xiph.org/flac/format.html#metadata_block_streaminfo">FLAC format
++   *     METADATA_BLOCK_STREAMINFO</a>
++   */
++  public FlacStreamInfo(
++      int minBlockSize,
++      int maxBlockSize,
++      int minFrameSize,
++      int maxFrameSize,
++      int sampleRate,
++      int channels,
++      int bitsPerSample,
++      long totalSamples,
++      ArrayList<String> vorbisCommentList) {
++    this.minBlockSize = minBlockSize;
++    this.maxBlockSize = maxBlockSize;
++    this.minFrameSize = minFrameSize;
++    this.maxFrameSize = maxFrameSize;
++    this.sampleRate = sampleRate;
++    this.channels = channels;
++    this.bitsPerSample = bitsPerSample;
++    this.totalSamples = totalSamples;
++    this.vorbisComments = decodeVorbisComments(vorbisCommentList);
++  }
++
++  /**
++   * Decodes an {@link ArrayList} of vorbis comments.
++   *
++   * @param metadataStringList An {@link ArrayList} containing vorbis comments as {@link String}
++   * @return A {@link Metadata} structure with the vorbis comments as its entries.
++   */
++  @Nullable
++  private static Metadata decodeVorbisComments(@Nullable ArrayList<String> metadataStringList) {
++    if (metadataStringList == null || metadataStringList.isEmpty()) {
++      return null;
++    }
++
++    ArrayList<VorbisCommentFrame> vorbisCommentFrames = new ArrayList<>();
++    VorbisCommentFrame vorbisCommentFrame;
++
++    for (String commentEntry : metadataStringList) {
++      String[] keyValue;
++
++      keyValue = commentEntry.split(SEPARATOR, 2);
++      if (keyValue.length != 2) {
++        /* Could not parse this comment, no key value pair found */
++        continue;
++      }
++      vorbisCommentFrame = new VorbisCommentFrame(keyValue[0], keyValue[1]);
++      vorbisCommentFrames.add(vorbisCommentFrame);
++    }
++
++    if (vorbisCommentFrames.isEmpty()) {
++      return null;
++    } else {
++      return new Metadata(vorbisCommentFrames);
++    }
+   }
+ 
+   /** Returns the maximum size for a decoded frame from the FLAC stream. */
+diff --git a/library/core/src/test/java/com/google/android/exoplayer2/metadata/vorbis/VorbisCommentDecoderTest.java b/library/core/src/test/java/com/google/android/exoplayer2/metadata/vorbis/VorbisCommentDecoderTest.java
+index e2c2bcf021..11b373327b 100644
+--- a/library/core/src/test/java/com/google/android/exoplayer2/metadata/vorbis/VorbisCommentDecoderTest.java
++++ b/library/core/src/test/java/com/google/android/exoplayer2/metadata/vorbis/VorbisCommentDecoderTest.java
+@@ -19,72 +19,72 @@
+ 
+ import androidx.test.ext.junit.runners.AndroidJUnit4;
+ import com.google.android.exoplayer2.metadata.Metadata;
++import com.google.android.exoplayer2.util.FlacStreamInfo;
+ import java.util.ArrayList;
+ import org.junit.Test;
+ import org.junit.runner.RunWith;
+ 
+-/** Test for {@link VorbisCommentDecoder}. */
++/** Test for {@link FlacStreamInfo}'s conversion of {@link ArrayList} to {@link Metadata}. */
+ @RunWith(AndroidJUnit4.class)
+ public final class VorbisCommentDecoderTest {
+ 
+   @Test
+   public void decode() {
+-    VorbisCommentDecoder decoder = new VorbisCommentDecoder();
+     ArrayList<String> commentsList = new ArrayList<>();
+ 
+-    commentsList.add("Title=Test");
+-    commentsList.add("Artist=Test2");
++    commentsList.add("Title=Song");
++    commentsList.add("Artist=Singer");
+ 
+-    Metadata metadata = decoder.decodeVorbisComments(commentsList);
++    Metadata metadata = new FlacStreamInfo(0, 0, 0, 0, 0, 0, 0, 0, commentsList).vorbisComments;
+ 
+     assertThat(metadata.length()).isEqualTo(2);
+     VorbisCommentFrame commentFrame = (VorbisCommentFrame) metadata.get(0);
+     assertThat(commentFrame.key).isEqualTo("Title");
+-    assertThat(commentFrame.value).isEqualTo("Test");
++    assertThat(commentFrame.value).isEqualTo("Song");
+     commentFrame = (VorbisCommentFrame) metadata.get(1);
+     assertThat(commentFrame.key).isEqualTo("Artist");
+-    assertThat(commentFrame.value).isEqualTo("Test2");
++    assertThat(commentFrame.value).isEqualTo("Singer");
+   }
+ 
+   @Test
+   public void decodeEmptyList() {
+-    VorbisCommentDecoder decoder = new VorbisCommentDecoder();
+     ArrayList<String> commentsList = new ArrayList<>();
+ 
+-    Metadata metadata = decoder.decodeVorbisComments(commentsList);
++    Metadata metadata = new FlacStreamInfo(0, 0, 0, 0, 0, 0, 0, 0, commentsList).vorbisComments;
+ 
+     assertThat(metadata).isNull();
+   }
+ 
+   @Test
+   public void decodeTwoSeparators() {
+-    VorbisCommentDecoder decoder = new VorbisCommentDecoder();
+     ArrayList<String> commentsList = new ArrayList<>();
+ 
+-    commentsList.add("Title=Test");
+-    commentsList.add("Artist=Test=2");
++    commentsList.add("Title=Song");
++    commentsList.add("Artist=Sing=er");
+ 
+-    Metadata metadata = decoder.decodeVorbisComments(commentsList);
++    Metadata metadata = new FlacStreamInfo(0, 0, 0, 0, 0, 0, 0, 0, commentsList).vorbisComments;
+ 
+-    assertThat(metadata.length()).isEqualTo(1);
++    assertThat(metadata.length()).isEqualTo(2);
+     VorbisCommentFrame commentFrame = (VorbisCommentFrame) metadata.get(0);
+     assertThat(commentFrame.key).isEqualTo("Title");
+-    assertThat(commentFrame.value).isEqualTo("Test");
++    assertThat(commentFrame.value).isEqualTo("Song");
++    commentFrame = (VorbisCommentFrame) metadata.get(1);
++    assertThat(commentFrame.key).isEqualTo("Artist");
++    assertThat(commentFrame.value).isEqualTo("Sing=er");
+   }
+ 
+   @Test
+   public void decodeNoSeparators() {
+-    VorbisCommentDecoder decoder = new VorbisCommentDecoder();
+     ArrayList<String> commentsList = new ArrayList<>();
+ 
+-    commentsList.add("TitleTest");
+-    commentsList.add("Artist=Test2");
++    commentsList.add("TitleSong");
++    commentsList.add("Artist=Singer");
+ 
+-    Metadata metadata = decoder.decodeVorbisComments(commentsList);
++    Metadata metadata = new FlacStreamInfo(0, 0, 0, 0, 0, 0, 0, 0, commentsList).vorbisComments;
+ 
+     assertThat(metadata.length()).isEqualTo(1);
+     VorbisCommentFrame commentFrame = (VorbisCommentFrame) metadata.get(0);
+     assertThat(commentFrame.key).isEqualTo("Artist");
+-    assertThat(commentFrame.value).isEqualTo("Test2");
++    assertThat(commentFrame.value).isEqualTo("Singer");
+   }
+ }

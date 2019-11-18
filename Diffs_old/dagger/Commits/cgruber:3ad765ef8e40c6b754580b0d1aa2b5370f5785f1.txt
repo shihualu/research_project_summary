@@ -1,0 +1,865 @@
+diff --git a/compiler/pom.xml b/compiler/pom.xml
+index af4eaa067..6b2990d91 100644
+--- a/compiler/pom.xml
++++ b/compiler/pom.xml
+@@ -79,6 +79,11 @@
+       <artifactId>guava-testlib</artifactId>
+       <scope>test</scope>
+     </dependency>
++    <dependency>
++      <groupId>org.mockito</groupId>
++      <artifactId>mockito-core</artifactId>
++      <scope>test</scope>
++    </dependency>
+     <dependency>
+       <groupId>org.truth0</groupId>
+       <artifactId>truth</artifactId>
+diff --git a/compiler/src/main/java/dagger/internal/codegen/InjectProcessor.java b/compiler/src/main/java/dagger/internal/codegen/InjectProcessor.java
+index bb53bd85d..ce16bbf70 100644
+--- a/compiler/src/main/java/dagger/internal/codegen/InjectProcessor.java
++++ b/compiler/src/main/java/dagger/internal/codegen/InjectProcessor.java
+@@ -41,7 +41,6 @@
+ import com.google.common.collect.ImmutableSet;
+ import com.google.common.collect.Multimaps;
+ 
+-import java.io.IOException;
+ import java.lang.annotation.Annotation;
+ import java.util.Collection;
+ import java.util.List;
+@@ -158,10 +157,9 @@ public Void visitExecutableAsMethod(ExecutableElement methodElement, Void p) {
+ 
+     for (Collection<MembersInjectionBinding> bindings : membersInjectionsByType.asMap().values()) {
+       try {
+-        membersInjectorWriter.write(
+-            MembersInjectionBinding.injectionOrdering().immutableSortedCopy(bindings));
+-      } catch (IOException e) {
+-        throw new RuntimeException(e);
++        membersInjectorWriter.generate(MembersInjectorDescriptor.create(bindings));
++      } catch (SourceFileGenerationException e) {
++        e.printMessageTo(messager);
+       }
+     }
+ 
+diff --git a/compiler/src/main/java/dagger/internal/codegen/MembersInjectorDescriptor.java b/compiler/src/main/java/dagger/internal/codegen/MembersInjectorDescriptor.java
+new file mode 100644
+index 000000000..5fa3d4df2
+--- /dev/null
++++ b/compiler/src/main/java/dagger/internal/codegen/MembersInjectorDescriptor.java
+@@ -0,0 +1,59 @@
++/*
++ * Copyright (C) 2014 Google, Inc.
++ *
++ * Licensed under the Apache License, Version 2.0 (the "License");
++ * you may not use this file except in compliance with the License.
++ * You may obtain a copy of the License at
++ *
++ * http://www.apache.org/licenses/LICENSE-2.0
++ *
++ * Unless required by applicable law or agreed to in writing, software
++ * distributed under the License is distributed on an "AS IS" BASIS,
++ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++ * See the License for the specific language governing permissions and
++ * limitations under the License.
++ */
++package dagger.internal.codegen;
++
++import com.google.auto.value.AutoValue;
++import com.google.common.base.Function;
++import com.google.common.collect.FluentIterable;
++import com.google.common.collect.ImmutableSortedSet;
++import com.google.common.collect.Iterables;
++
++import javax.lang.model.element.TypeElement;
++
++/**
++ * Represents the collection of {@link MembersInjectionBinding} instances that represent the total
++ * set of bindings for a single class.
++ *
++ * @author Gregory Kick
++ * @since 2.0
++ */
++@AutoValue
++abstract class MembersInjectorDescriptor {
++  abstract ImmutableSortedSet<MembersInjectionBinding> bindings();
++  abstract TypeElement injectedClass();
++
++  ClassName injectedClassName() {
++    return ClassName.fromTypeElement(injectedClass());
++  }
++
++  /**
++   * Creates a {@link MembersInjectorDescriptor} for the given bindings.
++   *
++   * @throws IllegalArgumentException if the bindings are not all associated with the same type.
++   */
++  static MembersInjectorDescriptor create(Iterable<MembersInjectionBinding> bindings) {
++    ImmutableSortedSet<MembersInjectionBinding> bindingSet =
++        ImmutableSortedSet.copyOf(MembersInjectionBinding.injectionOrdering(), bindings);
++    TypeElement injectedTypeElement = Iterables.getOnlyElement(FluentIterable.from(bindings)
++        .transform(new Function<MembersInjectionBinding, TypeElement>() {
++          @Override public TypeElement apply(MembersInjectionBinding binding) {
++            return binding.targetEnclosingType();
++          }
++        })
++        .toSet());
++    return new AutoValue_MembersInjectorDescriptor(bindingSet, injectedTypeElement);
++  }
++}
+diff --git a/compiler/src/main/java/dagger/internal/codegen/MembersInjectorWriter.java b/compiler/src/main/java/dagger/internal/codegen/MembersInjectorWriter.java
+index afcf374a6..f91e5e442 100644
+--- a/compiler/src/main/java/dagger/internal/codegen/MembersInjectorWriter.java
++++ b/compiler/src/main/java/dagger/internal/codegen/MembersInjectorWriter.java
+@@ -16,8 +16,6 @@
+ package dagger.internal.codegen;
+ 
+ import static com.google.common.base.CaseFormat.UPPER_CAMEL;
+-import static com.google.common.base.Preconditions.checkArgument;
+-import static com.google.common.base.Preconditions.checkNotNull;
+ import static com.squareup.javawriter.JavaWriter.stringLiteral;
+ import static com.squareup.javawriter.JavaWriter.type;
+ import static dagger.internal.codegen.JavaWriterUtil.flattenVariableMap;
+@@ -29,6 +27,7 @@
+ import com.google.common.base.CaseFormat;
+ import com.google.common.base.Function;
+ import com.google.common.base.Joiner;
++import com.google.common.base.Optional;
+ import com.google.common.collect.BiMap;
+ import com.google.common.collect.ComparisonChain;
+ import com.google.common.collect.FluentIterable;
+@@ -66,7 +65,6 @@
+ import javax.lang.model.element.Name;
+ import javax.lang.model.element.TypeElement;
+ import javax.lang.model.element.VariableElement;
+-import javax.tools.JavaFileObject;
+ 
+ /**
+  * Writes {@link MembersInjector} implementations from {@link MembersInjectionBinding} instances.
+@@ -74,153 +72,143 @@
+  * @author Gregory Kick
+  * @since 2.0
+  */
+-final class MembersInjectorWriter {
+-  private final Filer filer;
++final class MembersInjectorWriter extends SourceFileGenerator<MembersInjectorDescriptor> {
+   private final ProviderTypeRepository providerTypeRepository;
+ 
+   MembersInjectorWriter(Filer filer, ProviderTypeRepository providerTypeRepository) {
+-    this.filer = checkNotNull(filer);
++    super(filer);
+     this.providerTypeRepository = providerTypeRepository;
+   }
+ 
+-  /**
+-   * Writes a new source file for the generated {@link MembersInjector}.
+-   *
+-   * @throws IllegalArgumentException if the given bindings are not all for the same
+-   *     {@link MembersInjectionBinding#targetEnclosingType()}.
+-   */
+-  void write(ImmutableList<MembersInjectionBinding> bindings) throws IOException {
+-    checkNotNull(bindings);
+-    FluentIterable<MembersInjectionBinding> fluentBindings = FluentIterable.from(bindings);
+-    checkArgument(!fluentBindings.isEmpty());
+-    TypeElement injectedTypeElement = Iterables.getOnlyElement(fluentBindings
+-        .transform(new Function<MembersInjectionBinding, TypeElement>() {
+-          @Override public TypeElement apply(MembersInjectionBinding binding) {
+-            return binding.targetEnclosingType();
+-          }
+-        })
+-        .toSet());
+-
+-
+-    ClassName injectedClassName = ClassName.fromTypeElement(injectedTypeElement);
+-    ClassName injectorClassName =
+-        injectedClassName.peerNamed(injectedClassName.simpleName() + "$$MembersInjector");
++  @Override
++  ClassName nameGeneratedType(MembersInjectorDescriptor descriptor) {
++    ClassName injectedClassName = descriptor.injectedClassName();
++    return injectedClassName.peerNamed(injectedClassName.simpleName() + "$$MembersInjector");
++  }
+ 
+-    JavaFileObject sourceFile = filer.createSourceFile(injectorClassName.fullyQualifiedName(),
+-        fluentBindings.transform(new Function<MembersInjectionBinding, Element>() {
++  @Override
++  Iterable<? extends Element> getOriginatingElements(
++      MembersInjectorDescriptor descriptor) {
++    return FluentIterable.from(descriptor.bindings())
++        .transform(new Function<MembersInjectionBinding, Element>() {
+           @Override public Element apply(MembersInjectionBinding binding) {
+             return binding.target();
+           }
+         })
+-        .toArray(Element.class));
++        .toSet();
++  }
+ 
+-    JavaWriter writer = new JavaWriter(sourceFile.openWriter());
+-    try {
+-      writer.emitPackage(injectedClassName.packageName());
++  @Override
++  Optional<? extends Element> getElementForErrorReporting(MembersInjectorDescriptor input) {
++    return Optional.of(input.injectedClass());
++  }
+ 
++  @Override
++  void write(ClassName injectorClassName, JavaWriter writer, MembersInjectorDescriptor descriptor)
++      throws IOException {
++    ClassName injectedClassName = descriptor.injectedClassName();
++    ImmutableSortedSet<MembersInjectionBinding> bindings = descriptor.bindings();
+ 
+-      for (ClassName className : collectImports(injectorClassName, fluentBindings)) {
+-        writer.emitImports(className.fullyQualifiedName());
+-      }
+-      writer.emitEmptyLine();
+-
+-      writer.emitJavadoc("A {@link MembersInjector} implementation for {@link %s}.",
+-          injectedClassName.simpleName());
+-
+-      String membersInjectorType = type(MembersInjector.class, injectedClassName.simpleName());
+-      // @Generated("dagger.internal.codegen.InjectProcessor")
+-      // public final class Blah$$MembersInjector implements MembersInjector<Blah>
+-      writer.emitAnnotation(Generated.class, stringLiteral(InjectProcessor.class.getName()))
+-          .beginType(injectorClassName.simpleName(), "class", EnumSet.of(FINAL), null,
+-              membersInjectorType);
+-
+-      // Require a Provider/MembersInjector for each request
+-      ImmutableSetMultimap.Builder<Key, DependencyRequest> dependenciesByKeyBuilder =
+-          new ImmutableSetMultimap.Builder<Key, DependencyRequest>()
+-              .orderValuesBy(DEPENDENCY_ORDERING);
+-      for (MembersInjectionBinding binding : bindings) {
+-        for (DependencyRequest dependency : binding.dependencies()) {
+-          dependenciesByKeyBuilder.put(dependency.key(), dependency);
+-        }
++    writer.emitPackage(injectedClassName.packageName());
++
++    for (ClassName className : collectImports(injectorClassName, bindings)) {
++      writer.emitImports(className.fullyQualifiedName());
++    }
++    writer.emitEmptyLine();
++
++    writer.emitJavadoc("A {@link MembersInjector} implementation for {@link %s}.",
++        injectedClassName.simpleName());
++
++    String membersInjectorType = type(MembersInjector.class, injectedClassName.simpleName());
++    // @Generated("dagger.internal.codegen.InjectProcessor")
++    // public final class Blah$$MembersInjector implements MembersInjector<Blah>
++    writer.emitAnnotation(Generated.class, stringLiteral(InjectProcessor.class.getName()))
++    .beginType(injectorClassName.simpleName(), "class", EnumSet.of(FINAL), null,
++        membersInjectorType);
++
++    // Require a Provider/MembersInjector for each request
++    ImmutableSetMultimap.Builder<Key, DependencyRequest> dependenciesByKeyBuilder =
++        new ImmutableSetMultimap.Builder<Key, DependencyRequest>()
++        .orderValuesBy(DEPENDENCY_ORDERING);
++    for (MembersInjectionBinding binding : bindings) {
++      for (DependencyRequest dependency : binding.dependencies()) {
++        dependenciesByKeyBuilder.put(dependency.key(), dependency);
+       }
+-      ImmutableSetMultimap<Key, DependencyRequest> dependenciesByKey =
+-          dependenciesByKeyBuilder.build();
+-
+-
+-      final ImmutableBiMap<Key, String> providerNames = generateProviderNames(dependenciesByKey);
+-
+-      // Add the fields
+-      writeProviderFields(writer, providerNames);
+-
+-      // Add the constructor
+-      writeConstructor(writer, providerNames);
+-
+-      // @Override public void injectMembers(Blah instance)
+-      writer.emitAnnotation(Override.class)
+-          .beginMethod("void", "injectMembers", EnumSet.of(PUBLIC),
+-              injectedClassName.simpleName(), "instance");
+-      writer.beginControlFlow("if (instance == null)")
+-          .emitStatement(
+-              "throw new NullPointerException(\"Cannot inject members into a null reference\")")
+-          .endControlFlow();
+-
+-      for (MembersInjectionBinding binding : bindings) {
+-        Element target = binding.target();
+-        switch (target.getKind()) {
+-          case FIELD:
+-            Name fieldName = ((VariableElement) target).getSimpleName();
+-            DependencyRequest singleDependency = Iterables.getOnlyElement(binding.dependencies());
+-            String providerName = providerNames.get(singleDependency.key());
+-            switch (singleDependency.kind()) {
+-              case LAZY:
+-                writer.emitStatement("instance.%s = %s.create(%s)",
+-                    fieldName, DoubleCheckLazy.class.getSimpleName(), providerName);
+-                break;
+-              case INSTANCE:
+-                writer.emitStatement("instance.%s = %s.get()", fieldName, providerName);
+-                break;
+-              case PROVIDER:
+-                writer.emitStatement("instance.%s = %s", fieldName, providerName);
+-                break;
+-              default:
+-                throw new AssertionError();
+-            }
+-            break;
+-          case METHOD:
+-            Name methodName = ((ExecutableElement) target).getSimpleName();
+-            String parameterString =
+-                Joiner.on(", ").join(FluentIterable.from(binding.dependencies())
+-                    .transform(new Function<DependencyRequest, String>() {
+-                      @Override public String apply(DependencyRequest input) {
+-                        String providerName = providerNames.get(input.key());
+-                        switch (input.kind()) {
+-                          case LAZY:
+-                            return String.format("%s.create(%s)",
+-                                DoubleCheckLazy.class.getSimpleName(), providerName);
+-                          case INSTANCE:
+-                            return String.format("%s.get()", providerName);
+-                          case PROVIDER:
+-                            return String.format("%s", providerName);
+-                          default:
+-                            throw new AssertionError();
+-                        }
++    }
++    ImmutableSetMultimap<Key, DependencyRequest> dependenciesByKey =
++        dependenciesByKeyBuilder.build();
++
++
++    final ImmutableBiMap<Key, String> providerNames = generateProviderNames(dependenciesByKey);
++
++    // Add the fields
++    writeProviderFields(writer, providerNames);
++
++    // Add the constructor
++    writeConstructor(writer, providerNames);
++
++    // @Override public void injectMembers(Blah instance)
++    writer.emitAnnotation(Override.class)
++    .beginMethod("void", "injectMembers", EnumSet.of(PUBLIC),
++        injectedClassName.simpleName(), "instance");
++    writer.beginControlFlow("if (instance == null)")
++    .emitStatement(
++        "throw new NullPointerException(\"Cannot inject members into a null reference\")")
++        .endControlFlow();
++
++    for (MembersInjectionBinding binding : bindings) {
++      Element target = binding.target();
++      switch (target.getKind()) {
++        case FIELD:
++          Name fieldName = ((VariableElement) target).getSimpleName();
++          DependencyRequest singleDependency = Iterables.getOnlyElement(binding.dependencies());
++          String providerName = providerNames.get(singleDependency.key());
++          switch (singleDependency.kind()) {
++            case LAZY:
++              writer.emitStatement("instance.%s = %s.create(%s)",
++                  fieldName, DoubleCheckLazy.class.getSimpleName(), providerName);
++              break;
++            case INSTANCE:
++              writer.emitStatement("instance.%s = %s.get()", fieldName, providerName);
++              break;
++            case PROVIDER:
++              writer.emitStatement("instance.%s = %s", fieldName, providerName);
++              break;
++            default:
++              throw new AssertionError();
++          }
++          break;
++        case METHOD:
++          Name methodName = ((ExecutableElement) target).getSimpleName();
++          String parameterString =
++              Joiner.on(", ").join(FluentIterable.from(binding.dependencies())
++                  .transform(new Function<DependencyRequest, String>() {
++                    @Override public String apply(DependencyRequest input) {
++                      String providerName = providerNames.get(input.key());
++                      switch (input.kind()) {
++                        case LAZY:
++                          return String.format("%s.create(%s)",
++                              DoubleCheckLazy.class.getSimpleName(), providerName);
++                        case INSTANCE:
++                          return String.format("%s.get()", providerName);
++                        case PROVIDER:
++                          return String.format("%s", providerName);
++                        default:
++                          throw new AssertionError();
+                       }
+-                    }));
+-            writer.emitStatement("instance.%s(%s)", methodName, parameterString);
+-            break;
+-          default:
+-            throw new IllegalStateException(target.getKind().toString());
+-        }
++                    }
++                  }));
++          writer.emitStatement("instance.%s(%s)", methodName, parameterString);
++          break;
++        default:
++          throw new IllegalStateException(target.getKind().toString());
+       }
+-      writer.endMethod();
++    }
++    writer.endMethod();
+ 
+-      writeToString(writer, injectedClassName);
++    writeToString(writer, injectedClassName);
+ 
+-      writer.endType();
+-    } finally {
+-      writer.close();
+-      // TODO(gak): clean up malformed files caused by failures
+-    }
++    writer.endType();
+   }
+ 
+   private void writeProviderFields(JavaWriter writer, ImmutableBiMap<Key, String> providerNames)
+diff --git a/compiler/src/main/java/dagger/internal/codegen/PrintableErrorMessage.java b/compiler/src/main/java/dagger/internal/codegen/PrintableErrorMessage.java
+new file mode 100644
+index 000000000..bb9ba982c
+--- /dev/null
++++ b/compiler/src/main/java/dagger/internal/codegen/PrintableErrorMessage.java
+@@ -0,0 +1,34 @@
++/*
++ * Copyright (C) 2014 Google, Inc.
++ *
++ * Licensed under the Apache License, Version 2.0 (the "License");
++ * you may not use this file except in compliance with the License.
++ * You may obtain a copy of the License at
++ *
++ * http://www.apache.org/licenses/LICENSE-2.0
++ *
++ * Unless required by applicable law or agreed to in writing, software
++ * distributed under the License is distributed on an "AS IS" BASIS,
++ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++ * See the License for the specific language governing permissions and
++ * limitations under the License.
++ */
++package dagger.internal.codegen;
++
++import javax.annotation.processing.Messager;
++
++/**
++ * An interface for types that represent a compilation
++ * {@linkplain javax.tools.Diagnostic.Kind#ERROR error} (though, not necessarily a
++ * {@link Throwable}) that can be printed using a {@link Messager}.
++ *
++ * @author Gregory Kick
++ * @since 2.0
++ */
++interface PrintableErrorMessage {
++  /**
++   * Prints the information represented by this object to the given {@link Messager} as an
++   * {@link javax.tools.Diagnostic.Kind#ERROR}.
++   */
++  void printMessageTo(Messager messager);
++}
+diff --git a/compiler/src/main/java/dagger/internal/codegen/SourceFileGenerationException.java b/compiler/src/main/java/dagger/internal/codegen/SourceFileGenerationException.java
+new file mode 100644
+index 000000000..b1c40eafb
+--- /dev/null
++++ b/compiler/src/main/java/dagger/internal/codegen/SourceFileGenerationException.java
+@@ -0,0 +1,76 @@
++/*
++ * Copyright (C) 2014 Google, Inc.
++ *
++ * Licensed under the Apache License, Version 2.0 (the "License");
++ * you may not use this file except in compliance with the License.
++ * You may obtain a copy of the License at
++ *
++ * http://www.apache.org/licenses/LICENSE-2.0
++ *
++ * Unless required by applicable law or agreed to in writing, software
++ * distributed under the License is distributed on an "AS IS" BASIS,
++ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++ * See the License for the specific language governing permissions and
++ * limitations under the License.
++ */
++package dagger.internal.codegen;
++
++import static com.google.common.base.Preconditions.checkNotNull;
++import static javax.tools.Diagnostic.Kind.ERROR;
++
++import com.google.common.base.Optional;
++
++import javax.annotation.processing.Messager;
++import javax.lang.model.element.Element;
++
++/**
++ * An exception thrown to indicate that a source file could not be generated.
++ *
++ * <p>This exception <b>should not</b> be used to report detectable, logical errors as it may mask
++ * other errors that might have been caught upon further processing.  Use a {@link ValidationReport}
++ * for that.
++ *
++ * @author Gregory Kick
++ * @since 2.0
++ */
++final class SourceFileGenerationException extends Exception implements PrintableErrorMessage {
++  private final ClassName generatedClassName;
++  private final Optional<? extends Element> associatedElement;
++
++  SourceFileGenerationException(ClassName generatedClassName, Throwable cause,
++      Optional<? extends Element> associatedElement) {
++    super(createMessage(generatedClassName, cause.getMessage()), cause);
++    this.generatedClassName = checkNotNull(generatedClassName);
++    this.associatedElement = checkNotNull(associatedElement);
++  }
++
++  SourceFileGenerationException(ClassName generatedClassName, Throwable cause) {
++    this(generatedClassName, cause, Optional.<Element>absent());
++  }
++
++  SourceFileGenerationException(ClassName generatedClassName, Throwable cause,
++      Element associatedElement) {
++    this(generatedClassName, cause, Optional.of(associatedElement));
++  }
++
++  public ClassName generatedClassName() {
++    return generatedClassName;
++  }
++
++  public Optional<? extends Element> associatedElement() {
++    return associatedElement;
++  }
++
++  private static String createMessage(ClassName generatedClassName, String message) {
++    return String.format("Could not generate %s: %s.", generatedClassName, message);
++  }
++
++  @Override
++  public void printMessageTo(Messager messager) {
++    if (associatedElement.isPresent()) {
++      messager.printMessage(ERROR, getMessage(), associatedElement.get());
++    } else {
++      messager.printMessage(ERROR, getMessage());
++    }
++  }
++}
+diff --git a/compiler/src/main/java/dagger/internal/codegen/SourceFileGenerator.java b/compiler/src/main/java/dagger/internal/codegen/SourceFileGenerator.java
+new file mode 100644
+index 000000000..9c93cad13
+--- /dev/null
++++ b/compiler/src/main/java/dagger/internal/codegen/SourceFileGenerator.java
+@@ -0,0 +1,114 @@
++/*
++ * Copyright (C) 2014 Google, Inc.
++ *
++ * Licensed under the Apache License, Version 2.0 (the "License");
++ * you may not use this file except in compliance with the License.
++ * You may obtain a copy of the License at
++ *
++ * http://www.apache.org/licenses/LICENSE-2.0
++ *
++ * Unless required by applicable law or agreed to in writing, software
++ * distributed under the License is distributed on an "AS IS" BASIS,
++ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++ * See the License for the specific language governing permissions and
++ * limitations under the License.
++ */
++package dagger.internal.codegen;
++
++import static com.google.common.base.Preconditions.checkNotNull;
++
++import com.google.common.base.Optional;
++import com.google.common.base.Throwables;
++import com.google.common.collect.ImmutableSet;
++import com.google.common.collect.Iterables;
++import com.squareup.javawriter.JavaWriter;
++
++import java.io.IOException;
++
++import javax.annotation.processing.Filer;
++import javax.lang.model.element.Element;
++import javax.tools.JavaFileObject;
++
++/**
++ * A template class that provides a framework for properly handling IO while generating source files
++ * from an annotation processor.  Particularly, it makes a best effort to ensure that files that
++ * fail to write successfully are deleted.
++ *
++ * @param <T> The input type from which source is to be generated.
++ * @author Gregory Kick
++ * @since 2.0
++ */
++abstract class SourceFileGenerator<T> {
++  private final Filer filer;
++
++  SourceFileGenerator(Filer filer) {
++    this.filer = checkNotNull(filer);
++  }
++
++  void generate(T input) throws SourceFileGenerationException {
++    ClassName generatedTypeName = nameGeneratedType(input);
++    ImmutableSet<Element> originatingElements = ImmutableSet.copyOf(getOriginatingElements(input));
++    JavaFileObject file = null;
++    try {
++      // first, try to create the file
++      file = filer.createSourceFile(generatedTypeName.fullyQualifiedName(),
++          Iterables.toArray(originatingElements, Element.class));
++      // try to create the writer
++      JavaWriter writer = new JavaWriter(file.openWriter());
++      boolean thrownWriting = false;
++      try {
++        write(generatedTypeName, writer, input);
++      } catch (Exception e) {
++        thrownWriting = true;
++        throw new SourceFileGenerationException(generatedTypeName, e,
++            getElementForErrorReporting(input));
++      } finally {
++        // good or bad, we have to close the stream
++        try {
++          writer.close();
++        } catch (IOException e) {
++          // only throw this exception if nothing was thrown during writing as that one is much
++          // more likely to be interesting
++          if (!thrownWriting) {
++            throw new SourceFileGenerationException(generatedTypeName, e,
++                getElementForErrorReporting(input));
++          }
++        }
++      }
++    } catch (Exception e) {
++      // deletes the file if any exception occurred creating the file, opening the writer or writing
++      // the contents
++      if (file != null) {
++        file.delete();
++      }
++      // if the code above threw a SFGE, use that
++      Throwables.propagateIfPossible(e, SourceFileGenerationException.class);
++      // otherwise, throw a new one
++      throw new SourceFileGenerationException(generatedTypeName, e,
++          getElementForErrorReporting(input));
++    }
++  }
++
++  /**
++   * Implementations should return the {@link ClassName} for the top-level type to be generated.
++   */
++  abstract ClassName nameGeneratedType(T input);
++
++  /**
++   * Implementations should return {@link Element} instances from which the source is to be
++   * generated.
++   */
++  abstract Iterable<? extends Element> getOriginatingElements(T input);
++
++  /**
++   * Returns an optional element to be used for reporting errors. This returns a single element
++   * rather than a collection to reduce output noise.
++   */
++  abstract Optional<? extends Element> getElementForErrorReporting(T input);
++
++  /**
++   * Implementations should emit source using the given {@link JavaWriter} instance. It is not
++   * necessary to close the writer.
++   */
++  abstract void write(ClassName generatedTypeName, JavaWriter writer, T input) throws IOException;
++}
+diff --git a/compiler/src/main/java/dagger/internal/codegen/ValidationReport.java b/compiler/src/main/java/dagger/internal/codegen/ValidationReport.java
+index a5b7aa4e3..a337fc83c 100644
+--- a/compiler/src/main/java/dagger/internal/codegen/ValidationReport.java
++++ b/compiler/src/main/java/dagger/internal/codegen/ValidationReport.java
+@@ -50,12 +50,13 @@ void printMessagesTo(Messager messager) {
+   }
+ 
+   @AutoValue
+-  static abstract class Item {
++  static abstract class Item implements PrintableErrorMessage {
+     abstract String message();
+     abstract Element element();
+     abstract Optional<AnnotationMirror> annotation();
+ 
+-    void printMessageTo(Messager messager) {
++    @Override
++    public void printMessageTo(Messager messager) {
+       if (annotation().isPresent()) {
+         messager.printMessage(ERROR, message(), element(), annotation().get());
+       } else {
+diff --git a/compiler/src/test/java/dagger/internal/codegen/SourceFileGeneratorTest.java b/compiler/src/test/java/dagger/internal/codegen/SourceFileGeneratorTest.java
+new file mode 100644
+index 000000000..e05d6e30c
+--- /dev/null
++++ b/compiler/src/test/java/dagger/internal/codegen/SourceFileGeneratorTest.java
+@@ -0,0 +1,159 @@
++/*
++ * Copyright (C) 2014 Google, Inc.
++ *
++ * Licensed under the Apache License, Version 2.0 (the "License");
++ * you may not use this file except in compliance with the License.
++ * You may obtain a copy of the License at
++ *
++ * http://www.apache.org/licenses/LICENSE-2.0
++ *
++ * Unless required by applicable law or agreed to in writing, software
++ * distributed under the License is distributed on an "AS IS" BASIS,
++ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++ * See the License for the specific language governing permissions and
++ * limitations under the License.
++ */
++package dagger.internal.codegen;
++
++import static org.junit.Assert.fail;
++import static org.mockito.Matchers.anyString;
++import static org.mockito.Mockito.doThrow;
++import static org.mockito.Mockito.verify;
++import static org.mockito.Mockito.when;
++import static org.truth0.Truth.ASSERT;
++
++import com.google.common.base.Optional;
++import com.google.common.collect.ImmutableSet;
++import com.squareup.javawriter.JavaWriter;
++
++import java.io.IOException;
++import java.io.Writer;
++
++import javax.annotation.processing.Filer;
++import javax.lang.model.element.Element;
++import javax.tools.JavaFileObject;
++
++import org.junit.Before;
++import org.junit.Test;
++import org.junit.runner.RunWith;
++import org.mockito.Mock;
++import org.mockito.runners.MockitoJUnitRunner;
++
++@RunWith(MockitoJUnitRunner.class)
++public class SourceFileGeneratorTest {
++  private static final ClassName FAKE_CLASS_NAME = ClassName.create("test", "FakeClass");
++
++  @Mock public Filer filer;
++  @Mock public JavaFileObject file;
++  @Mock public Writer writer;
++
++  private SourceFileGenerator<Void> generator;
++
++  @Before public void createGenerator() {
++    this.generator = new FailingSourceFileGenerator(filer);
++  }
++
++  @Test public void generate_failToCreateFile() throws Exception {
++    when(filer.createSourceFile(FAKE_CLASS_NAME.fullyQualifiedName()))
++      .thenThrow(new IOException("file creation"));
++    try {
++      generator.generate(null);
++      fail();
++    } catch (SourceFileGenerationException e) {
++      String message = e.getMessage();
++      ASSERT.that(message).contains(FAKE_CLASS_NAME.fullyQualifiedName());
++      ASSERT.that(message).contains("file creation");
++    }
++  }
++
++  @Test public void generate_failToOpenWriter() throws Exception {
++    when(filer.createSourceFile(FAKE_CLASS_NAME.fullyQualifiedName())).thenReturn(file);
++    when(file.openWriter()).thenThrow(new IOException("opening writer"));
++    try {
++      generator.generate(null);
++      fail();
++    } catch (SourceFileGenerationException e) {
++      String message = e.getMessage();
++      ASSERT.that(message).contains(FAKE_CLASS_NAME.fullyQualifiedName());
++      ASSERT.that(message).contains("opening writer");
++    }
++    verify(file).delete();
++  }
++
++  @Test public void generate_failToWrite() throws Exception {
++    when(filer.createSourceFile(FAKE_CLASS_NAME.fullyQualifiedName())).thenReturn(file);
++    when(file.openWriter()).thenReturn(writer);
++    doThrow(new IOException("writing")).when(writer).write(anyString());
++    try {
++      generator.generate(null);
++      fail();
++    } catch (SourceFileGenerationException e) {
++      String message = e.getMessage();
++      ASSERT.that(message).contains(FAKE_CLASS_NAME.fullyQualifiedName());
++      ASSERT.that(message).contains("writing");
++    }
++    verify(writer).close();
++    verify(file).delete();
++  }
++
++  @Test public void generate_failToWriteFailToClose() throws Exception {
++    when(filer.createSourceFile(FAKE_CLASS_NAME.fullyQualifiedName())).thenReturn(file);
++    when(file.openWriter()).thenReturn(writer);
++    doThrow(new IOException("writing")).when(writer).write(anyString());
++    doThrow(new IOException("closing writer")).when(writer).close();
++    try {
++      generator.generate(null);
++      fail();
++    } catch (SourceFileGenerationException e) {
++      String message = e.getMessage();
++      ASSERT.that(message).contains(FAKE_CLASS_NAME.fullyQualifiedName());
++      ASSERT.that(message).contains("writing");
++    }
++    verify(writer).close();
++    verify(file).delete();
++  }
++
++  @Test public void generate_failToClose() throws Exception {
++    when(filer.createSourceFile(FAKE_CLASS_NAME.fullyQualifiedName())).thenReturn(file);
++    when(file.openWriter()).thenReturn(writer);
++    doThrow(new IOException("closing writer")).when(writer).close();
++    try {
++      generator.generate(null);
++      fail();
++    } catch (SourceFileGenerationException e) {
++      String message = e.getMessage();
++      ASSERT.that(message).contains(FAKE_CLASS_NAME.fullyQualifiedName());
++      ASSERT.that(message).contains("closing writer");
++    }
++    verify(writer).close();
++    verify(file).delete();
++  }
++
++  private static final class FailingSourceFileGenerator extends SourceFileGenerator<Void> {
++    FailingSourceFileGenerator(Filer filer) {
++      super(filer);
++    }
++
++    @Override
++    ClassName nameGeneratedType(Void input) {
++      return FAKE_CLASS_NAME;
++    }
++
++    @Override
++    Iterable<? extends Element> getOriginatingElements(Void input) {
++      return ImmutableSet.of();
++    }
++    
++    @Override
++    Optional<? extends Element> getElementForErrorReporting(Void input) {
++      return Optional.absent();
++    }
++
++    @Override
++    void write(ClassName generatedTypeName, JavaWriter writer, Void input) throws IOException {
++      writer.emitPackage(FAKE_CLASS_NAME.packageName())
++          .beginType("class", FAKE_CLASS_NAME.simpleName())
++          .endType();
++    }
++  }
++}
+diff --git a/pom.xml b/pom.xml
+index 1d8d53a1f..ffb6cbd36 100644
+--- a/pom.xml
++++ b/pom.xml
+@@ -47,10 +47,11 @@
+     <guava.version>16.0.1</guava.version>
+ 
+     <!-- Test Dependencies -->
+-    <junit.version>4.10</junit.version>
++    <compile-testing.version>0.4</compile-testing.version>
+     <fest.version>1.4</fest.version>
++    <junit.version>4.10</junit.version>
++    <mockito.version>1.9.5</mockito.version>
+     <truth.version>0.13</truth.version>
+-    <compile-testing.version>0.5</compile-testing.version>
+   </properties>
+ 
+   <scm>
+@@ -114,6 +115,11 @@
+         <artifactId>compile-testing</artifactId>
+         <version>${compile-testing.version}</version>
+       </dependency>
++      <dependency>
++        <groupId>org.mockito</groupId>
++        <artifactId>mockito-core</artifactId>
++        <version>${mockito.version}</version>
++      </dependency>
+       <dependency>
+         <groupId>org.truth0</groupId>
+         <artifactId>truth</artifactId>

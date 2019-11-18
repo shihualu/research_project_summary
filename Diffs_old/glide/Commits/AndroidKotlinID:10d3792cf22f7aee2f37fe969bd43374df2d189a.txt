@@ -1,0 +1,288 @@
+diff --git a/integration/okhttp3/src/main/java/com/bumptech/glide/integration/okhttp3/OkHttpStreamFetcher.java b/integration/okhttp3/src/main/java/com/bumptech/glide/integration/okhttp3/OkHttpStreamFetcher.java
+index 37f1f0e47..a0b0faaef 100644
+--- a/integration/okhttp3/src/main/java/com/bumptech/glide/integration/okhttp3/OkHttpStreamFetcher.java
++++ b/integration/okhttp3/src/main/java/com/bumptech/glide/integration/okhttp3/OkHttpStreamFetcher.java
+@@ -1,5 +1,6 @@
+ package com.bumptech.glide.integration.okhttp3;
+ 
++import android.os.Build;
+ import android.support.annotation.NonNull;
+ import android.util.Log;
+ import com.bumptech.glide.Priority;
+@@ -20,13 +21,15 @@
+ /**
+  * Fetches an {@link InputStream} using the okhttp library.
+  */
+-public class OkHttpStreamFetcher implements DataFetcher<InputStream> {
++public class OkHttpStreamFetcher implements DataFetcher<InputStream>,
++ okhttp3.Callback {
+   private static final String TAG = "OkHttpFetcher";
+   private final Call.Factory client;
+   private final GlideUrl url;
+   @Synthetic InputStream stream;
+   @Synthetic ResponseBody responseBody;
+   private volatile Call call;
++  private DataCallback<? super InputStream> callback;
+ 
+   public OkHttpStreamFetcher(Call.Factory client, GlideUrl url) {
+     this.client = client;
+@@ -41,29 +44,45 @@ public void loadData(Priority priority, final DataCallback<? super InputStream>
+       requestBuilder.addHeader(key, headerEntry.getValue());
+     }
+     Request request = requestBuilder.build();
++    this.callback = callback;
+ 
+     call = client.newCall(request);
+-    call.enqueue(new okhttp3.Callback() {
+-      @Override
+-      public void onFailure(Call call, IOException e) {
+-        if (Log.isLoggable(TAG, Log.DEBUG)) {
+-          Log.d(TAG, "OkHttp failed to obtain result", e);
+-        }
+-        callback.onLoadFailed(e);
++    if (Build.VERSION.SDK_INT != Build.VERSION_CODES.O) {
++      call.enqueue(this);
++    } else {
++      try {
++        // Calling execute instead of enqueue is a workaround for #2355, where okhttp throws a
++        // ClassCastException on O.
++        onResponse(call, call.execute());
++      } catch (IOException e) {
++        onFailure(call, e);
++      } catch (ClassCastException e) {
++        // It's not clear that this catch is necessary, the error may only occur even on O if
++        // enqueue is used.
++        onFailure(call, new IOException("Workaround for framework bug on O", e));
+       }
++    }
++  }
+ 
+-      @Override
+-      public void onResponse(Call call, Response response) throws IOException {
+-        responseBody = response.body();
+-        if (response.isSuccessful()) {
+-          long contentLength = responseBody.contentLength();
+-          stream = ContentLengthInputStream.obtain(responseBody.byteStream(), contentLength);
+-          callback.onDataReady(stream);
+-        } else {
+-          callback.onLoadFailed(new HttpException(response.message(), response.code()));
+-        }
+-      }
+-    });
++  @Override
++  public void onFailure(Call call, IOException e) {
++    if (Log.isLoggable(TAG, Log.DEBUG)) {
++      Log.d(TAG, "OkHttp failed to obtain result", e);
++    }
++
++    callback.onLoadFailed(e);
++  }
++
++  @Override
++  public void onResponse(Call call, Response response) throws IOException {
++    responseBody = response.body();
++    if (response.isSuccessful()) {
++      long contentLength = responseBody.contentLength();
++      stream = ContentLengthInputStream.obtain(responseBody.byteStream(), contentLength);
++      callback.onDataReady(stream);
++    } else {
++      callback.onLoadFailed(new HttpException(response.message(), response.code()));
++    }
+   }
+ 
+   @Override
+@@ -78,6 +97,7 @@ public void cleanup() {
+     if (responseBody != null) {
+       responseBody.close();
+     }
++    callback = null;
+   }
+ 
+   @Override
+diff --git a/library/src/main/java/com/bumptech/glide/load/engine/DecodeJob.java b/library/src/main/java/com/bumptech/glide/load/engine/DecodeJob.java
+index 9f715bb45..d1eb3619b 100644
+--- a/library/src/main/java/com/bumptech/glide/load/engine/DecodeJob.java
++++ b/library/src/main/java/com/bumptech/glide/load/engine/DecodeJob.java
+@@ -18,6 +18,7 @@
+ import com.bumptech.glide.load.engine.cache.DiskCache;
+ import com.bumptech.glide.load.resource.bitmap.Downsampler;
+ import com.bumptech.glide.util.LogTime;
++import com.bumptech.glide.util.Preconditions;
+ import com.bumptech.glide.util.Synthetic;
+ import com.bumptech.glide.util.pool.FactoryPools.Poolable;
+ import com.bumptech.glide.util.pool.StateVerifier;
+@@ -218,6 +219,9 @@ public void run() {
+     // swallows all otherwise fatal exceptions, this will at least make it obvious to developers
+     // that something is failing.
+     TraceCompat.beginSection("DecodeJob#run");
++    // Methods in the try statement can invalidate currentFetcher, so set a local variable here to
++    // ensure that the fetcher is cleaned up either way.
++    DataFetcher<?> localFetcher = currentFetcher;
+     try {
+       if (isCancelled) {
+         notifyFailed();
+@@ -238,8 +242,11 @@ public void run() {
+         throw e;
+       }
+     } finally {
+-      if (currentFetcher != null) {
+-        currentFetcher.cleanup();
++      Preconditions.checkArgument(
++          localFetcher == null || currentFetcher == null || localFetcher.equals(currentFetcher),
++          "Fetchers don't match!, old: " + localFetcher + " new: " + currentFetcher);
++      if (localFetcher != null) {
++        localFetcher.cleanup();
+       }
+       TraceCompat.endSection();
+     }
+diff --git a/library/src/main/java/com/bumptech/glide/load/model/LazyHeaders.java b/library/src/main/java/com/bumptech/glide/load/model/LazyHeaders.java
+index 1eb43556d..5f4b4c85d 100644
+--- a/library/src/main/java/com/bumptech/glide/load/model/LazyHeaders.java
++++ b/library/src/main/java/com/bumptech/glide/load/model/LazyHeaders.java
+@@ -1,5 +1,6 @@
+ package com.bumptech.glide.load.model;
+ 
++import android.support.annotation.VisibleForTesting;
+ import android.text.TextUtils;
+ import java.util.ArrayList;
+ import java.util.Collections;
+@@ -99,7 +100,7 @@ public int hashCode() {
+   @SuppressWarnings("PMD.FieldDeclarationsShouldBeAtStartOfClass")
+   public static final class Builder {
+     private static final String USER_AGENT_HEADER = "User-Agent";
+-    private static final String DEFAULT_USER_AGENT = System.getProperty("http.agent");
++    private static final String DEFAULT_USER_AGENT = getSanitizedUserAgent();
+     private static final Map<String, List<LazyHeaderFactory>> DEFAULT_HEADERS;
+ 
+     // Set Accept-Encoding header to do our best to avoid gzip since it's both inefficient for
+@@ -221,6 +222,31 @@ public LazyHeaders build() {
+       }
+       return result;
+     }
++
++    /**
++     * Ensures that the default header will pass OkHttp3's checks for header values.
++     *
++     * <p>See #2331.
++     */
++    @VisibleForTesting
++    static String getSanitizedUserAgent() {
++      String defaultUserAgent = System.getProperty("http.agent");
++      if (TextUtils.isEmpty(defaultUserAgent)) {
++        return defaultUserAgent;
++      }
++
++      int length = defaultUserAgent.length();
++      StringBuilder sb = new StringBuilder(defaultUserAgent.length());
++      for (int i = 0; i < length; i++) {
++        char c = defaultUserAgent.charAt(i);
++        if ((c > '\u001f' || c == '\t') && c < '\u007f') {
++          sb.append(c);
++        } else {
++          sb.append('?');
++        }
++      }
++      return sb.toString();
++    }
+   }
+ 
+   static final class StringHeaderFactory implements LazyHeaderFactory {
+diff --git a/library/src/main/java/com/bumptech/glide/load/resource/bitmap/TransformationUtils.java b/library/src/main/java/com/bumptech/glide/load/resource/bitmap/TransformationUtils.java
+index 2f6d60698..e17e7500c 100644
+--- a/library/src/main/java/com/bumptech/glide/load/resource/bitmap/TransformationUtils.java
++++ b/library/src/main/java/com/bumptech/glide/load/resource/bitmap/TransformationUtils.java
+@@ -172,7 +172,7 @@ public static Bitmap fitCenter(@NonNull BitmapPool pool, @NonNull Bitmap inBitma
+    * height is larger than the given dimensions
+    */
+   public static Bitmap centerInside(@NonNull BitmapPool pool, @NonNull Bitmap inBitmap, int width,
+-                                 int height) {
++      int height) {
+     if (inBitmap.getWidth() <= width && inBitmap.getHeight() <= height) {
+       if (Log.isLoggable(TAG, Log.VERBOSE)) {
+         Log.v(TAG, "requested target size larger or equal to input, returning input");
+@@ -368,7 +368,7 @@ private static Bitmap getAlphaSafeBitmap(@NonNull BitmapPool pool,
+ 
+     Bitmap argbBitmap = pool.get(maybeAlphaSafe.getWidth(), maybeAlphaSafe.getHeight(),
+         Bitmap.Config.ARGB_8888);
+-    new Canvas(argbBitmap).drawBitmap(maybeAlphaSafe, 0 /*left*/, 0 /*top*/, null /*pain*/);
++    new Canvas(argbBitmap).drawBitmap(maybeAlphaSafe, 0 /*left*/, 0 /*top*/, null /*paint*/);
+ 
+     // We now own this Bitmap. It's our responsibility to replace it in the pool outside this method
+     // when we're finished with it.
+diff --git a/library/src/test/java/com/bumptech/glide/load/model/LazyHeadersTest.java b/library/src/test/java/com/bumptech/glide/load/model/LazyHeadersTest.java
+index 907acb6ae..b0e2d1402 100644
+--- a/library/src/test/java/com/bumptech/glide/load/model/LazyHeadersTest.java
++++ b/library/src/test/java/com/bumptech/glide/load/model/LazyHeadersTest.java
+@@ -35,6 +35,43 @@ public void tearDown() {
+     }
+   }
+ 
++  // Tests for #2331.
++  @Test
++  public void getSanitizedUserAgent_withInvalidAgent_returnsAgentWithInvalidCharactersRemoved() {
++    String invalidUserAgent =
++        "Dalvik/2.1.0 (Linux; U; Android 5.0; P98 4G八核版(A8H8) Build/LRX21M)";
++    String validUserAgent = "Dalvik/2.1.0 (Linux; U; Android 5.0; P98 4G???(A8H8) Build/LRX21M)";
++    System.setProperty(DEFAULT_USER_AGENT_PROPERTY, invalidUserAgent);
++    assertThat(LazyHeaders.Builder.getSanitizedUserAgent()).isEqualTo(validUserAgent);
++  }
++
++  @Test
++  public void getSanitizedUserAgent_withValidAgent_returnsUnmodifiedAgent() {
++    String validUserAgent = "Dalvik/2.1.0 (Linux; U; Android 5.0; P98 4G(A8H8) Build/LRX21M)";
++    System.setProperty(DEFAULT_USER_AGENT_PROPERTY, validUserAgent);
++    assertThat(LazyHeaders.Builder.getSanitizedUserAgent()).isEqualTo(validUserAgent);
++  }
++
++  @Test
++  public void getSanitizedUserAgent_withMissingAgent_returnsNull() {
++    System.clearProperty(DEFAULT_USER_AGENT_PROPERTY);
++    assertThat(LazyHeaders.Builder.getSanitizedUserAgent()).isNull();
++  }
++
++  @Test
++  public void getSanitizedUserAgent_withEmptyStringAgent_returnsEmptyString() {
++    String userAgent = "";
++    System.setProperty(DEFAULT_USER_AGENT_PROPERTY, userAgent);
++    assertThat(LazyHeaders.Builder.getSanitizedUserAgent()).isEqualTo(userAgent);
++  }
++
++  @Test
++  public void getSanitizedUserAgent_withWhitespace_returnsWhitespaceString() {
++    String userAgent = "  \t";
++    System.setProperty(DEFAULT_USER_AGENT_PROPERTY, userAgent);
++    assertThat(LazyHeaders.Builder.getSanitizedUserAgent()).isEqualTo(userAgent);
++  }
++
+   @Test
+   public void testIncludesEagerHeaders() {
+     Map<String, String> headers = new Builder()
+diff --git a/samples/flickr/src/main/java/com/bumptech/glide/samples/flickr/FlickrSearchActivity.java b/samples/flickr/src/main/java/com/bumptech/glide/samples/flickr/FlickrSearchActivity.java
+index 0ac5810e6..08c5f5257 100644
+--- a/samples/flickr/src/main/java/com/bumptech/glide/samples/flickr/FlickrSearchActivity.java
++++ b/samples/flickr/src/main/java/com/bumptech/glide/samples/flickr/FlickrSearchActivity.java
+@@ -26,7 +26,6 @@
+ import com.bumptech.glide.samples.flickr.api.Api;
+ import com.bumptech.glide.samples.flickr.api.Photo;
+ import com.bumptech.glide.samples.flickr.api.Query;
+-import com.bumptech.glide.samples.flickr.api.RecentQuery;
+ import com.bumptech.glide.samples.flickr.api.SearchQuery;
+ import java.io.File;
+ import java.util.ArrayList;
+@@ -46,6 +45,7 @@
+     implements SearchView.OnQueryTextListener {
+   private static final String TAG = "FlickrSearchActivity";
+   private static final String STATE_QUERY = "state_search_string";
++  private static final Query DEFAULT_QUERY = new SearchQuery("kitten");
+ 
+   private final QueryListener queryListener = new QueryListener();
+   private View searching;
+@@ -143,7 +143,7 @@ public void onCreate(Bundle savedInstanceState) {
+         executeQuery(savedQuery);
+       }
+     } else {
+-      executeQuery(RecentQuery.get());
++      executeQuery(DEFAULT_QUERY);
+     }
+ 
+     int smallGridSize = res.getDimensionPixelSize(R.dimen.small_photo_side);

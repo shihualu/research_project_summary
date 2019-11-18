@@ -1,0 +1,289 @@
+diff --git a/core/src/main/java/dagger/ObjectGraph.java b/core/src/main/java/dagger/ObjectGraph.java
+index 096972257..467a7bea0 100644
+--- a/core/src/main/java/dagger/ObjectGraph.java
++++ b/core/src/main/java/dagger/ObjectGraph.java
+@@ -24,6 +24,7 @@
+ import dagger.internal.ModuleAdapter;
+ import dagger.internal.Modules;
+ import dagger.internal.ProblemDetector;
++import dagger.internal.SetBinding;
+ import dagger.internal.StaticInjection;
+ import dagger.internal.ThrowingErrorHandler;
+ import dagger.internal.UniqueMap;
+@@ -163,26 +164,46 @@ private static ObjectGraph makeGraph(DaggerObjectGraph base, Loader plugin, Obje
+ 
+       // Extract bindings in the 'base' and 'overrides' set. Within each set no
+       // duplicates are permitted.
+-      Map<String, Binding<?>> baseBindings = new UniqueMap<String, Binding<?>>();
+-      Map<String, Binding<?>> overrideBindings = new UniqueMap<String, Binding<?>>();
++      UniqueMap<String, Binding<?>> baseBindings = new UniqueMap<String, Binding<?>>() {
++        @Override public Binding<?> put(String key, Binding<?> value) {
++          return super.put(key, (value instanceof SetBinding)
++              ? new SetBinding<Object>((SetBinding<Object>) value) : value);
++        }
++      };
++      if (base != null) {
++        baseBindings.putAll(base.linkEverything()); // Add parent bindings
++      }
++      UniqueMap<String, Binding<?>> overrideBindings = new UniqueMap<String, Binding<?>>() {
++        @Override public Binding<?> put(String key, Binding<?> value) {
++          if (value instanceof SetBinding) {
++            throw new IllegalArgumentException("Module overrides cannot contribute set bindings.");
++          }
++          return super.put(key, value);
++        }
++      };
+       Map<ModuleAdapter<?>, Object> loadedModules =
+           Modules.loadModules(plugin, Arrays.asList(modules));
+       for (Entry<ModuleAdapter<?>, Object> loadedModule : loadedModules.entrySet()) {
+         @SuppressWarnings("unchecked")
+         ModuleAdapter<Object> moduleAdapter = (ModuleAdapter<Object>) loadedModule.getKey();
+-        for (String key : moduleAdapter.injectableTypes) {
+-          injectableTypes.put(key, moduleAdapter.moduleClass);
++        for (int i = 0; i < moduleAdapter.injectableTypes.length; i++) {
++          injectableTypes.put(moduleAdapter.injectableTypes[i], moduleAdapter.moduleClass);
++        }
++        for (int i = 0; i < moduleAdapter.staticInjections.length; i++) {
++          staticInjections.put(moduleAdapter.staticInjections[i], null);
+         }
+-        for (Class<?> c : moduleAdapter.staticInjections) {
+-          staticInjections.put(c, null);
++        try {
++          Map<String, Binding<?>> addTo = moduleAdapter.overrides ? overrideBindings : baseBindings;
++          moduleAdapter.getBindings(addTo, loadedModule.getValue());
++        } catch (IllegalArgumentException e) {
++          throw new IllegalArgumentException(moduleAdapter.moduleClass.getSimpleName()
++              + " is an overriding module and cannot contribute set bindings.");
+         }
+-        Map<String, Binding<?>> addTo = moduleAdapter.overrides ? overrideBindings : baseBindings;
+-        moduleAdapter.getBindings(addTo, loadedModule.getValue());
+       }
+ 
+       // Create a linker and install all of the user's bindings
+-      Linker linker = new Linker((base != null) ? base.linker : null, plugin,
+-          new ThrowingErrorHandler());
++      Linker linker =
++          new Linker((base != null) ? base.linker : null, plugin, new ThrowingErrorHandler());
+       linker.installBindings(baseBindings);
+       linker.installBindings(overrideBindings);
+ 
+@@ -190,10 +211,7 @@ private static ObjectGraph makeGraph(DaggerObjectGraph base, Loader plugin, Obje
+           injectableTypes);
+     }
+ 
+-
+-
+     @Override public ObjectGraph plus(Object... modules) {
+-      linkEverything();
+       return makeGraph(this, plugin, modules);
+     }
+ 
+@@ -299,4 +317,5 @@ private void linkInjectableTypes() {
+       }
+     }
+   }
++
+ }
+diff --git a/core/src/main/java/dagger/internal/Linker.java b/core/src/main/java/dagger/internal/Linker.java
+index 86edaf545..57e5b0459 100644
+--- a/core/src/main/java/dagger/internal/Linker.java
++++ b/core/src/main/java/dagger/internal/Linker.java
+@@ -280,10 +280,9 @@ private void assertLockHeld() {
+    * Returns a scoped binding for {@code binding}.
+    */
+   static <T> Binding<T> scope(final Binding<T> binding) {
+-    if (!binding.isSingleton()) {
+-      return binding;
++    if (!binding.isSingleton() || binding instanceof SingletonBinding) {
++      return binding; // Default scoped binding or already a scoped binding.
+     }
+-    if (binding instanceof SingletonBinding) throw new AssertionError();
+     return new SingletonBinding<T>(binding);
+   }
+ 
+@@ -424,5 +423,8 @@ private DeferredBinding(String deferredKey, ClassLoader classLoader, Object requ
+     @Override public void getDependencies(Set<Binding<?>> get, Set<Binding<?>> injectMembers) {
+       throw new UnsupportedOperationException("Deferred bindings must resolve first.");
+     }
++    @Override public String toString() {
++      return "DeferredBinding[deferredKey=" + deferredKey + "]";
++    }
+   }
+ }
+diff --git a/core/src/main/java/dagger/internal/Modules.java b/core/src/main/java/dagger/internal/Modules.java
+index 11edda9aa..5458a5a2f 100644
+--- a/core/src/main/java/dagger/internal/Modules.java
++++ b/core/src/main/java/dagger/internal/Modules.java
+@@ -51,7 +51,6 @@ private Modules() { }
+     Map<ModuleAdapter<?>, Object> result =
+         new LinkedHashMap<ModuleAdapter<?>, Object>(seedAdapters);
+ 
+-
+     // Next collect included modules
+     Map<Class<?>, ModuleAdapter<?>> transitiveInclusions =
+         new LinkedHashMap<Class<?>, ModuleAdapter<?>>();
+diff --git a/core/src/main/java/dagger/internal/SetBinding.java b/core/src/main/java/dagger/internal/SetBinding.java
+index cdfc161d0..0a08842a5 100644
+--- a/core/src/main/java/dagger/internal/SetBinding.java
++++ b/core/src/main/java/dagger/internal/SetBinding.java
+@@ -28,29 +28,48 @@
+  */
+ public final class SetBinding<T> extends Binding<Set<T>> {
+ 
+-  @SuppressWarnings("unchecked")
+   public static <T> void add(Map<String, Binding<?>> bindings, String setKey, Binding<?> binding) {
++    prepareSetBinding(bindings, setKey, binding).contributors.add(Linker.scope(binding));
++  }
++
++  @SuppressWarnings("unchecked")
++  private static <T> SetBinding<T> prepareSetBinding(
++      Map<String, Binding<?>> bindings, String setKey, Binding<?> binding) {
+     Binding<?> previous = bindings.get(setKey);
+     SetBinding<T> setBinding;
+     if (previous instanceof SetBinding) {
+-      setBinding = (SetBinding) previous;
++      setBinding = (SetBinding<T>) previous;
+       setBinding.setLibrary(setBinding.library() && binding.library());
++      return setBinding;
+     } else if (previous != null) {
+       throw new IllegalArgumentException("Duplicate:\n    " + previous + "\n    " + binding);
+     } else {
+       setBinding = new SetBinding<T>(setKey, binding.requiredBy);
+       setBinding.setLibrary(binding.library());
+       bindings.put(setKey, setBinding);
++      return (SetBinding<T>) bindings.get(setKey); // BindingMap.put() copies SetBindings.
+     }
+-    setBinding.contributors.add(Linker.scope(binding));
+   }
+ 
+   private final Set<Binding<?>> contributors = new LinkedHashSet<Binding<?>>();
+ 
++  /**
++   * Creates a new {@code SetBinding} with the given "provides" key, and the requiredBy object
++   * for traceability.
++   */
+   public SetBinding(String key, Object requiredBy) {
+     super(key, null, false, requiredBy);
+   }
+ 
++  /**
++   * Creates a new {@code SetBinding} with all of the contributing bindings of the provided
++   * original {@code SetBinding}.
++   */
++  public SetBinding(SetBinding<T> original) {
++    super(original.provideKey, null, false, original.requiredBy);
++    contributors.addAll(original.contributors);
++  }
++
+   @Override public void attach(Linker linker) {
+     for (Binding<?> contributor : contributors) {
+       contributor.attach(linker);
+diff --git a/core/src/test/java/dagger/ExtensionWithSetBindingsTest.java b/core/src/test/java/dagger/ExtensionWithSetBindingsTest.java
+new file mode 100644
+index 000000000..0f604236b
+--- /dev/null
++++ b/core/src/test/java/dagger/ExtensionWithSetBindingsTest.java
+@@ -0,0 +1,88 @@
++/*
++ * Copyright (C) 2013 Google Inc.
++ * Copyright (C) 2013 Square Inc.
++ *
++ * Licensed under the Apache License, Version 2.0 (the "License");
++ * you may not use this file except in compliance with the License.
++ * You may obtain a copy of the License at
++ *
++ * http://www.apache.org/licenses/LICENSE-2.0
++ *
++ * Unless required by applicable law or agreed to in writing, software
++ * distributed under the License is distributed on an "AS IS" BASIS,
++ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++ * See the License for the specific language governing permissions and
++ * limitations under the License.
++ */
++package dagger;
++
++import dagger.internal.TestingLoader;
++import java.util.Set;
++import java.util.concurrent.atomic.AtomicInteger;
++import javax.inject.Inject;
++import javax.inject.Singleton;
++import org.junit.Test;
++import org.junit.runner.RunWith;
++import org.junit.runners.JUnit4;
++
++import static dagger.Provides.Type.SET;
++import static org.fest.assertions.Assertions.assertThat;
++import static org.junit.Assert.assertEquals;
++import static org.junit.Assert.fail;
++
++@RunWith(JUnit4.class)
++public final class ExtensionWithSetBindingsTest {
++  private static final AtomicInteger counter = new AtomicInteger(0);
++
++  @Singleton
++  static class RealSingleton {
++    @Inject Set<Integer> ints;
++  }
++
++  @Singleton
++  static class Main {
++    @Inject Set<Integer> ints;
++  }
++
++  @Module(injects = RealSingleton.class)
++  static class RootModule {
++    @Provides(type=SET) @Singleton Integer provideA() { return counter.getAndIncrement(); }
++    @Provides(type=SET) @Singleton Integer provideB() { return counter.getAndIncrement(); }
++  }
++
++  @Module(addsTo = RootModule.class, injects = Main.class )
++  static class ExtensionModule {
++    @Provides(type=SET) @Singleton Integer provideC() { return counter.getAndIncrement(); }
++    @Provides(type=SET) @Singleton Integer provideD() { return counter.getAndIncrement(); }
++  }
++
++  @Test public void basicInjectionWithExtension() {
++    ObjectGraph root = ObjectGraph.createWith(new TestingLoader(), new RootModule());
++    RealSingleton rs = root.get(RealSingleton.class);
++    assertThat(rs.ints).contains(0, 1);
++
++    ObjectGraph extension = root.plus(new ExtensionModule());
++    Main main = extension.get(Main.class);
++    assertThat(main.ints).contains(0, 1, 2, 3);
++
++    // Second time around.
++    ObjectGraph extension2 = root.plus(new ExtensionModule());
++    Main main2 = extension2.get(Main.class);
++    assertThat(main2.ints).contains(0, 1, 4, 5);
++  }
++
++  @Module(includes = ExtensionModule.class, overrides = true)
++  static class TestModule {
++    @Provides(type=SET) @Singleton Integer provide9999() { return 9999; }
++  }
++
++  @Test public void basicInjectionWithExtensionAndOverrides() {
++    try {
++      ObjectGraph.createWith(new TestingLoader(), new RootModule()).plus(new TestModule());
++      fail("Should throw exception.");
++    } catch (IllegalArgumentException e) {
++      assertEquals("TestModule is an overriding module and cannot contribute set bindings.",
++          e.getMessage());
++    }
++  }
++}
+diff --git a/core/src/test/java/dagger/internal/TestingModuleAdapter.java b/core/src/test/java/dagger/internal/TestingModuleAdapter.java
+index ae8775f8c..eed43e973 100644
+--- a/core/src/test/java/dagger/internal/TestingModuleAdapter.java
++++ b/core/src/test/java/dagger/internal/TestingModuleAdapter.java
+@@ -127,6 +127,10 @@ private void handleSetBindings(Map<String, Binding<?>> bindings, M module, Metho
+     }
+   }
+ 
++  @Override public String toString() {
++    return "TestingModuleAdapter[" + this.moduleClass.getName() + "]";
++  }
++
+   /**
+    * Creates a TestingModuleAdapter or throws an {@code IllegalArgumentException}.
+    */

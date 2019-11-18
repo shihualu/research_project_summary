@@ -1,0 +1,1761 @@
+diff --git a/CHANGELOG.md b/CHANGELOG.md
+index bf3a6544..534efbba 100644
+--- a/CHANGELOG.md
++++ b/CHANGELOG.md
+@@ -1,5 +1,29 @@
+ # Change Log
+ 
++## Version 1.5 *(2016-09-28)*
++
++* New excluded leaks
++* Added `LeakCanary.isInAnalyzerProcess()` to the no-op jar
++* Fixed several file access issues:
++  * No more cleanup on startup, we rotate the heap dump files on every new heap dump.
++  * LeakCanary now falls back to the app directory until it can write to the external storage.
++* Leak notifications now each use a distinct notification instead of erasing each other.
++* If LeakCanary can't perform a heap dump for any reason (e.g. analysis in progress, debugger attached), it retries later with an exponential backoff.
++* Added confirmation dialog when user deletes all leaks.
++* Replace the two leakcanary configuration methods with a builder that provides more flexibility, see `LeakCanary.refWatcher()`.
++* For more details, see the [full diff](https://github.com/square/leakcanary/compare/v1.4...v1.5).
++
++### Public API changes
++
++* New `HeapAnalyzer.findTrackedReferences()` method for headless analysis when you have no context on what leaked.
++* Added `LeakCanary.isInAnalyzerProcess()` to the no-op jar
++* Added `LeakCanary.refWatcher()` which returns an `AndroidRefWatcherBuilder` that extends `RefWatcherBuilder` and lets you fully customize the `RefWatcher` instance.
++* Removed `LeakCanary.install(Application, Class)` and `LeakCanary.androidWatcher(Context, HeapDump.Listener, ExcludedRefs)`.
++* Removed `R.integer.leak_canary_max_stored_leaks` and `R.integer.leak_canary_watch_delay_millis`, those can now be set via `LeakCanary.refWatcher()`.
++* Updated the `LeakDirectoryProvider` API to centralize all file related responsibilities.
++* `RefWatcher` is now constructed with a `WatchExecutor` which executes a `Retryable`, instead of an `Executor` that executes a `Runnable`.
++* `HeapDumper.NO_DUMP` was renamed `HeapDumper.RETRY_LATER`
++
+ ## Version 1.4 *(2016-09-11)*
+ 
+ * Fix false negative where GC root is of type android.os.Binder [#482](https://github.com/square/leakcanary/issues/482)
+diff --git a/README.md b/README.md
+index 487d779e..75b3a3e2 100644
+--- a/README.md
++++ b/README.md
+@@ -12,9 +12,9 @@ In your `build.gradle`:
+ 
+ ```gradle
+  dependencies {
+-   debugCompile 'com.squareup.leakcanary:leakcanary-android:1.4'
+-   releaseCompile 'com.squareup.leakcanary:leakcanary-android-no-op:1.4'
+-   testCompile 'com.squareup.leakcanary:leakcanary-android-no-op:1.4'
++   debugCompile 'com.squareup.leakcanary:leakcanary-android:1.5'
++   releaseCompile 'com.squareup.leakcanary:leakcanary-android-no-op:1.5'
++   testCompile 'com.squareup.leakcanary:leakcanary-android-no-op:1.5'
+  }
+ ```
+ 
+diff --git a/build.gradle b/build.gradle
+index d03a1adb..3f6bd3d5 100644
+--- a/build.gradle
++++ b/build.gradle
+@@ -25,7 +25,7 @@ ext {
+   javaVersion = JavaVersion.VERSION_1_7
+ 
+   GROUP = 'com.squareup.leakcanary'
+-  VERSION_NAME = "1.5-SNAPSHOT"
++  VERSION_NAME = "1.6-SNAPSHOT"
+   POM_PACKAGING = "pom"
+   POM_DESCRIPTION= "Leak Canary"
+ 
+diff --git a/leakcanary-analyzer/src/main/java/com/squareup/leakcanary/HeapAnalyzer.java b/leakcanary-analyzer/src/main/java/com/squareup/leakcanary/HeapAnalyzer.java
+index 3b1effb6..18bb74e4 100644
+--- a/leakcanary-analyzer/src/main/java/com/squareup/leakcanary/HeapAnalyzer.java
++++ b/leakcanary-analyzer/src/main/java/com/squareup/leakcanary/HeapAnalyzer.java
+@@ -32,6 +32,7 @@
+ 
+ import java.io.File;
+ import java.util.ArrayList;
++import java.util.Collection;
+ import java.util.List;
+ import java.util.Map;
+ 
+@@ -43,6 +44,7 @@
+ import static com.squareup.leakcanary.HahaHelper.extendsThread;
+ import static com.squareup.leakcanary.HahaHelper.fieldToString;
+ import static com.squareup.leakcanary.HahaHelper.fieldValue;
++import static com.squareup.leakcanary.HahaHelper.hasField;
+ import static com.squareup.leakcanary.HahaHelper.threadName;
+ import static com.squareup.leakcanary.LeakTraceElement.Holder.ARRAY;
+ import static com.squareup.leakcanary.LeakTraceElement.Holder.CLASS;
+@@ -63,6 +65,36 @@ public HeapAnalyzer(ExcludedRefs excludedRefs) {
+     this.excludedRefs = excludedRefs;
+   }
+ 
++  public List<TrackedReference> findTrackedReferences(File heapDumpFile) {
++    if (!heapDumpFile.exists()) {
++      throw new IllegalArgumentException("File does not exist: " + heapDumpFile);
++    }
++    try {
++      HprofBuffer buffer = new MemoryMappedFileBuffer(heapDumpFile);
++      HprofParser parser = new HprofParser(buffer);
++      Snapshot snapshot = parser.parse();
++      deduplicateGcRoots(snapshot);
++
++      ClassObj refClass = snapshot.findClass(KeyedWeakReference.class.getName());
++      List<TrackedReference> references = new ArrayList<>();
++      for (Instance weakRef : refClass.getInstancesList()) {
++        List<ClassInstance.FieldValue> values = classInstanceValues(weakRef);
++        String key = asString(fieldValue(values, "key"));
++        String name =
++            hasField(values, "name") ? asString(fieldValue(values, "name")) : "(No name field)";
++        Instance instance = fieldValue(values, "referent");
++        if (instance != null) {
++          String className = getClassName(instance);
++          List<String> fields = describeFields(instance);
++          references.add(new TrackedReference(key, name, className, fields));
++        }
++      }
++      return references;
++    } catch (Throwable e) {
++      throw new RuntimeException(e);
++    }
++  }
++
+   /**
+    * Searches the heap dump for a {@link KeyedWeakReference} instance with the corresponding key,
+    * and then computes the shortest strong reference path from that instance to the GC roots.
+@@ -101,7 +133,7 @@ void deduplicateGcRoots(Snapshot snapshot) {
+     // THashMap has a smaller memory footprint than HashMap.
+     final THashMap<String, RootObj> uniqueRootMap = new THashMap<>();
+ 
+-    final List<RootObj> gcRoots = (ArrayList) snapshot.getGCRoots();
++    final Collection<RootObj> gcRoots = snapshot.getGCRoots();
+     for (RootObj root : gcRoots) {
+       String key = generateRootKey(root);
+       if (!uniqueRootMap.containsKey(key)) {
+@@ -112,8 +144,7 @@ void deduplicateGcRoots(Snapshot snapshot) {
+     // Repopulate snapshot with unique GC roots.
+     gcRoots.clear();
+     uniqueRootMap.forEach(new TObjectProcedure<String>() {
+-      @Override
+-      public boolean execute(String key) {
++      @Override public boolean execute(String key) {
+         return gcRoots.add(uniqueRootMap.get(key));
+       }
+     });
+@@ -250,37 +281,16 @@ private LeakTraceElement buildLeakElement(LeakNode node) {
+     LeakTraceElement.Holder holderType;
+     String className;
+     String extra = null;
+-    List<String> fields = new ArrayList<>();
++    List<String> fields = describeFields(holder);
++
++    className = getClassName(holder);
++
+     if (holder instanceof ClassObj) {
+-      ClassObj classObj = (ClassObj) holder;
+       holderType = CLASS;
+-      className = classObj.getClassName();
+-      for (Map.Entry<Field, Object> entry : classObj.getStaticFieldValues().entrySet()) {
+-        Field field = entry.getKey();
+-        Object value = entry.getValue();
+-        fields.add("static " + field.getName() + " = " + value);
+-      }
+     } else if (holder instanceof ArrayInstance) {
+-      ArrayInstance arrayInstance = (ArrayInstance) holder;
+       holderType = ARRAY;
+-      className = arrayInstance.getClassObj().getClassName();
+-      if (arrayInstance.getArrayType() == Type.OBJECT) {
+-        Object[] values = arrayInstance.getValues();
+-        for (int i = 0; i < values.length; i++) {
+-          fields.add("[" + i + "] = " + values[i]);
+-        }
+-      }
+     } else {
+-      ClassInstance classInstance = (ClassInstance) holder;
+       ClassObj classObj = holder.getClassObj();
+-      for (Map.Entry<Field, Object> entry : classObj.getStaticFieldValues().entrySet()) {
+-        fields.add("static " + fieldToString(entry));
+-      }
+-      for (ClassInstance.FieldValue field : classInstance.getValues()) {
+-        fields.add(fieldToString(field));
+-      }
+-      className = classObj.getClassName();
+-
+       if (extendsThread(classObj)) {
+         holderType = THREAD;
+         String threadName = threadName(holder);
+@@ -316,6 +326,52 @@ private LeakTraceElement buildLeakElement(LeakNode node) {
+         fields);
+   }
+ 
++  private List<String> describeFields(Instance instance) {
++    List<String> fields = new ArrayList<>();
++
++    if (instance instanceof ClassObj) {
++      ClassObj classObj = (ClassObj) instance;
++      for (Map.Entry<Field, Object> entry : classObj.getStaticFieldValues().entrySet()) {
++        Field field = entry.getKey();
++        Object value = entry.getValue();
++        fields.add("static " + field.getName() + " = " + value);
++      }
++    } else if (instance instanceof ArrayInstance) {
++      ArrayInstance arrayInstance = (ArrayInstance) instance;
++      if (arrayInstance.getArrayType() == Type.OBJECT) {
++        Object[] values = arrayInstance.getValues();
++        for (int i = 0; i < values.length; i++) {
++          fields.add("[" + i + "] = " + values[i]);
++        }
++      }
++    } else {
++      ClassObj classObj = instance.getClassObj();
++      for (Map.Entry<Field, Object> entry : classObj.getStaticFieldValues().entrySet()) {
++        fields.add("static " + fieldToString(entry));
++      }
++      ClassInstance classInstance = (ClassInstance) instance;
++      for (ClassInstance.FieldValue field : classInstance.getValues()) {
++        fields.add(fieldToString(field));
++      }
++    }
++    return fields;
++  }
++
++  private String getClassName(Instance instance) {
++    String className;
++    if (instance instanceof ClassObj) {
++      ClassObj classObj = (ClassObj) instance;
++      className = classObj.getClassName();
++    } else if (instance instanceof ArrayInstance) {
++      ArrayInstance arrayInstance = (ArrayInstance) instance;
++      className = arrayInstance.getClassObj().getClassName();
++    } else {
++      ClassObj classObj = instance.getClassObj();
++      className = classObj.getClassName();
++    }
++    return className;
++  }
++
+   private long since(long analysisStartNanoTime) {
+     return NANOSECONDS.toMillis(System.nanoTime() - analysisStartNanoTime);
+   }
+diff --git a/leakcanary-analyzer/src/main/java/com/squareup/leakcanary/TrackedReference.java b/leakcanary-analyzer/src/main/java/com/squareup/leakcanary/TrackedReference.java
+new file mode 100644
+index 00000000..61990d16
+--- /dev/null
++++ b/leakcanary-analyzer/src/main/java/com/squareup/leakcanary/TrackedReference.java
+@@ -0,0 +1,31 @@
++package com.squareup.leakcanary;
++
++import java.util.ArrayList;
++import java.util.Collections;
++import java.util.List;
++
++/**
++ * An instance tracked by a {@link KeyedWeakReference} that hadn't been cleared when the
++ * heap was dumped. May or may not point to a leaking reference.
++ */
++public class TrackedReference {
++
++  /** Corresponds to {@link KeyedWeakReference#key}. */
++  public final String key;
++
++  /** Corresponds to {@link KeyedWeakReference#name}. */
++  public final String name;
++
++  /** Class of the tracked instance. */
++  public final String className;
++
++  /** List of all fields (member and static) for that instance. */
++  public final List<String> fields;
++
++  public TrackedReference(String key, String name, String className, List<String> fields) {
++    this.key = key;
++    this.name = name;
++    this.className = className;
++    this.fields = Collections.unmodifiableList(new ArrayList<>(fields));
++  }
++}
+diff --git a/leakcanary-analyzer/src/test/java/com/squareup/leakcanary/HeapAnalyzerTest.java b/leakcanary-analyzer/src/test/java/com/squareup/leakcanary/HeapAnalyzerTest.java
+index 0d5607d8..584e37c0 100644
+--- a/leakcanary-analyzer/src/test/java/com/squareup/leakcanary/HeapAnalyzerTest.java
++++ b/leakcanary-analyzer/src/test/java/com/squareup/leakcanary/HeapAnalyzerTest.java
+@@ -13,11 +13,11 @@
+ 
+ import static com.squareup.haha.perflib.RootType.NATIVE_STATIC;
+ import static com.squareup.haha.perflib.RootType.SYSTEM_CLASS;
++import static com.squareup.leakcanary.TestUtil.NO_EXCLUDED_REFS;
+ import static java.util.Arrays.asList;
+ import static org.assertj.core.api.Assertions.assertThat;
+ 
+ public class HeapAnalyzerTest {
+-  private static final ExcludedRefs NO_EXCLUDED_REFS = null;
+   private static final List<RootObj> DUP_ROOTS =
+           asList(new RootObj(SYSTEM_CLASS, 6L),
+                   new RootObj(SYSTEM_CLASS, 5L),
+diff --git a/leakcanary-analyzer/src/test/java/com/squareup/leakcanary/TestUtil.java b/leakcanary-analyzer/src/test/java/com/squareup/leakcanary/TestUtil.java
+index 55428084..340ae3ee 100644
+--- a/leakcanary-analyzer/src/test/java/com/squareup/leakcanary/TestUtil.java
++++ b/leakcanary-analyzer/src/test/java/com/squareup/leakcanary/TestUtil.java
+@@ -17,17 +17,20 @@
+ 
+ import java.io.File;
+ import java.net.URL;
++import java.util.List;
+ 
+ final class TestUtil {
+ 
++  public static final ExcludedRefs NO_EXCLUDED_REFS = ExcludedRefs.builder().build();
++
+   enum HeapDumpFile {
+     ASYNC_TASK("leak_asynctask.hprof", "dc983a12-d029-4003-8890-7dd644c664c5"),
+     ASYNC_TASK_MPREVIEW2("leak_asynctask_mpreview2.hprof", "1114018e-e154-435f-9a3d-da63ae9b47fa"),
+     ASYNC_TASK_M_POSTPREVIEW2("leak_asynctask_m_postpreview2.hprof",
+         "25ae1778-7c1d-4ec7-ac50-5cce55424069");
+ 
+-    private final String filename;
+-    private final String referenceKey;
++    public final String filename;
++    public final String referenceKey;
+ 
+     HeapDumpFile(String filename, String referenceKey) {
+       this.filename = filename;
+@@ -42,6 +45,12 @@ static File fileFromName(String filename) {
+     return new File(url.getPath());
+   }
+ 
++  static List<TrackedReference> findTrackedReferences(HeapDumpFile heapDumpFile) {
++    File file = fileFromName(heapDumpFile.filename);
++    HeapAnalyzer heapAnalyzer = new HeapAnalyzer(NO_EXCLUDED_REFS);
++    return heapAnalyzer.findTrackedReferences(file);
++  }
++
+   static AnalysisResult analyze(HeapDumpFile heapDumpFile, ExcludedRefs.BuilderWithParams excludedRefs) {
+     File file = fileFromName(heapDumpFile.filename);
+     String referenceKey = heapDumpFile.referenceKey;
+diff --git a/leakcanary-analyzer/src/test/java/com/squareup/leakcanary/TrackedReferencesTest.java b/leakcanary-analyzer/src/test/java/com/squareup/leakcanary/TrackedReferencesTest.java
+new file mode 100644
+index 00000000..af523974
+--- /dev/null
++++ b/leakcanary-analyzer/src/test/java/com/squareup/leakcanary/TrackedReferencesTest.java
+@@ -0,0 +1,26 @@
++package com.squareup.leakcanary;
++
++import java.util.List;
++import org.junit.Test;
++
++import static com.squareup.leakcanary.TestUtil.HeapDumpFile.ASYNC_TASK;
++import static com.squareup.leakcanary.TestUtil.HeapDumpFile.ASYNC_TASK_MPREVIEW2;
++import static com.squareup.leakcanary.TestUtil.HeapDumpFile.ASYNC_TASK_M_POSTPREVIEW2;
++import static com.squareup.leakcanary.TestUtil.findTrackedReferences;
++import static org.assertj.core.api.Assertions.assertThat;
++
++public class TrackedReferencesTest {
++
++  @Test public void findsExpectedRef() {
++    List<TrackedReference> trackedReferences = findTrackedReferences(ASYNC_TASK_M_POSTPREVIEW2);
++    assertThat(trackedReferences).hasSize(1);
++    TrackedReference firstRef = trackedReferences.get(0);
++    assertThat(firstRef.key).isEqualTo(ASYNC_TASK_M_POSTPREVIEW2.referenceKey);
++    assertThat(firstRef.className).isEqualTo("com.example.leakcanary.MainActivity");
++  }
++
++  @Test public void findsSeveralRefs() {
++    List<TrackedReference> trackedReferences = findTrackedReferences(ASYNC_TASK);
++    assertThat(trackedReferences).hasSize(2);
++  }
++}
+diff --git a/leakcanary-android-no-op/src/main/java/com/squareup/leakcanary/LeakCanary.java b/leakcanary-android-no-op/src/main/java/com/squareup/leakcanary/LeakCanary.java
+index 8fc8a58c..a9784143 100644
+--- a/leakcanary-android-no-op/src/main/java/com/squareup/leakcanary/LeakCanary.java
++++ b/leakcanary-android-no-op/src/main/java/com/squareup/leakcanary/LeakCanary.java
+@@ -1,6 +1,7 @@
+ package com.squareup.leakcanary;
+ 
+ import android.app.Application;
++import android.content.Context;
+ 
+ /**
+  * A no-op version of {@link LeakCanary} that can be used in release builds.
+@@ -11,6 +12,10 @@ public static RefWatcher install(Application application) {
+     return RefWatcher.DISABLED;
+   }
+ 
++  public static boolean isInAnalyzerProcess(Context context) {
++    return false;
++  }
++
+   private LeakCanary() {
+     throw new AssertionError();
+   }
+diff --git a/leakcanary-android/src/main/java/com/squareup/leakcanary/AndroidHeapDumper.java b/leakcanary-android/src/main/java/com/squareup/leakcanary/AndroidHeapDumper.java
+index c46435f3..3002cd76 100644
+--- a/leakcanary-android/src/main/java/com/squareup/leakcanary/AndroidHeapDumper.java
++++ b/leakcanary-android/src/main/java/com/squareup/leakcanary/AndroidHeapDumper.java
+@@ -24,18 +24,14 @@
+ import android.view.LayoutInflater;
+ import android.widget.Toast;
+ import com.squareup.leakcanary.internal.FutureResult;
+-import com.squareup.leakcanary.internal.LeakCanaryInternals;
+ import java.io.File;
+-import java.io.IOException;
+ 
+ import static java.util.concurrent.TimeUnit.SECONDS;
+ 
+ public final class AndroidHeapDumper implements HeapDumper {
+ 
+-  private static final String HEAPDUMP_FILE = "suspected_leak_heapdump.hprof";
+-
+-  final Context context;
+-  final LeakDirectoryProvider leakDirectoryProvider;
++  private final Context context;
++  private final LeakDirectoryProvider leakDirectoryProvider;
+   private final Handler mainHandler;
+ 
+   public AndroidHeapDumper(Context context, LeakDirectoryProvider leakDirectoryProvider) {
+@@ -45,27 +41,10 @@ public AndroidHeapDumper(Context context, LeakDirectoryProvider leakDirectoryPro
+   }
+ 
+   @Override public File dumpHeap() {
+-    if (!leakDirectoryProvider.isLeakStorageWritable()) {
+-      CanaryLog.d("Could not write to leak storage to dump heap.");
+-      leakDirectoryProvider.requestWritePermissionNotification();
+-      return NO_DUMP;
+-    }
+-    File heapDumpFile = getHeapDumpFile();
+-    // Atomic way to check for existence & create the file if it doesn't exist.
+-    // Prevents several processes in the same app to attempt a heapdump at the same time.
+-    boolean fileCreated;
+-    try {
+-      fileCreated = heapDumpFile.createNewFile();
+-    } catch (IOException e) {
+-      cleanup();
+-      CanaryLog.d(e, "Could not check if heap dump file exists");
+-      return NO_DUMP;
+-    }
++    File heapDumpFile = leakDirectoryProvider.newHeapDumpFile();
+ 
+-    if (!fileCreated) {
+-      CanaryLog.d("Could not dump heap, previous analysis still is in progress.");
+-      // Heap analysis in progress, let's not put too much pressure on the device.
+-      return NO_DUMP;
++    if (heapDumpFile == RETRY_LATER) {
++      return RETRY_LATER;
+     }
+ 
+     FutureResult<Toast> waitingForToast = new FutureResult<>();
+@@ -73,7 +52,7 @@ public AndroidHeapDumper(Context context, LeakDirectoryProvider leakDirectoryPro
+ 
+     if (!waitingForToast.wait(5, SECONDS)) {
+       CanaryLog.d("Did not dump heap, too much time waiting for Toast.");
+-      return NO_DUMP;
++      return RETRY_LATER;
+     }
+ 
+     Toast toast = waitingForToast.get();
+@@ -82,40 +61,12 @@ public AndroidHeapDumper(Context context, LeakDirectoryProvider leakDirectoryPro
+       cancelToast(toast);
+       return heapDumpFile;
+     } catch (Exception e) {
+-      cleanup();
+-      CanaryLog.d(e, "Could not perform heap dump");
++      CanaryLog.d(e, "Could not dump heap");
+       // Abort heap dump
+-      return NO_DUMP;
++      return RETRY_LATER;
+     }
+   }
+ 
+-  /**
+-   * Call this on app startup to clean up all heap dump files that had not been handled yet when
+-   * the app process was killed.
+-   */
+-  public void cleanup() {
+-    LeakCanaryInternals.executeOnFileIoThread(new Runnable() {
+-      @Override public void run() {
+-        if (!leakDirectoryProvider.isLeakStorageWritable()) {
+-          CanaryLog.d("Could not attempt cleanup, leak storage not writable.");
+-          return;
+-        }
+-        File heapDumpFile = getHeapDumpFile();
+-        if (heapDumpFile.exists()) {
+-          CanaryLog.d("Previous analysis did not complete correctly, cleaning: %s", heapDumpFile);
+-          boolean success = heapDumpFile.delete();
+-          if (!success) {
+-            CanaryLog.d("Could not delete file %s", heapDumpFile.getPath());
+-          }
+-        }
+-      }
+-    });
+-  }
+-
+-  File getHeapDumpFile() {
+-    return new File(leakDirectoryProvider.leakDirectory(), HEAPDUMP_FILE);
+-  }
+-
+   private void showToast(final FutureResult<Toast> waitingForToast) {
+     mainHandler.post(new Runnable() {
+       @Override public void run() {
+diff --git a/leakcanary-android/src/main/java/com/squareup/leakcanary/AndroidRefWatcherBuilder.java b/leakcanary-android/src/main/java/com/squareup/leakcanary/AndroidRefWatcherBuilder.java
+new file mode 100644
+index 00000000..5f6a202d
+--- /dev/null
++++ b/leakcanary-android/src/main/java/com/squareup/leakcanary/AndroidRefWatcherBuilder.java
+@@ -0,0 +1,89 @@
++package com.squareup.leakcanary;
++
++import android.app.Application;
++import android.content.Context;
++import java.util.concurrent.TimeUnit;
++
++import static com.squareup.leakcanary.RefWatcher.DISABLED;
++import static java.util.concurrent.TimeUnit.SECONDS;
++
++/** A {@link RefWatcherBuilder} with appropriate Android defaults. */
++public final class AndroidRefWatcherBuilder extends RefWatcherBuilder<AndroidRefWatcherBuilder> {
++
++  private static final long DEFAULT_WATCH_DELAY_MILLIS = SECONDS.toMillis(5);
++
++  private final Context context;
++
++  AndroidRefWatcherBuilder(Context context) {
++    this.context = context.getApplicationContext();
++  }
++
++  /**
++   * Sets a custom {@link AbstractAnalysisResultService} to listen to analysis results. This
++   * overrides any call to {@link #heapDumpListener(HeapDump.Listener)}.
++   */
++  public AndroidRefWatcherBuilder listenerServiceClass(
++      Class<? extends AbstractAnalysisResultService> listenerServiceClass) {
++    return heapDumpListener(new ServiceHeapDumpListener(context, listenerServiceClass));
++  }
++
++  /**
++   * Sets a custom delay for how long the {@link RefWatcher} should wait until it checks if a
++   * tracked object has been garbage collected. This overrides any call to {@link
++   * #watchExecutor(WatchExecutor)}.
++   */
++  public AndroidRefWatcherBuilder watchDelay(long delay, TimeUnit unit) {
++    return watchExecutor(new AndroidWatchExecutor(unit.toMillis(delay)));
++  }
++
++  /**
++   * Sets the maximum number of heap dumps stored. This overrides any call to {@link
++   * #heapDumper(HeapDumper)} as well as any call to
++   * {@link LeakCanary#setDisplayLeakActivityDirectoryProvider(LeakDirectoryProvider)})}
++   *
++   * @throws IllegalArgumentException if maxStoredHeapDumps < 1.
++   */
++  public AndroidRefWatcherBuilder maxStoredHeapDumps(int maxStoredHeapDumps) {
++    LeakDirectoryProvider leakDirectoryProvider =
++        new DefaultLeakDirectoryProvider(context, maxStoredHeapDumps);
++    LeakCanary.setDisplayLeakActivityDirectoryProvider(leakDirectoryProvider);
++    return heapDumper(new AndroidHeapDumper(context, leakDirectoryProvider));
++  }
++
++  /**
++   * Creates a {@link RefWatcher} instance and starts watching activity references (on ICS+).
++   */
++  public RefWatcher buildAndInstall() {
++    RefWatcher refWatcher = build();
++    if (refWatcher != DISABLED) {
++      LeakCanary.enableDisplayLeakActivity(context);
++      ActivityRefWatcher.installOnIcsPlus((Application) context, refWatcher);
++    }
++    return refWatcher;
++  }
++
++  @Override protected boolean isDisabled() {
++    return LeakCanary.isInAnalyzerProcess(context);
++  }
++
++  @Override protected HeapDumper defaultHeapDumper() {
++    LeakDirectoryProvider leakDirectoryProvider = new DefaultLeakDirectoryProvider(context);
++    return new AndroidHeapDumper(context, leakDirectoryProvider);
++  }
++
++  @Override protected DebuggerControl defaultDebuggerControl() {
++    return new AndroidDebuggerControl();
++  }
++
++  @Override protected HeapDump.Listener defaultHeapDumpListener() {
++    return new ServiceHeapDumpListener(context, DisplayLeakService.class);
++  }
++
++  @Override protected ExcludedRefs defaultExcludedRefs() {
++    return AndroidExcludedRefs.createAppDefaults().build();
++  }
++
++  @Override protected WatchExecutor defaultWatchExecutor() {
++    return new AndroidWatchExecutor(DEFAULT_WATCH_DELAY_MILLIS);
++  }
++}
+diff --git a/leakcanary-android/src/main/java/com/squareup/leakcanary/AndroidWatchExecutor.java b/leakcanary-android/src/main/java/com/squareup/leakcanary/AndroidWatchExecutor.java
+index 8f8eff4b..c0011c8e 100644
+--- a/leakcanary-android/src/main/java/com/squareup/leakcanary/AndroidWatchExecutor.java
++++ b/leakcanary-android/src/main/java/com/squareup/leakcanary/AndroidWatchExecutor.java
+@@ -19,51 +19,67 @@
+ import android.os.HandlerThread;
+ import android.os.Looper;
+ import android.os.MessageQueue;
+-import java.util.concurrent.Executor;
++
++import static com.squareup.leakcanary.Retryable.Result.RETRY;
+ 
+ /**
+- * {@link Executor} suitable for watching Android reference leaks. This executor waits for the main
+- * thread to be idle then posts to a serial background thread with a delay of
++ * {@link WatchExecutor} suitable for watching Android reference leaks. This executor waits for the
++ * main thread to be idle then posts to a serial background thread with a delay of
+  * {@link R.integer#leak_canary_watch_delay_millis} seconds.
+  */
+-public final class AndroidWatchExecutor implements Executor {
++public final class AndroidWatchExecutor implements WatchExecutor {
+ 
+   static final String LEAK_CANARY_THREAD_NAME = "LeakCanary-Heap-Dump";
+   private final Handler mainHandler;
+-  final Handler backgroundHandler;
+-  final long delayMillis;
++  private final Handler backgroundHandler;
++  private final long initialDelayMillis;
++  private final long maxBackoffFactor;
+ 
+-  public AndroidWatchExecutor(int delayMillis) {
++  public AndroidWatchExecutor(long initialDelayMillis) {
+     mainHandler = new Handler(Looper.getMainLooper());
+     HandlerThread handlerThread = new HandlerThread(LEAK_CANARY_THREAD_NAME);
+     handlerThread.start();
+     backgroundHandler = new Handler(handlerThread.getLooper());
+-    this.delayMillis = delayMillis;
++    this.initialDelayMillis = initialDelayMillis;
++    maxBackoffFactor = Long.MAX_VALUE / initialDelayMillis;
+   }
+ 
+-  @Override public void execute(final Runnable command) {
+-    if (isOnMainThread()) {
+-      executeDelayedAfterIdleUnsafe(command);
++  @Override public void execute(Retryable retryable) {
++    if (Looper.getMainLooper().getThread() == Thread.currentThread()) {
++      waitForIdle(retryable, 0);
+     } else {
+-      mainHandler.post(new Runnable() {
+-        @Override public void run() {
+-          executeDelayedAfterIdleUnsafe(command);
+-        }
+-      });
++      postWaitForIdle(retryable, 0);
+     }
+   }
+ 
+-  private boolean isOnMainThread() {
+-    return Looper.getMainLooper().getThread() == Thread.currentThread();
++  private void postWaitForIdle(final Retryable retryable, final int failedAttempts) {
++    mainHandler.post(new Runnable() {
++      @Override public void run() {
++        waitForIdle(retryable, failedAttempts);
++      }
++    });
+   }
+ 
+-  void executeDelayedAfterIdleUnsafe(final Runnable runnable) {
++  void waitForIdle(final Retryable retryable, final int failedAttempts) {
+     // This needs to be called from the main thread.
+     Looper.myQueue().addIdleHandler(new MessageQueue.IdleHandler() {
+       @Override public boolean queueIdle() {
+-        backgroundHandler.postDelayed(runnable, delayMillis);
++        postToBackgroundWithDelay(retryable, failedAttempts);
+         return false;
+       }
+     });
+   }
++
++  private void postToBackgroundWithDelay(final Retryable retryable, final int failedAttempts) {
++    long exponentialBackoffFactor = (long) Math.min(Math.pow(2, failedAttempts), maxBackoffFactor);
++    long delayMillis = initialDelayMillis * exponentialBackoffFactor;
++    backgroundHandler.postDelayed(new Runnable() {
++      @Override public void run() {
++        Retryable.Result result = retryable.run();
++        if (result == RETRY) {
++          postWaitForIdle(retryable, failedAttempts + 1);
++        }
++      }
++    }, delayMillis);
++  }
+ }
+diff --git a/leakcanary-android/src/main/java/com/squareup/leakcanary/DefaultLeakDirectoryProvider.java b/leakcanary-android/src/main/java/com/squareup/leakcanary/DefaultLeakDirectoryProvider.java
+index 812b6e64..94957554 100644
+--- a/leakcanary-android/src/main/java/com/squareup/leakcanary/DefaultLeakDirectoryProvider.java
++++ b/leakcanary-android/src/main/java/com/squareup/leakcanary/DefaultLeakDirectoryProvider.java
+@@ -16,73 +16,196 @@
+ package com.squareup.leakcanary;
+ 
+ import android.annotation.TargetApi;
+-import android.app.Activity;
+ import android.app.PendingIntent;
+ import android.content.Context;
+ import android.os.Environment;
+ import com.squareup.leakcanary.internal.RequestStoragePermissionActivity;
+ import java.io.File;
++import java.io.FilenameFilter;
++import java.util.ArrayList;
++import java.util.Arrays;
++import java.util.Collections;
++import java.util.Comparator;
++import java.util.List;
++import java.util.UUID;
+ 
+ import static android.Manifest.permission.WRITE_EXTERNAL_STORAGE;
+ import static android.content.pm.PackageManager.PERMISSION_GRANTED;
+ import static android.os.Build.VERSION.SDK_INT;
+ import static android.os.Build.VERSION_CODES.M;
+ import static android.os.Environment.DIRECTORY_DOWNLOADS;
++import static com.squareup.leakcanary.HeapDumper.RETRY_LATER;
+ import static com.squareup.leakcanary.internal.LeakCanaryInternals.showNotification;
+ 
+ public final class DefaultLeakDirectoryProvider implements LeakDirectoryProvider {
+ 
++  private static final int DEFAULT_MAX_STORED_HEAP_DUMPS = 7;
++
++  private static final String HPROF_SUFFIX = ".hprof";
++  private static final String PENDING_HEAPDUMP_SUFFIX = "_pending" + HPROF_SUFFIX;
++
++  /** 10 minutes */
++  private static final int ANALYSIS_MAX_DURATION_MS = 10 * 60 * 1000;
++
+   private final Context context;
++  private final int maxStoredHeapDumps;
++
++  private volatile boolean writeExternalStorageGranted;
++  private volatile boolean permissionNotificationDisplayed;
+ 
+   public DefaultLeakDirectoryProvider(Context context) {
++    this(context, DEFAULT_MAX_STORED_HEAP_DUMPS);
++  }
++
++  public DefaultLeakDirectoryProvider(Context context, int maxStoredHeapDumps) {
++    if (maxStoredHeapDumps < 1) {
++      throw new IllegalArgumentException("maxStoredHeapDumps must be at least 1");
++    }
+     this.context = context.getApplicationContext();
++    this.maxStoredHeapDumps = maxStoredHeapDumps;
+   }
+ 
+-  @Override public File leakDirectory() {
+-    File downloadsDirectory = Environment.getExternalStoragePublicDirectory(DIRECTORY_DOWNLOADS);
+-    File directory = new File(downloadsDirectory, "leakcanary-" + context.getPackageName());
+-    boolean success = directory.mkdirs();
+-    if (!success && !directory.exists()) {
+-      throw new UnsupportedOperationException(
+-          "Could not create leak directory " + directory.getPath());
++  @Override public List<File> listFiles(FilenameFilter filter) {
++    if (!hasStoragePermission()) {
++      requestWritePermissionNotification();
++    }
++    List<File> files = new ArrayList<>();
++
++    File[] externalFiles = externalStorageDirectory().listFiles(filter);
++    if (externalFiles != null) {
++      files.addAll(Arrays.asList(externalFiles));
++    }
++
++    File[] appFiles = appStorageDirectory().listFiles(filter);
++    if (appFiles != null) {
++      files.addAll(Arrays.asList(appFiles));
++    }
++    return files;
++  }
++
++  @Override public File newHeapDumpFile() {
++    List<File> pendingHeapDumps = listFiles(new FilenameFilter() {
++      @Override public boolean accept(File dir, String filename) {
++        return filename.endsWith(PENDING_HEAPDUMP_SUFFIX);
++      }
++    });
++
++    // If a new heap dump file has been created recently and hasn't been processed yet, we skip.
++    // Otherwise we move forward and assume that the analyzer process crashes. The file will
++    // eventually be removed with heap dump file rotation.
++    for (File file : pendingHeapDumps) {
++      if (System.currentTimeMillis() - file.lastModified() < ANALYSIS_MAX_DURATION_MS) {
++        CanaryLog.d("Could not dump heap, previous analysis still is in progress.");
++        return RETRY_LATER;
++      }
++    }
++
++    cleanupOldHeapDumps();
++
++    File storageDirectory = externalStorageDirectory();
++    if (!directoryWritableAfterMkdirs(storageDirectory)) {
++      if (!hasStoragePermission()) {
++        CanaryLog.d("WRITE_EXTERNAL_STORAGE permission not granted");
++        requestWritePermissionNotification();
++      } else {
++        String state = Environment.getExternalStorageState();
++        if (!Environment.MEDIA_MOUNTED.equals(state)) {
++          CanaryLog.d("External storage not mounted, state: %s", state);
++        } else {
++          CanaryLog.d("Could not create heap dump directory in external storage: [%s]",
++              storageDirectory.getAbsolutePath());
++        }
++      }
++      // Fallback to app storage.
++      storageDirectory = appStorageDirectory();
++      if (!directoryWritableAfterMkdirs(storageDirectory)) {
++        CanaryLog.d("Could not create heap dump directory in app storage: [%s]",
++            storageDirectory.getAbsolutePath());
++        return RETRY_LATER;
++      }
++    }
++    // If two processes from the same app get to this step at the same time, they could both
++    // create a heap dump. This is an edge case we ignore.
++    return new File(storageDirectory, UUID.randomUUID().toString() + PENDING_HEAPDUMP_SUFFIX);
++  }
++
++  @Override public void clearLeakDirectory() {
++    List<File> allFilesExceptPending = listFiles(new FilenameFilter() {
++      @Override public boolean accept(File dir, String filename) {
++        return !filename.endsWith(PENDING_HEAPDUMP_SUFFIX);
++      }
++    });
++    for (File file : allFilesExceptPending) {
++      boolean deleted = file.delete();
++      if (!deleted) {
++        CanaryLog.d("Could not delete file %s", file.getPath());
++      }
+     }
+-    return directory;
+   }
+ 
+-  @Override public void requestWritePermissionNotification() {
+-    if (hasStoragePermission()) {
++  @TargetApi(M) private boolean hasStoragePermission() {
++    if (SDK_INT < M) {
++      return true;
++    }
++    // Once true, this won't change for the life of the process so we can cache it.
++    if (writeExternalStorageGranted) {
++      return true;
++    }
++    writeExternalStorageGranted =
++        context.checkSelfPermission(WRITE_EXTERNAL_STORAGE) == PERMISSION_GRANTED;
++    return writeExternalStorageGranted;
++  }
++
++  private void requestWritePermissionNotification() {
++    if (permissionNotificationDisplayed) {
+       return;
+     }
++    permissionNotificationDisplayed = true;
++
+     PendingIntent pendingIntent = RequestStoragePermissionActivity.createPendingIntent(context);
+     String contentTitle = context.getString(R.string.leak_canary_permission_notification_title);
+     CharSequence packageName = context.getPackageName();
+     String contentText =
+         context.getString(R.string.leak_canary_permission_notification_text, packageName);
+-    showNotification(context, contentTitle, contentText, pendingIntent);
++    showNotification(context, contentTitle, contentText, pendingIntent, 0xDEAFBEEF);
+   }
+ 
+-  @TargetApi(M) @Override public void requestPermission(Activity activity) {
+-    if (hasStoragePermission()) {
+-      return;
+-    }
+-    String[] permissions = {
+-        WRITE_EXTERNAL_STORAGE
+-    };
+-    activity.requestPermissions(permissions, 42);
++  private File externalStorageDirectory() {
++    File downloadsDirectory = Environment.getExternalStoragePublicDirectory(DIRECTORY_DOWNLOADS);
++    return new File(downloadsDirectory, "leakcanary-" + context.getPackageName());
+   }
+ 
+-  @Override public boolean isLeakStorageWritable() {
+-    if (!hasStoragePermission()) {
+-      return false;
+-    }
+-    String state = Environment.getExternalStorageState();
+-    return Environment.MEDIA_MOUNTED.equals(state);
++  private File appStorageDirectory() {
++    File appFilesDirectory = context.getFilesDir();
++    return new File(appFilesDirectory, "leakcanary");
+   }
+ 
+-  @TargetApi(M) private boolean hasStoragePermission() {
+-    if (SDK_INT < M) {
+-      return true;
++  private boolean directoryWritableAfterMkdirs(File directory) {
++    boolean success = directory.mkdirs();
++    return (success || directory.exists()) && directory.canWrite();
++  }
++
++  private void cleanupOldHeapDumps() {
++    List<File> hprofFiles = listFiles(new FilenameFilter() {
++      @Override public boolean accept(File dir, String filename) {
++        return filename.endsWith(HPROF_SUFFIX);
++      }
++    });
++    int filesToRemove = hprofFiles.size() - maxStoredHeapDumps;
++    if (filesToRemove > 0) {
++      CanaryLog.d("Removing %d heap dumps", filesToRemove);
++      // Sort with oldest modified first.
++      Collections.sort(hprofFiles, new Comparator<File>() {
++        @Override public int compare(File lhs, File rhs) {
++          return Long.valueOf(lhs.lastModified()).compareTo(rhs.lastModified());
++        }
++      });
++      for (int i = 0; i < filesToRemove; i++) {
++        boolean deleted = hprofFiles.get(i).delete();
++        if (!deleted) {
++          CanaryLog.d("Could not delete old hprof file %s", hprofFiles.get(i).getPath());
++        }
++      }
+     }
+-    return context.checkSelfPermission(WRITE_EXTERNAL_STORAGE) == PERMISSION_GRANTED;
+   }
+ }
+diff --git a/leakcanary-android/src/main/java/com/squareup/leakcanary/DisplayLeakService.java b/leakcanary-android/src/main/java/com/squareup/leakcanary/DisplayLeakService.java
+index afdc4e94..24e8842b 100644
+--- a/leakcanary-android/src/main/java/com/squareup/leakcanary/DisplayLeakService.java
++++ b/leakcanary-android/src/main/java/com/squareup/leakcanary/DisplayLeakService.java
+@@ -16,16 +16,13 @@
+ package com.squareup.leakcanary;
+ 
+ import android.app.PendingIntent;
+-import android.content.res.Resources;
++import android.os.SystemClock;
+ import com.squareup.leakcanary.internal.DisplayLeakActivity;
+ import java.io.File;
+ import java.io.FileOutputStream;
+-import java.io.FilenameFilter;
+ import java.io.IOException;
+ import java.io.ObjectOutputStream;
+ import java.text.SimpleDateFormat;
+-import java.util.Arrays;
+-import java.util.Comparator;
+ import java.util.Date;
+ import java.util.Locale;
+ 
+@@ -82,7 +79,9 @@
+       contentText = getString(R.string.leak_canary_could_not_save_text);
+       pendingIntent = null;
+     }
+-    showNotification(this, contentTitle, contentText, pendingIntent);
++    // New notification id every second.
++    int notificationId = (int) (SystemClock.uptimeMillis() / 1000);
++    showNotification(this, contentTitle, contentText, pendingIntent, notificationId);
+     afterDefaultHandling(heapDump, result, leakInfo);
+   }
+ 
+@@ -119,32 +118,9 @@ private HeapDump renameHeapdump(HeapDump heapDump) {
+       CanaryLog.d("Could not rename heap dump file %s to %s", heapDump.heapDumpFile.getPath(),
+           newFile.getPath());
+     }
+-    heapDump =
+-        new HeapDump(newFile, heapDump.referenceKey, heapDump.referenceName, heapDump.excludedRefs,
+-            heapDump.watchDurationMs, heapDump.gcDurationMs, heapDump.heapDumpDurationMs);
+-
+-    Resources resources = getResources();
+-    int maxStoredHeapDumps =
+-        Math.max(resources.getInteger(R.integer.leak_canary_max_stored_leaks), 1);
+-    File[] hprofFiles = heapDump.heapDumpFile.getParentFile().listFiles(new FilenameFilter() {
+-      @Override public boolean accept(File dir, String filename) {
+-        return filename.endsWith(".hprof");
+-      }
+-    });
+-
+-    if (hprofFiles.length > maxStoredHeapDumps) {
+-      // Sort with oldest modified first.
+-      Arrays.sort(hprofFiles, new Comparator<File>() {
+-        @Override public int compare(File lhs, File rhs) {
+-          return Long.valueOf(lhs.lastModified()).compareTo(rhs.lastModified());
+-        }
+-      });
+-      boolean deleted = hprofFiles[0].delete();
+-      if (!deleted) {
+-        CanaryLog.d("Could not delete old hprof file %s", hprofFiles[0].getPath());
+-      }
+-    }
+-    return heapDump;
++    return new HeapDump(newFile, heapDump.referenceKey, heapDump.referenceName,
++        heapDump.excludedRefs, heapDump.watchDurationMs, heapDump.gcDurationMs,
++        heapDump.heapDumpDurationMs);
+   }
+ 
+   /**
+diff --git a/leakcanary-android/src/main/java/com/squareup/leakcanary/LeakCanary.java b/leakcanary-android/src/main/java/com/squareup/leakcanary/LeakCanary.java
+index 1081ae34..98f8325a 100644
+--- a/leakcanary-android/src/main/java/com/squareup/leakcanary/LeakCanary.java
++++ b/leakcanary-android/src/main/java/com/squareup/leakcanary/LeakCanary.java
+@@ -19,7 +19,6 @@
+ import android.content.Context;
+ import android.content.pm.PackageInfo;
+ import android.content.pm.PackageManager;
+-import android.content.res.Resources;
+ import android.os.Build;
+ import android.util.Log;
+ import com.squareup.leakcanary.internal.DisplayLeakActivity;
+@@ -38,48 +37,25 @@
+    * references (on ICS+).
+    */
+   public static RefWatcher install(Application application) {
+-    return install(application, DisplayLeakService.class,
+-        AndroidExcludedRefs.createAppDefaults().build());
++    return refWatcher(application).listenerServiceClass(DisplayLeakService.class)
++        .excludedRefs(AndroidExcludedRefs.createAppDefaults().build())
++        .buildAndInstall();
+   }
+ 
+-  /**
+-   * Creates a {@link RefWatcher} that reports results to the provided service, and starts watching
+-   * activity references (on ICS+).
+-   */
+-  public static RefWatcher install(Application application,
+-      Class<? extends AbstractAnalysisResultService> listenerServiceClass,
+-      ExcludedRefs excludedRefs) {
+-    if (isInAnalyzerProcess(application)) {
+-      return RefWatcher.DISABLED;
+-    }
+-    enableDisplayLeakActivity(application);
+-    HeapDump.Listener heapDumpListener =
+-        new ServiceHeapDumpListener(application, listenerServiceClass);
+-    RefWatcher refWatcher = androidWatcher(application, heapDumpListener, excludedRefs);
+-    ActivityRefWatcher.installOnIcsPlus(application, refWatcher);
+-    return refWatcher;
+-  }
+-
+-  /**
+-   * Creates a {@link RefWatcher} with a default configuration suitable for Android.
+-   */
+-  public static RefWatcher androidWatcher(Context context, HeapDump.Listener heapDumpListener,
+-      ExcludedRefs excludedRefs) {
+-    LeakDirectoryProvider leakDirectoryProvider = new DefaultLeakDirectoryProvider(context);
+-    DebuggerControl debuggerControl = new AndroidDebuggerControl();
+-    AndroidHeapDumper heapDumper = new AndroidHeapDumper(context, leakDirectoryProvider);
+-    heapDumper.cleanup();
+-    Resources resources = context.getResources();
+-    int watchDelayMillis = resources.getInteger(R.integer.leak_canary_watch_delay_millis);
+-    AndroidWatchExecutor executor = new AndroidWatchExecutor(watchDelayMillis);
+-    return new RefWatcher(executor, debuggerControl, GcTrigger.DEFAULT, heapDumper,
+-        heapDumpListener, excludedRefs);
++  /** Builder to create a customized {@link RefWatcher} with appropriate Android defaults. */
++  public static AndroidRefWatcherBuilder refWatcher(Context context) {
++    return new AndroidRefWatcherBuilder(context);
+   }
+ 
+   public static void enableDisplayLeakActivity(Context context) {
+     setEnabled(context, DisplayLeakActivity.class, true);
+   }
+ 
++  /**
++   * If you build a {@link RefWatcher} with a {@link AndroidHeapDumper} that has a custom {@link
++   * LeakDirectoryProvider}, then you should also call this method to make sure the activity in
++   * charge of displaying leaks can find those on the file system.
++   */
+   public static void setDisplayLeakActivityDirectoryProvider(
+       LeakDirectoryProvider leakDirectoryProvider) {
+     DisplayLeakActivity.setLeakDirectoryProvider(leakDirectoryProvider);
+diff --git a/leakcanary-android/src/main/java/com/squareup/leakcanary/LeakDirectoryProvider.java b/leakcanary-android/src/main/java/com/squareup/leakcanary/LeakDirectoryProvider.java
+index 1e7ebf87..1dfa218f 100644
+--- a/leakcanary-android/src/main/java/com/squareup/leakcanary/LeakDirectoryProvider.java
++++ b/leakcanary-android/src/main/java/com/squareup/leakcanary/LeakDirectoryProvider.java
+@@ -15,23 +15,28 @@
+  */
+ package com.squareup.leakcanary;
+ 
+-import android.app.Activity;
+ import java.io.File;
++import java.io.FilenameFilter;
++import java.util.List;
+ 
+ /**
+- * Provides the directory in which heap dumps and analysis results will be stored.
+- * When using your own implementation, you may also want to call {@link
+- * LeakCanary#setDisplayLeakActivityDirectoryProvider(LeakDirectoryProvider)}.
++ * Provides access to where heap dumps and analysis results will be stored.
++ * When using your own implementation, you should also call {@link
++ * LeakCanary#setDisplayLeakActivityDirectoryProvider(LeakDirectoryProvider)} to ensure the
++ * provided activity is able to display the leaks.
+  */
+ public interface LeakDirectoryProvider {
+ 
+-  /** Returns a path to an existing directory were leaks can be stored. */
+-  File leakDirectory();
++  List<File> listFiles(FilenameFilter filter);
+ 
+-  void requestWritePermissionNotification();
++  /**
++   * @return {@link HeapDumper#RETRY_LATER} if a new heap dump file could not be created.
++   */
++  File newHeapDumpFile();
+ 
+-  void requestPermission(Activity activity);
+-
+-  /** True if we can currently write to the leak directory. */
+-  boolean isLeakStorageWritable();
++  /**
++   * Removes all heap dumps and analysis results, except for heap dumps that haven't been
++   * analyzed yet.
++   */
++  void clearLeakDirectory();
+ }
+diff --git a/leakcanary-android/src/main/java/com/squareup/leakcanary/internal/DisplayLeakActivity.java b/leakcanary-android/src/main/java/com/squareup/leakcanary/internal/DisplayLeakActivity.java
+index 4ab1baf2..e1fbb683 100644
+--- a/leakcanary-android/src/main/java/com/squareup/leakcanary/internal/DisplayLeakActivity.java
++++ b/leakcanary-android/src/main/java/com/squareup/leakcanary/internal/DisplayLeakActivity.java
+@@ -17,8 +17,10 @@
+ 
+ import android.annotation.TargetApi;
+ import android.app.Activity;
++import android.app.AlertDialog;
+ import android.app.PendingIntent;
+ import android.content.Context;
++import android.content.DialogInterface;
+ import android.content.Intent;
+ import android.net.Uri;
+ import android.os.Build;
+@@ -140,13 +142,7 @@ private static LeakDirectoryProvider leakDirectoryProvider(Context context) {
+ 
+   @Override protected void onResume() {
+     super.onResume();
+-    LeakDirectoryProvider leakDirectoryProvider = leakDirectoryProvider(this);
+-    if (leakDirectoryProvider.isLeakStorageWritable()) {
+-      File leakDirectory = leakDirectoryProvider.leakDirectory();
+-      LoadLeaks.load(this, leakDirectory);
+-    } else {
+-      leakDirectoryProvider.requestPermission(this);
+-    }
++    LoadLeaks.load(this, leakDirectoryProvider(this));
+   }
+ 
+   @Override public void setTheme(int resid) {
+@@ -242,16 +238,7 @@ void deleteVisibleLeak() {
+   }
+ 
+   void deleteAllLeaks() {
+-    File leakDirectory = leakDirectoryProvider(DisplayLeakActivity.this).leakDirectory();
+-    File[] files = leakDirectory.listFiles();
+-    if (files != null) {
+-      for (File file : files) {
+-        boolean deleted = file.delete();
+-        if (!deleted) {
+-          CanaryLog.d("Could not delete file %s", file.getPath());
+-        }
+-      }
+-    }
++    leakDirectoryProvider(DisplayLeakActivity.this).clearLeakDirectory();
+     leaks = Collections.emptyList();
+     updateUi();
+   }
+@@ -346,7 +333,17 @@ public void onItemClick(AdapterView<?> parent, View view, int position, long id)
+         actionButton.setText(R.string.leak_canary_delete_all);
+         actionButton.setOnClickListener(new View.OnClickListener() {
+           @Override public void onClick(View v) {
+-            deleteAllLeaks();
++            new AlertDialog.Builder(DisplayLeakActivity.this).setIcon(
++                android.R.drawable.ic_dialog_alert)
++                .setTitle(R.string.leak_canary_delete_all)
++                .setMessage(R.string.leak_canary_delete_all_leaks_title)
++                .setPositiveButton(android.R.string.yes, new DialogInterface.OnClickListener() {
++                  @Override public void onClick(DialogInterface dialog, int which) {
++                    deleteAllLeaks();
++                  }
++                })
++                .setNegativeButton(android.R.string.no, null)
++                .show();
+           }
+         });
+       }
+@@ -433,8 +430,8 @@ Leak getVisibleLeak() {
+ 
+     static final Executor backgroundExecutor = newSingleThreadExecutor("LoadLeaks");
+ 
+-    static void load(DisplayLeakActivity activity, File leakDirectory) {
+-      LoadLeaks loadLeaks = new LoadLeaks(activity, leakDirectory);
++    static void load(DisplayLeakActivity activity, LeakDirectoryProvider leakDirectoryProvider) {
++      LoadLeaks loadLeaks = new LoadLeaks(activity, leakDirectoryProvider);
+       inFlight.add(loadLeaks);
+       backgroundExecutor.execute(loadLeaks);
+     }
+@@ -447,58 +444,55 @@ static void forgetActivity() {
+     }
+ 
+     DisplayLeakActivity activityOrNull;
+-    private final File leakDirectory;
++    private final LeakDirectoryProvider leakDirectoryProvider;
+     private final Handler mainHandler;
+ 
+-    LoadLeaks(DisplayLeakActivity activity, File leakDirectory) {
++    LoadLeaks(DisplayLeakActivity activity, LeakDirectoryProvider leakDirectoryProvider) {
+       this.activityOrNull = activity;
+-      this.leakDirectory = leakDirectory;
++      this.leakDirectoryProvider = leakDirectoryProvider;
+       mainHandler = new Handler(Looper.getMainLooper());
+     }
+ 
+     @Override public void run() {
+       final List<Leak> leaks = new ArrayList<>();
+-      File[] files = leakDirectory.listFiles(new FilenameFilter() {
++      List<File> files = leakDirectoryProvider.listFiles(new FilenameFilter() {
+         @Override public boolean accept(File dir, String filename) {
+           return filename.endsWith(".result");
+         }
+       });
+-
+-      if (files != null) {
+-        for (File resultFile : files) {
+-          FileInputStream fis = null;
+-          try {
+-            fis = new FileInputStream(resultFile);
+-            ObjectInputStream ois = new ObjectInputStream(fis);
+-            HeapDump heapDump = (HeapDump) ois.readObject();
+-            AnalysisResult result = (AnalysisResult) ois.readObject();
+-            leaks.add(new Leak(heapDump, result, resultFile));
+-          } catch (IOException | ClassNotFoundException e) {
+-            // Likely a change in the serializable result class.
+-            // Let's remove the files, we can't read them anymore.
+-            boolean deleted = resultFile.delete();
+-            if (deleted) {
+-              CanaryLog.d(e, "Could not read result file %s, deleted it.", resultFile);
+-            } else {
+-              CanaryLog.d(e, "Could not read result file %s, could not delete it either.",
+-                  resultFile);
+-            }
+-          } finally {
+-            if (fis != null) {
+-              try {
+-                fis.close();
+-              } catch (IOException ignored) {
+-              }
++      for (File resultFile : files) {
++        FileInputStream fis = null;
++        try {
++          fis = new FileInputStream(resultFile);
++          ObjectInputStream ois = new ObjectInputStream(fis);
++          HeapDump heapDump = (HeapDump) ois.readObject();
++          AnalysisResult result = (AnalysisResult) ois.readObject();
++          leaks.add(new Leak(heapDump, result, resultFile));
++        } catch (IOException | ClassNotFoundException e) {
++          // Likely a change in the serializable result class.
++          // Let's remove the files, we can't read them anymore.
++          boolean deleted = resultFile.delete();
++          if (deleted) {
++            CanaryLog.d(e, "Could not read result file %s, deleted it.", resultFile);
++          } else {
++            CanaryLog.d(e, "Could not read result file %s, could not delete it either.",
++                resultFile);
++          }
++        } finally {
++          if (fis != null) {
++            try {
++              fis.close();
++            } catch (IOException ignored) {
+             }
+           }
+         }
+-        Collections.sort(leaks, new Comparator<Leak>() {
+-          @Override public int compare(Leak lhs, Leak rhs) {
+-            return Long.valueOf(rhs.resultFile.lastModified())
+-                .compareTo(lhs.resultFile.lastModified());
+-          }
+-        });
+       }
++      Collections.sort(leaks, new Comparator<Leak>() {
++        @Override public int compare(Leak lhs, Leak rhs) {
++          return Long.valueOf(rhs.resultFile.lastModified())
++              .compareTo(lhs.resultFile.lastModified());
++        }
++      });
+       mainHandler.post(new Runnable() {
+         @Override public void run() {
+           inFlight.remove(LoadLeaks.this);
+diff --git a/leakcanary-android/src/main/java/com/squareup/leakcanary/internal/LeakCanaryInternals.java b/leakcanary-android/src/main/java/com/squareup/leakcanary/internal/LeakCanaryInternals.java
+index cdb5a055..ab25c64c 100644
+--- a/leakcanary-android/src/main/java/com/squareup/leakcanary/internal/LeakCanaryInternals.java
++++ b/leakcanary-android/src/main/java/com/squareup/leakcanary/internal/LeakCanaryInternals.java
+@@ -133,7 +133,7 @@ public static boolean isInServiceProcess(Context context, Class<? extends Servic
+ 
+   @TargetApi(HONEYCOMB)
+   public static void showNotification(Context context, CharSequence contentTitle,
+-      CharSequence contentText, PendingIntent pendingIntent) {
++      CharSequence contentText, PendingIntent pendingIntent, int notificationId) {
+     NotificationManager notificationManager =
+         (NotificationManager) context.getSystemService(Context.NOTIFICATION_SERVICE);
+ 
+@@ -165,7 +165,7 @@ public static void showNotification(Context context, CharSequence contentTitle,
+         notification = builder.build();
+       }
+     }
+-    notificationManager.notify(0xDEAFBEEF, notification);
++    notificationManager.notify(notificationId, notification);
+   }
+ 
+   public static Executor newSingleThreadExecutor(String threadName) {
+diff --git a/leakcanary-android/src/main/res/values-de/leak_canary_strings.xml b/leakcanary-android/src/main/res/values-de/leak_canary_strings.xml
+index 6e43e4d3..b81463c9 100644
+--- a/leakcanary-android/src/main/res/values-de/leak_canary_strings.xml
++++ b/leakcanary-android/src/main/res/values-de/leak_canary_strings.xml
+@@ -28,6 +28,7 @@
+     <string name="leak_canary_delete">Löschen</string>
+     <string name="leak_canary_failure_report">"Bitte sende diesen Fehler an http://github.com/square/leakcanary\n"</string>
+     <string name="leak_canary_delete_all">Alle löschen</string>
++    <string name="leak_canary_delete_all_leaks_title">Are you sure you want to delete all leaks?</string>
+     <string name="leak_canary_could_not_save_title">Konnte Ergebnis nicht speichern.</string>
+     <string name="leak_canary_could_not_save_text">LeakCanary konnte das Ergebnis der Analyse nicht speichern.</string>
+     <string name="leak_canary_no_leak_title">Kein Leak gefunden</string>
+diff --git a/leakcanary-android/src/main/res/values/leak_canary_int.xml b/leakcanary-android/src/main/res/values/leak_canary_int.xml
+deleted file mode 100644
+index b7197372..00000000
+--- a/leakcanary-android/src/main/res/values/leak_canary_int.xml
++++ /dev/null
+@@ -1,20 +0,0 @@
+-<?xml version="1.0" encoding="utf-8"?>
+-<!--
+-  ~ Copyright (C) 2015 Square, Inc.
+-  ~
+-  ~ Licensed under the Apache License, Version 2.0 (the "License");
+-  ~ you may not use this file except in compliance with the License.
+-  ~ You may obtain a copy of the License at
+-  ~
+-  ~      http://www.apache.org/licenses/LICENSE-2.0
+-  ~
+-  ~ Unless required by applicable law or agreed to in writing, software
+-  ~ distributed under the License is distributed on an "AS IS" BASIS,
+-  ~ WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+-  ~ See the License for the specific language governing permissions and
+-  ~ limitations under the License.
+-  -->
+-<resources>
+-  <integer name="leak_canary_max_stored_leaks">7</integer>
+-  <integer name="leak_canary_watch_delay_millis">5000</integer>
+-</resources>
+diff --git a/leakcanary-android/src/main/res/values/leak_canary_public.xml b/leakcanary-android/src/main/res/values/leak_canary_public.xml
+index b5f11b97..7e90f597 100644
+--- a/leakcanary-android/src/main/res/values/leak_canary_public.xml
++++ b/leakcanary-android/src/main/res/values/leak_canary_public.xml
+@@ -19,7 +19,5 @@
+   <public name="leak_canary_display_activity_label" type="string"/>
+   <public name="leak_canary_heap_dump_toast" type="layout"/>
+   <public name="leak_canary_icon" type="drawable"/>
+-  <public name="leak_canary_max_stored_leaks" type="integer"/>
+-  <public name="leak_canary_watch_delay_millis" type="integer"/>
+ 
+ </resources>
+diff --git a/leakcanary-android/src/main/res/values/leak_canary_strings.xml b/leakcanary-android/src/main/res/values/leak_canary_strings.xml
+index d9aaee13..2fec1f11 100644
+--- a/leakcanary-android/src/main/res/values/leak_canary_strings.xml
++++ b/leakcanary-android/src/main/res/values/leak_canary_strings.xml
+@@ -29,6 +29,7 @@
+   <string name="leak_canary_delete">Delete</string>
+   <string name="leak_canary_failure_report">"Please report this failure to http://github.com/square/leakcanary\n"</string>
+   <string name="leak_canary_delete_all">Delete all</string>
++  <string name="leak_canary_delete_all_leaks_title">Are you sure you want to delete all leaks?</string>
+   <string name="leak_canary_could_not_save_title">Could not save result.</string>
+   <string name="leak_canary_could_not_save_text">LeakCanary was unable to save the analysis result.</string>
+   <string name="leak_canary_no_leak_title">No leak found</string>
+diff --git a/leakcanary-watcher/src/main/java/com/squareup/leakcanary/HeapDump.java b/leakcanary-watcher/src/main/java/com/squareup/leakcanary/HeapDump.java
+index fe88f38e..ee201585 100644
+--- a/leakcanary-watcher/src/main/java/com/squareup/leakcanary/HeapDump.java
++++ b/leakcanary-watcher/src/main/java/com/squareup/leakcanary/HeapDump.java
+@@ -20,9 +20,16 @@
+ 
+ import static com.squareup.leakcanary.Preconditions.checkNotNull;
+ 
++/** Data structure holding information about a heap dump. */
+ public final class HeapDump implements Serializable {
+ 
++  /** Receives a heap dump to analyze. */
+   public interface Listener {
++    Listener NONE = new Listener() {
++      @Override public void analyze(HeapDump heapDump) {
++      }
++    };
++
+     void analyze(HeapDump heapDump);
+   }
+ 
+diff --git a/leakcanary-watcher/src/main/java/com/squareup/leakcanary/HeapDumper.java b/leakcanary-watcher/src/main/java/com/squareup/leakcanary/HeapDumper.java
+index 715d089a..43a9499d 100644
+--- a/leakcanary-watcher/src/main/java/com/squareup/leakcanary/HeapDumper.java
++++ b/leakcanary-watcher/src/main/java/com/squareup/leakcanary/HeapDumper.java
+@@ -17,13 +17,19 @@
+ 
+ import java.io.File;
+ 
++/** Dumps the heap into a file. */
+ public interface HeapDumper {
++  HeapDumper NONE = new HeapDumper() {
++    @Override public File dumpHeap() {
++      return RETRY_LATER;
++    }
++  };
+ 
+-  File NO_DUMP = null;
++  File RETRY_LATER = null;
+ 
+   /**
+-   * @return a {@link File} referencing the heap dump, or {@link #NO_DUMP} if the heap could not be
+-   * dumped.
++   * @return a {@link File} referencing the dumped heap, or {@link #RETRY_LATER} if the heap could
++   * not be dumped.
+    */
+   File dumpHeap();
+ }
+\ No newline at end of file
+diff --git a/leakcanary-watcher/src/main/java/com/squareup/leakcanary/RefWatcher.java b/leakcanary-watcher/src/main/java/com/squareup/leakcanary/RefWatcher.java
+index 5d124535..57ee1e32 100644
+--- a/leakcanary-watcher/src/main/java/com/squareup/leakcanary/RefWatcher.java
++++ b/leakcanary-watcher/src/main/java/com/squareup/leakcanary/RefWatcher.java
+@@ -20,9 +20,11 @@
+ import java.util.Set;
+ import java.util.UUID;
+ import java.util.concurrent.CopyOnWriteArraySet;
+-import java.util.concurrent.Executor;
+ 
++import static com.squareup.leakcanary.HeapDumper.RETRY_LATER;
+ import static com.squareup.leakcanary.Preconditions.checkNotNull;
++import static com.squareup.leakcanary.Retryable.Result.DONE;
++import static com.squareup.leakcanary.Retryable.Result.RETRY;
+ import static java.util.concurrent.TimeUnit.NANOSECONDS;
+ 
+ /**
+@@ -33,24 +35,9 @@
+  */
+ public final class RefWatcher {
+ 
+-  public static final RefWatcher DISABLED = new RefWatcher(new Executor() {
+-    @Override public void execute(Runnable command) {
+-    }
+-  }, new DebuggerControl() {
+-    @Override public boolean isDebuggerAttached() {
+-      // Skips watching.
+-      return true;
+-    }
+-  }, GcTrigger.DEFAULT, new HeapDumper() {
+-    @Override public File dumpHeap() {
+-      return null;
+-    }
+-  }, new HeapDump.Listener() {
+-    @Override public void analyze(HeapDump heapDump) {
+-    }
+-  }, new ExcludedRefs.BuilderWithParams().build());
++  public static final RefWatcher DISABLED = new RefWatcherBuilder<>().build();
+ 
+-  private final Executor watchExecutor;
++  private final WatchExecutor watchExecutor;
+   private final DebuggerControl debuggerControl;
+   private final GcTrigger gcTrigger;
+   private final HeapDumper heapDumper;
+@@ -59,7 +46,7 @@
+   private final HeapDump.Listener heapdumpListener;
+   private final ExcludedRefs excludedRefs;
+ 
+-  public RefWatcher(Executor watchExecutor, DebuggerControl debuggerControl, GcTrigger gcTrigger,
++  RefWatcher(WatchExecutor watchExecutor, DebuggerControl debuggerControl, GcTrigger gcTrigger,
+       HeapDumper heapDumper, HeapDump.Listener heapdumpListener, ExcludedRefs excludedRefs) {
+     this.watchExecutor = checkNotNull(watchExecutor, "watchExecutor");
+     this.debuggerControl = checkNotNull(debuggerControl, "debuggerControl");
+@@ -82,36 +69,46 @@ public void watch(Object watchedReference) {
+ 
+   /**
+    * Watches the provided references and checks if it can be GCed. This method is non blocking,
+-   * the check is done on the {@link Executor} this {@link RefWatcher} has been constructed with.
++   * the check is done on the {@link WatchExecutor} this {@link RefWatcher} has been constructed
++   * with.
+    *
+    * @param referenceName An logical identifier for the watched object.
+    */
+   public void watch(Object watchedReference, String referenceName) {
+-    checkNotNull(watchedReference, "watchedReference");
+-    checkNotNull(referenceName, "referenceName");
+-    if (debuggerControl.isDebuggerAttached()) {
++    if (this == DISABLED) {
+       return;
+     }
++    checkNotNull(watchedReference, "watchedReference");
++    checkNotNull(referenceName, "referenceName");
+     final long watchStartNanoTime = System.nanoTime();
+     String key = UUID.randomUUID().toString();
+     retainedKeys.add(key);
+     final KeyedWeakReference reference =
+         new KeyedWeakReference(watchedReference, key, referenceName, queue);
+ 
+-    watchExecutor.execute(new Runnable() {
+-      @Override public void run() {
+-        ensureGone(reference, watchStartNanoTime);
++    ensureGoneAsync(watchStartNanoTime, reference);
++  }
++
++  private void ensureGoneAsync(final long watchStartNanoTime, final KeyedWeakReference reference) {
++    watchExecutor.execute(new Retryable() {
++      @Override public Retryable.Result run() {
++        return ensureGone(reference, watchStartNanoTime);
+       }
+     });
+   }
+ 
+-  void ensureGone(KeyedWeakReference reference, long watchStartNanoTime) {
++  Retryable.Result ensureGone(final KeyedWeakReference reference, final long watchStartNanoTime) {
+     long gcStartNanoTime = System.nanoTime();
+-
+     long watchDurationMs = NANOSECONDS.toMillis(gcStartNanoTime - watchStartNanoTime);
++
+     removeWeaklyReachableReferences();
+-    if (gone(reference) || debuggerControl.isDebuggerAttached()) {
+-      return;
++
++    if (debuggerControl.isDebuggerAttached()) {
++      // The debugger can create false leaks.
++      return RETRY;
++    }
++    if (gone(reference)) {
++      return DONE;
+     }
+     gcTrigger.runGc();
+     removeWeaklyReachableReferences();
+@@ -120,16 +117,16 @@ void ensureGone(KeyedWeakReference reference, long watchStartNanoTime) {
+       long gcDurationMs = NANOSECONDS.toMillis(startDumpHeap - gcStartNanoTime);
+ 
+       File heapDumpFile = heapDumper.dumpHeap();
+-
+-      if (heapDumpFile == HeapDumper.NO_DUMP) {
+-        // Could not dump the heap, abort.
+-        return;
++      if (heapDumpFile == RETRY_LATER) {
++        // Could not dump the heap.
++        return RETRY;
+       }
+       long heapDumpDurationMs = NANOSECONDS.toMillis(System.nanoTime() - startDumpHeap);
+       heapdumpListener.analyze(
+           new HeapDump(heapDumpFile, reference.key, reference.name, excludedRefs, watchDurationMs,
+               gcDurationMs, heapDumpDurationMs));
+     }
++    return DONE;
+   }
+ 
+   private boolean gone(KeyedWeakReference reference) {
+diff --git a/leakcanary-watcher/src/main/java/com/squareup/leakcanary/RefWatcherBuilder.java b/leakcanary-watcher/src/main/java/com/squareup/leakcanary/RefWatcherBuilder.java
+new file mode 100644
+index 00000000..9e5d2a1d
+--- /dev/null
++++ b/leakcanary-watcher/src/main/java/com/squareup/leakcanary/RefWatcherBuilder.java
+@@ -0,0 +1,124 @@
++package com.squareup.leakcanary;
++
++/**
++ * Responsible for building {@link RefWatcher} instances. Subclasses should provide sane defaults
++ * for the platform they support.
++ */
++public class RefWatcherBuilder<T extends RefWatcherBuilder> {
++
++  private ExcludedRefs excludedRefs;
++  private HeapDump.Listener heapDumpListener;
++  private DebuggerControl debuggerControl;
++  private HeapDumper heapDumper;
++  private WatchExecutor watchExecutor;
++  private GcTrigger gcTrigger;
++
++  /** @see HeapDump.Listener */
++  public final T heapDumpListener(HeapDump.Listener heapDumpListener) {
++    this.heapDumpListener = heapDumpListener;
++    return self();
++  }
++
++  /** @see ExcludedRefs */
++  public final T excludedRefs(ExcludedRefs excludedRefs) {
++    this.excludedRefs = excludedRefs;
++    return self();
++  }
++
++  /** @see HeapDumper */
++  public final T heapDumper(HeapDumper heapDumper) {
++    this.heapDumper = heapDumper;
++    return self();
++  }
++
++  /** @see DebuggerControl */
++  public final T debuggerControl(DebuggerControl debuggerControl) {
++    this.debuggerControl = debuggerControl;
++    return self();
++  }
++
++  /** @see WatchExecutor */
++  public final T watchExecutor(WatchExecutor watchExecutor) {
++    this.watchExecutor = watchExecutor;
++    return self();
++  }
++
++  /** @see GcTrigger */
++  public final T gcTrigger(GcTrigger gcTrigger) {
++    this.gcTrigger = gcTrigger;
++    return self();
++  }
++
++  /** Creates a {@link RefWatcher}. */
++  public final RefWatcher build() {
++    if (isDisabled()) {
++      return RefWatcher.DISABLED;
++    }
++
++    ExcludedRefs excludedRefs = this.excludedRefs;
++    if (excludedRefs == null) {
++      excludedRefs = defaultExcludedRefs();
++    }
++
++    HeapDump.Listener heapDumpListener = this.heapDumpListener;
++    if (heapDumpListener == null) {
++      heapDumpListener = defaultHeapDumpListener();
++    }
++
++    DebuggerControl debuggerControl = this.debuggerControl;
++    if (debuggerControl == null) {
++      debuggerControl = defaultDebuggerControl();
++    }
++
++    HeapDumper heapDumper = this.heapDumper;
++    if (heapDumper == null) {
++      heapDumper = defaultHeapDumper();
++    }
++
++    WatchExecutor watchExecutor = this.watchExecutor;
++    if (watchExecutor == null) {
++      watchExecutor = defaultWatchExecutor();
++    }
++
++    GcTrigger gcTrigger = this.gcTrigger;
++    if (gcTrigger == null) {
++      gcTrigger = defaultGcTrigger();
++    }
++
++    return new RefWatcher(watchExecutor, debuggerControl, gcTrigger, heapDumper, heapDumpListener,
++        excludedRefs);
++  }
++
++  protected boolean isDisabled() {
++    return false;
++  }
++
++  protected GcTrigger defaultGcTrigger() {
++    return GcTrigger.DEFAULT;
++  }
++
++  protected DebuggerControl defaultDebuggerControl() {
++    return DebuggerControl.NONE;
++  }
++
++  protected ExcludedRefs defaultExcludedRefs() {
++    return ExcludedRefs.builder().build();
++  }
++
++  protected HeapDumper defaultHeapDumper() {
++    return HeapDumper.NONE;
++  }
++
++  protected HeapDump.Listener defaultHeapDumpListener() {
++    return HeapDump.Listener.NONE;
++  }
++
++  protected WatchExecutor defaultWatchExecutor() {
++    return WatchExecutor.NONE;
++  }
++
++  protected final T self() {
++    //noinspection unchecked
++    return (T) this;
++  }
++}
+diff --git a/leakcanary-watcher/src/main/java/com/squareup/leakcanary/Retryable.java b/leakcanary-watcher/src/main/java/com/squareup/leakcanary/Retryable.java
+new file mode 100644
+index 00000000..d9d19d40
+--- /dev/null
++++ b/leakcanary-watcher/src/main/java/com/squareup/leakcanary/Retryable.java
+@@ -0,0 +1,11 @@
++package com.squareup.leakcanary;
++
++/** A unit of work that can be retried later. */
++public interface Retryable {
++
++  enum Result {
++    DONE, RETRY
++  }
++
++  Result run();
++}
+diff --git a/leakcanary-watcher/src/main/java/com/squareup/leakcanary/WatchExecutor.java b/leakcanary-watcher/src/main/java/com/squareup/leakcanary/WatchExecutor.java
+new file mode 100644
+index 00000000..9446877c
+--- /dev/null
++++ b/leakcanary-watcher/src/main/java/com/squareup/leakcanary/WatchExecutor.java
+@@ -0,0 +1,14 @@
++package com.squareup.leakcanary;
++
++/**
++ * A {@link WatchExecutor} is in charge of executing a {@link Retryable} in the future, and retry
++ * later if needed.
++ */
++public interface WatchExecutor {
++  WatchExecutor NONE = new WatchExecutor() {
++    @Override public void execute(Retryable retryable) {
++    }
++  };
++
++  void execute(Retryable retryable);
++}
+diff --git a/leakcanary-watcher/src/test/java/com/squareup/leakcanary/RefWatcherTest.java b/leakcanary-watcher/src/test/java/com/squareup/leakcanary/RefWatcherTest.java
+index 15b44def..c10b4d70 100644
+--- a/leakcanary-watcher/src/test/java/com/squareup/leakcanary/RefWatcherTest.java
++++ b/leakcanary-watcher/src/test/java/com/squareup/leakcanary/RefWatcherTest.java
+@@ -16,7 +16,6 @@
+ package com.squareup.leakcanary;
+ 
+ import java.io.File;
+-import java.util.concurrent.Executor;
+ import org.junit.Test;
+ 
+ import static org.junit.Assert.assertFalse;
+@@ -24,8 +23,6 @@
+ 
+ public class RefWatcherTest {
+ 
+-  static final ExcludedRefs NO_REF = new ExcludedRefs.BuilderWithParams().build();
+-
+   static class TestDumper implements HeapDumper {
+     boolean called;
+ 
+@@ -42,11 +39,11 @@
+ 
+   @SuppressWarnings("FieldCanBeLocal") Object ref;
+ 
+-  static class TestExecutor implements Executor {
+-    Runnable command;
++  static class TestExecutor implements WatchExecutor {
++    Retryable retryable;
+ 
+-    @Override public void execute(Runnable command) {
+-      this.command = command;
++    @Override public void execute(Retryable retryable) {
++      this.retryable = retryable;
+     }
+   }
+ 
+@@ -59,7 +56,7 @@
+     TestExecutor executor = new TestExecutor();
+     RefWatcher refWatcher = defaultWatcher(dumper, executor);
+     refWatcher.watch(new Object());
+-    executor.command.run();
++    executor.retryable.run();
+     assertFalse(dumper.called);
+   }
+ 
+@@ -69,12 +66,14 @@
+     RefWatcher refWatcher = defaultWatcher(dumper, executor);
+     ref = new Object();
+     refWatcher.watch(ref);
+-    executor.command.run();
++    executor.retryable.run();
+     assertTrue(dumper.called);
+   }
+ 
+   private RefWatcher defaultWatcher(TestDumper dumper, TestExecutor executor) {
+-    return new RefWatcher(executor, DebuggerControl.NONE, GcTrigger.DEFAULT, dumper,
+-        new TestListener(), NO_REF);
++    return new RefWatcherBuilder<>().watchExecutor(executor)
++        .heapDumper(dumper)
++        .heapDumpListener(new TestListener())
++        .build();
+   }
+ }

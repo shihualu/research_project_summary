@@ -1,0 +1,187 @@
+diff --git a/DaoCore/src/de/greenrobot/dao/DbUtils.java b/DaoCore/src/de/greenrobot/dao/DbUtils.java
+index 4cddca5a..114838ad 100644
+--- a/DaoCore/src/de/greenrobot/dao/DbUtils.java
++++ b/DaoCore/src/de/greenrobot/dao/DbUtils.java
+@@ -29,6 +29,8 @@
+ public class DbUtils {
+ 
+     private static ExceptionListener exceptionListener;
++    private static PerfListener perfListener;
++    private static CustomSerializeAndDeserializer customSerializeAndDeserializer;
+ 
+     public static void vacuum(SQLiteDatabase db) {
+         db.execSQL("VACUUM");
+@@ -133,7 +135,10 @@ public static void logTableDump(SQLiteDatabase db, String tablename) {
+         }
+     }
+ 
+-    public static byte[] serialize(Object o) throws IOException {
++    public static byte[] serialize(Object o, boolean ignoreCustomSerializer) throws IOException {
++        if(ignoreCustomSerializer == false && customSerializeAndDeserializer != null) {
++            return customSerializeAndDeserializer.serialize(o);
++        }
+         ByteArrayOutputStream bos = null;
+         try {
+             ObjectOutput out = null;
+@@ -152,7 +157,7 @@ public static void logTableDump(SQLiteDatabase db, String tablename) {
+             return null;
+         }
+         try {
+-            return serialize(o);
++            return serialize(o, false);
+         } catch(IOException ioe) {
+             if(exceptionListener != null) {
+                 exceptionListener.onSerializationError(ioe);
+@@ -162,7 +167,10 @@ public static void logTableDump(SQLiteDatabase db, String tablename) {
+         }
+     }
+ 
+-    public static Object deserialize(byte[] b) throws IOException, ClassNotFoundException {
++    public static Object deserialize(byte[] b, Class klass, boolean ignoreCustomDeserializer) throws IOException, ClassNotFoundException {
++        if(ignoreCustomDeserializer == false && customSerializeAndDeserializer != null) {
++            return customSerializeAndDeserializer.deserialize(b, klass);
++        }
+         ObjectInputStream in = null;
+         try {
+             in = new ObjectInputStream(new ByteArrayInputStream(b));
+@@ -172,12 +180,15 @@ public static Object deserialize(byte[] b) throws IOException, ClassNotFoundExce
+         }
+     }
+ 
+-    public static Object deserializeObject(byte[] b) {
++    public static Object deserializeObject(byte[] b, Class klass) {
+         if(b == null) {
+             return null;
+         }
+         try {
+-            return deserialize(b);
++            if(perfListener != null) {
++                perfListener.onStartDeserialization(klass);
++            }
++            return deserialize(b, klass,false);
+         } catch(ClassNotFoundException cnfe) {
+             if(exceptionListener != null) {
+                 exceptionListener.onDeserializationError(cnfe);
+@@ -188,6 +199,16 @@ public static Object deserializeObject(byte[] b) {
+                 exceptionListener.onDeserializationError(ioe);
+             }
+             throw new RuntimeException("inconsisitent db detected");
++        } catch (Exception e) {
++            if(exceptionListener != null) {
++                exceptionListener.onDeserializationError(e);
++            }
++            throw new RuntimeException("inconsisitent db detected");
++        }
++        finally {
++            if(perfListener != null) {
++                perfListener.onFinishDeserialization();
++            }
+         }
+     }
+ 
+@@ -206,9 +227,29 @@ public static void setExceptionListener(ExceptionListener exceptionListener) {
+         DbUtils.exceptionListener = exceptionListener;
+     }
+ 
++    public static void setPerfListener(PerfListener perfListener) {
++        DbUtils.perfListener = perfListener;
++    }
++
++    public static void setCustomSerializeAndDeserializer(CustomSerializeAndDeserializer customSerializeAndDeserializer) {
++        DbUtils.customSerializeAndDeserializer = customSerializeAndDeserializer;
++    }
++
+     public static interface ExceptionListener {
+         public void onSerializationError(IOException ioException);
+         public void onDeserializationError(ClassNotFoundException cnfException);
+         public void onDeserializationError(IOException ioException);
++        public void onDeserializationError(Exception anyException);
++    }
++
++    public static interface PerfListener {
++        public void onStartDeserialization(Class klass);
++        public void onFinishDeserialization();
++    }
++
++    public static interface CustomSerializeAndDeserializer {
++        public Object deserialize(byte[] b, Class klass) throws IOException, ClassNotFoundException;
++        public byte[] serialize(Object o) throws IOException;
+     }
++
+ }
+diff --git a/DaoGenerator/src-template/serialize-helper.ftl b/DaoGenerator/src-template/serialize-helper.ftl
+index df107c67..58dcdcdf 100644
+--- a/DaoGenerator/src-template/serialize-helper.ftl
++++ b/DaoGenerator/src-template/serialize-helper.ftl
+@@ -3,7 +3,7 @@
+     <@print_annotations stub.getterAnnotations, "    "/>
+     public ${stub.className} get${stub.propertyName?cap_first}() {
+         if(${stub.propertyName} == null && ${stub.property.propertyName} != null) {
+-           ${stub.propertyName}  = (${stub.className}) DbUtils.deserializeObject(${stub.property.propertyName});
++           ${stub.propertyName}  = (${stub.className}) DbUtils.deserializeObject(${stub.property.propertyName}, ${stub.genericClassName}.class);
+            ${stub.property.propertyName} = null; //clear memory, before save, we'll re-serialize anyways if needed
+         }
+         return ${stub.propertyName};
+diff --git a/DaoGenerator/src/de/greenrobot/daogenerator/SerializedProperty.java b/DaoGenerator/src/de/greenrobot/daogenerator/SerializedProperty.java
+index 7c75e156..b5c9ca6f 100644
+--- a/DaoGenerator/src/de/greenrobot/daogenerator/SerializedProperty.java
++++ b/DaoGenerator/src/de/greenrobot/daogenerator/SerializedProperty.java
+@@ -1,7 +1,9 @@
+ package de.greenrobot.daogenerator;
+ 
+ import java.util.ArrayList;
++import java.util.HashMap;
+ import java.util.List;
++import java.util.Map;
+ 
+ /**
+  * This can be used to auto-generate serialization-deserialization code
+@@ -11,6 +13,7 @@
+     protected Property property;
+     protected String propertyName;
+     protected String className;
++    protected String genericClassName;
+     protected List<String> imports = new ArrayList<String>();
+ 
+     private List<Annotation> setterAnnotations = new ArrayList<Annotation>();
+@@ -20,9 +23,40 @@ public SerializedProperty(Property property, String propertyName, String classNa
+         this.property = property;
+         this.propertyName = propertyName;
+         this.className = className;
++        setGenericClassNameFromClassName(className);
+         property.setSerialized(this);
+     }
+ 
++    private static Map<String, String> genericMapping = new HashMap<String, String>();
++    static {
++        genericMapping.put("Map", "java.util.HashMap");
++        genericMapping.put("List", "java.util.ArrayList");
++    }
++    private static String getGenericClassNameFromClassName(String className) {
++        int index = className.indexOf("<");
++        if(index == -1) {
++            return className;
++        }
++        String generic = className.substring(0, index);
++        //if it has java util, strip it
++        if(generic.startsWith("java.util.")) {
++            generic = generic.substring("java.util.".length(), generic.length());
++        }
++        String container = genericMapping.get(generic);
++        if(container == null) {
++            throw new RuntimeException("cannot find container for " + className);
++        }
++        return container;
++    }
++
++    private void setGenericClassNameFromClassName(String className) {
++        genericClassName = getGenericClassNameFromClassName(className);
++    }
++
++    public String getGenericClassName() {
++        return genericClassName;
++    }
++
+     public Property getProperty() {
+         return property;
+     }

@@ -1,0 +1,713 @@
+diff --git a/.travis.yml b/.travis.yml
+index e1bcf184..6e6a0f59 100644
+--- a/.travis.yml
++++ b/.travis.yml
+@@ -17,8 +17,8 @@ before_install:
+   - export TERM=dumb
+   # newer version of gradle
+   - wget http://services.gradle.org/distributions/gradle-1.9-bin.zip
+-  - unzip -qq gradle-1.8-bin.zip
+-  - export GRADLE_HOME=$PWD/gradle-1.8
++  - unzip -qq gradle-1.9-bin.zip
++  - export GRADLE_HOME=$PWD/gradle-1.9
+   - export PATH=$GRADLE_HOME/bin:$PATH
+   # just to test gradle version, against our provided one
+   - gradle -v
+@@ -29,6 +29,8 @@ before_install:
+   - export PATH=${PATH}:${ANDROID_HOME}/tools:${ANDROID_HOME}/platform-tools
+   # manually set sdk.dir variable, according to local paths
+   - echo "sdk.dir=$ANDROID_HOME" > local.properties
++  # list packages for debug purpose
++  - android list sdk -a -e -u
+   - echo yes | android update sdk -t tools,platform-tools,extra-android-support,extra-android-m2repository,android-19,build-tools-19.0.0 --force --no-ui
+   # Sonatype bypass
+   - echo "nexusUsername=dummy" >> library/gradle.properties
+diff --git a/library/src/main/java/com/loopj/android/http/AsyncHttpClient.java b/library/src/main/java/com/loopj/android/http/AsyncHttpClient.java
+index 24f409e2..dc3f9c10 100644
+--- a/library/src/main/java/com/loopj/android/http/AsyncHttpClient.java
++++ b/library/src/main/java/com/loopj/android/http/AsyncHttpClient.java
+@@ -63,15 +63,14 @@
+ 
+ import java.io.IOException;
+ import java.io.InputStream;
+-import java.lang.ref.WeakReference;
+ import java.util.HashMap;
++import java.util.Iterator;
+ import java.util.LinkedList;
+ import java.util.List;
+ import java.util.Map;
+ import java.util.WeakHashMap;
+ import java.util.concurrent.ExecutorService;
+ import java.util.concurrent.Executors;
+-import java.util.concurrent.Future;
+ import java.util.concurrent.ThreadPoolExecutor;
+ import java.util.zip.GZIPInputStream;
+ 
+@@ -109,7 +108,7 @@
+     private final DefaultHttpClient httpClient;
+     private final HttpContext httpContext;
+     private ExecutorService threadPool;
+-    private final Map<Context, List<WeakReference<Future<?>>>> requestMap;
++    private final Map<Context, List<RequestHandle>> requestMap;
+     private final Map<String, String> clientHeaderMap;
+     private boolean isUrlEncodingEnabled = true;
+ 
+@@ -211,7 +210,7 @@ public AsyncHttpClient(SchemeRegistry schemeRegistry) {
+         ThreadSafeClientConnManager cm = new ThreadSafeClientConnManager(httpParams, schemeRegistry);
+ 
+         threadPool = Executors.newCachedThreadPool();
+-        requestMap = new WeakHashMap<Context, List<WeakReference<Future<?>>>>();
++        requestMap = new WeakHashMap<Context, List<RequestHandle>>();
+         clientHeaderMap = new HashMap<String, String>();
+ 
+         httpContext = new SyncBasicHttpContext(new BasicHttpContext());
+@@ -488,16 +487,13 @@ public void clearBasicAuth() {
+      *                              pending requests.
+      */
+     public void cancelRequests(Context context, boolean mayInterruptIfRunning) {
+-        List<WeakReference<Future<?>>> requestList = requestMap.get(context);
++        List<RequestHandle> requestList = requestMap.get(context);
+         if (requestList != null) {
+-            for (WeakReference<Future<?>> requestRef : requestList) {
+-                Future<?> request = requestRef.get();
+-                if (request != null) {
+-                    request.cancel(mayInterruptIfRunning);
+-                }
++            for (RequestHandle requestHandle : requestList) {
++                requestHandle.cancel(mayInterruptIfRunning);
+             }
++            requestMap.remove(context);
+         }
+-        requestMap.remove(context);
+     }
+ 
+     // [+] HTTP HEAD
+@@ -897,22 +893,29 @@ protected RequestHandle sendRequest(DefaultHttpClient client, HttpContext httpCo
+         responseHandler.setRequestHeaders(uriRequest.getAllHeaders());
+         responseHandler.setRequestURI(uriRequest.getURI());
+ 
+-        Future<?> request = threadPool.submit(new AsyncHttpRequest(client, httpContext, uriRequest, responseHandler));
++        AsyncHttpRequest request = new AsyncHttpRequest(client, httpContext, uriRequest, responseHandler);
++        threadPool.submit(request);
++        RequestHandle requestHandle = new RequestHandle(request);
+ 
+         if (context != null) {
+             // Add request to request map
+-            List<WeakReference<Future<?>>> requestList = requestMap.get(context);
++            List<RequestHandle> requestList = requestMap.get(context);
+             if (requestList == null) {
+-                requestList = new LinkedList<WeakReference<Future<?>>>();
++                requestList = new LinkedList<RequestHandle>();
+                 requestMap.put(context, requestList);
+             }
+ 
+-            requestList.add(new WeakReference<Future<?>>(request));
++            requestList.add(requestHandle);
+ 
+-            // TODO: Remove dead weakrefs from requestLists?
++            Iterator<RequestHandle> iterator = requestList.iterator();
++            while (iterator.hasNext()) {
++                if (iterator.next().shouldBeGarbageCollected()) {
++                    iterator.remove();
++                }
++            }
+         }
+ 
+-        return new RequestHandle(request);
++        return requestHandle;
+     }
+ 
+     /**
+diff --git a/library/src/main/java/com/loopj/android/http/AsyncHttpRequest.java b/library/src/main/java/com/loopj/android/http/AsyncHttpRequest.java
+index 55791f18..b9dc45ca 100644
+--- a/library/src/main/java/com/loopj/android/http/AsyncHttpRequest.java
++++ b/library/src/main/java/com/loopj/android/http/AsyncHttpRequest.java
+@@ -39,6 +39,9 @@
+     private final HttpUriRequest request;
+     private final ResponseHandlerInterface responseHandler;
+     private int executionCount;
++    private boolean isCancelled = false;
++    private boolean cancelIsNotified = false;
++    private boolean isFinished = false;
+ 
+     public AsyncHttpRequest(AbstractHttpClient client, HttpContext context, HttpUriRequest request, ResponseHandlerInterface responseHandler) {
+         this.client = client;
+@@ -49,40 +52,53 @@ public AsyncHttpRequest(AbstractHttpClient client, HttpContext context, HttpUriR
+ 
+     @Override
+     public void run() {
++        if (isCancelled()) {
++            return;
++        }
++
+         if (responseHandler != null) {
+             responseHandler.sendStartMessage();
+         }
+ 
++        if (isCancelled()) {
++            return;
++        }
++
+         try {
+             makeRequestWithRetries();
+         } catch (IOException e) {
+-            if (responseHandler != null) {
++            if (!isCancelled() && responseHandler != null) {
+                 responseHandler.sendFailureMessage(0, null, null, e);
+             } else {
+                 Log.e("AsyncHttpRequest", "makeRequestWithRetries returned error, but handler is null", e);
+             }
+         }
+ 
++        if (isCancelled()) {
++            return;
++        }
++
+         if (responseHandler != null) {
+             responseHandler.sendFinishMessage();
+         }
++
++        isFinished = true;
+     }
+ 
+     private void makeRequest() throws IOException {
+-        if (!Thread.currentThread().isInterrupted()) {
+-            // Fixes #115
+-            if (request.getURI().getScheme() == null) {
+-                // subclass of IOException so processed in the caller
+-                throw new MalformedURLException("No valid URI scheme was provided");
+-            }
++        if (isCancelled()) {
++            return;
++        }
++        // Fixes #115
++        if (request.getURI().getScheme() == null) {
++            // subclass of IOException so processed in the caller
++            throw new MalformedURLException("No valid URI scheme was provided");
++        }
+ 
+-            HttpResponse response = client.execute(request, context);
++        HttpResponse response = client.execute(request, context);
+ 
+-            if (!Thread.currentThread().isInterrupted()) {
+-                if (responseHandler != null) {
+-                    responseHandler.sendResponseMessage(response);
+-                }
+-            }
++        if (!isCancelled() && responseHandler != null) {
++            responseHandler.sendResponseMessage(response);
+         }
+     }
+ 
+@@ -108,6 +124,10 @@ private void makeRequestWithRetries() throws IOException {
+                     cause = new IOException("NPE in HttpClient: " + e.getMessage());
+                     retry = retryHandler.retryRequest(cause, ++executionCount, context);
+                 } catch (IOException e) {
++                    if (isCancelled()) {
++                        // Eating exception, as the request was cancelled
++                        return;
++                    }
+                     cause = e;
+                     retry = retryHandler.retryRequest(cause, ++executionCount, context);
+                 }
+@@ -124,4 +144,31 @@ private void makeRequestWithRetries() throws IOException {
+         // cleaned up to throw IOException
+         throw (cause);
+     }
++
++    public boolean isCancelled() {
++        if (isCancelled) {
++            sendCancelNotification();
++        }
++        return isCancelled;
++    }
++
++    private synchronized void sendCancelNotification() {
++        if (!isFinished && isCancelled && !cancelIsNotified) {
++            cancelIsNotified = true;
++            if (responseHandler != null)
++                responseHandler.sendCancelMessage();
++        }
++    }
++
++    public boolean isDone() {
++        return isCancelled() || isFinished;
++    }
++
++    public boolean cancel(boolean mayInterruptIfRunning) {
++        isCancelled = true;
++        if (mayInterruptIfRunning && request != null && !request.isAborted()) {
++            request.abort();
++        }
++        return isCancelled();
++    }
+ }
+diff --git a/library/src/main/java/com/loopj/android/http/AsyncHttpResponseHandler.java b/library/src/main/java/com/loopj/android/http/AsyncHttpResponseHandler.java
+index a2cb8b3d..66404cc3 100644
+--- a/library/src/main/java/com/loopj/android/http/AsyncHttpResponseHandler.java
++++ b/library/src/main/java/com/loopj/android/http/AsyncHttpResponseHandler.java
+@@ -88,6 +88,7 @@
+     protected static final int FINISH_MESSAGE = 3;
+     protected static final int PROGRESS_MESSAGE = 4;
+     protected static final int RETRY_MESSAGE = 5;
++    protected static final int CANCEL_MESSAGE = 6;
+ 
+     protected static final int BUFFER_SIZE = 4096;
+ 
+@@ -221,6 +222,10 @@ public void onRetry(int retryNo) {
+         Log.d(LOG_TAG, String.format("Request retry no. %d", retryNo));
+     }
+ 
++    public void onCancel() {
++        Log.d(LOG_TAG, "Request got cancelled");
++    }
++
+     final public void sendProgressMessage(int bytesWritten, int bytesTotal) {
+         sendMessage(obtainMessage(PROGRESS_MESSAGE, new Object[]{bytesWritten, bytesTotal}));
+     }
+@@ -245,6 +250,10 @@ final public void sendRetryMessage(int retryNo) {
+         sendMessage(obtainMessage(RETRY_MESSAGE, new Object[]{retryNo}));
+     }
+ 
++    final public void sendCancelMessage() {
++        sendMessage(obtainMessage(CANCEL_MESSAGE, null));
++    }
++
+     // Methods which emulate android's Handler and Message methods
+     protected void handleMessage(Message message) {
+         Object[] response;
+@@ -291,6 +300,9 @@ protected void handleMessage(Message message) {
+                 else
+                     Log.e(LOG_TAG, "RETRY_MESSAGE didn't get enough params");
+                 break;
++            case CANCEL_MESSAGE:
++                onCancel();
++                break;
+         }
+     }
+ 
+diff --git a/library/src/main/java/com/loopj/android/http/MySSLSocketFactory.java b/library/src/main/java/com/loopj/android/http/MySSLSocketFactory.java
+index 03115afc..4ea14152 100644
+--- a/library/src/main/java/com/loopj/android/http/MySSLSocketFactory.java
++++ b/library/src/main/java/com/loopj/android/http/MySSLSocketFactory.java
+@@ -1,18 +1,37 @@
+ package com.loopj.android.http;
+ 
+-import org.apache.http.conn.ssl.SSLSocketFactory;
+-
++import java.io.BufferedInputStream;
+ import java.io.IOException;
++import java.io.InputStream;
+ import java.net.Socket;
++import java.net.UnknownHostException;
+ import java.security.KeyManagementException;
+ import java.security.KeyStore;
+ import java.security.KeyStoreException;
+ import java.security.NoSuchAlgorithmException;
+ import java.security.UnrecoverableKeyException;
+-
++import java.security.cert.Certificate;
++import java.security.cert.CertificateException;
++import java.security.cert.CertificateFactory;
++import java.security.cert.X509Certificate;
++ 
++import javax.net.ssl.HttpsURLConnection;
+ import javax.net.ssl.SSLContext;
+ import javax.net.ssl.TrustManager;
+ import javax.net.ssl.X509TrustManager;
++ 
++import org.apache.http.HttpVersion;
++import org.apache.http.conn.ClientConnectionManager;
++import org.apache.http.conn.scheme.PlainSocketFactory;
++import org.apache.http.conn.scheme.Scheme;
++import org.apache.http.conn.scheme.SchemeRegistry;
++import org.apache.http.conn.ssl.SSLSocketFactory;
++import org.apache.http.impl.client.DefaultHttpClient;
++import org.apache.http.impl.conn.tsccm.ThreadSafeClientConnManager;
++import org.apache.http.params.BasicHttpParams;
++import org.apache.http.params.HttpParams;
++import org.apache.http.params.HttpProtocolParams;
++import org.apache.http.protocol.HTTP;
+ 
+ /**
+  * This file is introduced to fix HTTPS Post bug on API &lt; ICS see
+@@ -22,42 +41,94 @@
+ public class MySSLSocketFactory extends SSLSocketFactory {
+     SSLContext sslContext = SSLContext.getInstance("TLS");
+ 
+-    public MySSLSocketFactory(KeyStore truststore)
+-            throws NoSuchAlgorithmException, KeyManagementException,
+-            KeyStoreException, UnrecoverableKeyException {
++    /**
++     * Creates a new SSL Socket Factory with the given KeyStore.
++     * 
++     * @param truststore A KeyStore to create the SSL Socket Factory in context of
++     * @throws NoSuchAlgorithmException
++     * @throws KeyManagementException
++     * @throws KeyStoreException
++     * @throws UnrecoverableKeyException
++     */
++    public MySSLSocketFactory(KeyStore truststore) throws NoSuchAlgorithmException, KeyManagementException, KeyStoreException, UnrecoverableKeyException {
+         super(truststore);
+-
+-        TrustManager tm = new X509TrustManager() {
+-            public java.security.cert.X509Certificate[] getAcceptedIssuers() {
+-                return null;
++ 
++        X509TrustManager tm = new X509TrustManager() {
++            public void checkClientTrusted(X509Certificate[] chain, String authType) throws CertificateException {
+             }
+-
+-            @Override
+-            public void checkClientTrusted(
+-                    java.security.cert.X509Certificate[] chain, String authType)
+-                    throws java.security.cert.CertificateException {
++ 
++            public void checkServerTrusted(X509Certificate[] chain, String authType) throws CertificateException {
+             }
+-
+-            @Override
+-            public void checkServerTrusted(
+-                    java.security.cert.X509Certificate[] chain, String authType)
+-                    throws java.security.cert.CertificateException {
++ 
++            public X509Certificate[] getAcceptedIssuers() {
++                return null;
+             }
+         };
+-        sslContext.init(null, new TrustManager[]{tm}, null);
++ 
++        sslContext.init(null, new TrustManager[] { tm }, null);
+     }
+-
+-    @Override
+-    public Socket createSocket(Socket socket, String host, int port, boolean autoClose) throws IOException {
++    
++    public Socket createSocket(Socket socket, String host, int port, boolean autoClose) throws IOException, UnknownHostException {
+         return sslContext.getSocketFactory().createSocket(socket, host, port, autoClose);
+     }
+-
++ 
+     @Override
+     public Socket createSocket() throws IOException {
+         return sslContext.getSocketFactory().createSocket();
++    }	
++    
++    /**
++     * Makes HttpsURLConnection trusts a set of certificates specified by the KeyStore
++     */
++    public void fixHttpsURLConnection() {
++    	HttpsURLConnection.setDefaultSSLSocketFactory(sslContext.getSocketFactory());
+     }
+-
+-    public static KeyStore getKeystore() {
++    
++    /**
++     * Gets a KeyStore containing the Certificate
++     * 
++     * @param cert InputStream of the Certificate
++     * @return KeyStore
++     */
++	public static KeyStore getKeystoreOfCA(InputStream cert) {
++		
++		// Load CAs from an InputStream
++		InputStream caInput = null;
++		Certificate ca = null;
++		try {
++			CertificateFactory cf = CertificateFactory.getInstance("X.509");
++			caInput = new BufferedInputStream(cert);
++			ca = (Certificate) cf.generateCertificate(caInput);
++		} catch (CertificateException e1) {
++			e1.printStackTrace();
++		} finally {
++			try {
++				caInput.close();
++			} catch (IOException e) {
++				e.printStackTrace();
++			}
++		}
++ 
++		// Create a KeyStore containing our trusted CAs
++		String keyStoreType = KeyStore.getDefaultType();
++		KeyStore keyStore = null;
++		try {
++			keyStore = KeyStore.getInstance(keyStoreType);
++			keyStore.load(null, null);
++			keyStore.setCertificateEntry("ca",
++					(java.security.cert.Certificate) ca);
++		} catch (Exception e) {
++			e.printStackTrace();
++		}
++		return keyStore;
++	}
++	
++	/**
++	 * Gets a Default KeyStore
++	 * 
++	 * @return KeyStore
++	 */
++	public static KeyStore getKeystore() {
+         KeyStore trustStore = null;
+         try {
+             trustStore = KeyStore.getInstance(KeyStore.getDefaultType());
+@@ -67,7 +138,12 @@ public static KeyStore getKeystore() {
+         }
+         return trustStore;
+     }
+-
++ 
++	/**
++	 * Returns a SSlSocketFactory which trusts all certificates
++	 * 
++	 * @return
++	 */
+     public static SSLSocketFactory getFixedSocketFactory() {
+         SSLSocketFactory socketFactory;
+         try {
+@@ -79,5 +155,31 @@ public static SSLSocketFactory getFixedSocketFactory() {
+         }
+         return socketFactory;
+     }
++    
++    /**
++     * Gets a DefaultHttpClient which trusts a set of certificates specified by the KeyStore
++     * 
++     * @param keyStore
++     * @return
++     */
++	public static DefaultHttpClient getNewHttpClient(KeyStore keyStore) {
++		
++	    try {
++		    SSLSocketFactory sf = new MySSLSocketFactory(keyStore);
++		    SchemeRegistry registry = new SchemeRegistry();
++		    registry.register(new Scheme("http", PlainSocketFactory.getSocketFactory(), 80));
++		    registry.register(new Scheme("https", sf, 443));
++ 
++	        HttpParams params = new BasicHttpParams();
++	        HttpProtocolParams.setVersion(params, HttpVersion.HTTP_1_1);
++	        HttpProtocolParams.setContentCharset(params, HTTP.UTF_8);
++ 
++	        ClientConnectionManager ccm = new ThreadSafeClientConnManager(params, registry);
++ 
++	        return new DefaultHttpClient(ccm, params);
++	    } catch (Exception e) {
++	        return new DefaultHttpClient();
++	    }
++	}
+ 
+-}
+\ No newline at end of file
++}
+diff --git a/library/src/main/java/com/loopj/android/http/RequestHandle.java b/library/src/main/java/com/loopj/android/http/RequestHandle.java
+index 08cb7824..bd9acb29 100644
+--- a/library/src/main/java/com/loopj/android/http/RequestHandle.java
++++ b/library/src/main/java/com/loopj/android/http/RequestHandle.java
+@@ -1,15 +1,15 @@
+ package com.loopj.android.http;
+ 
+-import java.util.concurrent.Future;
++import java.lang.ref.WeakReference;
+ 
+ /**
+  * A Handle to an AsyncRequest which can be used to cancel a running request.
+  */
+ public class RequestHandle {
+-    private final Future<?> request;
++    private final WeakReference<AsyncHttpRequest> request;
+ 
+-    public RequestHandle(Future<?> request) {
+-        this.request = request;
++    public RequestHandle(AsyncHttpRequest request) {
++        this.request = new WeakReference<AsyncHttpRequest>(request);
+     }
+ 
+     /**
+@@ -28,7 +28,8 @@ public RequestHandle(Future<?> request) {
+      * completed normally; true otherwise
+      */
+     public boolean cancel(boolean mayInterruptIfRunning) {
+-        return this.request != null && request.cancel(mayInterruptIfRunning);
++        AsyncHttpRequest _request = request.get();
++        return _request == null || _request.cancel(mayInterruptIfRunning);
+     }
+ 
+     /**
+@@ -38,7 +39,8 @@ public boolean cancel(boolean mayInterruptIfRunning) {
+      * @return true if this task completed
+      */
+     public boolean isFinished() {
+-        return this.request == null || request.isDone();
++        AsyncHttpRequest _request = request.get();
++        return _request == null || _request.isDone();
+     }
+ 
+     /**
+@@ -47,6 +49,14 @@ public boolean isFinished() {
+      * @return true if this task was cancelled before it completed
+      */
+     public boolean isCancelled() {
+-        return this.request != null && request.isCancelled();
++        AsyncHttpRequest _request = request.get();
++        return _request == null || _request.isCancelled();
++    }
++
++    public boolean shouldBeGarbageCollected() {
++        boolean should = isCancelled() || isFinished();
++        if (should)
++            request.clear();
++        return should;
+     }
+ }
+\ No newline at end of file
+diff --git a/library/src/main/java/com/loopj/android/http/ResponseHandlerInterface.java b/library/src/main/java/com/loopj/android/http/ResponseHandlerInterface.java
+index d563a20c..4641a868 100644
+--- a/library/src/main/java/com/loopj/android/http/ResponseHandlerInterface.java
++++ b/library/src/main/java/com/loopj/android/http/ResponseHandlerInterface.java
+@@ -37,6 +37,11 @@
+      */
+     void sendProgressMessage(int bytesWritten, int bytesTotal);
+ 
++    /**
++     * Notifies callback, that request was cancelled
++     */
++    void sendCancelMessage();
++
+     /**
+      * Notifies callback, that request was handled successfully
+      *
+diff --git a/library/src/main/java/com/loopj/android/http/SimpleMultipartEntity.java b/library/src/main/java/com/loopj/android/http/SimpleMultipartEntity.java
+index ef2d42ec..7d134599 100644
+--- a/library/src/main/java/com/loopj/android/http/SimpleMultipartEntity.java
++++ b/library/src/main/java/com/loopj/android/http/SimpleMultipartEntity.java
+@@ -190,7 +190,7 @@ public FilePart(String key, File file, String type) {
+         }
+ 
+         public long getTotalLength() {
+-            long streamLength = file.length();
++            long streamLength = file.length() + CR_LF.length;
+             return header.length + streamLength;
+         }
+ 
+diff --git a/sample/src/main/java/com/loopj/android/http/sample/SampleParentActivity.java b/sample/src/main/java/com/loopj/android/http/sample/SampleParentActivity.java
+index 2592ee81..182425d2 100644
+--- a/sample/src/main/java/com/loopj/android/http/sample/SampleParentActivity.java
++++ b/sample/src/main/java/com/loopj/android/http/sample/SampleParentActivity.java
+@@ -47,6 +47,7 @@ protected void onCreate(Bundle savedInstanceState) {
+         headersEditText = (EditText) findViewById(R.id.edit_headers);
+         bodyEditText = (EditText) findViewById(R.id.edit_body);
+         Button runButton = (Button) findViewById(R.id.button_run);
++        Button cancelButton = (Button) findViewById(R.id.button_cancel);
+         LinearLayout headersLayout = (LinearLayout) findViewById(R.id.layout_headers);
+         LinearLayout bodyLayout = (LinearLayout) findViewById(R.id.layout_body);
+         responseLayout = (LinearLayout) findViewById(R.id.layout_response);
+@@ -57,6 +58,10 @@ protected void onCreate(Bundle savedInstanceState) {
+         headersLayout.setVisibility(isRequestHeadersAllowed() ? View.VISIBLE : View.GONE);
+ 
+         runButton.setOnClickListener(onClickListener);
++        if (isCancelButtonAllowed() && cancelButton != null) {
++            cancelButton.setVisibility(View.VISIBLE);
++            cancelButton.setOnClickListener(onClickListener);
++        }
+     }
+ 
+     private View.OnClickListener onClickListener = new View.OnClickListener() {
+@@ -70,6 +75,9 @@ public void onClick(View v) {
+                             getRequestEntity(),
+                             getResponseHandler());
+                     break;
++                case R.id.button_cancel:
++                    asyncHttpClient.cancelRequests(SampleParentActivity.this, true);
++                    break;
+             }
+         }
+     };
+@@ -172,6 +180,10 @@ protected final void clearOutputs() {
+         responseLayout.removeAllViews();
+     }
+ 
++    protected boolean isCancelButtonAllowed() {
++        return false;
++    }
++
+     protected abstract int getSampleTitle();
+ 
+     protected abstract boolean isRequestBodyAllowed();
+diff --git a/sample/src/main/java/com/loopj/android/http/sample/ThreadingTimeoutSample.java b/sample/src/main/java/com/loopj/android/http/sample/ThreadingTimeoutSample.java
+index aeb131a5..568537fe 100644
+--- a/sample/src/main/java/com/loopj/android/http/sample/ThreadingTimeoutSample.java
++++ b/sample/src/main/java/com/loopj/android/http/sample/ThreadingTimeoutSample.java
+@@ -8,12 +8,11 @@
+ import org.apache.http.Header;
+ import org.apache.http.HttpEntity;
+ 
+-import java.util.Random;
+-
+ public class ThreadingTimeoutSample extends SampleParentActivity {
+ 
+     private static final String LOG_TAG = "ThreadingTimeoutSample";
+     private SparseArray<String> states = new SparseArray<String>();
++    private int counter = 0;
+ 
+     @Override
+     protected int getSampleTitle() {
+@@ -30,6 +29,11 @@ protected boolean isRequestHeadersAllowed() {
+         return false;
+     }
+ 
++    @Override
++    protected boolean isCancelButtonAllowed() {
++        return true;
++    }
++
+     @Override
+     protected String getDefaultURL() {
+         return "http://httpbin.org/delay/6";
+@@ -48,7 +52,7 @@ private synchronized void setStatus(int id, String status) {
+     protected AsyncHttpResponseHandler getResponseHandler() {
+         return new AsyncHttpResponseHandler() {
+ 
+-            private int id = new Random().nextInt(1000);
++            private int id = counter++;
+ 
+             @Override
+             public void onStart() {
+@@ -69,6 +73,11 @@ public void onFinish() {
+             public void onFailure(int statusCode, Header[] headers, byte[] responseBody, Throwable error) {
+                 setStatus(id, "FAILURE");
+             }
++
++            @Override
++            public void onCancel() {
++                setStatus(id, "CANCEL");
++            }
+         };
+     }
+ 
+diff --git a/sample/src/main/res/layout/parent_layout.xml b/sample/src/main/res/layout/parent_layout.xml
+index f6872a06..b32b7b74 100644
+--- a/sample/src/main/res/layout/parent_layout.xml
++++ b/sample/src/main/res/layout/parent_layout.xml
+@@ -31,6 +31,13 @@
+                 android:layout_width="wrap_content"
+                 android:layout_height="wrap_content"
+                 android:text="@string/button_run" />
++
++            <Button
++                android:id="@+id/button_cancel"
++                android:layout_width="wrap_content"
++                android:layout_height="wrap_content"
++                android:visibility="gone"
++                android:text="@string/button_cancel" />
+         </LinearLayout>
+ 
+         <LinearLayout
+diff --git a/sample/src/main/res/values/strings.xml b/sample/src/main/res/values/strings.xml
+index 3eb4b4d5..9e6bae35 100644
+--- a/sample/src/main/res/values/strings.xml
++++ b/sample/src/main/res/values/strings.xml
+@@ -12,4 +12,5 @@
+     <string name="button_run">Run</string>
+     <string name="label_headers">Headers (key=val, one per line)</string>
+     <string name="label_req_body">Request body</string>
++    <string name="button_cancel">Cancel</string>
+ </resources>

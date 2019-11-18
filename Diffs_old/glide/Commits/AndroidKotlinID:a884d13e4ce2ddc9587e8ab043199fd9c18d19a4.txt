@@ -1,0 +1,928 @@
+diff --git a/library/src/main/java/com/bumptech/glide/load/resource/bitmap/Downsampler.java b/library/src/main/java/com/bumptech/glide/load/resource/bitmap/Downsampler.java
+index 189343a98..963348f9d 100644
+--- a/library/src/main/java/com/bumptech/glide/load/resource/bitmap/Downsampler.java
++++ b/library/src/main/java/com/bumptech/glide/load/resource/bitmap/Downsampler.java
+@@ -119,9 +119,9 @@ public void onDecodeComplete(BitmapPool bitmapPool, Bitmap downsampled) throws I
+           )
+       );
+   private static final Queue<BitmapFactory.Options> OPTIONS_QUEUE = Util.createQueue(0);
+-  // 5MB. This is the max image header size we can handle, we preallocate a much smaller buffer
++  // 10MB. This is the max image header size we can handle, we preallocate a much smaller buffer
+   // but will resize up to this amount if necessary.
+-  private static final int MARK_POSITION = 5 * 1024 * 1024;
++  private static final int MARK_POSITION = 10 * 1024 * 1024;
+   // Defines the level of precision we get when using inDensity/inTargetDensity to calculate an
+   // arbitrary float scale factor.
+   private static final int DENSITY_PRECISION_MULTIPLIER = 1000000000;
+@@ -228,6 +228,14 @@ private Bitmap decodeFromWrappedStreams(InputStream is,
+     int sourceHeight = sourceDimensions[1];
+     String sourceMimeType = options.outMimeType;
+ 
++    // If we failed to obtain the image dimensions, we may end up with an incorrectly sized Bitmap,
++    // so we want to use a mutable Bitmap type. One way this can happen is if the image header is so
++    // large (10mb+) that our attempt to use inJustDecodeBounds fails and we're forced to decode the
++    // full size image.
++    if (sourceWidth == -1 || sourceHeight == -1) {
++      isHardwareConfigAllowed = false;
++    }
++
+     int orientation = ImageHeaderParserUtils.getOrientation(parsers, is, byteArrayPool);
+     int degreesToRotate = TransformationUtils.getExifOrientationDegrees(orientation);
+     boolean isExifOrientationRequired = TransformationUtils.isExifOrientationRequired(orientation);
+@@ -385,12 +393,20 @@ static void calculateScaling(
+     // JPEG - Always uses ceiling
+     // Webp - Prior to N, always uses floor. At and after N, always uses round.
+     options.inSampleSize = powerOfTwoSampleSize;
+-    final int powerOfTwoWidth;
+-    final int powerOfTwoHeight;
+-    // Jpeg rounds with ceiling on all API verisons.
++    int powerOfTwoWidth;
++    int powerOfTwoHeight;
+     if (imageType == ImageType.JPEG) {
+-      powerOfTwoWidth = (int) Math.ceil(sourceWidth / (float) powerOfTwoSampleSize);
+-      powerOfTwoHeight = (int) Math.ceil(sourceHeight / (float) powerOfTwoSampleSize);
++      // libjpegturbo can downsample up to a sample size of 8. libjpegturbo uses ceiling to round.
++      // After libjpegturbo's native rounding, skia does a secondary scale using floor
++      // (integer division). Here we replicate that logic.
++      int nativeScaling = Math.min(powerOfTwoSampleSize, 8);
++      powerOfTwoWidth = (int) Math.ceil(sourceWidth / (float) nativeScaling);
++      powerOfTwoHeight = (int) Math.ceil(sourceHeight / (float) nativeScaling);
++      int secondaryScaling = powerOfTwoSampleSize / 8;
++      if (secondaryScaling > 0) {
++        powerOfTwoWidth = powerOfTwoWidth / secondaryScaling;
++        powerOfTwoHeight = powerOfTwoHeight / secondaryScaling;
++      }
+     } else if (imageType == ImageType.PNG || imageType == ImageType.PNG_A) {
+       powerOfTwoWidth = (int) Math.floor(sourceWidth / (float) powerOfTwoSampleSize);
+       powerOfTwoHeight = (int) Math.floor(sourceHeight / (float) powerOfTwoSampleSize);
+diff --git a/library/src/main/java/com/bumptech/glide/request/target/ViewTarget.java b/library/src/main/java/com/bumptech/glide/request/target/ViewTarget.java
+index 335c00000..555fc3fcb 100644
+--- a/library/src/main/java/com/bumptech/glide/request/target/ViewTarget.java
++++ b/library/src/main/java/com/bumptech/glide/request/target/ViewTarget.java
+@@ -1,11 +1,16 @@
+ package com.bumptech.glide.request.target;
+ 
++import android.content.Context;
++import android.graphics.Point;
+ import android.graphics.drawable.Drawable;
+ import android.support.annotation.Nullable;
++import android.support.annotation.VisibleForTesting;
+ import android.util.Log;
++import android.view.Display;
+ import android.view.View;
+ import android.view.ViewGroup.LayoutParams;
+ import android.view.ViewTreeObserver;
++import android.view.WindowManager;
+ import com.bumptech.glide.request.Request;
+ import com.bumptech.glide.util.Preconditions;
+ import com.bumptech.glide.util.Synthetic;
+@@ -42,8 +47,12 @@
+   private final SizeDeterminer sizeDeterminer;
+ 
+   public ViewTarget(T view) {
++    this(view, false /*waitForLayout*/);
++  }
++
++  public ViewTarget(T view, boolean waitForLayout) {
+     this.view = Preconditions.checkNotNull(view);
+-    sizeDeterminer = new SizeDeterminer(view);
++    sizeDeterminer = new SizeDeterminer(view, waitForLayout);
+   }
+ 
+   /**
+@@ -164,16 +173,35 @@ public static void setTagId(int tagId) {
+       ViewTarget.tagId = tagId;
+   }
+ 
+-  private static class SizeDeterminer {
++  @VisibleForTesting
++  static final class SizeDeterminer {
+     // Some negative sizes (Target.SIZE_ORIGINAL) are valid, 0 is never valid.
+     private static final int PENDING_SIZE = 0;
++    @VisibleForTesting
++    @Nullable
++    static Integer maxDisplayLength;
+     private final View view;
++    private final boolean waitForLayout;
+     private final List<SizeReadyCallback> cbs = new ArrayList<>();
+ 
+     @Nullable private SizeDeterminerLayoutListener layoutListener;
+ 
+-    SizeDeterminer(View view) {
++    SizeDeterminer(View view, boolean waitForLayout) {
+       this.view = view;
++      this.waitForLayout = waitForLayout;
++    }
++
++    // Use the maximum to avoid depending on the device's current orientation.
++    private static int getMaxDisplayLength(Context context) {
++      if (maxDisplayLength == null) {
++        WindowManager windowManager =
++            (WindowManager) context.getSystemService(Context.WINDOW_SERVICE);
++        Display display = windowManager.getDefaultDisplay();
++        Point displayDimensions = new Point();
++        display.getSize(displayDimensions);
++        maxDisplayLength = Math.max(displayDimensions.x, displayDimensions.y);
++      }
++      return maxDisplayLength;
+     }
+ 
+     private void notifyCbs(int width, int height) {
+@@ -247,44 +275,8 @@ void clearCallbacksAndListener() {
+       cbs.clear();
+     }
+ 
+-    private boolean isViewStateAndSizeValid(int currentWidth, int currentHeight) {
+-      LayoutParams params = view.getLayoutParams();
+-
+-      int paramWidth;
+-      int paramHeight;
+-      if (params == null) {
+-        paramWidth = 0;
+-        paramHeight = 0;
+-      } else {
+-        paramWidth = params.width;
+-        paramHeight = params.height;
+-      }
+-      return isDimensionValid(paramWidth, currentWidth)
+-          && isDimensionValid(paramHeight, currentHeight);
+-    }
+-
+-    private boolean isDimensionValid(int layoutParam, int dimen) {
+-      // If the layout parameter is a fixed size and the padding adjusted parameter (dimen in this
+-      // case) is valid, we can trust that the size won't change due to a layout pass.
+-      if (layoutParam > 0 && dimen > 0) {
+-        return true;
+-      }
+-
+-      // SIZE_ORIGINAL is not dependent on a layout pass.
+-      if (dimen == Target.SIZE_ORIGINAL) {
+-        return true;
+-      }
+-
+-      // TODO: Is this correct? The view's parent could change size after a layout.
+-      // We're making an assumption that MATCH_PARENT won't change after it has been set once, so
+-      // future layout passes typically won't change it. This probably will break in some cases.
+-      if (layoutParam == LayoutParams.MATCH_PARENT && dimen > 0) {
+-        return true;
+-      }
+-
+-      // We can trust a non-zero dimension if no layout pass is pending, otherwise we're going to
+-      // have to wait for a layout pass.
+-      return dimen > 0 && !view.isLayoutRequested();
++    private boolean isViewStateAndSizeValid(int width, int height) {
++      return isDimensionValid(width) && isDimensionValid(height);
+     }
+ 
+     private int getTargetHeight() {
+@@ -302,20 +294,62 @@ private int getTargetWidth() {
+     }
+ 
+     private int getTargetDimen(int viewSize, int paramSize, int paddingSize) {
++      if (waitForLayout && view.isLayoutRequested()) {
++        return PENDING_SIZE;
++      }
++
++      // We consider the View state as valid if the View has non-null layout params and a non-zero
++      // layout params width and height. This is imperfect. We're making an assumption that View
++      // parents will obey their child's layout parameters, which isn't always the case.
++      int adjustedParamSize = paramSize - paddingSize;
++      if (adjustedParamSize > 0) {
++        return adjustedParamSize;
++      }
++
++      // We also consider the View state valid if the View has a non-zero width and height. This
++      // means that the View has gone through at least one layout pass. It does not mean the Views
++      // width and height are from the current layout pass. For example, if a View is re-used in
++      // RecyclerView or ListView, this width/height may be from an old position. In some cases
++      // the dimensions of the View at the old position may be different than the dimensions of the
++      // View in the new position because the LayoutManager/ViewParent can arbitrarily decide to
++      // change them. Nevertheless, in most cases this should be a reasonable choice.
+       int adjustedViewSize = viewSize - paddingSize;
+-      if (paramSize == LayoutParams.WRAP_CONTENT) {
+-        return SIZE_ORIGINAL;
+-      } else if (paramSize > 0) {
+-        return paramSize - paddingSize;
+-      } else if (adjustedViewSize > 0) {
++      if (adjustedViewSize > 0) {
+         return adjustedViewSize;
+-      } else {
+-        return PENDING_SIZE;
+       }
++
++      // Finally we consider the view valid if the layout parameter size is set to wrap_content.
++      // It's difficult for Glide to figure out what to do here. Although Target.SIZE_ORIGINAL is a
++      // coherent choice, it's extremely dangerous and therefore a bad default. If users want the
++      // original image, they can always use .override(Target.SIZE_ORIGINAL). Since wrap_content
++      // may never resolve to a real size unless we load something, we aim for a square whose length
++      // is the largest screen size. That way we're loading something and that something has some
++      // hope of being downsampled to a size that the device can support. We also log a warning that
++      // tries to explain what Glide is doing and why some alternatives are preferable.
++      if (paramSize == LayoutParams.WRAP_CONTENT) {
++        if (Log.isLoggable(TAG, Log.INFO)) {
++          Log.i(TAG, "Glide treats LayoutParams.WRAP_CONTENT as a request for an image the size of"
++              + " this device's screen dimensions. If you want to load the original image and are"
++              + " ok with the corresponding memory cost and OOMs (depending on the input size), use"
++              + " .override(Target.SIZE_ORIGINAL). Otherwise, use LayoutParams.MATCH_PARENT, set"
++              + " layout_width and layout_height to fixed dimension, or use .override() with fixed"
++              + " dimensions.");
++        }
++        return getMaxDisplayLength(view.getContext());
++      }
++
++      // If the layout parameters are < padding, the view size is < padding, or the layout
++      // parameters are set to match_parent or wrap_content and no layout has occurred, we should
++      // wait for layout and repeat.
++      return PENDING_SIZE;
++    }
++
++    private boolean isDimensionValid(int size) {
++      return size > 0 || size == SIZE_ORIGINAL;
+     }
+ 
+-    private static class SizeDeterminerLayoutListener implements ViewTreeObserver
+-        .OnPreDrawListener {
++    private static final class SizeDeterminerLayoutListener
++        implements ViewTreeObserver.OnPreDrawListener {
+       private final WeakReference<SizeDeterminer> sizeDeterminerRef;
+ 
+       SizeDeterminerLayoutListener(SizeDeterminer sizeDeterminer) {
+diff --git a/library/src/test/java/com/bumptech/glide/request/target/ViewTargetTest.java b/library/src/test/java/com/bumptech/glide/request/target/ViewTargetTest.java
+index 7d0756022..e8a603d36 100644
+--- a/library/src/test/java/com/bumptech/glide/request/target/ViewTargetTest.java
++++ b/library/src/test/java/com/bumptech/glide/request/target/ViewTargetTest.java
+@@ -13,10 +13,12 @@
+ import static org.mockito.Mockito.times;
+ import static org.mockito.Mockito.verify;
+ 
++import android.content.Context;
+ import android.graphics.drawable.Drawable;
+ import android.os.Build;
+ import android.view.View;
+ import android.view.ViewTreeObserver;
++import android.view.WindowManager;
+ import com.bumptech.glide.request.Request;
+ import com.bumptech.glide.request.transition.Transition;
+ import com.bumptech.glide.tests.Util;
+@@ -31,10 +33,12 @@
+ import org.mockito.MockitoAnnotations;
+ import org.robolectric.RobolectricTestRunner;
+ import org.robolectric.RuntimeEnvironment;
++import org.robolectric.Shadows;
+ import org.robolectric.annotation.Config;
+ import org.robolectric.annotation.Implementation;
+ import org.robolectric.annotation.Implements;
+ import org.robolectric.shadow.api.Shadow;
++import org.robolectric.shadows.ShadowDisplay;
+ import org.robolectric.shadows.ShadowView;
+ 
+ @RunWith(RobolectricTestRunner.class)
+@@ -63,6 +67,7 @@ public void setUp() {
+   @After
+   public void tearDown() {
+     Util.setSdkVersionInt(sdkVersion);
++    ViewTarget.SizeDeterminer.maxDisplayLength = null;
+   }
+ 
+   @Test
+@@ -98,11 +103,12 @@ public void testRetrievesRequestFromPreviousTargetForView() {
+   }
+ 
+   @Test
+-  public void getSize_withValidDimens_noLayoutRequested_callsSizeReady() {
++  public void testSizeCallbackIsCalledSynchronouslyIfViewSizeSet() {
+     int dimens = 333;
+     shadowView
+         .setWidth(dimens)
+-        .setHeight(dimens);
++        .setHeight(dimens)
++        .setIsLaidOut(true);
+ 
+     target.getSize(cb);
+ 
+@@ -110,24 +116,11 @@ public void getSize_withValidDimens_noLayoutRequested_callsSizeReady() {
+   }
+ 
+   @Test
+-  public void getSize_withValidDimens_layoutRequested_doesNotCallSizeReady() {
+-    int dimens = 333;
+-    shadowView
+-        .setWidth(dimens)
+-        .setHeight(dimens);
+-    view.requestLayout();
+-
+-    target.getSize(cb);
+-
+-    verify(cb, never()).onSizeReady(anyInt(), anyInt());
+-  }
+-
+-  @Test
+-  public void getSize_withFixedLayoutParams_callsSizeReady() {
++  public void testSizeCallbackIsCalledSynchronouslyIfLayoutParamsConcreteSizeSet() {
+     int dimens = 444;
+     LayoutParams layoutParams = new LayoutParams(dimens, dimens);
+     view.setLayoutParams(layoutParams);
+-    view.requestLayout();
++    shadowView.setIsLaidOut(true);
+ 
+     target.getSize(cb);
+ 
+@@ -135,215 +128,91 @@ public void getSize_withFixedLayoutParams_callsSizeReady() {
+   }
+ 
+   @Test
+-  public void getSize_withFixedWidthSetHeight_noLayoutRequested_callsSizeReady() {
+-    LayoutParams layoutParams = new LayoutParams(400 /*width*/, 0 /*height*/);
+-    shadowView.setHeight(200);
+-    view.setLayoutParams(layoutParams);
+-
+-    target.getSize(cb);
+-
+-    verify(cb).onSizeReady(eq(400), eq(200));
+-  }
+-
+-  @Test
+-  public void getSize_withFixedWidthSetHeight_layoutRequested_callsSizeReady() {
+-    LayoutParams layoutParams = new LayoutParams(400 /*width*/, 0 /*height*/);
+-    shadowView.setHeight(200);
+-    view.setLayoutParams(layoutParams);
+-    view.requestLayout();
+-
+-    target.getSize(cb);
+-
+-    verify(cb, never()).onSizeReady(anyInt(), anyInt());
+-  }
+-
+-
+-  @Test
+-  public void getSize_withFixedHeightSetWidth_noLayoutRequested_callsSizeReady() {
+-    LayoutParams layoutParams = new LayoutParams(0 /*width*/, 400 /*height*/);
+-    shadowView.setWidth(200);
+-    view.setLayoutParams(layoutParams);
+-
+-    target.getSize(cb);
+-
+-    verify(cb).onSizeReady(eq(200), eq(400));
+-  }
+-
+-  @Test
+-  public void getSize_withFixedHeightSetWidth_layoutRequested_callsSizeReady() {
+-    LayoutParams layoutParams = new LayoutParams(0 /*width*/, 400 /*height*/);
+-    shadowView.setWidth(200);
+-    view.setLayoutParams(layoutParams);
+-    view.requestLayout();
+-
+-    target.getSize(cb);
+-
+-    verify(cb, never()).onSizeReady(anyInt(), anyInt());
+-  }
+-
+-  @Test
+-  public void getSize_withBothWrapContent_isValid_andReturnsSizeOriginal() {
++  public void getSize_withBothWrapContent_usesDisplayDimens() {
+     LayoutParams layoutParams =
+         new LayoutParams(LayoutParams.WRAP_CONTENT, LayoutParams.WRAP_CONTENT);
+     view.setLayoutParams(layoutParams);
+-    view.requestLayout();
++    shadowView.setIsLaidOut(true);
++
++    setDisplayDimens(200, 300);
+ 
+     target.getSize(cb);
+ 
+-    verify(cb).onSizeReady(Target.SIZE_ORIGINAL, Target.SIZE_ORIGINAL);
++    verify(cb).onSizeReady(300, 300);
+   }
+ 
+   @Test
+-  public void getSize_withWrapContentWidthAndValidHeight_isValid_andUsesSizeOriginalWidth() {
++  public void getSize_withWrapContentWidthAndValidHeight_usesDisplayDimenAndValidHeight() {
+     int height = 100;
+     LayoutParams params = new LayoutParams(LayoutParams.WRAP_CONTENT, height);
+     view.setLayoutParams(params);
+-    view.requestLayout();
+-
+-    target.getSize(cb);
+-
+-    verify(cb).onSizeReady(Target.SIZE_ORIGINAL, height);
+-  }
+-
+-  @Test
+-  public void getSize_withWrapContentHeightAndValidWidth_isValid_andUsesSizeOriginalHeight() {
+-    int width = 100;
+-    LayoutParams params = new LayoutParams(width, LayoutParams.WRAP_CONTENT);
+-    view.setLayoutParams(params);
+-    view.requestLayout();
+-
+-    target.getSize(cb);
+-
+-    verify(cb).onSizeReady(width, Target.SIZE_ORIGINAL);
+-  }
++    shadowView.setIsLaidOut(true);
+ 
+-  @Test
+-  public void getSize_withWrapContentHeightSetWidth_noLayoutRequested_callsSizeReady() {
+-    int width = 100;
+-    LayoutParams params = new LayoutParams(0, LayoutParams.WRAP_CONTENT);
+-    view.setLayoutParams(params);
+-    shadowView.setWidth(width);
++    setDisplayDimens(100, 200);
+ 
+     target.getSize(cb);
+ 
+-    verify(cb).onSizeReady(width, Target.SIZE_ORIGINAL);
++    verify(cb).onSizeReady(200, height);
+   }
+ 
+   @Test
+-  public void getSize_withWrapContentHeightSetWidth_previousHeight_usesSizeOriginal() {
++  public void getSize_withWrapContentHeightAndValidWidth_returnsWidthAndDisplayDimen() {
+     int width = 100;
+-    int oldHeight = 500;
+-    LayoutParams params = new LayoutParams(0, LayoutParams.WRAP_CONTENT);
++    LayoutParams params = new LayoutParams(width, LayoutParams.WRAP_CONTENT);
+     view.setLayoutParams(params);
+-    shadowView
+-        .setWidth(width)
+-        .setHeight(oldHeight);
+-
+-    target.getSize(cb);
+-
+-    verify(cb).onSizeReady(width, Target.SIZE_ORIGINAL);
++    shadowView.setIsLaidOut(true);
+ 
+-  }
+-
+-  @Test
+-  public void getSize_withWrapContentHeightViewWidth_layoutRequested_doesNotCallSizeReady() {
+-    int width = 100;
+-    LayoutParams params = new LayoutParams(0, LayoutParams.WRAP_CONTENT);
+-    view.setLayoutParams(params);
+-    shadowView.setWidth(width);
+-    view.requestLayout();
++    setDisplayDimens(200, 100);
+ 
+     target.getSize(cb);
+ 
+-    verify(cb, never()).onSizeReady(anyInt(), anyInt());
++    verify(cb).onSizeReady(width, 200);
+   }
+ 
+   @Test
+-  public void getSize_withWrapContentWidthAndMatchParentHeight_callsSizeReadyOnPreDraw() {
++  public void getSize_withWrapContentWidthAndMatchParentHeight_usesDisplayDimenWidthAndHeight() {
+     LayoutParams params = new LayoutParams(LayoutParams.WRAP_CONTENT, LayoutParams.MATCH_PARENT);
+     view.setLayoutParams(params);
+ 
++    setDisplayDimens(500, 600);
++
+     target.getSize(cb);
+ 
+     verify(cb, never()).onSizeReady(anyInt(), anyInt());
+ 
+     int height = 32;
+     shadowView
+-        .setHeight(height);
+-    view.requestLayout();
++        .setHeight(height)
++        .setIsLaidOut(true);
+ 
+     shadowObserver.fireOnPreDrawListeners();
+ 
+-    verify(cb).onSizeReady(Target.SIZE_ORIGINAL, height);
+-  }
+-
+-  @Test
+-  public void getSize_withWrapContentWidthMatchParentHeightAndSetHeight_noLayoutRequested_calls() {
+-    LayoutParams params = new LayoutParams(LayoutParams.WRAP_CONTENT, LayoutParams.MATCH_PARENT);
+-    view.setLayoutParams(params);
+-    shadowView.setHeight(200);
+-
+-    target.getSize(cb);
+-
+-    verify(cb).onSizeReady(Target.SIZE_ORIGINAL, 200);
++    verify(cb).onSizeReady(600, height);
+   }
+ 
+   @Test
+-  public void getSize_withWrapContentWidthMatchParentHeightAndSetHeight_layoutRequested_calls() {
+-    LayoutParams params = new LayoutParams(LayoutParams.WRAP_CONTENT, LayoutParams.MATCH_PARENT);
+-    view.setLayoutParams(params);
+-    shadowView.setHeight(200);
+-    view.requestLayout();
+-
+-    target.getSize(cb);
+-
+-    verify(cb).onSizeReady(Target.SIZE_ORIGINAL, 200);
+-  }
+-
+-  @Test
+-  public void getSize_withMatchParentWidthAndWrapContentHeight_callsSizeReadyOnPreDraw() {
++  public void getSize_withMatchParentWidthAndWrapContentHeight_usesWidthAndDisplayDimenHeight() {
+     LayoutParams params = new LayoutParams(LayoutParams.MATCH_PARENT, LayoutParams.WRAP_CONTENT);
+     view.setLayoutParams(params);
+ 
++    setDisplayDimens(300, 400);
++
+     target.getSize(cb);
+ 
+     verify(cb, never()).onSizeReady(anyInt(), anyInt());
+ 
++
+     int width = 32;
+     shadowView
+-        .setWidth(width);
+-    view.requestLayout();
++        .setWidth(width)
++        .setIsLaidOut(true);
+     shadowObserver.fireOnPreDrawListeners();
+ 
+-    verify(cb).onSizeReady(width, Target.SIZE_ORIGINAL);
+-  }
+-
+-
+-  @Test
+-  public void getSize_withMatchParentWidthWrapContentHeightAndSetHeight_noLayoutRequested_calls() {
+-    LayoutParams params = new LayoutParams(LayoutParams.MATCH_PARENT, LayoutParams.WRAP_CONTENT);
+-    view.setLayoutParams(params);
+-    shadowView.setWidth(200);
+-
+-    target.getSize(cb);
+-
+-    verify(cb).onSizeReady(200, Target.SIZE_ORIGINAL);
++    verify(cb).onSizeReady(width, 400);
+   }
+ 
+   @Test
+-  public void getSize_withMatchParentWidthWrapContentHeightAndSetHeight_layoutRequested_calls() {
+-    LayoutParams params = new LayoutParams(LayoutParams.MATCH_PARENT, LayoutParams.WRAP_CONTENT);
+-    view.setLayoutParams(params);
+-    shadowView.setWidth(200);
+-    view.requestLayout();
+-
+-    target.getSize(cb);
+-
+-    verify(cb).onSizeReady(200, Target.SIZE_ORIGINAL);
+-  }
+-
+-  @Test
+-  public void getSize_withMatchParentWidthAndHeight_validDimens_layoutRequested_callsSizeReady() {
++  public void testMatchParentWidthAndHeight() {
+     LayoutParams params = new LayoutParams(LayoutParams.MATCH_PARENT, LayoutParams.MATCH_PARENT);
+     view.setLayoutParams(params);
+ 
+@@ -356,82 +225,27 @@ public void getSize_withMatchParentWidthAndHeight_validDimens_layoutRequested_ca
+     shadowView
+         .setWidth(width)
+         .setHeight(height)
+-        .requestLayout();
++        .setIsLaidOut(true);
+     shadowObserver.fireOnPreDrawListeners();
+ 
+     verify(cb).onSizeReady(eq(width), eq(height));
+   }
+ 
+   @Test
+-  public void getSize_onPreDraw_withValidWidthAndHeight_noLayoutRequested_callsSizeReady() {
++  public void testSizeCallbackIsCalledPreDrawIfNoDimensAndNoLayoutParams() {
+     target.getSize(cb);
+ 
+     int width = 12;
+     int height = 32;
+     shadowView
+         .setWidth(width)
+-        .setHeight(height);
++        .setHeight(height)
++        .setIsLaidOut(true);
+     shadowObserver.fireOnPreDrawListeners();
+ 
+     verify(cb).onSizeReady(eq(width), eq(height));
+   }
+ 
+-  @Test
+-  public void getSize_onPreDraw_withValidWidthAndHeight_layoutRequested_doesNotCallSizeReady() {
+-    target.getSize(cb);
+-
+-    int width = 12;
+-    int height = 32;
+-    shadowView
+-        .setWidth(width)
+-        .setHeight(height);
+-    view.requestLayout();
+-    shadowObserver.fireOnPreDrawListeners();
+-
+-    verify(cb, never()).onSizeReady(anyInt(), anyInt());
+-  }
+-
+-  @Test
+-  public void getSize_withWrapContentSize_callsSizeReadyWithSizeOriginal() {
+-    view.setLayoutParams(new LayoutParams(LayoutParams.WRAP_CONTENT, LayoutParams.WRAP_CONTENT));
+-    target.getSize(cb);
+-
+-    verify(cb).onSizeReady(Target.SIZE_ORIGINAL, Target.SIZE_ORIGINAL);
+-  }
+-
+-  @Test
+-  public void getSize_withValidViewDimensions_andWrapContent_callsSizeReadyWithSizeOriginal() {
+-    view.setLayoutParams(new LayoutParams(LayoutParams.WRAP_CONTENT, LayoutParams.WRAP_CONTENT));
+-    shadowView
+-        .setWidth(100)
+-        .setHeight(100);
+-    target.getSize(cb);
+-
+-    verify(cb).onSizeReady(Target.SIZE_ORIGINAL, Target.SIZE_ORIGINAL);
+-  }
+-
+-  @Test
+-  public void getSize_withValidViewDimensions_andFixedParams_callsSizeReadyWithParams() {
+-    view.setLayoutParams(new LayoutParams(100, 100));
+-    shadowView
+-        .setWidth(50)
+-        .setHeight(50);
+-    target.getSize(cb);
+-
+-    verify(cb).onSizeReady(100, 100);
+-  }
+-
+-  @Test
+-  public void getSize_withValidViewDimensions_invalidParams_callsSizeReadyWithViewDimensions() {
+-    view.setLayoutParams(new LayoutParams(0, 0));
+-    shadowView
+-        .setWidth(100)
+-        .setHeight(100);
+-    target.getSize(cb);
+-
+-    verify(cb).onSizeReady(100, 100);
+-  }
+-
+   @Test
+   public void testSizeCallbacksAreCalledInOrderPreDraw() {
+     SizeReadyCallback[] cbs = new SizeReadyCallback[25];
+@@ -443,7 +257,8 @@ public void testSizeCallbacksAreCalledInOrderPreDraw() {
+     int width = 100, height = 111;
+     shadowView
+         .setWidth(width)
+-        .setHeight(height);
++        .setHeight(height)
++        .setIsLaidOut(true);
+     shadowObserver.fireOnPreDrawListeners();
+ 
+     InOrder order = inOrder((Object[]) cbs);
+@@ -458,6 +273,7 @@ public void testDoesNotNotifyCallbackTwiceIfAddedTwice() {
+     target.getSize(cb);
+ 
+     view.setLayoutParams(new LayoutParams(100, 100));
++    shadowView.setIsLaidOut(true);
+     shadowObserver.fireOnPreDrawListeners();
+ 
+     verify(cb, times(1)).onSizeReady(anyInt(), anyInt());
+@@ -478,6 +294,7 @@ public void testDoesAddSecondListenerIfFirstListenerIsRemovedBeforeSecondRequest
+     target.getSize(cb1);
+ 
+     view.setLayoutParams(new LayoutParams(100, 100));
++    shadowView.setIsLaidOut(true);
+     shadowObserver.fireOnPreDrawListeners();
+ 
+     assertThat(shadowObserver.getPreDrawListeners()).hasSize(0);
+@@ -509,6 +326,7 @@ public void testSizeCallbackIsCalledPreDrawIfNoDimensAndNoLayoutParamsButLayoutP
+     int height = 354;
+     LayoutParams layoutParams = new LayoutParams(width, height);
+     view.setLayoutParams(layoutParams);
++    shadowView.setIsLaidOut(true);
+     shadowObserver.fireOnPreDrawListeners();
+ 
+     verify(cb).onSizeReady(eq(width), eq(height));
+@@ -520,6 +338,7 @@ public void testCallbackIsNotCalledTwiceIfPreDrawFiresTwice() {
+ 
+     LayoutParams layoutParams = new LayoutParams(1234, 4123);
+     view.setLayoutParams(layoutParams);
++    shadowView.setIsLaidOut(true);
+     shadowObserver.fireOnPreDrawListeners();
+     shadowObserver.fireOnPreDrawListeners();
+ 
+@@ -537,6 +356,7 @@ public void testCallbacksFromMultipleRequestsAreNotifiedOnPreDraw() {
+     int height = 875;
+     LayoutParams layoutParams = new LayoutParams(width, height);
+     view.setLayoutParams(layoutParams);
++    shadowView.setIsLaidOut(true);
+     shadowObserver.fireOnPreDrawListeners();
+     shadowObserver.fireOnPreDrawListeners();
+ 
+@@ -552,6 +372,7 @@ public void testDoesNotThrowOnPreDrawIfViewTreeObserverIsDead() {
+     int height = 2;
+     LayoutParams layoutParams = new LayoutParams(width, height);
+     view.setLayoutParams(layoutParams);
++    shadowView.setIsLaidOut(true);
+     shadowObserver.setIsAlive(false);
+     shadowObserver.fireOnPreDrawListeners();
+ 
+@@ -567,7 +388,7 @@ public void testThrowsIfGivenNullView() {
+   public void testDecreasesDimensionsByViewPadding() {
+     view.setLayoutParams(new LayoutParams(100, 100));
+     view.setPadding(25, 25, 25, 25);
+-    view.layout(0, 0, 100, 100);
++    shadowView.setIsLaidOut(true);
+ 
+     target.getSize(cb);
+ 
+@@ -576,18 +397,22 @@ public void testDecreasesDimensionsByViewPadding() {
+ 
+   @Test
+   public void getSize_withValidWidthAndHeight_notLaidOut_notLayoutRequested_callsSizeReady() {
+-    view.setLayoutParams(new LayoutParams(0, 0));
+     shadowView
+         .setWidth(100)
+-        .setHeight(100);
++        .setHeight(100)
++        .setIsLaidOut(false);
+     target.getSize(cb);
+ 
+     verify(cb).onSizeReady(100, 100);
+   }
+ 
+   @Test
+-  public void getSize_withLayoutParams_notLaidOut_notLayoutRequested_callsSizeReady() {
+-    view.setLayoutParams(new LayoutParams(10, 10));
++  public void getSize_withLayoutParams_notLaidOut_doesCallSizeReady() {
++    shadowView
++        .setLayoutParams(new LayoutParams(10, 10))
++        .setWidth(100)
++        .setHeight(100)
++        .setIsLaidOut(false);
+     target.getSize(cb);
+ 
+     verify(cb, times(1)).onSizeReady(anyInt(), anyInt());
+@@ -595,18 +420,18 @@ public void getSize_withLayoutParams_notLaidOut_notLayoutRequested_callsSizeRead
+ 
+   @Test
+   public void getSize_withLayoutParams_emptyParams_notLaidOutOrLayoutRequested_callsSizeReady() {
+-   view
+-        .setLayoutParams(new LayoutParams(0, 0));
+     shadowView
++        .setLayoutParams(new LayoutParams(0, 0))
+         .setWidth(100)
+-        .setHeight(100);
++        .setHeight(100)
++        .setIsLaidOut(false);
+     target.getSize(cb);
+ 
+     verify(cb).onSizeReady(100, 100);
+   }
+ 
+   @Test
+-  public void getSize_withValidWidthAndHeight_preV19_layoutRequested_doesNotCallSizeReady() {
++  public void getSize_withValidWidthAndHeight_preV19_layoutRequested_callsSizeReady() {
+     Util.setSdkVersionInt(18);
+     shadowView
+         .setWidth(100)
+@@ -615,14 +440,15 @@ public void getSize_withValidWidthAndHeight_preV19_layoutRequested_doesNotCallSi
+ 
+     target.getSize(cb);
+ 
+-    verify(cb, never()).onSizeReady(anyInt(), anyInt());
++    verify(cb).onSizeReady(100, 100);
+   }
+ 
+   @Test
+   public void getSize_withWidthAndHeightEqualToPadding_doesNotCallSizeReady() {
+     shadowView
+         .setWidth(100)
+-        .setHeight(100);
++        .setHeight(100)
++        .setIsLaidOut(true);
+ 
+     view.setPadding(50, 50, 50, 50);
+ 
+@@ -631,6 +457,19 @@ public void getSize_withWidthAndHeightEqualToPadding_doesNotCallSizeReady() {
+     verify(cb, never()).onSizeReady(anyInt(), anyInt());
+   }
+ 
++  private void setDisplayDimens(Integer width, Integer height) {
++    WindowManager windowManager =
++        (WindowManager) RuntimeEnvironment.application.getSystemService(Context.WINDOW_SERVICE);
++    ShadowDisplay shadowDisplay = Shadows.shadowOf(windowManager.getDefaultDisplay());
++    if (width != null) {
++      shadowDisplay.setWidth(width);
++    }
++
++    if (height != null) {
++      shadowDisplay.setHeight(height);
++    }
++  }
++
+   @Implements(ViewTreeObserver.class)
+   public static class PreDrawShadowViewTreeObserver {
+     private CopyOnWriteArrayList<OnPreDrawListener> preDrawListeners = new CopyOnWriteArrayList<>();
+@@ -650,7 +489,6 @@ public void removeOnPreDrawListener(OnPreDrawListener listener) {
+       preDrawListeners.remove(listener);
+     }
+ 
+-    @SuppressWarnings("WeakerAccess")
+     @Implementation
+     public boolean isAlive() {
+       return isAlive;
+@@ -662,27 +500,28 @@ private void checkIsAlive() {
+       }
+     }
+ 
+-    void setIsAlive(boolean isAlive) {
++    public void setIsAlive(boolean isAlive) {
+       this.isAlive = isAlive;
+     }
+ 
+-    void fireOnPreDrawListeners() {
++    public void fireOnPreDrawListeners() {
+       for (OnPreDrawListener listener : preDrawListeners) {
+         listener.onPreDraw();
+       }
+     }
+ 
+-    List<OnPreDrawListener> getPreDrawListeners() {
++    public List<OnPreDrawListener> getPreDrawListeners() {
+       return preDrawListeners;
+     }
+   }
+ 
+   @Implements(View.class)
+   public static class SizedShadowView extends ShadowView {
+-
+     private int width;
+     private int height;
+-    private LayoutParams params;
++    private LayoutParams layoutParams;
++    private boolean isLaidOut;
++    private boolean isLayoutRequested;
+ 
+     public SizedShadowView setWidth(int width) {
+       this.width = width;
+@@ -694,18 +533,19 @@ public SizedShadowView setHeight(int height) {
+       return this;
+     }
+ 
+-    // Implemented because get/setLayoutParams is not implemented by ShadowView.
+-    @Implementation
+-    @SuppressWarnings("unused")
+-    public void setLayoutParams(LayoutParams params) {
+-      this.params = params;
++    public SizedShadowView setLayoutParams(LayoutParams layoutParams) {
++      this.layoutParams = layoutParams;
++      return this;
++    }
++
++    public SizedShadowView setIsLaidOut(boolean isLaidOut) {
++      this.isLaidOut = isLaidOut;
++      return this;
+     }
+ 
+-    // Implemented because get/setLayoutParams is not implemented by ShadowView.
+     @Implementation
+-    @SuppressWarnings("unused")
+-    public LayoutParams getLayoutParams() {
+-      return params;
++    public void requestLayout() {
++      isLayoutRequested = true;
+     }
+ 
+     @Implementation
+@@ -717,12 +557,26 @@ public int getWidth() {
+     public int getHeight() {
+       return height;
+     }
+-  }
+ 
++    @Implementation
++    public boolean isLaidOut() {
++      return isLaidOut;
++    }
++
++    @Implementation
++    public boolean isLayoutRequested() {
++      return isLayoutRequested;
++    }
++
++    @Implementation
++    public LayoutParams getLayoutParams() {
++      return layoutParams;
++    }
++  }
+ 
+   private static class TestViewTarget extends ViewTarget<View, Object> {
+ 
+-    TestViewTarget(View view) {
++    public TestViewTarget(View view) {
+       super(view);
+     }
+ 
+diff --git a/samples/flickr/src/main/res/layout/flickr_photo_grid_item.xml b/samples/flickr/src/main/res/layout/flickr_photo_grid_item.xml
+index 5a53ad9fd..d21744355 100644
+--- a/samples/flickr/src/main/res/layout/flickr_photo_grid_item.xml
++++ b/samples/flickr/src/main/res/layout/flickr_photo_grid_item.xml
+@@ -2,6 +2,6 @@
+ <com.bumptech.glide.samples.flickr.SquareImageView
+        xmlns:android="http://schemas.android.com/apk/res/android"
+        android:scaleType="centerCrop"
+-       android:layout_width="fill_parent"
+-       android:layout_height="fill_parent"
++       android:layout_width="match_parent"
++       android:layout_height="match_parent"
+        android:contentDescription="@string/image_description"/>

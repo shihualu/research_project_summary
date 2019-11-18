@@ -1,0 +1,1296 @@
+diff --git a/compiler/pom.xml b/compiler/pom.xml
+index 9cacd2980..b10668842 100644
+--- a/compiler/pom.xml
++++ b/compiler/pom.xml
+@@ -64,6 +64,12 @@
+       <version>0.3</version>
+       <scope>test</scope>
+     </dependency>
++    <dependency>
++      <groupId>com.google.guava</groupId>
++      <artifactId>guava</artifactId>
++      <version>15.0</version>
++      <scope>test</scope>
++    </dependency>
+     <dependency>
+       <groupId>org.truth0</groupId>
+       <artifactId>truth</artifactId>
+diff --git a/compiler/src/main/java/dagger/internal/codegen/GraphAnalysisProcessor.java b/compiler/src/main/java/dagger/internal/codegen/GraphAnalysisProcessor.java
+index cb2d34f19..0f0c28093 100644
+--- a/compiler/src/main/java/dagger/internal/codegen/GraphAnalysisProcessor.java
++++ b/compiler/src/main/java/dagger/internal/codegen/GraphAnalysisProcessor.java
+@@ -22,6 +22,7 @@
+ import dagger.internal.Linker;
+ import dagger.internal.ProblemDetector;
+ import dagger.internal.SetBinding;
++import dagger.internal.codegen.Util.CodeGenerationIncompleteException;
+ import java.io.IOException;
+ import java.io.PrintWriter;
+ import java.io.StringWriter;
+@@ -59,12 +60,16 @@
+ import static dagger.internal.codegen.Util.getPackage;
+ import static dagger.internal.codegen.Util.isInterface;
+ import static dagger.internal.codegen.Util.methodName;
++import static java.util.Arrays.asList;
+ 
+ /**
+  * Performs full graph analysis on a module.
+  */
+ @SupportedAnnotationTypes("dagger.Module")
+ public final class GraphAnalysisProcessor extends AbstractProcessor {
++  private static final Set<String> ERROR_NAMES_TO_PROPAGATE = new LinkedHashSet<String>(asList(
++      "com.sun.tools.javac.code.Symbol$CompletionFailure"));
++
+   private final Set<String> delayedModuleNames = new LinkedHashSet<String>();
+ 
+   @Override public SourceVersion getSupportedSourceVersion() {
+@@ -95,9 +100,14 @@
+     }
+ 
+     for (Element element : modules) {
+-      Map<String, Object> annotation = getAnnotation(Module.class, element);
+-      TypeElement moduleType = (TypeElement) element;
++      Map<String, Object> annotation = null;
++      try {
++        annotation = getAnnotation(Module.class, element);
++      } catch (CodeGenerationIncompleteException e) {
++        continue; // skip this element. An up-stream compiler error is in play.
++      }
+ 
++      TypeElement moduleType = (TypeElement) element;
+       if (annotation == null) {
+         error("Missing @Module annotation.", moduleType);
+         continue;
+@@ -114,7 +124,11 @@
+           error("Graph validation failed: " + e.getMessage(), elements().getTypeElement(e.type));
+           continue;
+         } catch (RuntimeException e) {
+-          error("Graph validation failed: " + e.getMessage(), moduleType);
++          if (ERROR_NAMES_TO_PROPAGATE.contains(e.getClass().getName())) {
++            throw e;
++          }
++          error("Unknown error " + e.getClass().getName() + " thrown by javac in graph validation: "
++              + e.getMessage(), moduleType);
+           continue;
+         }
+         try {
+@@ -153,7 +167,7 @@ private void error(String message, Element element) {
+ 
+     Linker.ErrorHandler errorHandler = ignoreCompletenessErrors ? Linker.ErrorHandler.NULL
+         : new GraphAnalysisErrorHandler(processingEnv, rootModule.getQualifiedName().toString());
+-    Linker linker = new Linker(null, new GraphAnalysisLoader(processingEnv), errorHandler);
++    Linker linker = new Linker(new GraphAnalysisLoader(processingEnv), errorHandler);
+     // Linker requires synchronization for calls to requestBinding and linkAll.
+     // We know statically that we're single threaded, but we synchronize anyway
+     // to make the linker happy.
+@@ -167,10 +181,13 @@ private void error(String message, Element element) {
+         Map<String, Binding<?>> addTo = overrides ? overrideBindings : baseBindings;
+ 
+         // Gather the injectable types from the annotation.
++        Set<String> injectsProvisionKeys = new LinkedHashSet<String>();
+         for (Object injectableTypeObject : (Object[]) annotation.get("injects")) {
+           TypeMirror injectableType = (TypeMirror) injectableTypeObject;
++          String providerKey = GeneratorKeys.get(injectableType);
++          injectsProvisionKeys.add(providerKey);
+           String key = isInterface(injectableType)
+-              ? GeneratorKeys.get(injectableType)
++              ? providerKey
+               : GeneratorKeys.rawMembersKey(injectableType);
+           linker.requestBinding(key, module.getQualifiedName().toString(),
+               getClass().getClassLoader(), false, true);
+@@ -210,6 +227,9 @@ private void error(String message, Element element) {
+ 
+           switch (provides.type()) {
+             case UNIQUE:
++              if (injectsProvisionKeys.contains(binding.provideKey)) {
++                binding.setDependedOn(true);
++              }
+               addTo.put(key, binding);
+               break;
+ 
+diff --git a/compiler/src/main/java/dagger/internal/codegen/ModuleAdapterProcessor.java b/compiler/src/main/java/dagger/internal/codegen/ModuleAdapterProcessor.java
+index 969c37627..ff87d24aa 100644
+--- a/compiler/src/main/java/dagger/internal/codegen/ModuleAdapterProcessor.java
++++ b/compiler/src/main/java/dagger/internal/codegen/ModuleAdapterProcessor.java
+@@ -23,7 +23,10 @@
+ import dagger.internal.Linker;
+ import dagger.internal.ModuleAdapter;
+ import dagger.internal.SetBinding;
++import dagger.internal.codegen.Util.CodeGenerationIncompleteException;
+ import java.io.IOException;
++import java.io.StringWriter;
++import java.io.Writer;
+ import java.util.ArrayList;
+ import java.util.Arrays;
+ import java.util.EnumSet;
+@@ -47,6 +50,7 @@
+ import javax.lang.model.element.Modifier;
+ import javax.lang.model.element.TypeElement;
+ import javax.lang.model.element.VariableElement;
++import javax.lang.model.type.TypeKind;
+ import javax.lang.model.type.TypeMirror;
+ import javax.lang.model.util.Elements;
+ import javax.lang.model.util.Types;
+@@ -77,10 +81,13 @@
+  */
+ @SupportedAnnotationTypes({ "*" })
+ public final class ModuleAdapterProcessor extends AbstractProcessor {
+-  private final LinkedHashMap<String, List<ExecutableElement>> remainingTypes =
+-      new LinkedHashMap<String, List<ExecutableElement>>();
+   private static final String BINDINGS_MAP = JavaWriter.type(
+       Map.class, String.class.getCanonicalName(), Binding.class.getCanonicalName() + "<?>");
++  private static final List<String> INVALID_RETURN_TYPES =
++      Arrays.asList(Provider.class.getCanonicalName(), Lazy.class.getCanonicalName());
++
++  private final LinkedHashMap<String, List<ExecutableElement>> remainingTypes =
++      new LinkedHashMap<String, List<ExecutableElement>>();
+ 
+   @Override public SourceVersion getSupportedSourceVersion() {
+     return SourceVersion.latestSupported();
+@@ -92,19 +99,26 @@
+       String typeName = i.next();
+       TypeElement type = processingEnv.getElementUtils().getTypeElement(typeName);
+       List<ExecutableElement> providesTypes = remainingTypes.get(typeName);
++
+       try {
+         // Attempt to get the annotation. If types are missing, this will throw
+-        // IllegalStateException.
++        // CodeGenerationIncompleteException.
+         Map<String, Object> parsedAnnotation = getAnnotation(Module.class, type);
+-        try {
+-          generateModuleAdapter(type, parsedAnnotation, providesTypes);
+-        } catch (IOException e) {
+-          error("Code gen failed: " + e, type);
+-        }
+-        i.remove();
+-      } catch (IllegalStateException e) {
+-        // a dependent type was not defined, we'll catch it on another pass
++
++        //TODO(cgruber): Figure out an initial sizing of the StringWriter.
++        StringWriter stringWriter = new StringWriter();
++        String adapterName = adapterName(type, MODULE_ADAPTER_SUFFIX);
++        generateModuleAdapter(stringWriter, adapterName, type, parsedAnnotation, providesTypes);
++        JavaFileObject sourceFile = processingEnv.getFiler().createSourceFile(adapterName, type);
++        Writer sourceWriter = sourceFile.openWriter();
++        sourceWriter.append(stringWriter.getBuffer());
++        sourceWriter.close();
++      } catch (CodeGenerationIncompleteException e) {
++        continue; // A dependent type was not defined, we'll try to catch it on another pass.
++      } catch (IOException e) {
++        error("Code gen failed: " + e, type);
+       }
++      i.remove();
+     }
+     if (env.processingOver() && remainingTypes.size() > 0) {
+       processingEnv.getMessager().printMessage(Diagnostic.Kind.ERROR,
+@@ -163,14 +177,17 @@ private void error(String msg, Element element) {
+ 
+       // Invalidate return types.
+       TypeMirror returnType = types.erasure(providerMethodAsExecutable.getReturnType());
+-      for (String invalidTypeName : Arrays.asList(Provider.class.getCanonicalName(),
+-          Lazy.class.getCanonicalName())) {
+-        TypeElement invalidTypeElement = elementUtils.getTypeElement(invalidTypeName);
+-        if (invalidTypeElement != null && types.isSameType(returnType,
+-            types.erasure(invalidTypeElement.asType()))) {
+-          error(String.format("@Provides method must not return %s directly: %s.%s",
+-              invalidTypeElement, type.getQualifiedName(), providerMethod), providerMethod);
+-          continue provides; // Skip to next provides method.
++      if (!returnType.getKind().equals(TypeKind.ERROR)) {
++        // Validate if we have a type to validate (a type yet to be generated by other
++        // processors is not "invalid" in this way, so ignore).
++        for (String invalidTypeName : INVALID_RETURN_TYPES) {
++          TypeElement invalidTypeElement = elementUtils.getTypeElement(invalidTypeName);
++          if (invalidTypeElement != null && types.isSameType(returnType,
++              types.erasure(invalidTypeElement.asType()))) {
++            error(String.format("@Provides method must not return %s directly: %s.%s",
++                invalidTypeElement, type.getQualifiedName(), providerMethod), providerMethod);
++            continue provides; // Skip to next provides method.
++          }
+         }
+       }
+ 
+@@ -216,8 +233,8 @@ private void error(String msg, Element element) {
+    * Write a companion class for {@code type} that implements {@link
+    * ModuleAdapter} to expose its provider methods.
+    */
+-  private void generateModuleAdapter(TypeElement type, Map<String, Object> module,
+-      List<ExecutableElement> providerMethods) throws IOException {
++  private void generateModuleAdapter(Writer ioWriter, String adapterName, TypeElement type,
++      Map<String, Object> module, List<ExecutableElement> providerMethods) throws IOException {
+     if (module == null) {
+       error(type + " has @Provides methods but no @Module annotation", type);
+       return;
+@@ -231,10 +248,7 @@ private void generateModuleAdapter(TypeElement type, Map<String, Object> module,
+     boolean complete = (Boolean) module.get("complete");
+     boolean library = (Boolean) module.get("library");
+ 
+-    String adapterName = adapterName(type, MODULE_ADAPTER_SUFFIX);
+-    JavaFileObject sourceFile = processingEnv.getFiler()
+-        .createSourceFile(adapterName, type);
+-    JavaWriter writer = new JavaWriter(sourceFile.openWriter());
++    JavaWriter writer = new JavaWriter(ioWriter);
+ 
+     boolean multibindings = checkForMultibindings(providerMethods);
+     boolean providerMethodDependencies = checkForDependencies(providerMethods);
+@@ -343,8 +357,8 @@ private void generateModuleAdapter(TypeElement type, Map<String, Object> module,
+     }
+ 
+     for (ExecutableElement providerMethod : providerMethods) {
+-      generateProvidesAdapter(writer, providerMethod, methodToClassName, methodNameToNextId,
+-          library);
++      generateProvidesAdapter(
++          writer, providerMethod, methodToClassName, methodNameToNextId, library);
+     }
+ 
+     writer.endType();
+diff --git a/compiler/src/main/java/dagger/internal/codegen/Util.java b/compiler/src/main/java/dagger/internal/codegen/Util.java
+index 0826adf2f..0f8b36c24 100644
+--- a/compiler/src/main/java/dagger/internal/codegen/Util.java
++++ b/compiler/src/main/java/dagger/internal/codegen/Util.java
+@@ -137,10 +137,17 @@ public static void typeToString(final TypeMirror type, final StringBuilder resul
+         return null;
+       }
+       @Override public Void visitError(ErrorType errorType, Void v) {
+-        // There's already an error but it may not have been reported (most likely
+-        // a missing import). If we throw an UnsupportedOperationException here
+-        // we'll obscure the real error, so just continue.
+-        result.append("error");
++        // Error type found, a type may not yet have been generated, but we need the type
++        // so we can generate the correct code in anticipation of the type being available
++        // to the compiler.
++
++        // Paramterized types which don't exist are returned as an error type whose name is "<any>"
++        if ("<any>".equals(errorType.toString())) {
++          throw new CodeGenerationIncompleteException(
++              "Type reported as <any> is likely a not-yet generated parameterized type.");
++        }
++        // TODO(cgruber): Figure out a strategy for non-FQCN cases.
++        result.append(errorType.toString());
+         return null;
+       }
+       @Override protected Void defaultAction(TypeMirror typeMirror, Void v) {
+@@ -150,19 +157,30 @@ public static void typeToString(final TypeMirror type, final StringBuilder resul
+     }, null);
+   }
+ 
+-  private static final AnnotationValueVisitor<Object, Void> VALUE_EXTRACTOR
+-      = new SimpleAnnotationValueVisitor6<Object, Void>() {
+-    @Override protected Object defaultAction(Object o, Void v) {
+-      return o;
+-    }
+-    @Override public Object visitArray(List<? extends AnnotationValue> values, Void v) {
+-      Object[] result = new Object[values.size()];
+-      for (int i = 0; i < values.size(); i++) {
+-        result[i] = values.get(i).accept(this, null);
+-      }
+-      return result;
+-    }
+-  };
++  private static final AnnotationValueVisitor<Object, Void> VALUE_EXTRACTOR =
++      new SimpleAnnotationValueVisitor6<Object, Void>() {
++        @Override public Object visitString(String s, Void p) {
++          if ("<error>".equals(s)) {
++            throw new CodeGenerationIncompleteException("Unknown type returned as <error>.");
++          } else if ("<any>".equals(s)) {
++            throw new CodeGenerationIncompleteException("Unknown type returned as <any>.");
++          }
++          return s;
++        }
++        @Override public Object visitType(TypeMirror t, Void p) {
++          return t;
++        }
++        @Override protected Object defaultAction(Object o, Void v) {
++          return o;
++        }
++        @Override public Object visitArray(List<? extends AnnotationValue> values, Void v) {
++          Object[] result = new Object[values.size()];
++          for (int i = 0; i < values.size(); i++) {
++            result[i] = values.get(i).accept(this, null);
++          }
++          return result;
++        }
++      };
+ 
+   /**
+    * Returns the annotation on {@code element} formatted as a Map. This returns
+@@ -196,7 +214,6 @@ public static void typeToString(final TypeMirror type, final StringBuilder resul
+       }
+       return result;
+     }
+-
+     return null; // Annotation not found.
+   }
+ 
+@@ -327,4 +344,15 @@ static boolean isStatic(Element element) {
+     }
+     return false;
+   }
++
++  /**
++   * An exception thrown when a type is not extant (returns as an error type),
++   * usually as a result of another processor not having yet generated its types upon
++   * which a dagger-annotated type depends.
++   */
++  final static class CodeGenerationIncompleteException extends IllegalStateException {
++    public CodeGenerationIncompleteException(String s) {
++      super(s);
++    }
++  }
+ }
+diff --git a/compiler/src/main/java/dagger/internal/codegen/ValidationProcessor.java b/compiler/src/main/java/dagger/internal/codegen/ValidationProcessor.java
+index 3bbac71c2..578bdb3b9 100644
+--- a/compiler/src/main/java/dagger/internal/codegen/ValidationProcessor.java
++++ b/compiler/src/main/java/dagger/internal/codegen/ValidationProcessor.java
+@@ -18,6 +18,7 @@
+ 
+ import dagger.Module;
+ import dagger.Provides;
++import dagger.internal.codegen.Util.CodeGenerationIncompleteException;
+ import java.util.ArrayList;
+ import java.util.Arrays;
+ import java.util.LinkedHashMap;
+@@ -64,16 +65,20 @@
+     Map<Element, Element> parametersToTheirMethods = new LinkedHashMap<Element, Element>();
+     getAllElements(env, allElements, parametersToTheirMethods);
+     for (Element element : allElements) {
++      try {
+         validateProvides(element);
+-        validateScoping(element);
+-        validateQualifiers(element, parametersToTheirMethods);
++      } catch (CodeGenerationIncompleteException e) {
++        continue; // Upstream compiler issue in play. Ignore this element.
++      }
++      validateScoping(element);
++      validateQualifiers(element, parametersToTheirMethods);
+     }
+     return false;
+   }
+ 
+   private void validateProvides(Element element) {
+     if (element.getAnnotation(Provides.class) != null
+-        && element.getEnclosingElement().getAnnotation(Module.class) == null) {
++        && Util.getAnnotation(Module.class, element.getEnclosingElement()) == null) {
+       error("@Provides methods must be declared in modules: " + elementToString(element), element);
+     }
+   }
+diff --git a/compiler/src/test/java/dagger/tests/integration/codegen/InjectAdapterGenerationTest.java b/compiler/src/test/java/dagger/tests/integration/codegen/InjectAdapterGenerationTest.java
+index add46c255..17c3904a4 100644
+--- a/compiler/src/test/java/dagger/tests/integration/codegen/InjectAdapterGenerationTest.java
++++ b/compiler/src/test/java/dagger/tests/integration/codegen/InjectAdapterGenerationTest.java
+@@ -36,23 +36,23 @@
+         "class Basic {",
+         "  static class A { @Inject A() { } }",
+         "  @Module(injects = A.class)",
+-        "  static class CyclicModule { }",
++        "  static class AModule { }",
+         "}"));
+ 
+     JavaFileObject expectedModuleAdapter =
+-        JavaFileObjects.forSourceString("Basic$CyclicModule$$ModuleAdapter", Joiner.on("\n").join(
++        JavaFileObjects.forSourceString("Basic$AModule$$ModuleAdapter", Joiner.on("\n").join(
+             "import dagger.internal.ModuleAdapter;",
+-            "public final class Basic$CyclicModule$$ModuleAdapter",
+-            "    extends ModuleAdapter<Basic.CyclicModule> {",
++            "public final class Basic$AModule$$ModuleAdapter",
++            "    extends ModuleAdapter<Basic.AModule> {",
+             "  private static final String[] INJECTS = {\"members/Basic$A\"};",
+             "  private static final Class<?>[] STATIC_INJECTIONS = {};",
+             "  private static final Class<?>[] INCLUDES = {};",
+-            "  public Basic$CyclicModule$$ModuleAdapter() {",
+-            "    super(Basic.CyclicModule.class,INJECTS, STATIC_INJECTIONS, false, INCLUDES,",
+-            "      true, false);",
++            "  public Basic$AModule$$ModuleAdapter() {",
++            "    super(Basic.AModule.class, INJECTS, STATIC_INJECTIONS, false, INCLUDES, true,",
++            "      false);",
+             "  }",
+-            "  @Override public Basic.CyclicModule newModule() {",
+-            "    return new Basic.CyclicModule();",
++            "  @Override public Basic.AModule newModule() {",
++            "    return new Basic.AModule();",
+             "  }",
+             "}"));
+ 
+diff --git a/compiler/src/test/java/dagger/tests/integration/validation/GeneratedTypesNotReadyTest.java b/compiler/src/test/java/dagger/tests/integration/validation/GeneratedTypesNotReadyTest.java
+new file mode 100644
+index 000000000..ad8ca1745
+--- /dev/null
++++ b/compiler/src/test/java/dagger/tests/integration/validation/GeneratedTypesNotReadyTest.java
+@@ -0,0 +1,211 @@
++/**
++ * Copyright (c) 2013 Google, Inc.
++ * Copyright (c) 2013 Square, Inc.
++ *
++ * Licensed under the Apache License, Version 2.0 (the "License");
++ * you may not use this file except in compliance with the License.
++ * You may obtain a copy of the License at
++ *
++ * http://www.apache.org/licenses/LICENSE-2.0
++ *
++ * Unless required by applicable law or agreed to in writing, software
++ * distributed under the License is distributed on an "AS IS" BASIS,
++ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++ * See the License for the specific language governing permissions and
++ * limitations under the License.
++ */
++package dagger.tests.integration.validation;
++
++import com.google.common.base.Joiner;
++import com.google.testing.compile.JavaFileObjects;
++import java.io.IOException;
++import java.io.Writer;
++import java.util.Set;
++import javax.annotation.processing.AbstractProcessor;
++import javax.annotation.processing.RoundEnvironment;
++import javax.annotation.processing.SupportedAnnotationTypes;
++import javax.lang.model.SourceVersion;
++import javax.lang.model.element.TypeElement;
++import javax.tools.JavaFileObject;
++import org.junit.Test;
++import org.junit.runner.RunWith;
++import org.junit.runners.JUnit4;
++
++import static com.google.common.collect.Iterables.concat;
++import static com.google.testing.compile.JavaSourcesSubjectFactory.javaSources;
++import static dagger.tests.integration.ProcessorTestUtils.daggerProcessors;
++import static java.util.Arrays.asList;
++import static org.truth0.Truth.ASSERT;
++
++/**
++ * Tests that the annotation processor(s) will properly handle the case where
++ * code they are processing and depending on is generated by other processors
++ * in the environment, and so the types they need may not exist yet.
++ */
++@RunWith(JUnit4.class)
++public class GeneratedTypesNotReadyTest {
++  private final JavaFileObject foo = JavaFileObjects.forSourceString("Foo", Joiner.on("\n").join(
++      "package myPackage;",
++      "public interface Foo {}"
++  ));
++  private final JavaFileObject main = JavaFileObjects.forSourceString("Main", Joiner.on("\n").join(
++      "import javax.inject.Inject;",
++      "import myPackage.Foo;",
++      "class Main {",
++      "  @Inject Foo f;",
++      "}"));
++
++  @Test public void withstandsMissingTypeReferencedInInjects() {
++    // TODO(cgruber): remove Foo (interface) from this when injects= analysis is fixed.
++    JavaFileObject module = JavaFileObjects.forSourceString("FooModule", Joiner.on("\n").join(
++        "import dagger.Module;",
++        "import dagger.Provides;",
++        "import myPackage.Foo;",
++        "@Module(injects = { Main.class, myPackage.FooImpl.class })",
++        "class FooModule {",
++        "  @Provides Foo provideFoo(myPackage.FooImpl impl) {",
++        "    return impl;",
++        "  }",
++        "}"));
++
++    ASSERT.about(javaSources()).that(asList(foo, main, module))
++        .processedWith(concat(asList(new FooImplGenerator()), daggerProcessors()))
++        .compilesWithoutError();
++  }
++
++  @Test public void withstandsMissingTypeReferencedInsideModule() {
++    JavaFileObject module = JavaFileObjects.forSourceString("FooModule", Joiner.on("\n").join(
++        "import dagger.Module;",
++        "import dagger.Provides;",
++        "import myPackage.Foo;",
++        "@Module(injects = { Main.class })",
++        "class FooModule {",
++        "  @Provides Foo provideFoo(myPackage.FooImpl impl) {",
++        "    return impl;",
++        "  }",
++        "}"));
++
++    ASSERT.about(javaSources()).that(asList(foo, module, main))
++        .processedWith(concat(daggerProcessors(), asList(new FooImplGenerator())))
++        .compilesWithoutError();
++  }
++
++  @Test public void withstandsMissingTypeReferencedByProvidesReturnType() {
++    JavaFileObject main = JavaFileObjects.forSourceString("Main", Joiner.on("\n").join(
++        "import javax.inject.Inject;",
++        "class Main {",
++        "  @Inject myPackage.FooImpl f;",
++        "}"));
++    JavaFileObject module = JavaFileObjects.forSourceString("FooModule", Joiner.on("\n").join(
++        "import dagger.Module;",
++        "import dagger.Provides;",
++        "@Module(injects = { Main.class })",
++        "class FooModule {",
++        "  @Provides myPackage.FooImpl provideFoo() {",
++        "    return new myPackage.FooImpl();",
++        "  }",
++        "}"));
++
++    ASSERT.about(javaSources()).that(asList(foo, module, main))
++        .processedWith(concat(daggerProcessors(), asList(new FooImplGenerator())))
++        .compilesWithoutError();
++  }
++
++  @Test public void failsWhenMissingGenericTypeReferencedByProvidesReturnType() {
++    JavaFileObject main = JavaFileObjects.forSourceString("Main", Joiner.on("\n").join(
++        "import javax.inject.Inject;",
++        "class Main {",
++        "  @Inject myPackage.FooImpl2<String> f;",
++        "}"));
++    JavaFileObject module = JavaFileObjects.forSourceString("FooModule", Joiner.on("\n").join(
++        "import dagger.Module;",
++        "import dagger.Provides;",
++        "@Module(injects = { Main.class })",
++        "class FooModule {",
++        "  @Provides myPackage.FooImpl2<String> provideFoo() {",
++        "    return new myPackage.FooImpl2<String>();",
++        "  }",
++        "}"));
++
++    ASSERT.about(javaSources()).that(asList(foo, module, main))
++        .processedWith(new FooImplGenerator())
++        .compilesWithoutError();
++    ASSERT.about(javaSources()).that(asList(foo, module, main))
++        .processedWith(concat(daggerProcessors(), asList(new FooImplGenerator())))
++        .failsToCompile()
++        .withErrorContaining("Could not find types required by provides methods for [FooModule]");
++  }
++
++  @Test public void withstandsMissingTypeReferencedInTransitiveJITDependency() {
++    JavaFileObject main = JavaFileObjects.forSourceString("Main", Joiner.on("\n").join(
++        "import javax.inject.Inject;",
++        "import myPackage.FooImpl;",
++        "class Main {",
++        "  @Inject FooImpl f;",
++        "}"));
++    JavaFileObject module = JavaFileObjects.forSourceString("FooModule", Joiner.on("\n").join(
++        "import dagger.Module;",
++        "import dagger.Provides;",
++        "@Module(injects = { Main.class })",
++        "class FooModule {",
++        "}"));
++
++    ASSERT.about(javaSources()).that(asList(foo, module, main))
++        .processedWith(concat(daggerProcessors(), asList(new FooImplGenerator())))
++        .compilesWithoutError();
++  }
++
++  @Test public void verifyFooImplGeneratorIsCompilingWithoutDagger() {
++    JavaFileObject module = JavaFileObjects.forSourceString("FooModule", Joiner.on("\n").join(
++        "import dagger.Module;",
++        "import dagger.Provides;",
++        "import myPackage.Foo;",
++        "@Module(injects = { Main.class })",
++        "class FooModule {",
++        "  @Provides Foo provideFoo(myPackage.FooImpl impl) {",
++        "    return impl;",
++        "  }",
++        "}"));
++    ASSERT.about(javaSources()).that(asList(foo, module, main))
++        .processedWith(new FooImplGenerator())
++        .compilesWithoutError();
++  }
++
++  @SupportedAnnotationTypes("*")
++  private final class FooImplGenerator extends AbstractProcessor {
++    boolean written = false;
++    @Override public boolean process(Set<? extends TypeElement> na1, RoundEnvironment na2) {
++      if (!written) {
++        try {
++          JavaFileObject sourceFile = processingEnv.getFiler().createSourceFile("FooImpl");
++          Writer writer = sourceFile.openWriter();
++          writer.write(Joiner.on("\n").join(
++              "package myPackage;",
++              "import javax.inject.Inject;",
++              "public final class FooImpl implements Foo {",
++              "  @Inject public FooImpl() { }",
++              "}"));
++          writer.close();
++          sourceFile = processingEnv.getFiler().createSourceFile("FooImpl2");
++          writer = sourceFile.openWriter();
++          writer.write(Joiner.on("\n").join(
++              "package myPackage;",
++              "import javax.inject.Inject;",
++              "public final class FooImpl2<T> implements Foo {",
++              "  @Inject public FooImpl2() { }",
++              "}"));
++          writer.close();
++          written = true;
++        } catch (IOException e) {
++          throw new RuntimeException(e);
++        }
++      }
++      return false;
++    }
++
++    @Override public SourceVersion getSupportedSourceVersion() {
++      return SourceVersion.latestSupported();
++    }
++  }
++
++}
+diff --git a/compiler/src/test/java/dagger/tests/integration/validation/LibraryModuleTest.java b/compiler/src/test/java/dagger/tests/integration/validation/LibraryModuleTest.java
+index 7a368a3b1..edc8816a4 100644
+--- a/compiler/src/test/java/dagger/tests/integration/validation/LibraryModuleTest.java
++++ b/compiler/src/test/java/dagger/tests/integration/validation/LibraryModuleTest.java
+@@ -18,12 +18,14 @@
+ 
+ import com.google.common.base.Joiner;
+ import com.google.testing.compile.JavaFileObjects;
++import java.util.Arrays;
+ import javax.tools.JavaFileObject;
+ import org.junit.Test;
+ import org.junit.runner.RunWith;
+ import org.junit.runners.JUnit4;
+ 
+ import static com.google.testing.compile.JavaSourceSubjectFactory.javaSource;
++import static com.google.testing.compile.JavaSourcesSubjectFactory.javaSources;
+ import static dagger.tests.integration.ProcessorTestUtils.daggerProcessors;
+ import static org.truth0.Truth.ASSERT;
+ 
+@@ -32,7 +34,6 @@
+   @Test public void unusedProviderMethodsPassOnLibrary() {
+     JavaFileObject source = JavaFileObjects.forSourceString("Library", Joiner.on("\n").join(
+         "import dagger.Module;",
+-        "import dagger.ObjectGraph;",
+         "import dagger.Provides;",
+         "import java.lang.Override;",
+         "@Module(library = true)",
+@@ -48,7 +49,6 @@
+   @Test public void unusedProviderMethodsFailOnNonLibrary() {
+     JavaFileObject source = JavaFileObjects.forSourceString("Library", Joiner.on("\n").join(
+         "import dagger.Module;",
+-        "import dagger.ObjectGraph;",
+         "import dagger.Provides;",
+         "import java.lang.Override;",
+         "@Module(library = false)",
+@@ -58,9 +58,44 @@
+         "  }",
+         "}"));
+     ASSERT.about(javaSource()).that(source).processedWith(daggerProcessors()).failsToCompile()
+-        .withErrorContaining("Graph validation failed:").in(source).onLine(6).and()
+-        .withErrorContaining("You have these unused @Provider methods:").in(source).onLine(6).and()
+-        .withErrorContaining("1. TestModule.string()").in(source).onLine(6).and()
+-        .withErrorContaining("Set library=true in your module").in(source).onLine(6);
++        .withErrorContaining("Graph validation failed:").in(source).onLine(5).and()
++        .withErrorContaining("You have these unused @Provider methods:").in(source).onLine(5).and()
++        .withErrorContaining("1. TestModule.string()").in(source).onLine(5).and()
++        .withErrorContaining("Set library=true in your module").in(source).onLine(5);
+   }
++
++  @Test public void injectsOfInterfaceMakesProvidesBindingNotAnOrphan() {
++    JavaFileObject foo = JavaFileObjects.forSourceString("Foo", "interface Foo {}");
++    JavaFileObject module = JavaFileObjects.forSourceString("TestModule", Joiner.on("\n").join(
++        "import dagger.Module;",
++        "import dagger.Provides;",
++        "import javax.inject.Singleton;",
++        "@Module(injects = Foo.class, library = false)",
++        "class TestModule {",
++        "  @Singleton @Provides Foo provideFoo() {",
++        "    return new Foo() {};",
++        "  }",
++        "}"));
++    ASSERT.about(javaSources()).that(Arrays.asList(foo, module))
++        .processedWith(daggerProcessors())
++        .compilesWithoutError();
++  }
++
++  @Test public void injectsOfClassMakesProvidesBindingNotAnOrphan() {
++    JavaFileObject foo = JavaFileObjects.forSourceString("Foo", "class Foo {}");
++    JavaFileObject module = JavaFileObjects.forSourceString("TestModule", Joiner.on("\n").join(
++        "import dagger.Module;",
++        "import dagger.Provides;",
++        "import javax.inject.Singleton;",
++        "@Module(injects = Foo.class, library = false)",
++        "class TestModule {",
++        "  @Singleton @Provides Foo provideFoo() {",
++        "    return new Foo() {};",
++        "  }",
++        "}"));
++    ASSERT.about(javaSources()).that(Arrays.asList(foo, module))
++        .processedWith(daggerProcessors())
++        .compilesWithoutError();
++  }
++
+ }
+diff --git a/core/src/main/java/dagger/ObjectGraph.java b/core/src/main/java/dagger/ObjectGraph.java
+index 096972257..03b3d8c9a 100644
+--- a/core/src/main/java/dagger/ObjectGraph.java
++++ b/core/src/main/java/dagger/ObjectGraph.java
+@@ -24,10 +24,10 @@
+ import dagger.internal.ModuleAdapter;
+ import dagger.internal.Modules;
+ import dagger.internal.ProblemDetector;
++import dagger.internal.SetBinding;
+ import dagger.internal.StaticInjection;
+ import dagger.internal.ThrowingErrorHandler;
+ import dagger.internal.UniqueMap;
+-import java.util.Arrays;
+ import java.util.LinkedHashMap;
+ import java.util.Map;
+ import java.util.Map.Entry;
+@@ -163,26 +163,45 @@ private static ObjectGraph makeGraph(DaggerObjectGraph base, Loader plugin, Obje
+ 
+       // Extract bindings in the 'base' and 'overrides' set. Within each set no
+       // duplicates are permitted.
+-      Map<String, Binding<?>> baseBindings = new UniqueMap<String, Binding<?>>();
+-      Map<String, Binding<?>> overrideBindings = new UniqueMap<String, Binding<?>>();
+-      Map<ModuleAdapter<?>, Object> loadedModules =
+-          Modules.loadModules(plugin, Arrays.asList(modules));
++      UniqueMap<String, Binding<?>> baseBindings = new UniqueMap<String, Binding<?>>() {
++        @Override public Binding<?> put(String key, Binding<?> value) {
++          return super.put(key, (value instanceof SetBinding)
++              ? new SetBinding<Object>((SetBinding<Object>) value) : value);
++        }
++      };
++      if (base != null) {
++        baseBindings.putAll(base.linkEverything()); // Add parent bindings
++      }
++      UniqueMap<String, Binding<?>> overrideBindings = new UniqueMap<String, Binding<?>>() {
++        @Override public Binding<?> put(String key, Binding<?> value) {
++          if (value instanceof SetBinding) {
++            throw new IllegalArgumentException("Module overrides cannot contribute set bindings.");
++          }
++          return super.put(key, value);
++        }
++      };
++
++      Map<ModuleAdapter<?>, Object> loadedModules = Modules.loadModules(plugin, modules);
+       for (Entry<ModuleAdapter<?>, Object> loadedModule : loadedModules.entrySet()) {
+         @SuppressWarnings("unchecked")
+         ModuleAdapter<Object> moduleAdapter = (ModuleAdapter<Object>) loadedModule.getKey();
+-        for (String key : moduleAdapter.injectableTypes) {
+-          injectableTypes.put(key, moduleAdapter.moduleClass);
++        for (int i = 0; i < moduleAdapter.injectableTypes.length; i++) {
++          injectableTypes.put(moduleAdapter.injectableTypes[i], moduleAdapter.moduleClass);
+         }
+-        for (Class<?> c : moduleAdapter.staticInjections) {
+-          staticInjections.put(c, null);
++        for (int i = 0; i < moduleAdapter.staticInjections.length; i++) {
++          staticInjections.put(moduleAdapter.staticInjections[i], null);
++        }
++        try {
++          Map<String, Binding<?>> addTo = moduleAdapter.overrides ? overrideBindings : baseBindings;
++          moduleAdapter.getBindings(addTo, loadedModule.getValue());
++        } catch (IllegalArgumentException e) {
++          throw new IllegalArgumentException(moduleAdapter.moduleClass.getSimpleName()
++              + " is an overriding module and cannot contribute set bindings.");
+         }
+-        Map<String, Binding<?>> addTo = moduleAdapter.overrides ? overrideBindings : baseBindings;
+-        moduleAdapter.getBindings(addTo, loadedModule.getValue());
+       }
+ 
+       // Create a linker and install all of the user's bindings
+-      Linker linker = new Linker((base != null) ? base.linker : null, plugin,
+-          new ThrowingErrorHandler());
++      Linker linker = new Linker(plugin, new ThrowingErrorHandler());
+       linker.installBindings(baseBindings);
+       linker.installBindings(overrideBindings);
+ 
+@@ -190,10 +209,7 @@ private static ObjectGraph makeGraph(DaggerObjectGraph base, Loader plugin, Obje
+           injectableTypes);
+     }
+ 
+-
+-
+     @Override public ObjectGraph plus(Object... modules) {
+-      linkEverything();
+       return makeGraph(this, plugin, modules);
+     }
+ 
+@@ -299,4 +315,5 @@ private void linkInjectableTypes() {
+       }
+     }
+   }
++
+ }
+diff --git a/core/src/main/java/dagger/internal/Linker.java b/core/src/main/java/dagger/internal/Linker.java
+index 86edaf545..0fef0fe41 100644
+--- a/core/src/main/java/dagger/internal/Linker.java
++++ b/core/src/main/java/dagger/internal/Linker.java
+@@ -30,13 +30,6 @@
+ public final class Linker {
+   private static final Object UNINITIALIZED = new Object();
+ 
+-  /**
+-   * The base {@code Linker} which will be consulted to satisfy bindings not
+-   * otherwise satisfiable from this {@code Linker}. The top-most {@code Linker}
+-   * in a chain will have a null base linker.
+-   */
+-  private final Linker base;
+-
+   /** Bindings requiring a call to attach(). May contain deferred bindings. */
+   private final Queue<Binding<?>> toLink = new LinkedList<Binding<?>>();
+ 
+@@ -53,11 +46,10 @@
+ 
+   private final ErrorHandler errorHandler;
+ 
+-  public Linker(Linker base, Loader plugin, ErrorHandler errorHandler) {
++  public Linker(Loader plugin, ErrorHandler errorHandler) {
+     if (plugin == null) throw new NullPointerException("plugin");
+     if (errorHandler == null) throw new NullPointerException("errorHandler");
+ 
+-    this.base = base;
+     this.plugin = plugin;
+     this.errorHandler = errorHandler;
+   }
+@@ -234,15 +226,7 @@ private void assertLockHeld() {
+       boolean mustHaveInjections, boolean library) {
+     assertLockHeld();
+ 
+-    Binding<?> binding = null;
+-    for (Linker linker = this; linker != null; linker = linker.base) {
+-      binding = linker.bindings.get(key);
+-      if (binding != null) {
+-        if (linker != this && !binding.isLinked()) throw new AssertionError();
+-        break;
+-      }
+-    }
+-
++    Binding<?> binding = bindings.get(key);
+     if (binding == null) {
+       // We can't satisfy this binding. Make sure it'll work next time!
+       Binding<?> deferredBinding =
+@@ -280,10 +264,9 @@ private void assertLockHeld() {
+    * Returns a scoped binding for {@code binding}.
+    */
+   static <T> Binding<T> scope(final Binding<T> binding) {
+-    if (!binding.isSingleton()) {
+-      return binding;
++    if (!binding.isSingleton() || binding instanceof SingletonBinding) {
++      return binding; // Default scoped binding or already a scoped binding.
+     }
+-    if (binding instanceof SingletonBinding) throw new AssertionError();
+     return new SingletonBinding<T>(binding);
+   }
+ 
+@@ -418,11 +401,17 @@ private DeferredBinding(String deferredKey, ClassLoader classLoader, Object requ
+       this.classLoader = classLoader;
+       this.mustHaveInjections = mustHaveInjections;
+     }
++
+     @Override public void injectMembers(Object t) {
+       throw new UnsupportedOperationException("Deferred bindings must resolve first.");
+     }
++
+     @Override public void getDependencies(Set<Binding<?>> get, Set<Binding<?>> injectMembers) {
+       throw new UnsupportedOperationException("Deferred bindings must resolve first.");
+     }
++
++    @Override public String toString() {
++      return "DeferredBinding[deferredKey=" + deferredKey + "]";
++    }
+   }
+ }
+diff --git a/core/src/main/java/dagger/internal/Memoizer.java b/core/src/main/java/dagger/internal/Memoizer.java
+index 300cb9a94..04cdc104c 100644
+--- a/core/src/main/java/dagger/internal/Memoizer.java
++++ b/core/src/main/java/dagger/internal/Memoizer.java
+@@ -15,7 +15,7 @@
+  */
+ package dagger.internal;
+ 
+-import java.util.HashMap;
++import java.util.LinkedHashMap;
+ import java.util.Map;
+ import java.util.concurrent.locks.Lock;
+ import java.util.concurrent.locks.ReadWriteLock;
+@@ -30,7 +30,7 @@
+   private final Lock writeLock;
+ 
+   public Memoizer() {
+-    this.map = new HashMap<K, V>();
++    this.map = new LinkedHashMap<K, V>();
+     ReadWriteLock lock = new ReentrantReadWriteLock();
+     this.readLock = lock.readLock();
+     this.writeLock = lock.writeLock();
+@@ -70,7 +70,7 @@ public final V get(K key) {
+ 
+   protected abstract V create(K key);
+ 
+-  @Override public synchronized final String toString() {
++  @Override public final String toString() {
+     readLock.lock();
+     try {
+       return map.toString();
+diff --git a/core/src/main/java/dagger/internal/ModuleAdapter.java b/core/src/main/java/dagger/internal/ModuleAdapter.java
+index 43f814b4c..dfe09b236 100644
+--- a/core/src/main/java/dagger/internal/ModuleAdapter.java
++++ b/core/src/main/java/dagger/internal/ModuleAdapter.java
+@@ -61,7 +61,7 @@ protected T newModule() {
+   }
+ 
+   @Override
+-  final public boolean equals(Object obj) {
++  public final boolean equals(Object obj) {
+     if (obj == this) {
+       return true;
+     } else if (obj instanceof ModuleAdapter<?>) {
+diff --git a/core/src/main/java/dagger/internal/Modules.java b/core/src/main/java/dagger/internal/Modules.java
+index 11edda9aa..8b269f57f 100644
+--- a/core/src/main/java/dagger/internal/Modules.java
++++ b/core/src/main/java/dagger/internal/Modules.java
+@@ -18,7 +18,6 @@
+ 
+ 
+ import java.util.LinkedHashMap;
+-import java.util.List;
+ import java.util.Map;
+ 
+ /**
+@@ -33,16 +32,16 @@ private Modules() { }
+    * modules.
+    */
+   public static Map<ModuleAdapter<?>, Object> loadModules(Loader loader,
+-      List<Object> seedModulesOrClasses) {
++      Object[] seedModulesOrClasses) {
+     Map<ModuleAdapter<?>, Object> seedAdapters =
+-        new LinkedHashMap<ModuleAdapter<?>, Object>(seedModulesOrClasses.size());
+-    for (Object moduleOrClass : seedModulesOrClasses) {
+-      if (moduleOrClass instanceof Class<?>) {
+-        ModuleAdapter<?> moduleAdapter = loader.getModuleAdapter((Class<?>) moduleOrClass);
+-        seedAdapters.put(moduleAdapter, moduleAdapter.newModule());
++        new LinkedHashMap<ModuleAdapter<?>, Object>(seedModulesOrClasses.length);
++    for (int i = 0; i < seedModulesOrClasses.length; i++) {
++      if (seedModulesOrClasses[i] instanceof Class<?>) {
++        ModuleAdapter<?> adapter = loader.getModuleAdapter((Class<?>) seedModulesOrClasses[i]);
++        seedAdapters.put(adapter, adapter.newModule());
+       } else {
+-        ModuleAdapter<?> moduleAdapter = loader.getModuleAdapter(moduleOrClass.getClass());
+-        seedAdapters.put(moduleAdapter, moduleOrClass);
++        ModuleAdapter<?> adapter = loader.getModuleAdapter(seedModulesOrClasses[i].getClass());
++        seedAdapters.put(adapter, seedModulesOrClasses[i]);
+       }
+     }
+ 
+@@ -51,7 +50,6 @@ private Modules() { }
+     Map<ModuleAdapter<?>, Object> result =
+         new LinkedHashMap<ModuleAdapter<?>, Object>(seedAdapters);
+ 
+-
+     // Next collect included modules
+     Map<Class<?>, ModuleAdapter<?>> transitiveInclusions =
+         new LinkedHashMap<Class<?>, ModuleAdapter<?>>();
+diff --git a/core/src/main/java/dagger/internal/SetBinding.java b/core/src/main/java/dagger/internal/SetBinding.java
+index cdfc161d0..ed0c5f71a 100644
+--- a/core/src/main/java/dagger/internal/SetBinding.java
++++ b/core/src/main/java/dagger/internal/SetBinding.java
+@@ -28,27 +28,49 @@
+  */
+ public final class SetBinding<T> extends Binding<Set<T>> {
+ 
+-  @SuppressWarnings("unchecked")
+   public static <T> void add(Map<String, Binding<?>> bindings, String setKey, Binding<?> binding) {
++    prepareSetBinding(bindings, setKey, binding).contributors.add(Linker.scope(binding));
++  }
++
++  @SuppressWarnings("unchecked")
++  private static <T> SetBinding<T> prepareSetBinding(
++      Map<String, Binding<?>> bindings, String setKey, Binding<?> binding) {
+     Binding<?> previous = bindings.get(setKey);
+     SetBinding<T> setBinding;
+     if (previous instanceof SetBinding) {
+-      setBinding = (SetBinding) previous;
++      setBinding = (SetBinding<T>) previous;
+       setBinding.setLibrary(setBinding.library() && binding.library());
++      return setBinding;
+     } else if (previous != null) {
+       throw new IllegalArgumentException("Duplicate:\n    " + previous + "\n    " + binding);
+     } else {
+       setBinding = new SetBinding<T>(setKey, binding.requiredBy);
+       setBinding.setLibrary(binding.library());
+       bindings.put(setKey, setBinding);
++      return (SetBinding<T>) bindings.get(setKey); // BindingMap.put() copies SetBindings.
+     }
+-    setBinding.contributors.add(Linker.scope(binding));
+   }
+ 
+-  private final Set<Binding<?>> contributors = new LinkedHashSet<Binding<?>>();
++  private final Set<Binding<?>> contributors;
+ 
++  /**
++   * Creates a new {@code SetBinding} with the given "provides" key, and the requiredBy object
++   * for traceability.
++   */
+   public SetBinding(String key, Object requiredBy) {
+     super(key, null, false, requiredBy);
++    contributors = new LinkedHashSet<Binding<?>>();
++  }
++
++  /**
++   * Creates a new {@code SetBinding} with all of the contributing bindings of the provided
++   * original {@code SetBinding}.
++   */
++  public SetBinding(SetBinding<T> original) {
++    super(original.provideKey, null, false, original.requiredBy);
++    this.setLibrary(original.library());
++    this.setDependedOn(original.dependedOn());
++    contributors = new LinkedHashSet<Binding<?>>(original.contributors);
+   }
+ 
+   @Override public void attach(Linker linker) {
+diff --git a/core/src/test/java/dagger/ExtensionWithSetBindingsTest.java b/core/src/test/java/dagger/ExtensionWithSetBindingsTest.java
+new file mode 100644
+index 000000000..30b4929b0
+--- /dev/null
++++ b/core/src/test/java/dagger/ExtensionWithSetBindingsTest.java
+@@ -0,0 +1,88 @@
++/*
++ * Copyright (C) 2013 Google Inc.
++ * Copyright (C) 2013 Square Inc.
++ *
++ * Licensed under the Apache License, Version 2.0 (the "License");
++ * you may not use this file except in compliance with the License.
++ * You may obtain a copy of the License at
++ *
++ * http://www.apache.org/licenses/LICENSE-2.0
++ *
++ * Unless required by applicable law or agreed to in writing, software
++ * distributed under the License is distributed on an "AS IS" BASIS,
++ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++ * See the License for the specific language governing permissions and
++ * limitations under the License.
++ */
++package dagger;
++
++import dagger.internal.TestingLoader;
++import java.util.Set;
++import java.util.concurrent.atomic.AtomicInteger;
++import javax.inject.Inject;
++import javax.inject.Singleton;
++import org.junit.Test;
++import org.junit.runner.RunWith;
++import org.junit.runners.JUnit4;
++
++import static dagger.Provides.Type.SET;
++import static org.fest.assertions.Assertions.assertThat;
++import static org.junit.Assert.assertEquals;
++import static org.junit.Assert.fail;
++
++@RunWith(JUnit4.class)
++public final class ExtensionWithSetBindingsTest {
++  private static final AtomicInteger counter = new AtomicInteger(0);
++
++  @Singleton
++  static class RealSingleton {
++    @Inject Set<Integer> ints;
++  }
++
++  @Singleton
++  static class Main {
++    @Inject Set<Integer> ints;
++  }
++
++  @Module(injects = RealSingleton.class)
++  static class RootModule {
++    @Provides(type=SET) @Singleton Integer provideA() { return counter.getAndIncrement(); }
++    @Provides(type=SET) @Singleton Integer provideB() { return counter.getAndIncrement(); }
++  }
++
++  @Module(addsTo = RootModule.class, injects = Main.class )
++  static class ExtensionModule {
++    @Provides(type=SET) @Singleton Integer provideC() { return counter.getAndIncrement(); }
++    @Provides(type=SET) @Singleton Integer provideD() { return counter.getAndIncrement(); }
++  }
++
++  @Test public void basicInjectionWithExtension() {
++    ObjectGraph root = ObjectGraph.createWith(new TestingLoader(), new RootModule());
++    RealSingleton rs = root.get(RealSingleton.class);
++    assertThat(rs.ints).containsOnly(0, 1);
++
++    ObjectGraph extension = root.plus(new ExtensionModule());
++    Main main = extension.get(Main.class);
++    assertThat(main.ints).containsOnly(0, 1, 2, 3);
++
++    // Second time around.
++    ObjectGraph extension2 = root.plus(new ExtensionModule());
++    Main main2 = extension2.get(Main.class);
++    assertThat(main2.ints).containsOnly(0, 1, 4, 5);
++  }
++
++  @Module(includes = ExtensionModule.class, overrides = true)
++  static class TestModule {
++    @Provides(type=SET) @Singleton Integer provide9999() { return 9999; }
++  }
++
++  @Test public void basicInjectionWithExtensionAndOverrides() {
++    try {
++      ObjectGraph.createWith(new TestingLoader(), new RootModule()).plus(new TestModule());
++      fail("Should throw exception.");
++    } catch (IllegalArgumentException e) {
++      assertEquals("TestModule is an overriding module and cannot contribute set bindings.",
++          e.getMessage());
++    }
++  }
++}
+diff --git a/core/src/test/java/dagger/internal/SingletonBindingTest.java b/core/src/test/java/dagger/internal/SingletonBindingTest.java
+index 8c6154cfd..515a2eb7a 100644
+--- a/core/src/test/java/dagger/internal/SingletonBindingTest.java
++++ b/core/src/test/java/dagger/internal/SingletonBindingTest.java
+@@ -1,76 +1,76 @@
+-/**
+- * Copyright (C) 2013 Square, Inc.
+- *
+- * Licensed under the Apache License, Version 2.0 (the "License");
+- * you may not use this file except in compliance with the License.
+- * You may obtain a copy of the License at
+- *
+- * http://www.apache.org/licenses/LICENSE-2.0
+- *
+- * Unless required by applicable law or agreed to in writing, software
+- * distributed under the License is distributed on an "AS IS" BASIS,
+- * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+- * See the License for the specific language governing permissions and
+- * limitations under the License.
+- */
+-
+-package dagger.internal;
+-
+-import org.junit.Before;
+-import org.junit.Test;
+-import org.junit.runner.RunWith;
+-import org.junit.runners.JUnit4;
+-import static org.fest.assertions.Assertions.assertThat;
+-
+-@RunWith(JUnit4.class)
+-public final class SingletonBindingTest {
+-  private Binding<String> wrappedBinding;
+-  private Binding<String> singletonBinding;
+-
+-  @Before public void setUp() {
+-    wrappedBinding = new StringBinding();
+-    singletonBinding = Linker.scope(wrappedBinding);
+-  }
+-
+-  @Test public void testSingletonBindingIsSingleton() {
+-    assertThat(singletonBinding.isSingleton()).isTrue();
+-  }
+-
+-  // This next batch of tests validates that SingletonBinding consistently delegates to the wrapped binding for state.
+-  @Test public void testSingletonBindingDelegatesSetLinked() {
+-    singletonBinding.setLinked();
+-    assertThat(wrappedBinding.isLinked()).isTrue();
+-  }
+-
+-  @Test public void testSingletonBindingDelegatesIsLinked() {
+-    wrappedBinding.setLinked();
+-    assertThat(singletonBinding.isLinked()).isTrue();
+-  }
+-
+-  @Test public void testSingletonBindingDelegatesSetVisiting() {
+-    singletonBinding.setVisiting(true);
+-    assertThat(wrappedBinding.isVisiting()).isTrue();
+-  }
+-
+-  @Test public void testSingletonBindingDelegatesIsVisiting() {
+-    wrappedBinding.setVisiting(true);
+-    assertThat(singletonBinding.isVisiting()).isTrue();
+-  }
+-
+-  @Test public void testSingletonBindingDelegatesSetCycleFree() {
+-    singletonBinding.setCycleFree(true);
+-    assertThat(wrappedBinding.isCycleFree()).isTrue();
+-  }
+-
+-  @Test public void testSingletonBindingDelegatesIsCycleFree() {
+-    wrappedBinding.setCycleFree(true);
+-    assertThat(singletonBinding.isCycleFree()).isTrue();
+-  }
+-
+-  private static class StringBinding extends Binding<String> {
+-    private StringBinding() {
+-      super("dummy", "dummy", true, "dummy"); // 3rd arg true => singleton
+-    }
+-
+-  }
+-}
++/**
++ * Copyright (C) 2013 Square, Inc.
++ *
++ * Licensed under the Apache License, Version 2.0 (the "License");
++ * you may not use this file except in compliance with the License.
++ * You may obtain a copy of the License at
++ *
++ * http://www.apache.org/licenses/LICENSE-2.0
++ *
++ * Unless required by applicable law or agreed to in writing, software
++ * distributed under the License is distributed on an "AS IS" BASIS,
++ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++ * See the License for the specific language governing permissions and
++ * limitations under the License.
++ */
++
++package dagger.internal;
++
++import org.junit.Before;
++import org.junit.Test;
++import org.junit.runner.RunWith;
++import org.junit.runners.JUnit4;
++import static org.fest.assertions.Assertions.assertThat;
++
++@RunWith(JUnit4.class)
++public final class SingletonBindingTest {
++  private Binding<String> wrappedBinding;
++  private Binding<String> singletonBinding;
++
++  @Before public void setUp() {
++    wrappedBinding = new StringBinding();
++    singletonBinding = Linker.scope(wrappedBinding);
++  }
++
++  @Test public void testSingletonBindingIsSingleton() {
++    assertThat(singletonBinding.isSingleton()).isTrue();
++  }
++
++  // This next batch of tests validates that SingletonBinding consistently delegates to the wrapped binding for state.
++  @Test public void testSingletonBindingDelegatesSetLinked() {
++    singletonBinding.setLinked();
++    assertThat(wrappedBinding.isLinked()).isTrue();
++  }
++
++  @Test public void testSingletonBindingDelegatesIsLinked() {
++    wrappedBinding.setLinked();
++    assertThat(singletonBinding.isLinked()).isTrue();
++  }
++
++  @Test public void testSingletonBindingDelegatesSetVisiting() {
++    singletonBinding.setVisiting(true);
++    assertThat(wrappedBinding.isVisiting()).isTrue();
++  }
++
++  @Test public void testSingletonBindingDelegatesIsVisiting() {
++    wrappedBinding.setVisiting(true);
++    assertThat(singletonBinding.isVisiting()).isTrue();
++  }
++
++  @Test public void testSingletonBindingDelegatesSetCycleFree() {
++    singletonBinding.setCycleFree(true);
++    assertThat(wrappedBinding.isCycleFree()).isTrue();
++  }
++
++  @Test public void testSingletonBindingDelegatesIsCycleFree() {
++    wrappedBinding.setCycleFree(true);
++    assertThat(singletonBinding.isCycleFree()).isTrue();
++  }
++
++  private static class StringBinding extends Binding<String> {
++    private StringBinding() {
++      super("dummy", "dummy", true, "dummy"); // 3rd arg true => singleton
++    }
++
++  }
++}
+diff --git a/core/src/test/java/dagger/internal/TestingModuleAdapter.java b/core/src/test/java/dagger/internal/TestingModuleAdapter.java
+index ae8775f8c..eed43e973 100644
+--- a/core/src/test/java/dagger/internal/TestingModuleAdapter.java
++++ b/core/src/test/java/dagger/internal/TestingModuleAdapter.java
+@@ -127,6 +127,10 @@ private void handleSetBindings(Map<String, Binding<?>> bindings, M module, Metho
+     }
+   }
+ 
++  @Override public String toString() {
++    return "TestingModuleAdapter[" + this.moduleClass.getName() + "]";
++  }
++
+   /**
+    * Creates a TestingModuleAdapter or throws an {@code IllegalArgumentException}.
+    */

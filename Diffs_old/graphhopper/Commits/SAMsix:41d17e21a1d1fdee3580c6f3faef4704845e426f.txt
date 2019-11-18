@@ -1,0 +1,3331 @@
+diff --git a/core/files/changelog.txt b/core/files/changelog.txt
+index ac3ec1275a..f181d4e272 100644
+--- a/core/files/changelog.txt
++++ b/core/files/changelog.txt
+@@ -1,3 +1,9 @@
++0.4.0
++    with the introduction of lock protection mechanism (see #112) GraphHopper needs always write access, see also #217
++    new GraphHopper.clean method to remove the directory via Java API
++    FlagEncoder: replaced isFoward and isBackward with more generic isBool(flags, FlagEncoder.FORWARD|BACKWARD)
++        restrictions type was: String[], is: List<String>
++
+ 0.3.0
+     introduced prefer bits, now bike uses more bits and 3 bike encoder do not fit into 32 bit anymore, will be fixed later
+     moved Translation argument into Path.calcInstruction for more fine grained control, instructions are now uncached and GHRequest: new locale parameter
+diff --git a/core/src/main/java/com/graphhopper/GraphHopper.java b/core/src/main/java/com/graphhopper/GraphHopper.java
+index bfb62dfbd7..f70cc0f6ed 100644
+--- a/core/src/main/java/com/graphhopper/GraphHopper.java
++++ b/core/src/main/java/com/graphhopper/GraphHopper.java
+@@ -76,6 +76,9 @@ public static void main( String[] strs ) throws Exception
+     private boolean sortGraph = false;
+     boolean removeZipped = true;
+     private boolean elevation = false;
++    private LockFactory lockFactory = new NativeFSLockFactory();
++    private final String fileLockName = "gh.lock";
++    private boolean allowWrites = true;
+     // for routing
+     private boolean simplifyRequest = true;
+     // for index
+@@ -443,6 +446,21 @@ public GraphHopper setSortGraph( boolean sortGraph )
+         return this;
+     }
+ 
++    /**
++     * Specifies if it is allowed for GraphHopper to write. E.g. for read only filesystems it is not
++     * possible to create a lock file and so we can avoid write locks.
++     */
++    public GraphHopper setAllowWrites( boolean allowWrites )
++    {
++        this.allowWrites = allowWrites;
++        return this;
++    }
++
++    public boolean isAllowWrites()
++    {
++        return allowWrites;
++    }
++
+     public TranslationMap getTranslationMap()
+     {
+         return trMap;
+@@ -499,6 +517,27 @@ public GraphHopper init( CmdArgs args )
+         sortGraph = args.getBool("graph.doSort", sortGraph);
+         removeZipped = args.getBool("graph.removeZipped", removeZipped);
+         turnCosts = args.getBool("graph.turnCosts", turnCosts);
++        if (args.get("graph.locktype", "native").equals("simple"))
++            lockFactory = new SimpleFSLockFactory();
++        else
++            lockFactory = new NativeFSLockFactory();
++
++        // elevation
++        String eleProviderStr = args.get("graph.elevation.provider", "noop").toLowerCase();
++        String cacheDirStr = args.get("graph.elevation.cachedir", "");
++        String baseURL = args.get("graph.elevation.baseurl", "");
++        DAType elevationDAType = DAType.fromString(args.get("graph.elevation.dataaccess", "MMAP"));
++        ElevationProvider tmpProvider = ElevationProvider.NOOP;
++        if (eleProviderStr.equalsIgnoreCase("srtm"))
++            tmpProvider = new SRTMProvider();
++        // later:
++//        else if(eleProviderStr.startsWith("cgiar:"))        
++//            eleProvider = new CGIARProvider().setCacheDir(new File());        
++
++        tmpProvider.setCacheDir(new File(cacheDirStr));
++        tmpProvider.setBaseURL(baseURL);
++        tmpProvider.setInMemory(elevationDAType.isInMemory());
++        setElevationProvider(tmpProvider);
+ 
+         // optimizable prepare
+         minNetworkSize = args.getInt("prepare.minNetworkSize", minNetworkSize);
+@@ -523,23 +562,6 @@ public GraphHopper init( CmdArgs args )
+         workerThreads = args.getInt("osmreader.workerThreads", workerThreads);
+         enableInstructions = args.getBool("osmreader.instructions", enableInstructions);
+ 
+-        // elevation
+-        String eleProviderStr = args.get("graph.elevation.provider", "noop").toLowerCase();
+-        String cacheDirStr = args.get("graph.elevation.cachedir", "");
+-        String baseURL = args.get("graph.elevation.baseurl", "");
+-        DAType elevationDAType = DAType.fromString(args.get("graph.elevation.dataaccess", "MMAP"));
+-        ElevationProvider tmpProvider = ElevationProvider.NOOP;
+-        if (eleProviderStr.equalsIgnoreCase("srtm"))
+-            tmpProvider = new SRTMProvider();
+-        // later:
+-//        else if(eleProviderStr.startsWith("cgiar:"))        
+-//            eleProvider = new CGIARProvider().setCacheDir(new File());        
+-
+-        tmpProvider.setCacheDir(new File(cacheDirStr));
+-        tmpProvider.setBaseURL(baseURL);
+-        tmpProvider.setInMemory(elevationDAType.isInMemory());
+-        setElevationProvider(tmpProvider);
+-
+         // index
+         preciseIndexResolution = args.getInt("index.highResolution", preciseIndexResolution);
+         return this;
+@@ -575,23 +597,40 @@ public GraphHopper importOrLoad()
+     private GraphHopper process( String graphHopperLocation )
+     {
+         setGraphHopperLocation(graphHopperLocation);
++        Lock lock = null;
+         try
+         {
+-            importData();
+-            graph.getProperties().put("osmreader.import.date", formatDateTime(new Date()));
+-        } catch (IOException ex)
++            if (graph.getDirectory().getDefaultType().isStoring())
++            {
++                lockFactory.setLockDir(new File(graphHopperLocation));
++                lock = lockFactory.create(fileLockName, true);
++                if (!lock.tryLock())
++                    throw new RuntimeException("To avoid multiple writers we need to obtain a write lock but it failed. In " + graphHopperLocation, lock.getObtainFailedReason());
++            }
++
++            try
++            {
++                importData();
++                graph.getProperties().put("osmreader.import.date", formatDateTime(new Date()));
++            } catch (IOException ex)
++            {
++                throw new RuntimeException("Cannot parse OSM file " + getOSMFile(), ex);
++            }
++            cleanUp();
++            optimize();
++            postProcessing();
++            flush();
++        } finally
+         {
+-            throw new RuntimeException("Cannot parse OSM file " + getOSMFile(), ex);
++            if (lock != null)
++                lock.release();
+         }
+-        cleanUp();
+-        optimize();
+-        postProcessing();
+-        flush();
+         return this;
+     }
+ 
+     protected DataReader importData() throws IOException
+     {
++        ensureWriteAccess();
+         if (graph == null)
+             throw new IllegalStateException("Load graph before importing OSM data");
+ 
+@@ -680,12 +719,31 @@ else if (turnCosts)
+             graph = new GraphHopperStorage(dir, encodingManager, hasElevation());
+ 
+         graph.setSegmentSize(defaultSegmentSize);
+-        if (!graph.loadExisting())
+-            return false;
+ 
+-        postProcessing();
+-        fullyLoaded = true;
+-        return true;
++        Lock lock = null;
++        try
++        {
++            // create locks only if writes are allowed, if they are not allowed a lock cannot be created 
++            // (e.g. on a read only filesystem locks would fail)
++            if (graph.getDirectory().getDefaultType().isStoring() && isAllowWrites())
++            {
++                lockFactory.setLockDir(new File(ghLocation));
++                lock = lockFactory.create(fileLockName, false);
++                if (!lock.tryLock())
++                    throw new RuntimeException("To avoid reading partial data we need to obtain the read lock but it failed. In " + ghLocation, lock.getObtainFailedReason());
++            }
++
++            if (!graph.loadExisting())
++                return false;
++
++            postProcessing();
++            fullyLoaded = true;
++            return true;
++        } finally
++        {
++            if (lock != null)
++                lock.release();
++        }
+     }
+ 
+     /**
+@@ -887,7 +945,10 @@ protected LocationIndex createLocationIndex( Directory dir )
+         }
+ 
+         if (!tmpIndex.loadExisting())
++        {
++            ensureWriteAccess();
+             tmpIndex.prepareIndex();
++        }
+ 
+         return tmpIndex;
+     }
+@@ -930,6 +991,7 @@ protected void prepare()
+         boolean tmpPrepare = doPrepare && prepare != null;
+         if (tmpPrepare)
+         {
++            ensureWriteAccess();
+             if (prepare instanceof PrepareContractionHierarchies && encodingManager.getVehicleCount() > 1)
+                 throw new IllegalArgumentException("Contraction hierarchies preparation "
+                         + "requires (at the moment) only one vehicle. But was:" + encodingManager);
+@@ -963,7 +1025,8 @@ protected void flush()
+     }
+ 
+     /**
+-     * Releases all associated resources like memory or files.
++     * Releases all associated resources like memory or files. But it does not remove them. To
++     * remove the files created in graphhopperLocation you have to call clean().
+      */
+     public void close()
+     {
+@@ -972,12 +1035,27 @@ public void close()
+ 
+         if (locationIndex != null)
+             locationIndex.close();
++
++        try
++        {
++            lockFactory.forceRemove(fileLockName, true);
++        } catch (Exception ex)
++        {
++            // silently fail
++        }
+     }
+ 
+-    protected void ensureNotLoaded()
++    /**
++     * Removes the on-disc routing files. Call only after calling close or before importOrLoad or
++     * load
++     */
++    public void clean()
+     {
+-        if (fullyLoaded)
+-            throw new IllegalStateException("No configuration changes are possible after loading the graph");
++        if (getGraphHopperLocation().isEmpty())
++            throw new IllegalStateException("Cannot clean GraphHopper without specified graphHopperLocation");
++
++        File folder = new File(getGraphHopperLocation());
++        Helper.removeDir(folder);
+     }
+ 
+     // make sure this is identical to buildDate used in pom.xml
+@@ -986,4 +1064,16 @@ private String formatDateTime( Date date )
+     {
+         return new SimpleDateFormat("yyyy-MM-dd'T'HH:mm:ssZ").format(date);
+     }
++
++    protected void ensureNotLoaded()
++    {
++        if (fullyLoaded)
++            throw new IllegalStateException("No configuration changes are possible after loading the graph");
++    }
++
++    protected void ensureWriteAccess()
++    {
++        if (!allowWrites)
++            throw new IllegalStateException("Writes are not allowed!");
++    }
+ }
+diff --git a/core/src/main/java/com/graphhopper/reader/OSMElement.java b/core/src/main/java/com/graphhopper/reader/OSMElement.java
+index a943eec8cb..9820bbee00 100644
+--- a/core/src/main/java/com/graphhopper/reader/OSMElement.java
++++ b/core/src/main/java/com/graphhopper/reader/OSMElement.java
+@@ -21,6 +21,7 @@
+ import javax.xml.stream.XMLStreamException;
+ import javax.xml.stream.XMLStreamReader;
+ import java.util.HashMap;
++import java.util.List;
+ import java.util.Map;
+ import java.util.Map.Entry;
+ import java.util.Set;
+@@ -167,7 +168,7 @@ public final boolean hasTag( String key, Set<String> values )
+      * Check a number of tags in the given order for the any of the given values. Used to parse
+      * hierarchical access restrictions
+      */
+-    public boolean hasTag( String[] keyList, Set<String> values )
++    public boolean hasTag( List<String> keyList, Set<String> values )
+     {
+         for (String key : keyList)
+         {
+diff --git a/core/src/main/java/com/graphhopper/reader/OSMReader.java b/core/src/main/java/com/graphhopper/reader/OSMReader.java
+index 38b6b1ebb8..25dfb5ddc3 100644
+--- a/core/src/main/java/com/graphhopper/reader/OSMReader.java
++++ b/core/src/main/java/com/graphhopper/reader/OSMReader.java
+@@ -104,11 +104,10 @@
+     private LongIntMap osmNodeIdToInternalNodeMap;
+     private TLongLongHashMap osmNodeIdToNodeFlagsMap;
+     private TLongLongHashMap osmWayIdToRouteWeightMap;
+-    // stores osm ids used by relations to identify which edge ids needs to be mapped later
++    // stores osm way ids used by relations to identify which edge ids needs to be mapped later
+     private TLongHashSet osmIdStoreRequiredSet = new TLongHashSet();
+-    ; 
+-    private TIntLongMap edgeIdToOsmidMap;
+-    private final TLongList barrierNodeIDs = new TLongArrayList();
++    private TIntLongMap edgeIdToOsmIdMap;
++    private final TLongList barrierNodeIds = new TLongArrayList();
+     protected PillarInfo pillarInfo;
+     private final DistanceCalc distCalc = new DistanceCalcEarth();
+     private final DistanceCalc3D distCalc3D = new DistanceCalc3D();
+@@ -117,7 +116,7 @@
+     private int nextTowerId = 0;
+     private int nextPillarId = 0;
+     // negative but increasing to avoid clash with custom created OSM files
+-    private long newUniqueOSMId = -Long.MAX_VALUE;
++    private long newUniqueOsmId = -Long.MAX_VALUE;
+     private ElevationProvider eleProvider = ElevationProvider.NOOP;
+     private boolean exitOnlyPillarNodeException = true;
+     private File osmFile;
+@@ -236,10 +235,10 @@ private TLongSet getOsmIdStoreRequiredSet()
+ 
+     private TIntLongMap getEdgeIdToOsmidMap()
+     {
+-        if (edgeIdToOsmidMap == null)
+-            edgeIdToOsmidMap = new TIntLongHashMap(getOsmIdStoreRequiredSet().size());
++        if (edgeIdToOsmIdMap == null)
++            edgeIdToOsmIdMap = new TIntLongHashMap(getOsmIdStoreRequiredSet().size());
+ 
+-        return edgeIdToOsmidMap;
++        return edgeIdToOsmIdMap;
+     }
+ 
+     /**
+@@ -411,9 +410,6 @@ void processWay( OSMWay way )
+                     // remember barrier for processing the way behind it
+                     lastBarrier = i;
+                 }
+-            } else if (nodeFlags < 0)
+-            {
+-                wayFlags = encodingManager.applyNodeFlags(wayFlags, -nodeFlags);
+             }
+         }
+ 
+@@ -790,7 +786,7 @@ private int handlePillarNode( int tmpNode, long osmId, PointList pointList, bool
+         return (int) tmpNode;
+     }
+ 
+-    void finishedReading()
++    protected void finishedReading()
+     {
+         printInfo("way");
+         pillarInfo.clear();
+@@ -799,7 +795,7 @@ void finishedReading()
+         osmNodeIdToNodeFlagsMap = null;
+         osmWayIdToRouteWeightMap = null;
+         osmIdStoreRequiredSet = null;
+-        edgeIdToOsmidMap = null;
++        edgeIdToOsmIdMap = null;
+     }
+ 
+     /**
+@@ -827,7 +823,7 @@ long addBarrierNode( long nodeId )
+ 
+     private long createNewNodeId()
+     {
+-        return newUniqueOSMId++;
++        return newUniqueOsmId++;
+     }
+ 
+     /**
+@@ -838,10 +834,10 @@ private long createNewNodeId()
+         // clear barred directions from routing flags
+         flags &= ~nodeFlags;
+         // add edge
+-        barrierNodeIDs.clear();
+-        barrierNodeIDs.add(fromId);
+-        barrierNodeIDs.add(toId);
+-        return addOSMWay(barrierNodeIDs, flags, wayOsmId);
++        barrierNodeIds.clear();
++        barrierNodeIds.add(fromId);
++        barrierNodeIds.add(toId);
++        return addOSMWay(barrierNodeIds, flags, wayOsmId);
+     }
+ 
+     /**
+@@ -893,12 +889,12 @@ boolean isInBounds( OSMNode node )
+     /**
+      * Maps OSM IDs (long) to internal node IDs (int)
+      */
+-    LongIntMap getNodeMap()
++    protected LongIntMap getNodeMap()
+     {
+         return osmNodeIdToInternalNodeMap;
+     }
+ 
+-    TLongLongMap getNodeFlagsMap()
++    protected TLongLongMap getNodeFlagsMap()
+     {
+         return osmNodeIdToNodeFlagsMap;
+     }
+diff --git a/core/src/main/java/com/graphhopper/routing/Path.java b/core/src/main/java/com/graphhopper/routing/Path.java
+index 829c4696a2..447f83e3e8 100644
+--- a/core/src/main/java/com/graphhopper/routing/Path.java
++++ b/core/src/main/java/com/graphhopper/routing/Path.java
+@@ -216,10 +216,10 @@ protected void processEdge( int edgeId, int adjNode )
+      */
+     protected long calcMillis( double distance, long flags, boolean revert )
+     {
+-        if (revert && !encoder.isBackward(flags)
+-                || !revert && !encoder.isForward(flags))
++        if (revert && !encoder.isBool(flags, FlagEncoder.K_BACKWARD)
++                || !revert && !encoder.isBool(flags, FlagEncoder.K_FORWARD))
+             throw new IllegalStateException("Calculating time should not require to read speed from edge in wrong direction. "
+-                    + "Reverse:" + revert + ", fwd:" + encoder.isForward(flags) + ", bwd:" + encoder.isBackward(flags));
++                    + "Reverse:" + revert + ", fwd:" + encoder.isBool(flags, FlagEncoder.K_FORWARD) + ", bwd:" + encoder.isBool(flags, FlagEncoder.K_BACKWARD));
+ 
+         double speed = revert ? encoder.getReverseSpeed(flags) : encoder.getSpeed(flags);
+         if (Double.isInfinite(speed) || Double.isNaN(speed))
+diff --git a/core/src/main/java/com/graphhopper/routing/util/AbstractFlagEncoder.java b/core/src/main/java/com/graphhopper/routing/util/AbstractFlagEncoder.java
+index c07e036d2c..95aed62ad0 100644
+--- a/core/src/main/java/com/graphhopper/routing/util/AbstractFlagEncoder.java
++++ b/core/src/main/java/com/graphhopper/routing/util/AbstractFlagEncoder.java
+@@ -30,7 +30,7 @@
+ import com.graphhopper.reader.OSMRelation;
+ import com.graphhopper.reader.OSMTurnRelation.TurnCostTableEntry;
+ import com.graphhopper.util.*;
+-import java.util.Collections;
++import java.util.*;
+ 
+ /**
+  * Abstract class which handles flag decoding and encoding. Every encoder should be registered to a
+@@ -52,6 +52,7 @@
+     protected long forwardBit = 0;
+     protected long backwardBit = 0;
+     protected long directionBitMask = 0;
++    protected long roundaboutBit = 0;
+     protected EncodedDoubleValue speedEncoder;
+     // bit to signal that way is accepted
+     protected long acceptBit = 0;
+@@ -68,9 +69,9 @@
+     protected EdgeExplorer edgeOutExplorer;
+     protected EdgeExplorer edgeInExplorer;
+ 
+-    /* restriction definitions */
+-    protected String[] restrictions;
+-    protected HashSet<String> intendedValues = new HashSet<String>();
++    /* restriction definitions where order is important */
++    protected List<String> restrictions = new ArrayList<String>(5);
++    protected HashSet<String> intendedValues = new HashSet<String>(5);
+     protected HashSet<String> restrictedValues = new HashSet<String>(5);
+     protected HashSet<String> ferries = new HashSet<String>(5);
+     protected HashSet<String> oneways = new HashSet<String>(5);
+@@ -123,14 +124,16 @@ public int defineWayBits( int index, int shift )
+         forwardBit = 1 << shift;
+         backwardBit = 2 << shift;
+         directionBitMask = 3 << shift;
++        shift += 2;
++        roundaboutBit = 1 << shift;
++        shift++;
+ 
+         // define internal flags for parsing
+         index *= 2;
+         acceptBit = 1 << index;
+         ferryBit = 2 << index;
+ 
+-        // forward and backward bit:
+-        return shift + 2;
++        return shift;
+     }
+ 
+     /**
+@@ -208,26 +211,6 @@ public long handleNodeTags( OSMNode node )
+         return 0;
+     }
+ 
+-    /**
+-     * This method is called after determining the node flags and way flags.
+-     */
+-    public long applyNodeFlags( long wayFlags, long nodeFlags )
+-    {
+-        return nodeFlags | wayFlags;
+-    }
+-
+-    @Override
+-    public boolean isForward( long flags )
+-    {
+-        return (flags & forwardBit) != 0;
+-    }
+-
+-    @Override
+-    public boolean isBackward( long flags )
+-    {
+-        return (flags & backwardBit) != 0;
+-    }
+-
+     @Override
+     public InstructionAnnotation getAnnotation( long flags, Translation tr )
+     {
+@@ -236,7 +219,8 @@ public InstructionAnnotation getAnnotation( long flags, Translation tr )
+ 
+     /**
+      * Swapping directions means swapping bits which are dependent on the direction of an edge like
+-     * the access bits. But also direction dependent speed values should be swapped too.
++     * the access bits. But also direction dependent speed values should be swapped too. Keep in
++     * mind that this method is performance critical!
+      */
+     public long reverseFlags( long flags )
+     {
+@@ -259,7 +243,7 @@ public long flagsDefault( boolean forward, boolean backward )
+     @Override
+     public long setAccess( long flags, boolean forward, boolean backward )
+     {
+-        return flags | (forward ? forwardBit : 0) | (backward ? backwardBit : 0);
++        return setBool(setBool(flags, K_BACKWARD, backward), K_FORWARD, forward);
+     }
+ 
+     @Override
+@@ -561,4 +545,70 @@ public long getTurnFlags( boolean restricted, int costs )
+     {
+         return Collections.emptyList();
+     }
++
++    protected boolean isFerry( long internalFlags )
++    {
++        return (internalFlags & ferryBit) != 0;
++    }
++
++    protected boolean isAccept( long internalFlags )
++    {
++        return (internalFlags & acceptBit) != 0;
++    }
++
++    @Override
++    public long setBool( long flags, int key, boolean value )
++    {
++        switch (key)
++        {
++            case K_FORWARD:
++                return value ? flags | forwardBit : flags & ~forwardBit;
++            case K_BACKWARD:
++                return value ? flags | backwardBit : flags & ~backwardBit;
++            case K_ROUNDABOUT:
++                return value ? flags | roundaboutBit : flags & ~roundaboutBit;
++            default:
++                throw new IllegalArgumentException("Unknown key " + key + " for boolean value");
++        }
++    }
++
++    @Override
++    public boolean isBool( long flags, int key )
++    {
++        switch (key)
++        {
++            case K_FORWARD:
++                return (flags & forwardBit) != 0;
++            case K_BACKWARD:
++                return (flags & backwardBit) != 0;
++            case K_ROUNDABOUT:
++                return (flags & roundaboutBit) != 0;
++            default:
++                throw new IllegalArgumentException("Unknown key " + key + " for boolean value");
++        }
++    }
++
++    @Override
++    public long setLong( long flags, int key, long value )
++    {
++        throw new UnsupportedOperationException("Unknown key " + key + " for long value.");
++    }
++
++    @Override
++    public long getLong( long flags, int key )
++    {
++        throw new UnsupportedOperationException("Unknown key " + key + " for long value.");
++    }
++
++    @Override
++    public long setDouble( long flags, int key, double value )
++    {
++        throw new UnsupportedOperationException("Unknown key " + key + " for double value.");
++    }
++
++    @Override
++    public double getDouble( long flags, int key )
++    {
++        throw new UnsupportedOperationException("Unknown key " + key + " for double value.");
++    }
+ }
+diff --git a/core/src/main/java/com/graphhopper/routing/util/Bike2WeightFlagEncoder.java b/core/src/main/java/com/graphhopper/routing/util/Bike2WeightFlagEncoder.java
+index 7bf4db95f9..0e4e9d601e 100644
+--- a/core/src/main/java/com/graphhopper/routing/util/Bike2WeightFlagEncoder.java
++++ b/core/src/main/java/com/graphhopper/routing/util/Bike2WeightFlagEncoder.java
+@@ -20,7 +20,6 @@
+ 
+ import com.graphhopper.reader.OSMWay;
+ import com.graphhopper.util.BitUtil;
+-import com.graphhopper.util.DistanceCalc3D;
+ import com.graphhopper.util.EdgeIteratorState;
+ import com.graphhopper.util.PointList;
+ import static com.graphhopper.util.Helper.*;
+@@ -32,7 +31,6 @@
+  */
+ public class Bike2WeightFlagEncoder extends BikeFlagEncoder
+ {
+-    private final DistanceCalc3D distCalc = new DistanceCalc3D();
+     private EncodedDoubleValue reverseSpeed;
+ 
+     @Override
+@@ -111,7 +109,7 @@ public long setProperties( double speed, boolean forward, boolean backward )
+ 
+     @Override
+     public long reverseFlags( long flags )
+-    {
++    {        
+         // swap access
+         flags = super.reverseFlags(flags);
+ 
+@@ -186,7 +184,7 @@ public void applyWayTags( OSMWay way, EdgeIteratorState edge )
+             double fwdDecline = decDist2DSum > 1 ? decEleSum / decDist2DSum : 0;
+             double restDist2D = fullDist2D - incDist2DSum - decDist2DSum;
+             double maxSpeed = getHighwaySpeed("cycleway");
+-            if (isForward(flags))
++            if (isBool(flags, K_FORWARD))
+             {
+                 // use weighted mean so that longer incline infuences speed more than shorter
+                 double speed = getSpeed(flags);
+@@ -198,7 +196,7 @@ public void applyWayTags( OSMWay way, EdgeIteratorState edge )
+                 flags = this.setSpeed(flags, keepIn(speed, PUSHING_SECTION_SPEED / 2, maxSpeed));
+             }
+ 
+-            if (isBackward(flags))
++            if (isBool(flags, K_BACKWARD))
+             {
+                 double speedReverse = getReverseSpeed(flags);
+                 double bwFaster = 1 + 2 * keepIn(fwdIncline, 0, 0.2);
+diff --git a/core/src/main/java/com/graphhopper/routing/util/BikeCommonFlagEncoder.java b/core/src/main/java/com/graphhopper/routing/util/BikeCommonFlagEncoder.java
+index 5da0f09642..5c181595c2 100644
+--- a/core/src/main/java/com/graphhopper/routing/util/BikeCommonFlagEncoder.java
++++ b/core/src/main/java/com/graphhopper/routing/util/BikeCommonFlagEncoder.java
+@@ -66,10 +66,7 @@ protected BikeCommonFlagEncoder( int speedBits, double speedFactor )
+     {
+         super(speedBits, speedFactor);
+         // strict set, usually vehicle and agricultural/forestry are ignored by cyclists
+-        restrictions = new String[]
+-        {
+-            "bicycle", "access"
+-        };
++        restrictions = new ArrayList<String>(Arrays.asList("bicycle", "access"));
+         restrictedValues.add("private");
+         restrictedValues.add("no");
+         restrictedValues.add("restricted");
+@@ -288,18 +285,18 @@ public long handleRelationTags( OSMRelation relation, long oldRelationFlags )
+     @Override
+     public long handleWayTags( OSMWay way, long allowed, long relationFlags )
+     {
+-        if ((allowed & acceptBit) == 0)
++        if (!isAccept(allowed))
+             return 0;
+ 
+         long encoded = 0;
+-        if ((allowed & ferryBit) == 0)
++        if (!isFerry(allowed))
+         {
+             double speed = getSpeed(way);
+             int priorityFromRelation = 0;
+             if (relationFlags != 0)
+                 priorityFromRelation = (int) relationCodeEncoder.getValue(relationFlags);
+ 
+-            encoded = preferWayEncoder.setValue(encoded, handlePriority(way, priorityFromRelation));
++            encoded = setLong(encoded, K_PRIORITY_LONG, handlePriority(way, priorityFromRelation));
+ 
+             // bike maxspeed handling is different from car as we don't increase speed
+             speed = reduceToMaxSpeed(way, speed);
+@@ -391,7 +388,7 @@ int getSpeed( OSMWay way )
+     public InstructionAnnotation getAnnotation( long flags, Translation tr )
+     {
+         int paveType = 0; // paved
+-        if ((flags & unpavedBit) != 0)
++        if (isBool(flags, K_UNPAVED))
+             paveType = 1; // unpaved        
+ 
+         int wayType = (int) wayTypeEncoder.getValue(flags);
+@@ -436,19 +433,6 @@ String getWayName( int pavementType, int wayType, Translation tr )
+         }
+     }
+ 
+-    /**
+-     * Returns a double value in [0, 1] to identify ways as good or bad regarding safety or other
+-     * preferences.
+-     */
+-    public double getPriority( long flags )
+-    {
+-        double prio = preferWayEncoder.getValue(flags);
+-        if (prio == 0)
+-            return (double) UNCHANGED.getValue() / BEST.getValue();
+-
+-        return prio / BEST.getValue();
+-    }
+-
+     /**
+      * In this method we prefer cycleways or roads with designated bike access and avoid big roads
+      * or roads with trams or pedestrian.
+@@ -523,7 +507,7 @@ long handleBikeRelated( OSMWay way, long encoded, boolean partOfCycleRelation )
+                 || "path".equals(highway) && surfaceTag == null
+                 || unpavedSurfaceTags.contains(surfaceTag))
+         {
+-            encoded |= unpavedBit;
++            encoded = setBool(encoded, K_UNPAVED, true);
+         }
+ 
+         if (way.hasTag("bicycle", intendedValues))
+@@ -540,6 +524,76 @@ else if (roadValues.contains(highway))
+         return wayTypeEncoder.setValue(encoded, wayType.getValue());
+     }
+ 
++    /**
++     * Reports wether this edge is unpaved.
++     */
++    public static final int K_UNPAVED = 100;
++    public static final int K_PRIORITY = 101, K_PRIORITY_LONG = 102;
++
++    @Override
++    public long setBool( long flags, int key, boolean value )
++    {
++        switch (key)
++        {
++            case K_UNPAVED:
++                return value ? flags | unpavedBit : flags & ~unpavedBit;
++            default:
++                return super.setBool(flags, key, value);
++        }
++    }
++
++    @Override
++    public boolean isBool( long flags, int key )
++    {
++        switch (key)
++        {
++            case K_UNPAVED:
++                return (flags & unpavedBit) != 0;
++            default:
++                return super.isBool(flags, key);
++        }
++    }
++
++    @Override
++    public double getDouble( long flags, int key )
++    {
++        switch (key)
++        {
++            case K_PRIORITY:
++                double prio = preferWayEncoder.getValue(flags);
++                if (prio == 0)
++                    return (double) UNCHANGED.getValue() / BEST.getValue();
++
++                return prio / BEST.getValue();
++            default:
++                return super.getDouble(flags, key);
++        }
++    }
++
++    @Override
++    public long getLong( long flags, int key )
++    {
++        switch (key)
++        {
++            case K_PRIORITY_LONG:
++                return preferWayEncoder.getValue(flags);
++            default:
++                return super.getLong(flags, key);
++        }
++    }
++
++    @Override
++    public long setLong( long flags, int key, long value )
++    {
++        switch (key)
++        {
++            case K_PRIORITY_LONG:
++                return preferWayEncoder.setValue(flags, value);
++            default:
++                return super.setLong(flags, key, value);
++        }
++    }
++
+     boolean isPushingSection( OSMWay way )
+     {
+         return way.hasTag("highway", pushingSections);
+diff --git a/core/src/main/java/com/graphhopper/routing/util/CarFlagEncoder.java b/core/src/main/java/com/graphhopper/routing/util/CarFlagEncoder.java
+index 97bf949409..bee7f2830b 100644
+--- a/core/src/main/java/com/graphhopper/routing/util/CarFlagEncoder.java
++++ b/core/src/main/java/com/graphhopper/routing/util/CarFlagEncoder.java
+@@ -30,6 +30,7 @@
+ import com.graphhopper.reader.OSMTurnRelation.TurnCostTableEntry;
+ import com.graphhopper.reader.OSMWay;
+ import com.graphhopper.util.Helper;
++import java.util.*;
+ 
+ /**
+  * Defines bit layout for cars. (speed, access, ferries, ...)
+@@ -59,10 +60,7 @@ protected CarFlagEncoder()
+     protected CarFlagEncoder( int speedBits, double speedFactor )
+     {
+         super(speedBits, speedFactor);
+-        restrictions = new String[]
+-        {
+-            "motorcar", "motor_vehicle", "vehicle", "access"
+-        };
++        restrictions = new ArrayList<String>(Arrays.asList("motorcar", "motor_vehicle", "vehicle", "access"));
+         restrictedValues.add("private");
+         restrictedValues.add("agricultural");
+         restrictedValues.add("forestry");
+@@ -214,11 +212,11 @@ public long handleRelationTags( OSMRelation relation, long oldRelationFlags )
+     @Override
+     public long handleWayTags( OSMWay way, long allowed, long relationCode )
+     {
+-        if ((allowed & acceptBit) == 0)
++        if (!isAccept(allowed))
+             return 0;
+ 
+         long encoded;
+-        if ((allowed & ferryBit) == 0)
++        if (!isFerry(allowed))
+         {
+             // get assumed speed from highway type
+             double speed = getSpeed(way);
+@@ -233,7 +231,11 @@ public long handleWayTags( OSMWay way, long allowed, long relationCode )
+ 
+             encoded = setSpeed(0, speed);
+ 
+-            if (way.hasTag("oneway", oneways) || way.hasTag("junction", "roundabout"))
++            boolean isRoundabout = way.hasTag("junction", "roundabout");
++            if (isRoundabout)
++                encoded = setBool(encoded, K_ROUNDABOUT, true);
++
++            if (way.hasTag("oneway", oneways) || isRoundabout)
+             {
+                 if (way.hasTag("oneway", "-1"))
+                     encoded |= backwardBit;
+diff --git a/core/src/main/java/com/graphhopper/routing/util/DefaultEdgeFilter.java b/core/src/main/java/com/graphhopper/routing/util/DefaultEdgeFilter.java
+index e86ca2c43d..1cdd5bada9 100644
+--- a/core/src/main/java/com/graphhopper/routing/util/DefaultEdgeFilter.java
++++ b/core/src/main/java/com/graphhopper/routing/util/DefaultEdgeFilter.java
+@@ -47,7 +47,7 @@ public DefaultEdgeFilter( FlagEncoder encoder, boolean in, boolean out )
+     public final boolean accept( EdgeIteratorState iter )
+     {
+         long flags = iter.getFlags();
+-        return out && encoder.isForward(flags) || in && encoder.isBackward(flags);
++        return out && encoder.isBool(flags, FlagEncoder.K_FORWARD) || in && encoder.isBool(flags, FlagEncoder.K_BACKWARD);
+     }
+ 
+     @Override
+diff --git a/core/src/main/java/com/graphhopper/routing/util/EncodingManager.java b/core/src/main/java/com/graphhopper/routing/util/EncodingManager.java
+index 7039d521e0..1490701ea1 100644
+--- a/core/src/main/java/com/graphhopper/routing/util/EncodingManager.java
++++ b/core/src/main/java/com/graphhopper/routing/util/EncodingManager.java
+@@ -235,7 +235,7 @@ private FlagEncoder getEncoder( String name, boolean throwExc )
+                 return encoder;
+         }
+         if (throwExc)
+-            throw new IllegalArgumentException("Encoder for " + name + " not found.");
++            throw new IllegalArgumentException("Encoder for " + name + " not found. Existing: " + toDetailsString());
+         return null;
+     }
+ 
+@@ -321,10 +321,10 @@ public String toDetailsString()
+     public FlagEncoder getSingle()
+     {
+         if (getVehicleCount() > 1)
+-            throw new IllegalStateException("multiple encoders are active. cannot return one:" + toString());
++            throw new IllegalStateException("Multiple encoders are active. cannot return one:" + toString());
+ 
+         if (getVehicleCount() == 0)
+-            throw new IllegalStateException("no encoder is active!");
++            throw new IllegalStateException("No encoder is active!");
+ 
+         return edgeEncoders.get(0);
+     }
+@@ -344,9 +344,11 @@ public long flagsDefault( boolean forward, boolean backward )
+      */
+     public long reverseFlags( long flags )
+     {
+-        for (AbstractFlagEncoder encoder : edgeEncoders)
++        // performance critical
++        int len = edgeEncoders.size();
++        for (int i = 0; i < len; i++)
+         {
+-            flags = encoder.reverseFlags(flags);
++            flags = edgeEncoders.get(i).reverseFlags(flags);
+         }
+         return flags;
+     }
+@@ -390,20 +392,6 @@ public long handleNodeTags( OSMNode node )
+         return flags;
+     }
+ 
+-    /**
+-     * When parsing the ways we have the node flags as long variable encoded in analyzeNode.
+-     */
+-    public long applyNodeFlags( long wayFlags, long nodeFlags )
+-    {
+-        long flags = 0;
+-        for (AbstractFlagEncoder encoder : edgeEncoders)
+-        {
+-            flags |= encoder.applyNodeFlags(wayFlags & encoder.getWayBitMask(), nodeFlags);
+-        }
+-
+-        return flags;
+-    }
+-
+     private static int determineRequiredBits( int value )
+     {
+         int numberOfBits = 0;
+diff --git a/core/src/main/java/com/graphhopper/routing/util/FastestWeighting.java b/core/src/main/java/com/graphhopper/routing/util/FastestWeighting.java
+index a5c3909d50..1e63d99e1e 100644
+--- a/core/src/main/java/com/graphhopper/routing/util/FastestWeighting.java
++++ b/core/src/main/java/com/graphhopper/routing/util/FastestWeighting.java
+@@ -26,7 +26,7 @@
+  */
+ public class FastestWeighting implements Weighting
+ {
+-    private final FlagEncoder encoder;
++    protected final FlagEncoder encoder;
+     private final double maxSpeed;
+ 
+     public FastestWeighting( FlagEncoder encoder )
+diff --git a/core/src/main/java/com/graphhopper/routing/util/FlagEncoder.java b/core/src/main/java/com/graphhopper/routing/util/FlagEncoder.java
+index 6020955b19..d9af1ea570 100644
+--- a/core/src/main/java/com/graphhopper/routing/util/FlagEncoder.java
++++ b/core/src/main/java/com/graphhopper/routing/util/FlagEncoder.java
+@@ -69,9 +69,46 @@
+      */
+     long setProperties( double speed, boolean forward, boolean backward );
+ 
+-    boolean isForward( long flags );
++    /*
++     * Simple rules for every subclass which introduces a new key. It has to use the prefix K_ and
++     * uses a minimum value which is two magnitudes higher than in the super class. 
++     * Currently this means starting from 100, and subclasses of this class start from 10000 and so on.
++     */
++    /**
++     * Reports wether the edge is available in forward direction for a certain vehicle
++     */
++    static final int K_FORWARD = 0;
++    /**
++     * Reports wether the edge is available in backward direction for a certain vehicle
++     */
++    static final int K_BACKWARD = 1;
++    /**
++     * Reports wether this edge is part of a roundabout.
++     */
++    static final int K_ROUNDABOUT = 2;
++
++    /**
++     * Returns arbitrary boolean value identified by the specified key.
++     */
++    boolean isBool( long flags, int key );
++
++    long setBool( long flags, int key, boolean value );
++
++    /**
++     * Returns arbitrary long value identified by the specified key. E.g. can be used to return the
++     * way or surface type of an edge
++     */
++    long getLong( long flags, int key );
++
++    long setLong( long flags, int key, long value );
++
++    /**
++     * Returns arbitrary long value identified by the specified key. E.g. can be used to return the
++     * maximum width or height allowed for an edge.
++     */
++    double getDouble( long flags, int key );
+ 
+-    boolean isBackward( long flags );
++    long setDouble( long flags, int key, double value );
+ 
+     /**
+      * @return additional cost or warning information for an instruction like ferry or road charges.
+diff --git a/core/src/main/java/com/graphhopper/routing/util/FootFlagEncoder.java b/core/src/main/java/com/graphhopper/routing/util/FootFlagEncoder.java
+index f0c7af515a..92cb899319 100644
+--- a/core/src/main/java/com/graphhopper/routing/util/FootFlagEncoder.java
++++ b/core/src/main/java/com/graphhopper/routing/util/FootFlagEncoder.java
+@@ -22,6 +22,8 @@
+ 
+ import com.graphhopper.reader.OSMRelation;
+ import com.graphhopper.reader.OSMWay;
++import java.util.ArrayList;
++import java.util.Arrays;
+ 
+ /**
+  * Defines bit layout for pedestrians (speed, access, surface, ...).
+@@ -32,9 +34,9 @@
+  */
+ public class FootFlagEncoder extends AbstractFlagEncoder
+ {
+-    static final int SLOW = 2;
+-    static final int MEAN = 5;
+-    static final int FERRY = 10;
++    static final int SLOW_SPEED = 2;
++    static final int MEAN_SPEED = 5;
++    static final int FERRY_SPEED = 10;
+     private int safeWayBit = 0;
+     protected HashSet<String> sidewalks = new HashSet<String>();
+     private final Set<String> safeHighwayTags = new HashSet<String>();
+@@ -51,10 +53,7 @@ protected FootFlagEncoder()
+     protected FootFlagEncoder( int speedBits, double speedFactor )
+     {
+         super(speedBits, speedFactor);
+-        restrictions = new String[]
+-        {
+-            "foot", "access"
+-        };
++        restrictions = new ArrayList<String>(Arrays.asList("foot", "access"));
+         restrictedValues.add("private");
+         restrictedValues.add("no");
+         restrictedValues.add("restricted");
+@@ -106,7 +105,7 @@ public int defineWayBits( int index, int shift )
+         // first two bits are reserved for route handling in superclass
+         shift = super.defineWayBits(index, shift);
+         // larger value required - ferries are faster than pedestrians
+-        speedEncoder = new EncodedDoubleValue("Speed", shift, speedBits, speedFactor, MEAN, FERRY);
++        speedEncoder = new EncodedDoubleValue("Speed", shift, speedBits, speedFactor, MEAN_SPEED, FERRY_SPEED);
+         shift += speedBits;
+ 
+         safeWayBit = 1 << shift++;
+@@ -218,22 +217,22 @@ public long handleRelationTags( OSMRelation relation, long oldRelationFlags )
+     @Override
+     public long handleWayTags( OSMWay way, long allowed, long relationCode )
+     {
+-        if ((allowed & acceptBit) == 0)
++        if (!isAccept(allowed))
+             return 0;
+ 
+         long encoded;
+-        if ((allowed & ferryBit) == 0)
++        if (!isFerry(allowed))
+         {
+             String sacScale = way.getTag("sac_scale");
+             if (sacScale != null)
+             {
+                 if ("hiking".equals(sacScale))
+-                    encoded = speedEncoder.setDoubleValue(0, MEAN);
++                    encoded = speedEncoder.setDoubleValue(0, MEAN_SPEED);
+                 else
+-                    encoded = speedEncoder.setDoubleValue(0, SLOW);
++                    encoded = speedEncoder.setDoubleValue(0, SLOW_SPEED);
+             } else
+             {
+-                encoded = speedEncoder.setDoubleValue(0, MEAN);
++                encoded = speedEncoder.setDoubleValue(0, MEAN_SPEED);
+             }
+             encoded |= directionBitMask;
+ 
+@@ -246,7 +245,7 @@ public long handleWayTags( OSMWay way, long allowed, long relationCode )
+ 
+         } else
+         {
+-            encoded = handleFerryTags(way, SLOW, MEAN, FERRY);
++            encoded = handleFerryTags(way, SLOW_SPEED, MEAN_SPEED, FERRY_SPEED);
+             encoded |= directionBitMask;
+         }
+ 
+diff --git a/core/src/main/java/com/graphhopper/routing/util/PriorityWeighting.java b/core/src/main/java/com/graphhopper/routing/util/PriorityWeighting.java
+index f01b27a5b1..082041545e 100644
+--- a/core/src/main/java/com/graphhopper/routing/util/PriorityWeighting.java
++++ b/core/src/main/java/com/graphhopper/routing/util/PriorityWeighting.java
+@@ -27,12 +27,9 @@
+  */
+ public class PriorityWeighting extends FastestWeighting
+ {
+-    private final BikeCommonFlagEncoder encoder;
+-
+-    public PriorityWeighting( BikeCommonFlagEncoder encoder )
++    public PriorityWeighting( FlagEncoder encoder )
+     {
+         super(encoder);
+-        this.encoder = encoder;
+     }
+ 
+     @Override
+@@ -40,7 +37,7 @@ public double calcWeight( EdgeIteratorState edge, boolean reverse )
+     {
+         double weight = super.calcWeight(edge, reverse);
+         if (Double.isInfinite(weight))
+-            return Double.POSITIVE_INFINITY;        
+-        return weight / (0.5 + encoder.getPriority(edge.getFlags()));
++            return Double.POSITIVE_INFINITY;
++        return weight / (0.5 + encoder.getDouble(edge.getFlags(), BikeCommonFlagEncoder.K_PRIORITY));
+     }
+ }
+diff --git a/core/src/main/java/com/graphhopper/storage/Lock.java b/core/src/main/java/com/graphhopper/storage/Lock.java
+new file mode 100644
+index 0000000000..ca9c118e67
+--- /dev/null
++++ b/core/src/main/java/com/graphhopper/storage/Lock.java
+@@ -0,0 +1,37 @@
++/*
++ *  Licensed to Peter Karich under one or more contributor license
++ *  agreements. See the NOTICE file distributed with this work for
++ *  additional information regarding copyright ownership.
++ *
++ *  Peter Karich licenses this file to you under the Apache License,
++ *  Version 2.0 (the "License"); you may not use this file except
++ *  in compliance with the License. You may obtain a copy of the
++ *  License at
++ *
++ *       http://www.apache.org/licenses/LICENSE-2.0
++ *
++ *  Unless required by applicable law or agreed to in writing, software
++ *  distributed under the License is distributed on an "AS IS" BASIS,
++ *  WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++ *  See the License for the specific language governing permissions and
++ *  limitations under the License.
++ */
++package com.graphhopper.storage;
++
++/**
++ * A write lock. Influenced by Lucene code
++ * <p>
++ * @author Peter Karich
++ */
++public interface Lock
++{
++    String getName();
++
++    boolean tryLock();
++
++    boolean isLocked();
++
++    void release();
++    
++    Exception getObtainFailedReason();
++}
+diff --git a/core/src/main/java/com/graphhopper/storage/LockFactory.java b/core/src/main/java/com/graphhopper/storage/LockFactory.java
+new file mode 100644
+index 0000000000..1d7170c40f
+--- /dev/null
++++ b/core/src/main/java/com/graphhopper/storage/LockFactory.java
+@@ -0,0 +1,41 @@
++/*
++ *  Licensed to Peter Karich under one or more contributor license
++ *  agreements. See the NOTICE file distributed with this work for
++ *  additional information regarding copyright ownership.
++ *
++ *  Peter Karich licenses this file to you under the Apache License,
++ *  Version 2.0 (the "License"); you may not use this file except
++ *  in compliance with the License. You may obtain a copy of the
++ *  License at
++ *
++ *       http://www.apache.org/licenses/LICENSE-2.0
++ *
++ *  Unless required by applicable law or agreed to in writing, software
++ *  distributed under the License is distributed on an "AS IS" BASIS,
++ *  WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++ *  See the License for the specific language governing permissions and
++ *  limitations under the License.
++ */
++package com.graphhopper.storage;
++
++import java.io.File;
++
++/**
++ * @author Peter Karich
++ */
++public interface LockFactory
++{
++    void setLockDir( File lockDir );
++
++    /**
++     * This creates a file for write or read locks depending on the specified writeAccess property.
++     * Important note: even for read locks we need write access to the underlying filesystem in
++     * order to avoid writes from other processes.
++     */
++    Lock create( String fileName, boolean writeAccess );
++
++    /**
++     * Removes the specified lock.
++     */
++    void forceRemove( String fileName, boolean writeAccess );
++}
+diff --git a/core/src/main/java/com/graphhopper/storage/NativeFSLockFactory.java b/core/src/main/java/com/graphhopper/storage/NativeFSLockFactory.java
+new file mode 100644
+index 0000000000..f9640b2053
+--- /dev/null
++++ b/core/src/main/java/com/graphhopper/storage/NativeFSLockFactory.java
+@@ -0,0 +1,253 @@
++/*
++ *  Licensed to Peter Karich under one or more contributor license
++ *  agreements. See the NOTICE file distributed with this work for
++ *  additional information regarding copyright ownership.
++ *
++ *  Peter Karich licenses this file to you under the Apache License,
++ *  Version 2.0 (the "License"); you may not use this file except
++ *  in compliance with the License. You may obtain a copy of the
++ *  License at
++ *
++ *       http://www.apache.org/licenses/LICENSE-2.0
++ *
++ *  Unless required by applicable law or agreed to in writing, software
++ *  distributed under the License is distributed on an "AS IS" BASIS,
++ *  WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++ *  See the License for the specific language governing permissions and
++ *  limitations under the License.
++ */
++package com.graphhopper.storage;
++
++import com.graphhopper.util.Helper;
++import java.io.File;
++import java.io.IOException;
++import java.io.RandomAccessFile;
++import java.nio.channels.FileChannel;
++import java.nio.channels.FileLock;
++
++/**
++ * Creates a write lock file. Influenced by Lucene code
++ * <p>
++ * @author Peter Karich
++ */
++public class NativeFSLockFactory implements LockFactory
++{
++    private File lockDir;
++
++    public NativeFSLockFactory()
++    {
++    }
++
++    public NativeFSLockFactory( File dir )
++    {
++        this.lockDir = dir;
++    }
++
++    @Override
++    public void setLockDir( File lockDir )
++    {
++        this.lockDir = lockDir;
++    }
++
++    @Override
++    public synchronized Lock create( String fileName, boolean writeAccess )
++    {
++        if (lockDir == null)
++            throw new RuntimeException("Set lockDir before creating " + (writeAccess ? "write" : "read") + " locks");
++
++        return new NativeLock(lockDir, fileName, writeAccess);
++    }
++
++    @Override
++    public synchronized void forceRemove( String fileName, boolean writeAccess )
++    {
++        if (lockDir.exists())
++        {
++            create(fileName, writeAccess).release();
++            File lockFile = new File(lockDir, fileName);
++            if (!lockFile.delete())
++                throw new RuntimeException("Cannot delete " + lockFile);
++        }
++    }
++
++    static class NativeLock implements Lock
++    {
++        private RandomAccessFile tmpRaFile;
++        private FileChannel tmpChannel;
++        private FileLock tmpLock;
++
++        private final String name;
++        private final File lockDir;
++        private final File lockFile;
++        private final boolean writeLock;
++
++        private Exception failedReason;
++
++        public NativeLock( File lockDir, String fileName, boolean writeLock )
++        {
++            this.name = fileName;
++            this.lockDir = lockDir;
++            this.lockFile = new File(lockDir, fileName);
++            this.writeLock = writeLock;
++        }
++
++        @Override
++        public synchronized boolean tryLock()
++        {
++            // already locked
++            if (lockExists())
++                return false;
++
++            // on-the-fly: make sure directory exists
++            if (!lockDir.exists())
++            {
++                if (!lockDir.mkdirs())
++                    throw new RuntimeException("Directory " + lockDir + " does not exist and cannot created to place lock file there: " + lockFile);
++            }
++
++            if (!lockDir.isDirectory())
++                throw new IllegalArgumentException("lockDir has to be a directory: " + lockDir);
++
++            try
++            {
++                failedReason = null;
++                // we need write access even for read locks - in order to create the lock file!
++                tmpRaFile = new RandomAccessFile(lockFile, "rw");
++            } catch (IOException ex)
++            {
++                failedReason = ex;
++                return false;
++            }
++
++            try
++            {
++                tmpChannel = tmpRaFile.getChannel();
++                try
++                {
++                    tmpLock = tmpChannel.tryLock(0, Long.MAX_VALUE, !writeLock);
++                    // OverlappingFileLockException is not an IOException!
++                } catch (Exception ex)
++                {
++                    failedReason = ex;
++                } finally
++                {
++                    if (tmpLock == null)
++                    {
++                        Helper.close(tmpChannel);
++                        tmpChannel = null;
++                    }
++                }
++            } finally
++            {
++                if (tmpChannel == null)
++                {
++                    Helper.close(tmpRaFile);
++                    tmpRaFile = null;
++                }
++            }
++            return lockExists();
++        }
++
++        private synchronized boolean lockExists()
++        {
++            return tmpLock != null;
++        }
++
++        @Override
++        public synchronized boolean isLocked()
++        {
++            if (!lockFile.exists())
++                return false;
++
++            if (lockExists())
++                return true;
++
++            try
++            {
++                boolean obtained = tryLock();
++                if (obtained)
++                    release();
++                return !obtained;
++            } catch (Exception ex)
++            {
++                return false;
++            }
++        }
++
++        @Override
++        public synchronized void release()
++        {
++            if (lockExists())
++            {
++                try
++                {
++                    failedReason = null;
++                    tmpLock.release();
++                } catch (Exception ex)
++                {
++                    throw new RuntimeException(ex);
++                } finally
++                {
++                    tmpLock = null;
++                    try
++                    {
++                        tmpChannel.close();
++                    } catch (Exception ex)
++                    {
++                        throw new RuntimeException(ex);
++                    } finally
++                    {
++                        tmpChannel = null;
++                        try
++                        {
++                            tmpRaFile.close();
++                        } catch (Exception ex)
++                        {
++                            throw new RuntimeException(ex);
++                        } finally
++                        {
++                            tmpRaFile = null;
++                        }
++                    }
++                }
++                lockFile.delete();
++            }
++        }
++
++        @Override
++        public String getName()
++        {
++            return name;
++        }
++
++        @Override
++        public Exception getObtainFailedReason()
++        {
++            return failedReason;
++        }
++
++        @Override
++        public String toString()
++        {
++            return lockFile.toString();
++        }
++    }
++
++    public static void main( String[] args ) throws IOException
++    {
++        // trying FileLock mechanics in different processes
++        File file = new File("tmp.lock");
++
++        file.createNewFile();
++        FileChannel channel = new RandomAccessFile(file, "r").getChannel();
++        
++        boolean shared = true;
++        FileLock lock1 = channel.tryLock(0, Long.MAX_VALUE, shared);
++
++        System.out.println("locked " + lock1);
++        System.in.read();
++
++        System.out.println("release " + lock1);
++        lock1.release();
++    }
++}
+diff --git a/core/src/main/java/com/graphhopper/storage/SimpleFSLockFactory.java b/core/src/main/java/com/graphhopper/storage/SimpleFSLockFactory.java
+new file mode 100644
+index 0000000000..41b958fc1c
+--- /dev/null
++++ b/core/src/main/java/com/graphhopper/storage/SimpleFSLockFactory.java
+@@ -0,0 +1,138 @@
++/*
++ *  Licensed to Peter Karich under one or more contributor license
++ *  agreements. See the NOTICE file distributed with this work for
++ *  additional information regarding copyright ownership.
++ *
++ *  Peter Karich licenses this file to you under the Apache License,
++ *  Version 2.0 (the "License"); you may not use this file except
++ *  in compliance with the License. You may obtain a copy of the
++ *  License at
++ *
++ *       http://www.apache.org/licenses/LICENSE-2.0
++ *
++ *  Unless required by applicable law or agreed to in writing, software
++ *  distributed under the License is distributed on an "AS IS" BASIS,
++ *  WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++ *  See the License for the specific language governing permissions and
++ *  limitations under the License.
++ */
++package com.graphhopper.storage;
++
++import java.io.File;
++import java.io.IOException;
++
++/**
++ * Creates a write lock file. Influenced by Lucene code
++ * <p>
++ * @author Peter Karich
++ */
++public class SimpleFSLockFactory implements LockFactory
++{
++    private File lockDir;
++
++    public SimpleFSLockFactory()
++    {
++    }
++
++    public SimpleFSLockFactory( File dir )
++    {
++        this.lockDir = dir;
++    }
++
++    @Override
++    public void setLockDir( File lockDir )
++    {
++        this.lockDir = lockDir;
++    }
++
++    @Override
++    public synchronized Lock create( String fileName, boolean writeAccess )
++    {
++        // TODO no read access-only support
++        if (lockDir == null)
++            throw new RuntimeException("Set lockDir before creating locks");
++
++        return new SimpleLock(lockDir, fileName);
++    }
++
++    @Override
++    public synchronized void forceRemove( String fileName, boolean writeAccess )
++    {
++        if (lockDir.exists())
++        {
++            File lockFile = new File(lockDir, fileName);
++            if (lockFile.exists() && !lockFile.delete())
++                throw new RuntimeException("Cannot delete " + lockFile);
++        }
++    }
++
++    static class SimpleLock implements Lock
++    {
++        private final File lockDir;
++        private final File lockFile;
++        private final String name;
++        private IOException failedReason;
++
++        public SimpleLock( File lockDir, String fileName )
++        {
++            this.name = fileName;
++            this.lockDir = lockDir;
++            this.lockFile = new File(lockDir, fileName);
++        }
++
++        @Override
++        public synchronized boolean tryLock()
++        {
++            // make sure directory exists, do it on-the-fly (not possible when setLockDir is called)
++            if (!lockDir.exists())
++            {
++                if (!lockDir.mkdirs())
++                    throw new RuntimeException("Directory " + lockDir + " does not exist and cannot created to place lock file there: " + lockFile);
++            }
++
++            // this test can only be performed after the dir has created!
++            if (!lockDir.isDirectory())
++                throw new IllegalArgumentException("lockDir has to be a directory: " + lockDir);
++
++            try
++            {
++                return lockFile.createNewFile();
++            } catch (IOException ex)
++            {
++                failedReason = ex;
++                return false;
++            }
++        }
++
++        @Override
++        public synchronized boolean isLocked()
++        {
++            return lockFile.exists();
++        }
++
++        @Override
++        public synchronized void release()
++        {
++            if (isLocked() && !lockFile.delete())
++                throw new RuntimeException("Cannot release lock file: " + lockFile);
++        }
++
++        @Override
++        public String getName()
++        {
++            return name;
++        }
++
++        @Override
++        public synchronized Exception getObtainFailedReason()
++        {
++            return failedReason;
++        }
++
++        @Override
++        public String toString()
++        {
++            return lockFile.toString();
++        }
++    }
++}
+diff --git a/core/src/main/java/com/graphhopper/util/GHUtility.java b/core/src/main/java/com/graphhopper/util/GHUtility.java
+index 6af3ce37a8..5671488537 100644
+--- a/core/src/main/java/com/graphhopper/util/GHUtility.java
++++ b/core/src/main/java/com/graphhopper/util/GHUtility.java
+@@ -138,8 +138,8 @@ public static void printEdgeInfo( final Graph g, FlagEncoder encoder )
+                 AllEdgesSkipIterator aeSkip = (AllEdgesSkipIterator) iter;
+                 sc = aeSkip.isShortcut() ? "sc" : "  ";
+             }
+-            String fwdStr = encoder.isForward(iter.getFlags()) ? "fwd" : "   ";
+-            String bckStr = encoder.isBackward(iter.getFlags()) ? "bckwd" : "";
++            String fwdStr = encoder.isBool(iter.getFlags(), FlagEncoder.K_FORWARD) ? "fwd" : "   ";
++            String bckStr = encoder.isBool(iter.getFlags(), FlagEncoder.K_BACKWARD) ? "bckwd" : "";
+             System.out.println(sc + " " + iter + " " + fwdStr + " " + bckStr);
+         }
+     }
+diff --git a/core/src/test/java/com/graphhopper/GraphHopperTest.java b/core/src/test/java/com/graphhopper/GraphHopperTest.java
+index 0ebc290196..8039a63a82 100644
+--- a/core/src/test/java/com/graphhopper/GraphHopperTest.java
++++ b/core/src/test/java/com/graphhopper/GraphHopperTest.java
+@@ -17,6 +17,7 @@
+  */
+ package com.graphhopper;
+ 
++import com.graphhopper.reader.DataReader;
+ import com.graphhopper.routing.util.EdgeFilter;
+ import com.graphhopper.routing.util.EncodingManager;
+ import com.graphhopper.storage.index.QueryResult;
+@@ -26,6 +27,8 @@
+ import com.graphhopper.util.shapes.GHPoint;
+ import java.io.File;
+ import java.io.IOException;
++import java.util.concurrent.CountDownLatch;
++import java.util.concurrent.atomic.AtomicReference;
+ import org.junit.After;
+ import org.junit.Test;
+ import static org.junit.Assert.*;
+@@ -95,6 +98,97 @@ public void testLoadOSM()
+         }
+     }
+ 
++    @Test
++    public void testAllowMultipleReadingInstances()
++    {
++        GraphHopper instance1 = new GraphHopper().setInMemory(true).
++                setEncodingManager(new EncodingManager("CAR")).
++                setGraphHopperLocation(ghLoc).
++                setOSMFile(testOsm);
++        instance1.importOrLoad();
++
++        GraphHopper instance2 = new GraphHopper().setInMemory(true).
++                setEncodingManager(new EncodingManager("CAR")).
++                setOSMFile(testOsm);
++        instance2.load(ghLoc);
++
++        GraphHopper instance3 = new GraphHopper().setInMemory(true).
++                setEncodingManager(new EncodingManager("CAR")).
++                setOSMFile(testOsm);
++        instance3.load(ghLoc);
++
++        instance1.close();
++        instance2.close();
++        instance3.close();
++    }
++
++    @Test
++    public void testDoNotAllowWritingAndLoadingAtTheSameTime() throws Exception
++    {
++        final CountDownLatch latch1 = new CountDownLatch(1);
++        final CountDownLatch latch2 = new CountDownLatch(1);
++        final GraphHopper instance1 = new GraphHopper()
++        {
++            @Override
++            protected DataReader importData() throws IOException
++            {
++                try
++                {
++                    latch2.countDown();
++                    latch1.await();
++                } catch (InterruptedException ex)
++                {
++                }
++                return super.importData();
++            }
++        }.setInMemory(true).
++                setEncodingManager(new EncodingManager("CAR")).
++                setGraphHopperLocation(ghLoc).
++                setOSMFile(testOsm);
++        final AtomicReference<Exception> ar = new AtomicReference<Exception>();
++        Thread thread = new Thread()
++        {
++            @Override
++            public void run()
++            {
++                try
++                {
++                    instance1.importOrLoad();
++                } catch (Exception ex)
++                {
++                    ar.set(ex);
++                }
++            }
++        };
++        thread.start();
++
++        GraphHopper instance2 = new GraphHopper().setInMemory(true).
++                setEncodingManager(new EncodingManager("CAR")).
++                setOSMFile(testOsm);
++        try
++        {
++            // let thread reach the CountDownLatch
++            latch2.await();
++            // now importOrLoad should have create a lock which this load call does not like
++            instance2.load(ghLoc);
++            assertTrue(false);
++        } catch (RuntimeException ex)
++        {
++            assertNotNull(ex);
++            assertTrue(ex.getMessage(), ex.getMessage().startsWith("To avoid reading partial data"));
++        } finally
++        {
++            instance2.close();
++            latch1.countDown();
++            // make sure the import process wasn't interrupted and no other error happened
++            thread.join();
++        }
++
++        if (ar.get() != null)
++            assertNull(ar.get().getMessage(), ar.get());
++        instance1.close();
++    }
++
+     @Test
+     public void testPrepare()
+     {
+diff --git a/core/src/test/java/com/graphhopper/reader/OSMReaderTest.java b/core/src/test/java/com/graphhopper/reader/OSMReaderTest.java
+index e0714be4da..666829a6ea 100644
+--- a/core/src/test/java/com/graphhopper/reader/OSMReaderTest.java
++++ b/core/src/test/java/com/graphhopper/reader/OSMReaderTest.java
+@@ -161,8 +161,8 @@ public void testMain()
+         assertEquals(n50, iter.getAdjNode());
+         AbstractGraphStorageTester.assertPList(Helper.createPointList(51.25, 9.43), iter.fetchWayGeometry(0));
+         CarFlagEncoder flags = carEncoder;
+-        assertTrue(flags.isForward(iter.getFlags()));
+-        assertTrue(flags.isBackward(iter.getFlags()));
++        assertTrue(flags.isBool(iter.getFlags(), FlagEncoder.K_FORWARD));
++        assertTrue(flags.isBool(iter.getFlags(), FlagEncoder.K_BACKWARD));
+ 
+         assertTrue(iter.next());
+         assertEquals("route 666", iter.getName());
+@@ -174,8 +174,8 @@ public void testMain()
+         assertEquals(n10, iter.getAdjNode());
+         assertEquals(88643, iter.getDistance(), 1);
+ 
+-        assertTrue(flags.isForward(iter.getFlags()));
+-        assertTrue(flags.isBackward(iter.getFlags()));
++        assertTrue(flags.isBool(iter.getFlags(), FlagEncoder.K_FORWARD));
++        assertTrue(flags.isBool(iter.getFlags(), FlagEncoder.K_BACKWARD));
+         assertFalse(iter.next());
+ 
+         // get third added location id=30
+@@ -281,27 +281,27 @@ public void testOneWay()
+         iter = carAllExplorer.setBaseNode(n20);
+         assertTrue(iter.next());
+         assertEquals(n23, iter.getAdjNode());
+-        assertTrue(encoder.isForward(iter.getFlags()));
+-        assertFalse(encoder.isBackward(iter.getFlags()));
++        assertTrue(encoder.isBool(iter.getFlags(), FlagEncoder.K_FORWARD));
++        assertFalse(encoder.isBool(iter.getFlags(), FlagEncoder.K_BACKWARD));
+ 
+         assertTrue(iter.next());
+         assertEquals(n22, iter.getAdjNode());
+-        assertFalse(encoder.isForward(iter.getFlags()));
+-        assertTrue(encoder.isBackward(iter.getFlags()));
++        assertFalse(encoder.isBool(iter.getFlags(), FlagEncoder.K_FORWARD));
++        assertTrue(encoder.isBool(iter.getFlags(), FlagEncoder.K_BACKWARD));
+ 
+         assertTrue(iter.next());
+-        assertFalse(encoder.isForward(iter.getFlags()));
+-        assertTrue(encoder.isBackward(iter.getFlags()));
++        assertFalse(encoder.isBool(iter.getFlags(), FlagEncoder.K_FORWARD));
++        assertTrue(encoder.isBool(iter.getFlags(), FlagEncoder.K_BACKWARD));
+ 
+         assertTrue(iter.next());
+         assertEquals(n30, iter.getAdjNode());
+-        assertTrue(encoder.isForward(iter.getFlags()));
+-        assertFalse(encoder.isBackward(iter.getFlags()));
++        assertTrue(encoder.isBool(iter.getFlags(), FlagEncoder.K_FORWARD));
++        assertFalse(encoder.isBool(iter.getFlags(), FlagEncoder.K_BACKWARD));
+ 
+         assertTrue(iter.next());
+         assertEquals(n10, iter.getAdjNode());
+-        assertFalse(encoder.isForward(iter.getFlags()));
+-        assertTrue(encoder.isBackward(iter.getFlags()));
++        assertFalse(encoder.isBool(iter.getFlags(), FlagEncoder.K_FORWARD));
++        assertTrue(encoder.isBool(iter.getFlags(), FlagEncoder.K_BACKWARD));
+     }
+ 
+     @Test
+@@ -580,16 +580,6 @@ public long handleNodeTags( OSMNode node )
+                     return -objectEncoder.setValue(0, 1);
+                 return 0;
+             }
+-
+-            @Override
+-            public long applyNodeFlags( long wayFlags, long nodeFlags )
+-            {
+-                double speed = getSpeed(wayFlags);
+-                if (objectEncoder.getValue(nodeFlags) != 0)
+-                    speed -= 5;
+-
+-                return setSpeed(0, speed);
+-            }
+         };
+         EncodingManager manager = new EncodingManager(encoder);
+         GraphStorage graph = newGraph(dir, manager, false, false);
+@@ -619,9 +609,6 @@ public long applyNodeFlags( long wayFlags, long nodeFlags )
+             @Override
+             Collection<EdgeIteratorState> addOSMWay( TLongList osmNodeIds, long wayFlags, long osmId )
+             {
+-                // reduced speed due to node tags
+-                increased.incrementAndGet();
+-                assertEquals(100 - 5, encoder.getSpeed(wayFlags), 1e-1);
+                 return Collections.emptyList();
+             }
+         };
+@@ -644,7 +631,6 @@ public long applyNodeFlags( long wayFlags, long nodeFlags )
+         assertEquals(1.0, p.lon, 1e-3);
+         Double d = way.getTag("estimated_distance", null);
+         assertEquals(11119.5, d, 1e-1);
+-        assertEquals(1, increased.get());
+     }
+ 
+     @Test
+diff --git a/core/src/test/java/com/graphhopper/routing/QueryGraphTest.java b/core/src/test/java/com/graphhopper/routing/QueryGraphTest.java
+index 2622a32343..7f7930da5a 100644
+--- a/core/src/test/java/com/graphhopper/routing/QueryGraphTest.java
++++ b/core/src/test/java/com/graphhopper/routing/QueryGraphTest.java
+@@ -353,13 +353,13 @@ public void testOneWayLoop_Issue162()
+         assertTrue(qr.getClosestNode() > 1);
+         assertEquals(2, GHUtility.count(ee.setBaseNode(qr.getClosestNode())));
+         EdgeIterator iter = ee.setBaseNode(qr.getClosestNode());
+-        iter.next();
+-        assertFalse(iter.toString(), carEncoder.isBackward(iter.getFlags()));
+-        assertTrue(iter.toString(), carEncoder.isForward(iter.getFlags()));
++        iter.next();        
++        assertTrue(iter.toString(), carEncoder.isBool(iter.getFlags(), FlagEncoder.K_FORWARD));
++        assertFalse(iter.toString(), carEncoder.isBool(iter.getFlags(), FlagEncoder.K_BACKWARD));
+ 
+-        iter.next();
+-        assertTrue(iter.toString(), carEncoder.isBackward(iter.getFlags()));
+-        assertFalse(iter.toString(), carEncoder.isForward(iter.getFlags()));
++        iter.next();        
++        assertFalse(iter.toString(), carEncoder.isBool(iter.getFlags(), FlagEncoder.K_FORWARD));
++        assertTrue(iter.toString(), carEncoder.isBool(iter.getFlags(), FlagEncoder.K_BACKWARD));
+     }
+ 
+     @Test
+diff --git a/core/src/test/java/com/graphhopper/routing/RoutingAlgorithmIT.java b/core/src/test/java/com/graphhopper/routing/RoutingAlgorithmIT.java
+index ec6a4b472f..7dc2034626 100644
+--- a/core/src/test/java/com/graphhopper/routing/RoutingAlgorithmIT.java
++++ b/core/src/test/java/com/graphhopper/routing/RoutingAlgorithmIT.java
+@@ -254,7 +254,7 @@ public void testMonacoRacingBike()
+         assertEquals(testCollector.toString(), 0, testCollector.errors.size());
+ 
+         runAlgo(testCollector, "files/monaco.osm.gz", "target/monaco-gh",
+-                list, "CAR,BIKE,RACINGBIKE", false, "RACINGBIKE", "fastest", false);
++                list, "CAR,RACINGBIKE", false, "RACINGBIKE", "fastest", false);
+         assertEquals(testCollector.toString(), 0, testCollector.errors.size());
+     }
+ 
+@@ -271,7 +271,7 @@ public void testKremsBikeRelation()
+         assertEquals(testCollector.toString(), 0, testCollector.errors.size());
+ 
+         runAlgo(testCollector, "files/krems.osm.gz", "target/krems-gh",
+-                list, "CAR,BIKE,MTB", false, "BIKE", "fastest", false);
++                list, "CAR,BIKE", false, "BIKE", "fastest", false);
+         assertEquals(testCollector.toString(), 0, testCollector.errors.size());
+     }
+ 
+@@ -288,7 +288,7 @@ public void testKremsMountainBikeRelation()
+         assertEquals(testCollector.toString(), 0, testCollector.errors.size());
+ 
+         runAlgo(testCollector, "files/krems.osm.gz", "target/krems-gh",
+-                list, "CAR,BIKE,MTB", false, "MTB", "fastest", false);
++                list, "CAR,MTB", false, "MTB", "fastest", false);
+         assertEquals(testCollector.toString(), 0, testCollector.errors.size());
+     }
+ 
+diff --git a/core/src/test/java/com/graphhopper/routing/ch/PrepareContractionHierarchiesTest.java b/core/src/test/java/com/graphhopper/routing/ch/PrepareContractionHierarchiesTest.java
+index d59ebe06e1..1e965a5394 100644
+--- a/core/src/test/java/com/graphhopper/routing/ch/PrepareContractionHierarchiesTest.java
++++ b/core/src/test/java/com/graphhopper/routing/ch/PrepareContractionHierarchiesTest.java
+@@ -204,11 +204,12 @@ public void testDirectedGraph3()
+ 
+         // both dirs
+         assertTrue(sc1.toString(), sc1.from == 3 && sc1.to == 2);
+-        assertTrue(sc1.toString(), carEncoder.isForward(sc1.flags) && carEncoder.isBackward(sc1.flags));
++        assertTrue(sc1.toString(), carEncoder.isBool(sc1.flags, FlagEncoder.K_FORWARD) 
++                && carEncoder.isBool(sc1.flags, FlagEncoder.K_BACKWARD));
+ 
+         // directed
+         assertTrue(sc2.toString(), sc2.from == 2 && sc2.to == 3);
+-        assertTrue(sc2.toString(), carEncoder.isForward(sc2.flags));
++        assertTrue(sc2.toString(), carEncoder.isBool(sc2.flags, FlagEncoder.K_FORWARD));
+ 
+         assertEquals(sc1.toString(), 4, sc1.weight, 1e-4);
+         assertEquals(sc2.toString(), 12, sc2.weight, 1e-4);
+diff --git a/core/src/test/java/com/graphhopper/routing/util/AbstractBikeFlagEncoderTester.java b/core/src/test/java/com/graphhopper/routing/util/AbstractBikeFlagEncoderTester.java
+index 7842fcddd0..1458d10f49 100644
+--- a/core/src/test/java/com/graphhopper/routing/util/AbstractBikeFlagEncoderTester.java
++++ b/core/src/test/java/com/graphhopper/routing/util/AbstractBikeFlagEncoderTester.java
+@@ -329,7 +329,7 @@ public void testHandleWayTagsCallsHandlePriority()
+         OSMWay osmWay = new OSMWay(1);
+         osmWay.setTag("highway", "cycleway");
+         long encoded = encoder.handleWayTags(osmWay, encoder.acceptBit, 0);
+-        assertEquals((double) VERY_NICE.getValue() / BEST.getValue(), encoder.getPriority(encoded), 1e-3);
++        assertEquals((double) VERY_NICE.getValue() / BEST.getValue(), encoder.getDouble(encoded, BikeCommonFlagEncoder.K_PRIORITY), 1e-3);
+     }
+ 
+     @Test
+@@ -340,4 +340,14 @@ public void testAvoidMotorway()
+         osmWay.setTag("bicycle", "yes");
+         assertPriority(REACH_DEST.getValue(), osmWay);
+     }
++
++    @Test
++    public void testPriority()
++    {
++        long flags = encoder.setLong(0L, BikeCommonFlagEncoder.K_PRIORITY_LONG, BikeCommonFlagEncoder.PriorityCode.BEST.getValue());
++        assertEquals(1, encoder.getDouble(flags, BikeCommonFlagEncoder.K_PRIORITY), 1e-3);
++
++        flags = encoder.setLong(0L, BikeCommonFlagEncoder.K_PRIORITY_LONG, BikeCommonFlagEncoder.PriorityCode.AVOID_IF_POSSIBLE.getValue());
++        assertEquals(3d / 7d, encoder.getDouble(flags, BikeCommonFlagEncoder.K_PRIORITY), 1e-3);
++    }
+ }
+diff --git a/core/src/test/java/com/graphhopper/routing/util/BikeFlagEncoderTest.java b/core/src/test/java/com/graphhopper/routing/util/BikeFlagEncoderTest.java
+index a1058baf50..b7b682b94c 100644
+--- a/core/src/test/java/com/graphhopper/routing/util/BikeFlagEncoderTest.java
++++ b/core/src/test/java/com/graphhopper/routing/util/BikeFlagEncoderTest.java
+@@ -26,7 +26,7 @@
+ 
+ /**
+  * @author Peter Karich
+- * @ratrun
++ * @author ratrun
+  */
+ public class BikeFlagEncoderTest extends AbstractBikeFlagEncoderTester
+ {
+@@ -232,13 +232,13 @@ public void testCalcPriority()
+         osmRel.setTag("network", "icn");
+         long relFlags = encoder.handleRelationTags(osmRel, 0);
+         long flags = encoder.handleWayTags(osmWay, allowed, relFlags);
+-        assertEquals((double) BEST.getValue() / BEST.getValue(), encoder.getPriority(flags), 1e-3);
++        assertEquals((double) BEST.getValue() / BEST.getValue(), encoder.getDouble(flags, BikeCommonFlagEncoder.K_PRIORITY), 1e-3);
+ 
+         // important: UNCHANGED should not get 0 priority!
+         osmWay = new OSMWay(1);
+         osmWay.setTag("highway", "somethingelse");
+         flags = encoder.handleWayTags(osmWay, allowed, 0);
+-        assertEquals((double) UNCHANGED.getValue() / BEST.getValue(), encoder.getPriority(flags), 1e-3);
++        assertEquals((double) UNCHANGED.getValue() / BEST.getValue(), encoder.getDouble(flags, BikeCommonFlagEncoder.K_PRIORITY), 1e-3);
+     }
+ 
+     @Test
+diff --git a/core/src/test/java/com/graphhopper/routing/util/CarFlagEncoderTest.java b/core/src/test/java/com/graphhopper/routing/util/CarFlagEncoderTest.java
+index a23c71d6d5..457ea9324b 100644
+--- a/core/src/test/java/com/graphhopper/routing/util/CarFlagEncoderTest.java
++++ b/core/src/test/java/com/graphhopper/routing/util/CarFlagEncoderTest.java
+@@ -44,7 +44,7 @@ public void testAccess()
+         way.clearTags();
+         way.setTag("highway", "track");
+         assertTrue(encoder.acceptWay(way) > 0);
+-        
++
+         way.setTag("motorcar", "no");
+         assertFalse(encoder.acceptWay(way) > 0);
+ 
+@@ -75,6 +75,7 @@ public void testAccess()
+         way.clearTags();
+         way.setTag("route", "ferry");
+         assertTrue(encoder.acceptWay(way) > 0);
++        assertTrue(encoder.isFerry(encoder.acceptWay(way)));
+         way.setTag("motorcar", "no");
+         assertFalse(encoder.acceptWay(way) > 0);
+ 
+@@ -82,29 +83,41 @@ public void testAccess()
+         way.setTag("route", "ferry");
+         way.setTag("foot", "yes");
+         assertFalse(encoder.acceptWay(way) > 0);
++        assertFalse(encoder.isFerry(encoder.acceptWay(way)));
+ 
+         way.clearTags();
+         way.setTag("highway", "primary");
+         long flags = encoder.handleWayTags(way, encoder.acceptWay(way), 0);
+-        assertTrue(encoder.isForward(flags));
+-        assertTrue(encoder.isBackward(flags));
++        assertTrue(encoder.isBool(flags, FlagEncoder.K_FORWARD));
++        assertTrue(encoder.isBool(flags, FlagEncoder.K_BACKWARD));
+         way.setTag("oneway", "yes");
+         flags = encoder.handleWayTags(way, encoder.acceptWay(way), 0);
+-        assertTrue(encoder.isForward(flags));
+-        assertFalse(encoder.isBackward(flags));
++        assertTrue(encoder.isBool(flags, FlagEncoder.K_FORWARD));
++        assertFalse(encoder.isBool(flags, FlagEncoder.K_BACKWARD));
+     }
+ 
+     @Test
+     public void testSetAccess()
+     {
+-        assertTrue(encoder.isForward(encoder.setProperties(0, true, true)));
+-        assertTrue(encoder.isBackward(encoder.setProperties(0, true, true)));
++        assertTrue(encoder.isBool(encoder.setProperties(0, true, true), FlagEncoder.K_FORWARD));
++        assertTrue(encoder.isBool(encoder.setProperties(0, true, true), FlagEncoder.K_BACKWARD));
++
++        assertTrue(encoder.isBool(encoder.setProperties(0, true, false), FlagEncoder.K_FORWARD));
++        assertFalse(encoder.isBool(encoder.setProperties(0, true, false), FlagEncoder.K_BACKWARD));
++
++        assertFalse(encoder.isBool(encoder.setProperties(0, false, true), FlagEncoder.K_FORWARD));
++        assertTrue(encoder.isBool(encoder.setProperties(0, false, true), FlagEncoder.K_BACKWARD));
++
++        assertTrue(encoder.isBool(encoder.flagsDefault(true, true), FlagEncoder.K_FORWARD));
++        assertTrue(encoder.isBool(encoder.flagsDefault(true, true), FlagEncoder.K_BACKWARD));
+ 
+-        assertTrue(encoder.isForward(encoder.setProperties(0, true, false)));
+-        assertFalse(encoder.isBackward(encoder.setProperties(0, true, false)));
++        assertTrue(encoder.isBool(encoder.flagsDefault(true, false), FlagEncoder.K_FORWARD));
++        assertFalse(encoder.isBool(encoder.flagsDefault(true, false), FlagEncoder.K_BACKWARD));
+ 
+-        assertFalse(encoder.isForward(encoder.setProperties(0, false, true)));
+-        assertTrue(encoder.isBackward(encoder.setProperties(0, false, true)));
++        long flags = encoder.flagsDefault(true, true);
++        // disable access
++        assertFalse(encoder.isBool(encoder.setAccess(flags, false, false), FlagEncoder.K_FORWARD));
++        assertFalse(encoder.isBool(encoder.setAccess(flags, false, false), FlagEncoder.K_BACKWARD));
+     }
+ 
+     @Test
+@@ -183,6 +196,34 @@ public void testSetSpeed()
+         assertEquals(10, encoder.getSpeed(encoder.setSpeed(0, 10)), 1e-1);
+     }
+ 
++    @Test
++    public void testRoundabout()
++    {
++        long flags = encoder.setAccess(0, true, true);
++        long resFlags = encoder.setBool(flags, FlagEncoder.K_ROUNDABOUT, true);
++        assertTrue(encoder.isBool(resFlags, FlagEncoder.K_ROUNDABOUT));
++        assertTrue(encoder.isBool(resFlags, FlagEncoder.K_FORWARD));
++        assertTrue(encoder.isBool(resFlags, FlagEncoder.K_BACKWARD));
++
++        resFlags = encoder.setBool(flags, FlagEncoder.K_ROUNDABOUT, false);
++        assertFalse(encoder.isBool(resFlags, FlagEncoder.K_ROUNDABOUT));
++        assertTrue(encoder.isBool(resFlags, FlagEncoder.K_FORWARD));
++        assertTrue(encoder.isBool(resFlags, FlagEncoder.K_BACKWARD));
++
++        OSMWay way = new OSMWay(1);
++        way.setTag("highway", "motorway");
++        flags = encoder.handleWayTags(way, encoder.acceptBit, 0);
++        assertTrue(encoder.isBool(flags, FlagEncoder.K_FORWARD));
++        assertTrue(encoder.isBool(flags, FlagEncoder.K_BACKWARD));
++        assertFalse(encoder.isBool(flags, FlagEncoder.K_ROUNDABOUT));
++
++        way.setTag("junction", "roundabout");
++        flags = encoder.handleWayTags(way, encoder.acceptBit, 0);
++        assertTrue(encoder.isBool(flags, FlagEncoder.K_FORWARD));
++        assertFalse(encoder.isBool(flags, FlagEncoder.K_BACKWARD));
++        assertTrue(encoder.isBool(flags, FlagEncoder.K_ROUNDABOUT));
++    }
++
+     @Test
+     public void testRailway()
+     {
+@@ -221,27 +262,17 @@ public void testRailway()
+         assertEquals(60, encoder.getSpeed(encoder.handleFerryTags(way, 20, 30, 40)), 1e-1);
+     }
+ 
+-    @Test
+-    public void testBasics()
+-    {
+-        assertTrue(encoder.isForward(encoder.flagsDefault(true, true)));
+-        assertTrue(encoder.isBackward(encoder.flagsDefault(true, true)));
+-
+-        assertTrue(encoder.isForward(encoder.flagsDefault(true, false)));
+-        assertFalse(encoder.isBackward(encoder.flagsDefault(true, false)));
+-    }
+-
+     @Test
+     public void testSwapDir()
+     {
+         long swappedFlags = encoder.reverseFlags(encoder.flagsDefault(true, true));
+-        assertTrue(encoder.isForward(swappedFlags));
+-        assertTrue(encoder.isBackward(swappedFlags));
++        assertTrue(encoder.isBool(swappedFlags, FlagEncoder.K_FORWARD));
++        assertTrue(encoder.isBool(swappedFlags, FlagEncoder.K_BACKWARD));
+ 
+         swappedFlags = encoder.reverseFlags(encoder.flagsDefault(true, false));
+ 
+-        assertFalse(encoder.isForward(swappedFlags));
+-        assertTrue(encoder.isBackward(swappedFlags));
++        assertFalse(encoder.isBool(swappedFlags, FlagEncoder.K_FORWARD));
++        assertTrue(encoder.isBool(swappedFlags, FlagEncoder.K_BACKWARD));
+ 
+         assertEquals(0, encoder.reverseFlags(0));
+     }
+diff --git a/core/src/test/java/com/graphhopper/routing/util/EncodingManagerTest.java b/core/src/test/java/com/graphhopper/routing/util/EncodingManagerTest.java
+index da833c2720..f31bd75679 100644
+--- a/core/src/test/java/com/graphhopper/routing/util/EncodingManagerTest.java
++++ b/core/src/test/java/com/graphhopper/routing/util/EncodingManagerTest.java
+@@ -143,7 +143,8 @@ public String toString()
+         long allow = defaultBike.acceptBit | lessRelationCodes.acceptBit;
+         long flags = manager.handleWayTags(osmWay, allow, relFlags);
+ 
+-        assertTrue(defaultBike.getPriority(flags) > lessRelationCodes.getPriority(flags));
++        assertTrue(defaultBike.getDouble(flags, BikeCommonFlagEncoder.K_PRIORITY) > 
++                lessRelationCodes.getDouble(flags, BikeCommonFlagEncoder.K_PRIORITY));
+     }
+ 
+     @Test
+@@ -168,7 +169,8 @@ public void testMixBikeTypesAndRelationCombination()
+ 
+         // bike: uninfluenced speed for grade but via network => VERY_NICE                
+         // mtb: uninfluenced speed only PREFER
+-        assertTrue(bikeEncoder.getPriority(flags) > mtbEncoder.getPriority(flags));
++        assertTrue(bikeEncoder.getDouble(flags, BikeCommonFlagEncoder.K_PRIORITY) 
++                > mtbEncoder.getDouble(flags, BikeCommonFlagEncoder.K_PRIORITY));
+     }
+ 
+     public void testFullBitMask()
+@@ -182,68 +184,6 @@ public void testFullBitMask()
+         assertTrue(bitUtil.toBitString(foot.getNodeBitMask()).endsWith("00011111110000000"));
+     }
+ 
+-    @Test
+-    public void testApplyNodeTags()
+-    {
+-        CarFlagEncoder car = new CarFlagEncoder();
+-        CarFlagEncoder car2 = new CarFlagEncoder(7, 1)
+-        {
+-            protected EncodedValue nodeEncoder;
+-
+-            @Override
+-            public int defineNodeBits( int index, int shift )
+-            {
+-                shift = super.defineNodeBits(index, shift);
+-                nodeEncoder = new EncodedValue("nodeEnc", shift, 2, 1, 0, 3);
+-                return shift + 2;
+-            }
+-
+-            @Override
+-            public long handleNodeTags( OSMNode node )
+-            {
+-                String tmp = node.getTag("test");
+-                // return negative value to indicate that this is not a barrier
+-                if (tmp == null)
+-                    return -nodeEncoder.setValue(0, 1);
+-                return -nodeEncoder.setValue(0, 2);
+-            }
+-
+-            @Override
+-            public long applyNodeFlags( long wayFlags, long nodeFlags )
+-            {
+-                double speed = speedEncoder.getDoubleValue(wayFlags);
+-                double speedDecrease = nodeEncoder.getValue(nodeFlags);
+-                return setSpeed(wayFlags, speed - speedDecrease);
+-            }
+-        };
+-        EncodingManager manager = new EncodingManager(car, car2);
+-
+-        OSMNode node = new OSMNode(1, Double.NaN, Double.NaN);
+-        OSMWay way = new OSMWay(2);
+-        way.setTag("highway", "secondary");
+-
+-        long wayFlags = manager.handleWayTags(way, manager.acceptWay(way), 0);
+-        long nodeFlags = manager.handleNodeTags(node);
+-        wayFlags = manager.applyNodeFlags(wayFlags, -nodeFlags);
+-        assertEquals(60, car.getSpeed(wayFlags), 1e-1);
+-        assertEquals(59, car2.getSpeed(wayFlags), 1e-1);
+-
+-        node.setTag("test", "something");
+-        wayFlags = manager.handleWayTags(way, manager.acceptWay(way), 0);
+-        nodeFlags = manager.handleNodeTags(node);
+-        wayFlags = manager.applyNodeFlags(wayFlags, -nodeFlags);
+-        assertEquals(58, car2.getSpeed(wayFlags), 1e-1);
+-        assertEquals(60, car.getSpeed(wayFlags), 1e-1);
+-
+-        way.setTag("maxspeed", "130");
+-        wayFlags = manager.handleWayTags(way, manager.acceptWay(way), 0);
+-        assertEquals(car.getMaxSpeed(), car2.getSpeed(wayFlags), 1e-1);
+-        nodeFlags = manager.handleNodeTags(node);
+-        wayFlags = manager.applyNodeFlags(wayFlags, -nodeFlags);
+-        assertEquals(98, car2.getSpeed(wayFlags), 1e-1);
+-        assertEquals(100, car.getSpeed(wayFlags), 1e-1);
+-    }
+-
+     /**
+      * Tests the combination of different turn cost flags by different encoders.
+      */
+diff --git a/core/src/test/java/com/graphhopper/routing/util/FootFlagEncoderTest.java b/core/src/test/java/com/graphhopper/routing/util/FootFlagEncoderTest.java
+index 538ecccf2a..60f250ac74 100644
+--- a/core/src/test/java/com/graphhopper/routing/util/FootFlagEncoderTest.java
++++ b/core/src/test/java/com/graphhopper/routing/util/FootFlagEncoderTest.java
+@@ -20,15 +20,10 @@
+ import com.graphhopper.reader.OSMWay;
+ import com.graphhopper.storage.Graph;
+ import com.graphhopper.storage.GraphBuilder;
+-import com.graphhopper.util.BitUtil;
+ import com.graphhopper.util.EdgeExplorer;
+ import com.graphhopper.util.GHUtility;
+ 
+-import java.util.HashMap;
+-import java.util.Map;
+-
+ import org.junit.Test;
+-
+ import static org.junit.Assert.*;
+ 
+ /**
+@@ -51,7 +46,7 @@ public void testGetSpeed()
+     public void testBasics()
+     {
+         long fl = footEncoder.flagsDefault(true, true);
+-        assertEquals(FootFlagEncoder.MEAN, footEncoder.getSpeed(fl), 1e-1);
++        assertEquals(FootFlagEncoder.MEAN_SPEED, footEncoder.getSpeed(fl), 1e-1);
+ 
+         long fl1 = footEncoder.flagsDefault(true, false);
+         long fl2 = footEncoder.reverseFlags(fl1);
+@@ -64,12 +59,12 @@ public void testCombined()
+         FlagEncoder carEncoder = encodingManager.getEncoder("CAR");
+         long fl = footEncoder.setProperties(10, true, true) | carEncoder.setProperties(100, true, false);
+         assertEquals(10, footEncoder.getSpeed(fl), 1e-1);
+-        assertTrue(footEncoder.isForward(fl));
+-        assertTrue(footEncoder.isBackward(fl));
++        assertTrue(footEncoder.isBool(fl, FlagEncoder.K_FORWARD));
++        assertTrue(footEncoder.isBool(fl, FlagEncoder.K_BACKWARD));
+ 
+         assertEquals(100, carEncoder.getSpeed(fl), 1e-1);
+-        assertTrue(carEncoder.isForward(fl));
+-        assertFalse(carEncoder.isBackward(fl));
++        assertTrue(carEncoder.isBool(fl, FlagEncoder.K_FORWARD));
++        assertFalse(carEncoder.isBool(fl, FlagEncoder.K_BACKWARD));
+ 
+         assertEquals(0, carEncoder.getSpeed(footEncoder.setProperties(10, true, true)), 1e-1);
+     }
+@@ -176,12 +171,12 @@ public void testSlowHiking()
+         way.setTag("highway", "track");
+         way.setTag("sac_scale", "hiking");
+         long flags = footEncoder.handleWayTags(way, footEncoder.acceptWay(way), 0);
+-        assertEquals(FootFlagEncoder.MEAN, footEncoder.getSpeed(flags), 1e-1);
++        assertEquals(FootFlagEncoder.MEAN_SPEED, footEncoder.getSpeed(flags), 1e-1);
+ 
+         way.setTag("highway", "track");
+         way.setTag("sac_scale", "mountain_hiking");
+         flags = footEncoder.handleWayTags(way, footEncoder.acceptWay(way), 0);
+-        assertEquals(FootFlagEncoder.SLOW, footEncoder.getSpeed(flags), 1e-1);
++        assertEquals(FootFlagEncoder.SLOW_SPEED, footEncoder.getSpeed(flags), 1e-1);
+     }
+ 
+     @Test
+diff --git a/core/src/test/java/com/graphhopper/storage/AbstractGraphStorageTester.java b/core/src/test/java/com/graphhopper/storage/AbstractGraphStorageTester.java
+index c9ad7d2618..6c62966989 100644
+--- a/core/src/test/java/com/graphhopper/storage/AbstractGraphStorageTester.java
++++ b/core/src/test/java/com/graphhopper/storage/AbstractGraphStorageTester.java
+@@ -800,14 +800,14 @@ public void testCreateDuplicateEdges()
+         EdgeIteratorState oneIter = graph.getEdgeProps(iter.getEdge(), 3);
+         assertEquals(13, oneIter.getDistance(), 1e-6);
+         assertEquals(2, oneIter.getBaseNode());
+-        assertTrue(carEncoder.isForward(oneIter.getFlags()));
+-        assertFalse(carEncoder.isBackward(oneIter.getFlags()));
++        assertTrue(carEncoder.isBool(oneIter.getFlags(), FlagEncoder.K_FORWARD));
++        assertFalse(carEncoder.isBool(oneIter.getFlags(), FlagEncoder.K_BACKWARD));
+ 
+         oneIter = graph.getEdgeProps(iter.getEdge(), 2);
+         assertEquals(13, oneIter.getDistance(), 1e-6);
+         assertEquals(3, oneIter.getBaseNode());
+-        assertTrue(carEncoder.isBackward(oneIter.getFlags()));
+-        assertFalse(carEncoder.isForward(oneIter.getFlags()));
++        assertFalse(carEncoder.isBool(oneIter.getFlags(), FlagEncoder.K_FORWARD));
++        assertTrue(carEncoder.isBool(oneIter.getFlags(), FlagEncoder.K_BACKWARD));
+ 
+         graph.edge(3, 2, 14, true);
+         assertEquals(4, GHUtility.count(carOutExplorer.setBaseNode(2)));
+@@ -1026,8 +1026,8 @@ public void test8BytesFlags()
+     {
+         Directory dir = new RAMDirectory();
+         List<FlagEncoder> list = new ArrayList<FlagEncoder>();
+-        list.add(new TmpCarFlagEncoder(30, 0.001));
+-        list.add(new TmpCarFlagEncoder(30, 0.001));
++        list.add(new TmpCarFlagEncoder(29, 0.001));
++        list.add(new TmpCarFlagEncoder(29, 0.001));
+         EncodingManager manager = new EncodingManager(list, 8, 0);
+         graph = new GraphHopperStorage(dir, manager, false).create(defaultSize);
+ 
+@@ -1044,15 +1044,15 @@ public void test8BytesFlags()
+         assertEquals(99.123, list.get(0).getSpeed(edge.getFlags()), 1e-3);
+         long flags = GHUtility.getEdge(graph, 1, 0).getFlags();
+         assertEquals(99.123, list.get(0).getSpeed(flags), 1e-3);
+-        assertTrue(list.get(0).isForward(flags));
+-        assertTrue(list.get(0).isBackward(flags));
++        assertTrue(list.get(0).isBool(flags, FlagEncoder.K_FORWARD));
++        assertTrue(list.get(0).isBool(flags, FlagEncoder.K_BACKWARD));
+         edge = graph.edge(2, 3);
+         edge.setFlags(list.get(1).setProperties(44.123, true, false));
+         assertEquals(44.123, list.get(1).getSpeed(edge.getFlags()), 1e-3);
+         flags = GHUtility.getEdge(graph, 3, 2).getFlags();
+         assertEquals(44.123, list.get(1).getSpeed(flags), 1e-3);
+-        assertTrue(list.get(1).isForward(flags));
+-        assertFalse(list.get(1).isBackward(flags));
++        assertTrue(list.get(1).isBool(flags, FlagEncoder.K_FORWARD));
++        assertFalse(list.get(1).isBool(flags, FlagEncoder.K_BACKWARD));
+     }
+ 
+     @Test
+@@ -1096,13 +1096,13 @@ public void testDetachEdge()
+         assertEquals(2, iter.getAdjNode());
+         assertEquals(1, edgeState2.fetchWayGeometry(0).getLatitude(0), 1e-1);
+         assertEquals(2, edgeState2.getAdjNode());
+-        assertTrue(carEncoder.isForward(edgeState2.getFlags()));
++        assertTrue(carEncoder.isBool(edgeState2.getFlags(), FlagEncoder.K_FORWARD));
+ 
+         EdgeIteratorState edgeState3 = iter.detach(true);
+         assertEquals(0, edgeState3.getAdjNode());
+         assertEquals(2, edgeState3.getBaseNode());
+         assertEquals(3, edgeState3.fetchWayGeometry(0).getLatitude(0), 1e-1);
+-        assertFalse(carEncoder.isForward(edgeState3.getFlags()));
++        assertFalse(carEncoder.isBool(edgeState3.getFlags(), FlagEncoder.K_FORWARD));
+         assertEquals(GHUtility.getEdge(graph, 0, 2).getFlags(), edgeState2.getFlags());
+         assertEquals(GHUtility.getEdge(graph, 2, 0).getFlags(), edgeState3.getFlags());
+ 
+diff --git a/core/src/test/java/com/graphhopper/storage/AbstractLockFactoryTester.java b/core/src/test/java/com/graphhopper/storage/AbstractLockFactoryTester.java
+new file mode 100644
+index 0000000000..276392a40b
+--- /dev/null
++++ b/core/src/test/java/com/graphhopper/storage/AbstractLockFactoryTester.java
+@@ -0,0 +1,86 @@
++/*
++ *  Licensed to Peter Karich under one or more contributor license
++ *  agreements. See the NOTICE file distributed with this work for
++ *  additional information regarding copyright ownership.
++ *
++ *  Peter Karich licenses this file to you under the Apache License,
++ *  Version 2.0 (the "License"); you may not use this file except
++ *  in compliance with the License. You may obtain a copy of the
++ *  License at
++ *
++ *       http://www.apache.org/licenses/LICENSE-2.0
++ *
++ *  Unless required by applicable law or agreed to in writing, software
++ *  distributed under the License is distributed on an "AS IS" BASIS,
++ *  WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++ *  See the License for the specific language governing permissions and
++ *  limitations under the License.
++ */
++package com.graphhopper.storage;
++
++import com.graphhopper.util.Helper;
++import java.io.File;
++import org.junit.After;
++import static org.junit.Assert.assertFalse;
++import static org.junit.Assert.assertTrue;
++import org.junit.Before;
++import org.junit.Test;
++
++/**
++ * @author Peter Karich
++ */
++public abstract class AbstractLockFactoryTester
++{
++
++    protected final File lockDir = new File("./target/lockingtest/");
++
++    protected abstract LockFactory createLockFactory();
++
++    @Before
++    public void setUp()
++    {
++        lockDir.mkdirs();
++    }
++
++    @After
++    public void tearDown()
++    {
++        Helper.removeDir(lockDir);
++    }
++
++    @Test
++    public void testObtain()
++    {
++        LockFactory instance = createLockFactory();
++        instance.setLockDir(lockDir);
++        Lock lock = instance.create("test", true);
++        assertTrue(lock.tryLock());
++        assertTrue(lock.isLocked());
++        assertFalse(lock.tryLock());
++        assertTrue(lock.isLocked());
++
++        Lock lock2 = instance.create("test", true);
++        assertFalse(lock2.tryLock());
++        assertTrue(lock2.isLocked());
++
++        // fails for SimpleFSLockFactory:
++        // although it is locked do not allow release:
++        // lock2.release();
++        // assertTrue(lock.isLocked());
++
++        lock.release();
++        assertFalse(lock.isLocked());
++    }
++
++    @Test
++    public void testForceDelete()
++    {
++        LockFactory instance = createLockFactory();
++        instance.setLockDir(lockDir);
++        Lock lock = instance.create("testlock", true);
++        assertTrue(lock.tryLock());
++        assertTrue(lock.isLocked());
++        instance.forceRemove(lock.getName(), true);
++        assertFalse(lock.isLocked());
++    }
++}
+diff --git a/core/src/test/java/com/graphhopper/storage/LevelGraphStorageTest.java b/core/src/test/java/com/graphhopper/storage/LevelGraphStorageTest.java
+index 413f1538b9..cad468fb81 100644
+--- a/core/src/test/java/com/graphhopper/storage/LevelGraphStorageTest.java
++++ b/core/src/test/java/com/graphhopper/storage/LevelGraphStorageTest.java
+@@ -174,15 +174,15 @@ public void testGetWeight()
+         sc1.setFlags(flags);
+         sc1.setWeight(100.123);
+         assertEquals(100.123, sc1.getWeight(), 1e-3);
+-        assertTrue(carEncoder.isBackward(sc1.getFlags()));
+-        assertTrue(carEncoder.isForward(sc1.getFlags()));
++        assertTrue(carEncoder.isBool(sc1.getFlags(), FlagEncoder.K_FORWARD));
++        assertTrue(carEncoder.isBool(sc1.getFlags(), FlagEncoder.K_BACKWARD));
+ 
+         flags = carEncoder.setProperties(10, false, true);
+         sc1.setFlags(flags);
+         sc1.setWeight(100.123);
+-        assertEquals(100.123, sc1.getWeight(), 1e-3);
+-        assertTrue(carEncoder.isBackward(sc1.getFlags()));
+-        assertFalse(carEncoder.isForward(sc1.getFlags()));
++        assertEquals(100.123, sc1.getWeight(), 1e-3);        
++        assertFalse(carEncoder.isBool(sc1.getFlags(), FlagEncoder.K_FORWARD));
++        assertTrue(carEncoder.isBool(sc1.getFlags(), FlagEncoder.K_BACKWARD));
+     }
+ 
+     @Test
+diff --git a/core/src/test/java/com/graphhopper/storage/NativeFSLockFactoryTest.java b/core/src/test/java/com/graphhopper/storage/NativeFSLockFactoryTest.java
+new file mode 100644
+index 0000000000..ddeaa9e012
+--- /dev/null
++++ b/core/src/test/java/com/graphhopper/storage/NativeFSLockFactoryTest.java
+@@ -0,0 +1,70 @@
++/*
++ *  Licensed to Peter Karich under one or more contributor license
++ *  agreements. See the NOTICE file distributed with this work for
++ *  additional information regarding copyright ownership.
++ *
++ *  Peter Karich licenses this file to you under the Apache License,
++ *  Version 2.0 (the "License"); you may not use this file except
++ *  in compliance with the License. You may obtain a copy of the
++ *  License at
++ *
++ *       http://www.apache.org/licenses/LICENSE-2.0
++ *
++ *  Unless required by applicable law or agreed to in writing, software
++ *  distributed under the License is distributed on an "AS IS" BASIS,
++ *  WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++ *  See the License for the specific language governing permissions and
++ *  limitations under the License.
++ */
++package com.graphhopper.storage;
++
++import java.nio.channels.OverlappingFileLockException;
++import org.junit.Test;
++import static org.junit.Assert.*;
++
++/**
++ *
++ * @author Peter Karich
++ */
++public class NativeFSLockFactoryTest extends AbstractLockFactoryTester
++{
++    @Override
++    protected LockFactory createLockFactory()
++    {
++        return new NativeFSLockFactory(lockDir);
++    }
++
++    @Test
++    public void testMultiReadObtain()
++    {
++        LockFactory instance = createLockFactory();
++        instance.setLockDir(lockDir);
++        Lock writeLock1 = instance.create("test", true);
++        assertTrue(writeLock1.tryLock());
++
++        // BUT disallow more than one write lock!
++        Lock lock2 = instance.create("test", false);
++        assertFalse(lock2.tryLock());
++
++        writeLock1.release();
++
++        assertTrue(lock2.tryLock());
++
++        // http://stackoverflow.com/q/24367887/194609
++        // we cannot test 'allow multiple read locks' as multiple reads are only allowed for different processes        
++        // Lock lock3 = instance.create("test", false);
++        // assertFalse(lock3.tryLock());
++        // lock3.release();
++        // still the lock should be valid
++        assertTrue(lock2.isLocked());
++
++        // disallow write lock if currently reading
++        Lock writeLock4 = instance.create("test", true);
++        assertFalse(writeLock4.tryLock());
++        assertEquals(OverlappingFileLockException.class, writeLock4.getObtainFailedReason().getClass());
++        writeLock4.release();
++
++        assertTrue(lock2.isLocked());
++        lock2.release();
++    }
++}
+diff --git a/core/src/test/java/com/graphhopper/storage/SimpleFSLockFactoryTest.java b/core/src/test/java/com/graphhopper/storage/SimpleFSLockFactoryTest.java
+new file mode 100644
+index 0000000000..1f9badefe4
+--- /dev/null
++++ b/core/src/test/java/com/graphhopper/storage/SimpleFSLockFactoryTest.java
+@@ -0,0 +1,32 @@
++/*
++ *  Licensed to Peter Karich under one or more contributor license
++ *  agreements. See the NOTICE file distributed with this work for
++ *  additional information regarding copyright ownership.
++ *
++ *  Peter Karich licenses this file to you under the Apache License,
++ *  Version 2.0 (the "License"); you may not use this file except
++ *  in compliance with the License. You may obtain a copy of the
++ *  License at
++ *
++ *       http://www.apache.org/licenses/LICENSE-2.0
++ *
++ *  Unless required by applicable law or agreed to in writing, software
++ *  distributed under the License is distributed on an "AS IS" BASIS,
++ *  WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++ *  See the License for the specific language governing permissions and
++ *  limitations under the License.
++ */
++package com.graphhopper.storage;
++
++/**
++ *
++ * @author Peter Karich
++ */
++public class SimpleFSLockFactoryTest extends AbstractLockFactoryTester
++{
++    @Override
++    protected LockFactory createLockFactory()
++    {
++        return new SimpleFSLockFactory(lockDir);
++    }
++}
+diff --git a/graphhopper.sh b/graphhopper.sh
+index e4d3be91c2..fe1c44bc33 100755
+--- a/graphhopper.sh
++++ b/graphhopper.sh
+@@ -218,12 +218,14 @@ if [ "x$ACTION" = "xui" ] || [ "x$ACTION" = "xweb" ]; then
+   RC_BASE=./web/src/main/webapp
+ 
+   if [ "x$GH_FOREGROUND" = "x" ]; then
+-    exec "$JAVA" $JAVA_OPTS -jar "$WEB_JAR" jetty.resourcebase=$RC_BASE jetty.port=$JETTY_PORT config=$CONFIG \
+-         $GH_WEB_OPTS graph.location="$GRAPH" osmreader.osm="$OSM_FILE"
++    exec "$JAVA" $JAVA_OPTS -jar "$WEB_JAR" jetty.resourcebase=$RC_BASE \
++	jetty.port=$JETTY_PORT jetty.host=$JETTY_HOST \
++    	config=$CONFIG $GH_WEB_OPTS graph.location="$GRAPH" osmreader.osm="$OSM_FILE"
+     # foreground => we never reach this here
+   else
+-    exec "$JAVA" $JAVA_OPTS -jar "$WEB_JAR" jetty.resourcebase=$RC_BASE jetty.port=$JETTY_PORT config=$CONFIG \
+-         $GH_WEB_OPTS graph.location="$GRAPH" osmreader.osm="$OSM_FILE" <&- &
++    exec "$JAVA" $JAVA_OPTS -jar "$WEB_JAR" jetty.resourcebase=$RC_BASE \
++    	jetty.port=$JETTY_PORT jetty.host=$JETTY_HOST \
++    	config=$CONFIG $GH_WEB_OPTS graph.location="$GRAPH" osmreader.osm="$OSM_FILE" <&- &
+     if [ "x$GH_PID_FILE" != "x" ]; then
+        echo $! > $GH_PID_FILE
+     fi
+diff --git a/pom.xml b/pom.xml
+index a7ad26d5c9..6d715f771f 100644
+--- a/pom.xml
++++ b/pom.xml
+@@ -91,7 +91,8 @@
+                     <!--
+                     <compilerArgument>-Xlint:unchecked</compilerArgument>
+                     -->
+-                    
++                    <compilerArgument>-XDignore.symbol.file</compilerArgument>
++                    <fork>true</fork>
+                     <source>1.6</source>
+                     <target>1.6</target>
+                 </configuration>
+@@ -115,6 +116,7 @@
+                     <execution>
+                         <goals>
+                             <goal>integration-test</goal>
++                            <goal>verify</goal>
+                         </goals>
+                     </execution>
+                 </executions>
+diff --git a/tools/src/main/java/com/graphhopper/ui/MiniGraphUI.java b/tools/src/main/java/com/graphhopper/ui/MiniGraphUI.java
+index 0ecd384439..71991666a2 100644
+--- a/tools/src/main/java/com/graphhopper/ui/MiniGraphUI.java
++++ b/tools/src/main/java/com/graphhopper/ui/MiniGraphUI.java
+@@ -22,12 +22,7 @@
+ import com.graphhopper.coll.GHTBitSet;
+ import com.graphhopper.routing.Path;
+ import com.graphhopper.routing.RoutingAlgorithm;
+-import com.graphhopper.routing.util.AlgorithmPreparation;
+-import com.graphhopper.routing.util.BikeCommonFlagEncoder;
+-import com.graphhopper.routing.util.EdgeFilter;
+-import com.graphhopper.routing.util.NoOpAlgorithmPreparation;
+-import com.graphhopper.routing.util.PriorityWeighting;
+-import com.graphhopper.routing.util.Weighting;
++import com.graphhopper.routing.util.*;
+ import com.graphhopper.storage.Graph;
+ import com.graphhopper.storage.NodeAccess;
+ import com.graphhopper.storage.index.LocationIndex;
+@@ -75,14 +70,14 @@ public static void main( String[] strs ) throws Exception
+     private final MapLayer pathLayer;
+     private boolean fastPaint = false;
+     private final Weighting weighting;
+-    private final BikeCommonFlagEncoder encoder;
++    private final FlagEncoder encoder;
+ 
+     public MiniGraphUI( GraphHopper hopper, boolean debug )
+     {
+         this.graph = hopper.getGraph();
+         this.na = graph.getNodeAccess();
+         prepare = hopper.getPreparation();
+-        encoder = (BikeCommonFlagEncoder) hopper.getEncodingManager().getEncoder("bike");
++        encoder = hopper.getEncodingManager().getSingle();
+         weighting = new PriorityWeighting(encoder);
+         if (prepare == null)
+             prepare = NoOpAlgorithmPreparation.createAlgoPrepare(graph, "dijkstrabi", encoder, weighting);
+@@ -181,21 +176,7 @@ public void paintComponent( Graphics2D g2 )
+ 
+                         // mg.plotText(g2, lat * 0.9 + lat2 * 0.1, lon * 0.9 + lon2 * 0.1, iter.getName());
+                         mg.plotText(g2, lat * 0.9 + lat2 * 0.1, lon * 0.9 + lon2 * 0.1, "s:" + (int) encoder.getSpeed(iter.getFlags()));
+-                        g2.setColor(Color.BLACK);
+-
+-                        double prio = encoder.getPriority(iter.getFlags());
+-                        if (prio < 0.2)
+-                            g2.setColor(Color.RED.darker());
+-                        else if (prio < 0.3)
+-                            g2.setColor(Color.RED.brighter());
+-                        else if (prio < 0.5)
+-                            g2.setColor(Color.ORANGE);
+-                        else if (prio < 0.6)
+-                            g2.setColor(Color.GRAY);
+-                        else if (prio < 0.8)
+-                            g2.setColor(Color.GREEN.brighter());
+-                        else
+-                            g2.setColor(Color.GREEN.darker());
++                        g2.setColor(Color.BLACK);                        
+ 
+                         mg.plotEdge(g2, lat, lon, lat2, lon2);
+                         g2.setColor(Color.BLACK);
+diff --git a/web/src/main/java/com/graphhopper/http/GHServer.java b/web/src/main/java/com/graphhopper/http/GHServer.java
+index 6143ab01d4..ccdca1fb2a 100644
+--- a/web/src/main/java/com/graphhopper/http/GHServer.java
++++ b/web/src/main/java/com/graphhopper/http/GHServer.java
+@@ -23,6 +23,7 @@
+ import com.google.inject.Module;
+ import com.google.inject.servlet.GuiceFilter;
+ import com.graphhopper.util.CmdArgs;
++import java.net.InetSocketAddress;
+ import org.eclipse.jetty.server.Server;
+ import org.eclipse.jetty.servlet.ServletHolder;
+ 
+@@ -75,18 +76,20 @@ public void start( Injector injector ) throws Exception
+         server = new Server();
+         // getSessionHandler and getSecurityHandler should always return null
+         ServletContextHandler servHandler = new ServletContextHandler(ServletContextHandler.NO_SECURITY | ServletContextHandler.NO_SESSIONS);
+-        servHandler.setContextPath("/");        
++        servHandler.setContextPath("/");
+ 
+         servHandler.addServlet(new ServletHolder(new InvalidRequestServlet()), "/*");
+ 
+         FilterHolder guiceFilter = new FilterHolder(injector.getInstance(GuiceFilter.class));
+         servHandler.addFilter(guiceFilter, "/*", EnumSet.allOf(DispatcherType.class));
+ 
+-        int httpPort = args.getInt("jetty.port", 8989);
+         SelectChannelConnector connector0 = new SelectChannelConnector();
+-        // don't allow access from outside!
+-        // connector0.setHost("127.0.0.1");
++        int httpPort = args.getInt("jetty.port", 8989);
++        String host = args.get("jetty.host", "");
+         connector0.setPort(httpPort);
++        if (!host.isEmpty())
++            connector0.setHost(host);
++        
+         server.addConnector(connector0);
+ 
+         HandlerList handlers = new HandlerList();
+@@ -96,10 +99,10 @@ public void start( Injector injector ) throws Exception
+         });
+         server.setHandler(handlers);
+         server.start();
+-        logger.info("Started server at HTTP " + httpPort);
++        logger.info("Started server at HTTP " + host + ":" + httpPort);
+     }
+ 
+-    private Module createModule()
++    protected Module createModule()
+     {
+         return new AbstractModule()
+         {
+@@ -109,7 +112,7 @@ protected void configure()
+                 binder().requireExplicitBindings();
+ 
+                 install(new DefaultModule(args));
+-                install(new GHServletModule());
++                install(new GHServletModule(args));
+ 
+                 bind(GuiceFilter.class);
+             }
+diff --git a/web/src/main/java/com/graphhopper/http/GHServletModule.java b/web/src/main/java/com/graphhopper/http/GHServletModule.java
+index 15cbe52aca..1acbdc3b52 100644
+--- a/web/src/main/java/com/graphhopper/http/GHServletModule.java
++++ b/web/src/main/java/com/graphhopper/http/GHServletModule.java
+@@ -18,6 +18,7 @@
+ package com.graphhopper.http;
+ 
+ import com.google.inject.servlet.ServletModule;
++import com.graphhopper.util.CmdArgs;
+ import java.util.HashMap;
+ import java.util.Map;
+ import javax.inject.Singleton;
+@@ -28,9 +29,11 @@
+ public class GHServletModule extends ServletModule
+ {
+     protected Map<String, String> params = new HashMap<String, String>();
++    private final CmdArgs args;
+ 
+-    public GHServletModule()
++    public GHServletModule( CmdArgs args )
+     {
++        this.args = args;
+         params.put("mimeTypes", "text/html,"
+                 + "text/plain,"
+                 + "text/xml,"
+@@ -46,10 +49,13 @@ protected void configureServlets()
+     {
+         filter("*").through(GHGZIPHook.class, params);
+         bind(GHGZIPHook.class).in(Singleton.class);
+-        
++
+         filter("*").through(CORSFilter.class, params);
+         bind(CORSFilter.class).in(Singleton.class);
+ 
++        filter("*").through(IPFilter.class);
++        bind(IPFilter.class).toInstance(new IPFilter(args.get("jetty.whiteips", ""), args.get("jetty.blackips", "")));
++
+         serve("/i18n*").with(I18NServlet.class);
+         bind(I18NServlet.class).in(Singleton.class);
+ 
+diff --git a/web/src/main/java/com/graphhopper/http/GraphHopperServlet.java b/web/src/main/java/com/graphhopper/http/GraphHopperServlet.java
+index 66f23af58d..73c7571c1e 100644
+--- a/web/src/main/java/com/graphhopper/http/GraphHopperServlet.java
++++ b/web/src/main/java/com/graphhopper/http/GraphHopperServlet.java
+@@ -23,7 +23,6 @@
+ import com.graphhopper.routing.util.FlagEncoder;
+ import com.graphhopper.util.*;
+ import com.graphhopper.util.Helper;
+-import com.graphhopper.util.Translation;
+ import com.graphhopper.util.shapes.GHPoint;
+ import java.io.IOException;
+ import java.util.*;
+diff --git a/web/src/main/java/com/graphhopper/http/GuiceServletConfig.java b/web/src/main/java/com/graphhopper/http/GuiceServletConfig.java
+index 118f2fa147..830e6e03cd 100644
+--- a/web/src/main/java/com/graphhopper/http/GuiceServletConfig.java
++++ b/web/src/main/java/com/graphhopper/http/GuiceServletConfig.java
+@@ -24,7 +24,7 @@
+ import com.graphhopper.util.CmdArgs;
+ 
+ /**
+- * Replacement of web.xml
++ * Replacement of web.xml used only for container deployment. Preferred method is to use GHServer.
+  * <p/>
+  * http://code.google.com/p/google-guice/wiki/ServletModule
+  * <p/>
+@@ -32,6 +32,19 @@
+  */
+ public class GuiceServletConfig extends GuiceServletContextListener
+ {
++    private final CmdArgs args;
++
++    public GuiceServletConfig()
++    {
++        try
++        {
++            args = CmdArgs.readFromConfig("config.properties", "graphhopper.config");
++        } catch (Exception ex)
++        {
++            throw new RuntimeException(ex);
++        }
++    }
++
+     @Override
+     protected Injector getInjector()
+     {
+@@ -40,11 +53,11 @@ protected Injector getInjector()
+ 
+     protected Module createDefaultModule()
+     {
+-        return new DefaultModule(new CmdArgs());
++        return new DefaultModule(args);
+     }
+ 
+     protected Module createServletModule()
+     {
+-        return new GHServletModule();
++        return new GHServletModule(args);
+     }
+ }
+diff --git a/web/src/main/java/com/graphhopper/http/IPFilter.java b/web/src/main/java/com/graphhopper/http/IPFilter.java
+new file mode 100644
+index 0000000000..9b40dd4c02
+--- /dev/null
++++ b/web/src/main/java/com/graphhopper/http/IPFilter.java
+@@ -0,0 +1,116 @@
++package com.graphhopper.http;
++
++import java.io.IOException;
++import java.util.HashSet;
++import java.util.Set;
++import javax.servlet.*;
++import javax.servlet.http.HttpServletResponse;
++import org.slf4j.Logger;
++import org.slf4j.LoggerFactory;
++
++/**
++ * This IP filter class accepts a list of IPs for blacklisting OR for whitelisting (but not both).
++ * <p>
++ * Additionally to exact match a simple wildcard expression ala 1.2.3* or 1.*.3.4 is allowed.
++ * <p>
++ * The internal ip filter from jetty did not work (NP exceptions)
++ * <p>
++ * @author Peter Karich
++ */
++public class IPFilter implements Filter
++{
++    private final Logger logger = LoggerFactory.getLogger(getClass());
++    private final Set<String> whites;
++    private final Set<String> blacks;
++
++    public IPFilter( String whiteList, String blackList )
++    {
++        whites = createSet(whiteList.split(","));
++        blacks = createSet(blackList.split(","));
++        if (!whites.isEmpty())
++            logger.debug("whitelist:" + whites);
++        if (!blackList.isEmpty())
++            logger.debug("blacklist:" + blacks);
++
++        if (!blacks.isEmpty() && !whites.isEmpty())
++            throw new IllegalArgumentException("blacklist and whitelist at the same time?");
++    }
++
++    @Override
++    public void doFilter( ServletRequest request, ServletResponse response, FilterChain chain ) throws IOException, ServletException
++    {
++        String ip = request.getRemoteAddr();
++        if (accept(ip))
++        {
++            chain.doFilter(request, response);
++        } else
++        {
++            logger.warn("Did not accept IP " + ip);
++            ((HttpServletResponse) response).sendError(HttpServletResponse.SC_FORBIDDEN);
++        }
++    }
++
++    public boolean accept( String ip )
++    {
++        if (whites.isEmpty() && blacks.isEmpty())
++            return true;
++
++        if (!whites.isEmpty())
++        {
++            for (String w : whites)
++            {
++                if (simpleMatch(ip, w))
++                    return true;
++            }
++            return false;
++        }
++
++        if (blacks.isEmpty())
++            throw new IllegalStateException("cannot happen");
++
++        for (String b : blacks)
++        {
++            if (simpleMatch(ip, b))
++                return false;
++        }
++
++        return true;
++    }
++
++    @Override
++    public void init( FilterConfig filterConfig ) throws ServletException
++    {
++    }
++
++    @Override
++    public void destroy()
++    {
++    }
++
++    private Set<String> createSet( String[] split )
++    {
++        Set<String> set = new HashSet<String>(split.length);
++        for (String str : split)
++        {
++            str = str.trim();
++            if (!str.isEmpty())
++                set.add(str);
++        }
++        return set;
++    }
++
++    public boolean simpleMatch( String ip, String pattern )
++    {
++        String[] ipParts = pattern.split("\\*");
++        for (String ipPart : ipParts)
++        {
++            int idx = ip.indexOf(ipPart);
++            if (idx == -1)
++                return false;
++
++            ip = ip.substring(idx + ipPart.length());
++        }
++
++        return true;
++    }
++}
+diff --git a/web/src/main/java/com/graphhopper/http/WebHelper.java b/web/src/main/java/com/graphhopper/http/WebHelper.java
+index d73f0b8081..48c8ff1aee 100644
+--- a/web/src/main/java/com/graphhopper/http/WebHelper.java
++++ b/web/src/main/java/com/graphhopper/http/WebHelper.java
+@@ -94,6 +94,9 @@ public static PointList decodePolyline( String encoded, int initCap, boolean is3
+     // https://developers.google.com/maps/documentation/utilities/polylinealgorithm?hl=de
+     public static String encodePolyline( PointList poly )
+     {
++        if (poly.isEmpty())
++            return "";
++        
+         return encodePolyline(poly, poly.is3D());
+     }
+ 
+diff --git a/web/src/main/webapp/css/leaflet.contextmenu.css b/web/src/main/webapp/css/leaflet.contextmenu.css
+new file mode 100644
+index 0000000000..55e405c6d3
+--- /dev/null
++++ b/web/src/main/webapp/css/leaflet.contextmenu.css
+@@ -0,0 +1,54 @@
++.leaflet-contextmenu {
++    display: none;
++	box-shadow: 0 1px 7px rgba(0,0,0,0.4);
++	-webkit-border-radius: 4px;
++	border-radius: 4px;
++    padding: 4px 0;
++    background-color: #fff;
++    cursor: default;
++	-webkit-user-select: none;
++	-moz-user-select: none;
++	user-select: none;
++}
++
++.leaflet-contextmenu a.leaflet-contextmenu-item {
++    display: block;
++    color: #222;
++    font-size: 12px;
++    line-height: 20px;
++    text-decoration: none;
++    padding: 0 12px;
++    border-top: 1px solid transparent;
++    border-bottom: 1px solid transparent;
++    cursor: default;
++    outline: none;
++}
++
++.leaflet-contextmenu a.leaflet-contextmenu-item-disabled {
++    opacity: 0.5;
++}
++
++.leaflet-contextmenu a.leaflet-contextmenu-item.over {
++    background-color: #f4f4f4;
++    border-top: 1px solid #f0f0f0;
++    border-bottom: 1px solid #f0f0f0;
++}
++
++.leaflet-contextmenu a.leaflet-contextmenu-item-disabled.over {
++    background-color: inherit;
++    border-top: 1px solid transparent;
++    border-bottom: 1px solid transparent;
++}
++
++.leaflet-contextmenu-icon {
++    margin: 2px 8px 0 0;
++    width: 16px;
++    height: 16px;
++    float: left;
++    border: 0;
++}
++
++.leaflet-contextmenu-separator {
++    border-bottom: 1px solid #ccc;
++    margin: 5px 0;
++}
+\ No newline at end of file
+diff --git a/web/src/main/webapp/index.html b/web/src/main/webapp/index.html
+index 47b67b5949..c6ae5699c0 100644
+--- a/web/src/main/webapp/index.html
++++ b/web/src/main/webapp/index.html
+@@ -7,22 +7,25 @@
+         <link type="image/png" rel="icon" href="/favicon.ico"/>        
+         <link rel="search" type="application/opensearchdescription+xml" title="GraphHopper Maps" href="opensearch.xml"/>
+         <title>Driving Directions - GraphHopper Maps</title>
+-
++        <meta name="description" content="A fast route planner for biking, hiking and more! Based on OpenStreetMap including elevation data. Try out for free!"/>
+         <link rel="stylesheet" href="css/leaflet.css" />        
+         <script type="text/javascript" src="js/leaflet.js?v=0.7.2"></script>
+         <link rel="stylesheet" href="css/Leaflet.Elevation-0.0.2.css" />
+         <script type="text/javascript" src="js/d3.min.js"></script>
+         <script type="text/javascript" src="js/Leaflet.Elevation-0.0.2.min.js"></script>        
+ 
++        <link rel="stylesheet" href="css/leaflet.contextmenu.css" />
++        <script async="yes" type="text/javascript" src="js/leaflet.contextmenu.js"></script>
++        
+         <script type="text/javascript" src="js/jquery-2.1.0.min.js"></script>        
+         <!--
+         <script type="text/javascript" src="http://code.jquery.com/jquery-2.1.0.min.js"></script>        
+         -->
+         <script type="text/javascript" src="js/jquery.history.js"></script>
+         <!--        <script type="text/javascript" src="js/jquery.autocomplete.min.js"></script>-->
+-        <script type="text/javascript" src="js/jquery.autocomplete.js"></script>
+-        <script type="text/javascript" src="js/ghrequest.js?v=0.4.1"></script>
+-        <script type="text/javascript" src="js/main.js?v=0.4.1"></script>         
++        <script type="text/javascript" src="js/jquery.autocomplete.js"></script>        
++        <script type="text/javascript" src="js/ghrequest.js?v=0.4.1"></script>        
++        <script type="text/javascript" src="js/main.js?v=0.4.1"></script>
+         <link rel="stylesheet" type="text/css" href="css/style.css" />
+     </head>
+     <body>
+diff --git a/web/src/main/webapp/js/jquery.autocomplete.js b/web/src/main/webapp/js/jquery.autocomplete.js
+index 3028e735a6..bbacf00c11 100644
+--- a/web/src/main/webapp/js/jquery.autocomplete.js
++++ b/web/src/main/webapp/js/jquery.autocomplete.js
+@@ -159,15 +159,15 @@
+             // special on() plugin code for 'autocomplete'
+             // http://api.jquery.com/on/#on-events-selector-data
+             // Listen for mouse over event on suggestions list:
+-            container.on('mouseenter.autocomplete', suggestionSelector, function () {
+-                that.activate($(this).data('index'));
+-            });
+-
+-            // Deselect active element when mouse leaves suggestions container:
+-            container.on('mouseleave.autocomplete', suggestionSelector, function () {                
+-                that.selectedIndex = -1;
+-                container.children('.' + selected).removeClass(selected);
+-            });
++//            container.on('mouseenter.autocomplete', suggestionSelector, function () {
++//                that.activate($(this).data('index'));
++//            });
++//
++//            // Deselect active element when mouse leaves suggestions container:
++//            container.on('mouseleave.autocomplete', suggestionSelector, function () {                
++//                that.selectedIndex = -1;
++//                container.children('.' + selected).removeClass(selected);
++//            });
+ 
+             // Listen for click event on suggestions list:
+             container.on('click.autocomplete', suggestionSelector, function () {
+diff --git a/web/src/main/webapp/js/leaflet.contextmenu.js b/web/src/main/webapp/js/leaflet.contextmenu.js
+new file mode 100644
+index 0000000000..6092cdbc52
+--- /dev/null
++++ b/web/src/main/webapp/js/leaflet.contextmenu.js
+@@ -0,0 +1,5 @@
++/*
++	Leaflet.contextmenu, a context menu for Leaflet.
++	(c) 2014, Adam Ratcliffe, GeoSmart Maps Limited
++*/
++L.Map.mergeOptions({contextmenuItems:[]});L.Map.ContextMenu=L.Handler.extend({statics:{BASE_CLS:"leaflet-contextmenu"},initialize:function(map){L.Handler.prototype.initialize.call(this,map);this._items=[];this._visible=false;var container=this._container=L.DomUtil.create("div",L.Map.ContextMenu.BASE_CLS,map._container);container.style.zIndex=1e4;container.style.position="absolute";if(map.options.contextmenuWidth){container.style.width=map.options.contextmenuWidth+"px"}this._createItems();L.DomEvent.on(container,"click",L.DomEvent.stop).on(container,"mousedown",L.DomEvent.stop).on(container,"dblclick",L.DomEvent.stop).on(container,"contextmenu",L.DomEvent.stop)},addHooks:function(){L.DomEvent.on(document,L.Browser.touch?"touchstart":"mousedown",this._onMouseDown,this).on(document,"keydown",this._onKeyDown,this);this._map.on({contextmenu:this._show,mouseout:this._hide,mousedown:this._hide,movestart:this._hide,zoomstart:this._hide},this)},removeHooks:function(){L.DomEvent.off(document,"keydown",this._onKeyDown,this);this._map.off({contextmenu:this._show,mouseout:this._hide,mousedown:this._hide,movestart:this._hide,zoomstart:this._hide},this)},showAt:function(point,data){if(point instanceof L.LatLng){point=this._map.latLngToContainerPoint(point)}this._showAtPoint(point,data)},hide:function(){this._hide()},addItem:function(options){return this.insertItem(options)},insertItem:function(options,index){index=index!==undefined?index:this._items.length;var item=this._createItem(this._container,options,index);this._items.push(item);this._sizeChanged=true;this._map.fire("contextmenu.additem",{contextmenu:this,el:item.el,index:index});return item.el},removeItem:function(item){var container=this._container;if(!isNaN(item)){item=container.children[item]}if(item){this._removeItem(L.Util.stamp(item));this._sizeChanged=true;this._map.fire("contextmenu.removeitem",{contextmenu:this,el:item})}},removeAllItems:function(){var item;while(this._container.children.length){item=this._container.children[0];this._removeItem(L.Util.stamp(item))}},setDisabled:function(item,disabled){var container=this._container,itemCls=L.Map.ContextMenu.BASE_CLS+"-item";if(!isNaN(item)){item=container.children[item]}if(item&&L.DomUtil.hasClass(item,itemCls)){if(disabled){L.DomUtil.addClass(item,itemCls+"-disabled");this._map.fire("contextmenu.disableitem",{contextmenu:this,el:item})}else{L.DomUtil.removeClass(item,itemCls+"-disabled");this._map.fire("contextmenu.enableitem",{contextmenu:this,el:item})}}},isVisible:function(){return this._visible},_createItems:function(){var itemOptions=this._map.options.contextmenuItems,item,i,l;for(i=0,l=itemOptions.length;i<l;i++){this._items.push(this._createItem(this._container,itemOptions[i]))}},_createItem:function(container,options,index){if(options.separator||options==="-"){return this._createSeparator(container,index)}var itemCls=L.Map.ContextMenu.BASE_CLS+"-item",cls=options.disabled?itemCls+" "+itemCls+"-disabled":itemCls,el=this._insertElementAt("a",cls,container,index),callback=this._createEventHandler(el,options.callback,options.context,options.hideOnSelect),html="";if(options.icon){html='<img class="'+L.Map.ContextMenu.BASE_CLS+'-icon" src="'+options.icon+'"/>'}else if(options.iconCls){html='<span class="'+L.Map.ContextMenu.BASE_CLS+"-icon "+options.iconCls+'"></span>'}el.innerHTML=html+options.text;el.href="#";L.DomEvent.on(el,"mouseover",this._onItemMouseOver,this).on(el,"mouseout",this._onItemMouseOut,this).on(el,"mousedown",L.DomEvent.stopPropagation).on(el,"click",callback);return{id:L.Util.stamp(el),el:el,callback:callback}},_removeItem:function(id){var item,el,i,l;for(i=0,l=this._items.length;i<l;i++){item=this._items[i];if(item.id===id){el=item.el;callback=item.callback;if(callback){L.DomEvent.off(el,"mouseover",this._onItemMouseOver,this).off(el,"mouseover",this._onItemMouseOut,this).off(el,"mousedown",L.DomEvent.stopPropagation).off(el,"click",item.callback)}this._container.removeChild(el);this._items.splice(i,1);return item}}return null},_createSeparator:function(container,index){var el=this._insertElementAt("div",L.Map.ContextMenu.BASE_CLS+"-separator",container,index);return{id:L.Util.stamp(el),el:el}},_createEventHandler:function(el,func,context,hideOnSelect){var me=this,map=this._map,disabledCls=L.Map.ContextMenu.BASE_CLS+"-item-disabled",hideOnSelect=hideOnSelect!==undefined?hideOnSelect:true;return function(e){if(L.DomUtil.hasClass(el,disabledCls)){return}if(hideOnSelect){me._hide()}if(func){func.call(context||map,me._showLocation)}me._map.fire("contextmenu:select",{contextmenu:me,el:el})}},_insertElementAt:function(tagName,className,container,index){var refEl,el=document.createElement(tagName);el.className=className;if(index!==undefined){refEl=container.children[index]}if(refEl){container.insertBefore(el,refEl)}else{container.appendChild(el)}return el},_show:function(e){this._showAtPoint(e.containerPoint)},_showAtPoint:function(pt,data){if(this._items.length){var map=this._map,layerPoint=map.containerPointToLayerPoint(pt),latlng=map.layerPointToLatLng(layerPoint),event={contextmenu:this};if(data){event=L.extend(data,event)}this._showLocation={latlng:latlng,layerPoint:layerPoint,containerPoint:pt};this._setPosition(pt);if(!this._visible){this._container.style.display="block";this._visible=true}else{this._setPosition(pt)}this._map.fire("contextmenu.show",event)}},_hide:function(){if(this._visible){this._visible=false;this._container.style.display="none";this._map.fire("contextmenu.hide",{contextmenu:this})}},_setPosition:function(pt){var mapSize=this._map.getSize(),container=this._container,containerSize=this._getElementSize(container),anchor;if(this._map.options.contextmenuAnchor){anchor=L.point(this._map.options.contextmenuAnchor);pt=pt.add(anchor)}container._leaflet_pos=pt;if(pt.x+containerSize.x>mapSize.x){container.style.left="auto";container.style.right=Math.max(mapSize.x-pt.x,0)+"px"}else{container.style.left=Math.max(pt.x,0)+"px";container.style.right="auto"}if(pt.y+containerSize.y>mapSize.y){container.style.top="auto";container.style.bottom=Math.max(mapSize.y-pt.y,0)+"px"}else{container.style.top=Math.max(pt.y,0)+"px";container.style.bottom="auto"}},_getElementSize:function(el){var size=this._size,initialDisplay=el.style.display;if(!size||this._sizeChanged){size={};el.style.left="-999999px";el.style.right="auto";el.style.display="block";size.x=el.offsetWidth;size.y=el.offsetHeight;el.style.left="auto";el.style.display=initialDisplay;this._sizeChanged=false}return size},_onMouseDown:function(e){console.log("_onMouseDown");this._hide()},_onKeyDown:function(e){var key=e.keyCode;if(key===27){this._hide()}},_onItemMouseOver:function(e){L.DomUtil.addClass(e.target,"over")},_onItemMouseOut:function(e){L.DomUtil.removeClass(e.target,"over")}});L.Map.addInitHook("addHandler","contextmenu",L.Map.ContextMenu);L.Mixin.ContextMenu={_initContextMenu:function(){this._items=[];this.on("contextmenu",this._showContextMenu,this)},_showContextMenu:function(e){var itemOptions,pt,i,l;if(this._map.contextmenu){pt=this._map.mouseEventToContainerPoint(e.originalEvent);for(i=0,l=this.options.contextmenuItems.length;i<l;i++){itemOptions=this.options.contextmenuItems[i];this._items.push(this._map.contextmenu.insertItem(itemOptions,itemOptions.index))}this._map.once("contextmenu.hide",this._hideContextMenu,this);this._map.contextmenu.showAt(pt,{relatedTarget:this})}},_hideContextMenu:function(){var i,l;for(i=0,l=this._items.length;i<l;i++){this._map.contextmenu.removeItem(this._items[i])}this._items.length=0}};L.Marker.mergeOptions({contextmenu:false,contextmenuItems:[]});L.Marker.addInitHook(function(){if(this.options.contextmenu){this._initContextMenu()}});L.Marker.include(L.Mixin.ContextMenu);L.Path.mergeOptions({contextmenu:false,contextmenuItems:[]});L.Path.addInitHook(function(){if(this.options.contextmenu){this._initContextMenu()}});L.Path.include(L.Mixin.ContextMenu);
+\ No newline at end of file
+diff --git a/web/src/main/webapp/js/main.js b/web/src/main/webapp/js/main.js
+index 2a8ccf4ca6..d906cdb130 100644
+--- a/web/src/main/webapp/js/main.js
++++ b/web/src/main/webapp/js/main.js
+@@ -5,7 +5,7 @@
+  */
+ var tmpArgs = parseUrlWithHisto();
+ var host = tmpArgs["host"];
+-//var host = "http://graphhopper.com/api/1";
++// var host = "http://graphhopper.com/api/1";
+ if (!host) {
+     if (location.port === '') {
+         host = location.protocol + '//' + location.hostname;
+@@ -24,7 +24,6 @@ var nominatim_reverse = "http://nominatim.openstreetmap.org/reverse";
+ var routingLayer;
+ var map;
+ var browserTitle = "GraphHopper Maps - Driving Directions";
+-var firstClickToRoute;
+ var defaultTranslationMap = null;
+ var enTranslationMap = null;
+ var routeSegmentPopup = null;
+@@ -258,7 +257,29 @@ function initMap() {
+ 
+     // default
+     map = L.map('map', {
+-        layers: [lyrk]
++        layers: [lyrk],
++        contextmenu: true,
++        contextmenuWidth: 140,
++        contextmenuItems: [{
++                text: 'Set as start',
++                callback: setStartCoord
++            }, {
++                text: 'Set as end',
++                callback: setEndCoord
++            }, {
++                separator: true,
++                index: 1
++            }, {
++                text: 'Show coordinates',
++                callback: function(e) {
++                    alert(e.latlng.lat + "," + e.latlng.lng);
++                }
++            }, {
++                text: 'Center map here',
++                callback: function(e) {
++                    map.panTo(e.latlng);
++                }
++            }]
+     });
+ 
+     var baseMaps = {
+@@ -272,20 +293,15 @@ function initMap() {
+         "OpenStreetMap": osm,
+         "OpenStreetMap.de": osmde
+     };
+-
+-    //    var overlays = {
+-    //        "MapQuest Hybrid": mapquest
+-    //    };
+-
+-    // no layers for small browser windows
+-    if ($(window).width() > 400) {
+-        L.control.layers(baseMaps/*, overlays*/).addTo(map);
+-    }
++    
++    L.control.layers(baseMaps/*, overlays*/).addTo(map);
+ 
+     L.control.scale().addTo(map);
+ 
+     map.fitBounds(new L.LatLngBounds(new L.LatLng(bounds.minLat, bounds.minLon),
+             new L.LatLng(bounds.maxLat, bounds.maxLon)));
++    if(isProduction())
++        map.setView(new L.LatLng(0, 0), 2);
+ 
+     map.attributionControl.setPrefix('');
+ 
+@@ -314,28 +330,26 @@ function initMap() {
+ 
+     routingLayer = L.geoJson().addTo(map);
+     routingLayer.options = {style: {color: "#00cc33", "weight": 5, "opacity": 0.6}};
++}
+ 
+-    firstClickToRoute = true;
+-    function onMapClick(e) {
+-        var latlng = e.latlng;
+-        latlng.lng = makeValidLng(latlng.lng);
+-        if (firstClickToRoute) {
+-            // set start point
+-            routingLayer.clearLayers();
+-            firstClickToRoute = false;
+-            ghRequest.from.setCoord(latlng.lat, latlng.lng);
+-            resolveFrom();
+-        } else {
+-            // set end point
+-            ghRequest.to.setCoord(latlng.lat, latlng.lng);
+-            resolveTo();
+-            // do not wait for resolving
+-            routeLatLng(ghRequest);
+-            firstClickToRoute = true;
+-        }
+-    }
++function setStartCoord(e) {
++    ghRequest.from.setCoord(e.latlng.lat, e.latlng.lng);
++    resolveFrom();
++    routeIfAllResolved();
++}
+ 
+-    map.on('click', onMapClick);
++function setEndCoord(e) {
++    ghRequest.to.setCoord(e.latlng.lat, e.latlng.lng);
++    resolveTo();
++    routeIfAllResolved();
++}
++
++function routeIfAllResolved() {
++    if (ghRequest.from.isResolved() && ghRequest.to.isResolved()) {
++        routeLatLng(ghRequest);
++        return true;
++    }
++    return false;
+ }
+ 
+ function makeValidLng(lon) {
+@@ -762,13 +776,12 @@ function routeLatLng(request, doQuery) {
+             if (request.vehicle.toUpperCase() === "FOOT") {
+                 addToGoogle = "&dirflg=w";
+                 addToBing = "&mode=W";
+-            } else if ((request.vehicle.toUpperCase() === "BIKE") ||
+-                    (request.vehicle.toUpperCase() === "RACINGBIKE") ||
++            } else if ((request.vehicle.toUpperCase().indexOf("BIKE") >= 0) ||
+                     (request.vehicle.toUpperCase() === "MTB")) {
+                 addToGoogle = "&dirflg=b";
+                 // ? addToBing = "&mode=B";
+             }
+-            googleLink.attr("href", "http://maps.google.com/?q=from:" + from + "+to:" + to + addToGoogle);
++            googleLink.attr("href", "http://maps.google.com/?q=saddr=" + from + "&daddr=" + to + addToGoogle);
+             hiddenDiv.append(googleLink);
+             var bingLink = $("<a>Bing</a> ");
+             bingLink.attr("href", "http://www.bing.com/maps/default.aspx?rtp=adr." + from + "~adr." + to + addToBing);
+@@ -1090,9 +1103,7 @@ function setAutoCompleteList(fromOrTo) {
+             req.setCoord(point.lat, point.lng);
+ 
+             req.input = suggestion.value;
+-            if (ghRequest.from.isResolved() && ghRequest.to.isResolved())
+-                routeLatLng(ghRequest);
+-            else
++            if (!routeIfAllResolved())
+                 focus(req, 15, isFrom);
+ 
+             myAutoDiv.autocomplete().enable();
+@@ -1100,13 +1111,15 @@ function setAutoCompleteList(fromOrTo) {
+     };
+ 
+     myAutoDiv.autocomplete(options);
+-    $("#" + fromOrTo + "Input").focusout(function() {
+-        myAutoDiv.autocomplete().disable();
+-        myAutoDiv.autocomplete().hide();
+-    });
+-    $("#" + fromOrTo + "Input").focusin(function() {
+-        myAutoDiv.autocomplete().enable();
+-    });
++
++    // with the following more stable code we cannot click on suggestions anylonger
++//    $("#" + fromOrTo + "Input").focusout(function() {
++//        myAutoDiv.autocomplete().disable();
++//        myAutoDiv.autocomplete().hide();
++//    });
++//    $("#" + fromOrTo + "Input").focusin(function() {
++//        myAutoDiv.autocomplete().enable();
++//    });
+ }
+ 
+ function dataToHtml(data, query) {
+diff --git a/web/src/test/java/com/graphhopper/http/BaseServletTester.java b/web/src/test/java/com/graphhopper/http/BaseServletTester.java
+index 5e66eadd61..849141d8e7 100644
+--- a/web/src/test/java/com/graphhopper/http/BaseServletTester.java
++++ b/web/src/test/java/com/graphhopper/http/BaseServletTester.java
+@@ -20,11 +20,9 @@
+ import com.google.inject.Guice;
+ import com.google.inject.Injector;
+ import com.google.inject.Module;
+-import com.google.inject.servlet.GuiceFilter;
+ import com.graphhopper.util.CmdArgs;
+ import com.graphhopper.util.Downloader;
+ import org.json.JSONObject;
+-import org.junit.AfterClass;
+ import org.slf4j.Logger;
+ import org.slf4j.LoggerFactory;
+ 
+@@ -62,7 +60,7 @@ private void bootJetty( CmdArgs args, int retryCount )
+         server = new GHServer(args);
+ 
+         if (injector == null)
+-            setUpGuice(new DefaultModule(args), new GHServletModule());
++            setUpGuice(new DefaultModule(args), new GHServletModule(args));
+ 
+         for (int i = 0; i < retryCount; i++)
+         {
+diff --git a/web/src/test/java/com/graphhopper/http/IPFilterTest.java b/web/src/test/java/com/graphhopper/http/IPFilterTest.java
+new file mode 100644
+index 0000000000..dc2470b6f2
+--- /dev/null
++++ b/web/src/test/java/com/graphhopper/http/IPFilterTest.java
+@@ -0,0 +1,55 @@
++package com.graphhopper.http;
++
++import org.junit.Test;
++import static org.junit.Assert.*;
++
++/**
++ *
++ * @author Peter Karich
++ */
++public class IPFilterTest
++{
++    @Test
++    public void testAcceptWhite()
++    {
++        IPFilter instance = new IPFilter("1.2.3.4, 4.5.67.1", "");
++        assertTrue(instance.accept("1.2.3.4"));
++        assertTrue(instance.accept("4.5.67.1"));
++        assertFalse(instance.accept("1.2.3.5"));
++
++        instance = new IPFilter("1.2.3*, 4.5.67.1, 7.8.*.3", "");
++        assertTrue(instance.accept("1.2.3.4"));
++        assertTrue(instance.accept("4.5.67.1"));
++        assertTrue(instance.accept("1.2.3.5"));
++        assertFalse(instance.accept("1.3.5.7"));
++
++        assertTrue(instance.accept("7.8.5.3"));
++        assertFalse(instance.accept("7.88.5.3"));
++    }
++
++    @Test
++    public void testAcceptBlack()
++    {
++        IPFilter instance = new IPFilter("", "1.2.3.4, 4.5.67.1");
++
++        assertFalse(instance.accept("1.2.3.4"));
++        assertFalse(instance.accept("4.5.67.1"));
++        assertTrue(instance.accept("1.2.3.5"));
++    }
++
++    @Test
++    public void testFilterSpecialCases()
++    {
++        IPFilter instance = new IPFilter("", "");
++        assertTrue(instance.accept("1.2.3.4"));
++
++        try
++        {
++            new IPFilter("1.2.3.4, 4.5.67.1", "8.9.7.3");
++            assertFalse("black and white", true);
++        } catch (Exception ex)
++        {
++
++        }
++    }
++}

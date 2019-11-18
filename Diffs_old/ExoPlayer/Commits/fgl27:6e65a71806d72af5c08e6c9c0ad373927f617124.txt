@@ -1,0 +1,188 @@
+diff --git a/extensions/flac/src/main/java/com/google/android/exoplayer2/ext/flac/FlacDecoderJni.java b/extensions/flac/src/main/java/com/google/android/exoplayer2/ext/flac/FlacDecoderJni.java
+index f454e28c68..5e020175e7 100644
+--- a/extensions/flac/src/main/java/com/google/android/exoplayer2/ext/flac/FlacDecoderJni.java
++++ b/extensions/flac/src/main/java/com/google/android/exoplayer2/ext/flac/FlacDecoderJni.java
+@@ -19,6 +19,8 @@
+ import com.google.android.exoplayer2.C;
+ import com.google.android.exoplayer2.ParserException;
+ import com.google.android.exoplayer2.extractor.ExtractorInput;
++import com.google.android.exoplayer2.extractor.SeekMap;
++import com.google.android.exoplayer2.extractor.SeekPoint;
+ import com.google.android.exoplayer2.util.FlacStreamMetadata;
+ import com.google.android.exoplayer2.util.Util;
+ import java.io.IOException;
+@@ -216,15 +218,25 @@ public long getNextFrameFirstSampleIndex() {
+   }
+ 
+   /**
+-   * Maps a seek position in microseconds to a corresponding position (byte offset) in the flac
++   * Maps a seek position in microseconds to the corresponding {@link SeekMap.SeekPoints} in the
+    * stream.
+    *
+    * @param timeUs A seek position in microseconds.
+-   * @return The corresponding position (byte offset) in the flac stream or -1 if the stream doesn't
+-   * have a seek table.
++   * @return The corresponding {@link SeekMap.SeekPoints} obtained from the seek table, or {@code
++   *     null} if the stream doesn't have a seek table.
+    */
+-  public long getSeekPosition(long timeUs) {
+-    return flacGetSeekPosition(nativeDecoderContext, timeUs);
++  @Nullable
++  public SeekMap.SeekPoints getSeekPoints(long timeUs) {
++    long[] seekPoints = new long[4];
++    if (!flacGetSeekPoints(nativeDecoderContext, timeUs, seekPoints)) {
++      return null;
++    }
++    SeekPoint firstSeekPoint = new SeekPoint(seekPoints[0], seekPoints[1]);
++    SeekPoint secondSeekPoint =
++        seekPoints[2] == seekPoints[0]
++            ? firstSeekPoint
++            : new SeekPoint(seekPoints[2], seekPoints[3]);
++    return new SeekMap.SeekPoints(firstSeekPoint, secondSeekPoint);
+   }
+ 
+   public String getStateString() {
+@@ -283,7 +295,7 @@ private native int flacDecodeToArray(long context, byte[] outputArray)
+ 
+   private native long flacGetNextFrameFirstSampleIndex(long context);
+ 
+-  private native long flacGetSeekPosition(long context, long timeUs);
++  private native boolean flacGetSeekPoints(long context, long timeUs, long[] outSeekPoints);
+ 
+   private native String flacGetStateString(long context);
+ 
+diff --git a/extensions/flac/src/main/java/com/google/android/exoplayer2/ext/flac/FlacExtractor.java b/extensions/flac/src/main/java/com/google/android/exoplayer2/ext/flac/FlacExtractor.java
+index cd91b06288..59fb7b4835 100644
+--- a/extensions/flac/src/main/java/com/google/android/exoplayer2/ext/flac/FlacExtractor.java
++++ b/extensions/flac/src/main/java/com/google/android/exoplayer2/ext/flac/FlacExtractor.java
+@@ -276,10 +276,10 @@ private static FlacBinarySearchSeeker outputSeekMap(
+       FlacStreamMetadata streamMetadata,
+       long streamLength,
+       ExtractorOutput output) {
+-    boolean hasSeekTable = decoderJni.getSeekPosition(/* timeUs= */ 0) != -1;
++    boolean haveSeekTable = decoderJni.getSeekPoints(/* timeUs= */ 0) != null;
+     FlacBinarySearchSeeker binarySearchSeeker = null;
+     SeekMap seekMap;
+-    if (hasSeekTable) {
++    if (haveSeekTable) {
+       seekMap = new FlacSeekMap(streamMetadata.durationUs(), decoderJni);
+     } else if (streamLength != C.LENGTH_UNSET) {
+       long firstFramePosition = decoderJni.getDecodePosition();
+@@ -341,8 +341,8 @@ public boolean isSeekable() {
+ 
+     @Override
+     public SeekPoints getSeekPoints(long timeUs) {
+-      // TODO: Access the seek table via JNI to return two seek points when appropriate.
+-      return new SeekPoints(new SeekPoint(timeUs, decoderJni.getSeekPosition(timeUs)));
++      @Nullable SeekPoints seekPoints = decoderJni.getSeekPoints(timeUs);
++      return seekPoints == null ? new SeekPoints(SeekPoint.START) : seekPoints;
+     }
+ 
+     @Override
+diff --git a/extensions/flac/src/main/jni/flac_jni.cc b/extensions/flac/src/main/jni/flac_jni.cc
+index 134b13ccc2..f0a33f323c 100644
+--- a/extensions/flac/src/main/jni/flac_jni.cc
++++ b/extensions/flac/src/main/jni/flac_jni.cc
+@@ -17,6 +17,7 @@
+ #include <android/log.h>
+ #include <jni.h>
+ 
++#include <array>
+ #include <cstdlib>
+ #include <cstring>
+ 
+@@ -198,9 +199,15 @@ DECODER_FUNC(jlong, flacGetNextFrameFirstSampleIndex, jlong jContext) {
+   return context->parser->getNextFrameFirstSampleIndex();
+ }
+ 
+-DECODER_FUNC(jlong, flacGetSeekPosition, jlong jContext, jlong timeUs) {
++DECODER_FUNC(jboolean, flacGetSeekPoints, jlong jContext, jlong timeUs,
++             jlongArray outSeekPoints) {
+   Context *context = reinterpret_cast<Context *>(jContext);
+-  return context->parser->getSeekPosition(timeUs);
++  std::array<int64_t, 4> result;
++  bool success = context->parser->getSeekPositions(timeUs, result);
++  if (success) {
++    env->SetLongArrayRegion(outSeekPoints, 0, result.size(), result.data());
++  }
++  return success;
+ }
+ 
+ DECODER_FUNC(jstring, flacGetStateString, jlong jContext) {
+diff --git a/extensions/flac/src/main/jni/flac_parser.cc b/extensions/flac/src/main/jni/flac_parser.cc
+index 830f3e2178..7c69119fe4 100644
+--- a/extensions/flac/src/main/jni/flac_parser.cc
++++ b/extensions/flac/src/main/jni/flac_parser.cc
+@@ -438,22 +438,41 @@ size_t FLACParser::readBuffer(void *output, size_t output_size) {
+   return bufferSize;
+ }
+ 
+-int64_t FLACParser::getSeekPosition(int64_t timeUs) {
++bool FLACParser::getSeekPositions(int64_t timeUs,
++                                  std::array<int64_t, 4> &result) {
+   if (!mSeekTable) {
+-    return -1;
++    return false;
+   }
+ 
+-  int64_t sample = (timeUs * getSampleRate()) / 1000000LL;
+-  if (sample >= getTotalSamples()) {
+-      sample = getTotalSamples();
++  unsigned sampleRate = getSampleRate();
++  int64_t totalSamples = getTotalSamples();
++  int64_t targetSampleNumber = (timeUs * sampleRate) / 1000000LL;
++  if (targetSampleNumber >= totalSamples) {
++    targetSampleNumber = totalSamples - 1;
+   }
+ 
+   FLAC__StreamMetadata_SeekPoint* points = mSeekTable->points;
+-  for (unsigned i = mSeekTable->num_points; i > 0; ) {
+-    i--;
+-    if (points[i].sample_number <= sample) {
+-      return firstFrameOffset + points[i].stream_offset;
++  unsigned length = mSeekTable->num_points;
++
++  for (unsigned i = length; i != 0; i--) {
++    int64_t sampleNumber = points[i - 1].sample_number;
++    if (sampleNumber <= targetSampleNumber) {
++      result[0] = (sampleNumber * 1000000LL) / sampleRate;
++      result[1] = firstFrameOffset + points[i - 1].stream_offset;
++      if (sampleNumber == targetSampleNumber || i >= length) {
++        // exact seek, or no following seek point.
++        result[2] = result[0];
++        result[3] = result[1];
++      } else {
++        result[2] = (points[i].sample_number * 1000000LL) / sampleRate;
++        result[3] = firstFrameOffset + points[i].stream_offset;
++      }
++      return true;
+     }
+   }
+-  return firstFrameOffset;
++  result[0] = 0;
++  result[1] = firstFrameOffset;
++  result[2] = 0;
++  result[3] = firstFrameOffset;
++  return true;
+ }
+diff --git a/extensions/flac/src/main/jni/include/flac_parser.h b/extensions/flac/src/main/jni/include/flac_parser.h
+index fd3e36a806..44a0d08718 100644
+--- a/extensions/flac/src/main/jni/include/flac_parser.h
++++ b/extensions/flac/src/main/jni/include/flac_parser.h
+@@ -19,6 +19,7 @@
+ 
+ #include <stdint.h>
+ 
++#include <array>
+ #include <cstdlib>
+ #include <string>
+ #include <vector>
+@@ -84,7 +85,7 @@ class FLACParser {
+   bool decodeMetadata();
+   size_t readBuffer(void *output, size_t output_size);
+ 
+-  int64_t getSeekPosition(int64_t timeUs);
++  bool getSeekPositions(int64_t timeUs, std::array<int64_t, 4> &result);
+ 
+   void flush() {
+     reset(mCurrentPos);

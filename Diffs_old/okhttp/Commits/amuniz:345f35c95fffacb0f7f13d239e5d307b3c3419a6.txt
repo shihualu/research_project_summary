@@ -1,0 +1,148 @@
+diff --git a/mockwebserver/src/main/java/okhttp3/internal/tls/HeldCertificate.java b/mockwebserver/src/main/java/okhttp3/internal/tls/HeldCertificate.java
+index a7fe81f0ef..eedfc2a094 100644
+--- a/mockwebserver/src/main/java/okhttp3/internal/tls/HeldCertificate.java
++++ b/mockwebserver/src/main/java/okhttp3/internal/tls/HeldCertificate.java
+@@ -22,14 +22,21 @@
+ import java.security.SecureRandom;
+ import java.security.Security;
+ import java.security.cert.X509Certificate;
++import java.util.ArrayList;
+ import java.util.Date;
++import java.util.List;
+ import java.util.UUID;
+ import javax.security.auth.x500.X500Principal;
++import org.bouncycastle.asn1.ASN1Encodable;
++import org.bouncycastle.asn1.DERSequence;
+ import org.bouncycastle.asn1.x509.BasicConstraints;
++import org.bouncycastle.asn1.x509.GeneralName;
+ import org.bouncycastle.asn1.x509.X509Extensions;
+ import org.bouncycastle.jce.provider.BouncyCastleProvider;
+ import org.bouncycastle.x509.X509V3CertificateGenerator;
+ 
++import static okhttp3.internal.Util.verifyAsIpAddress;
++
+ /**
+  * A certificate and its private key. This can be used on the server side by HTTPS servers, or on
+  * the client side to verify those HTTPS servers. A held certificate can also be used to sign other
+@@ -51,6 +58,7 @@ public HeldCertificate(X509Certificate certificate, KeyPair keyPair) {
+ 
+     private final long duration = 1000L * 60 * 60 * 24; // One day.
+     private String hostname;
++    private List<String> altNames = new ArrayList<>();
+     private String serialNumber = "1";
+     private KeyPair keyPair;
+     private HeldCertificate issuedBy;
+@@ -93,6 +101,15 @@ public Builder ca(int maxIntermediateCas) {
+       return this;
+     }
+ 
++    /**
++     * Adds a subject alternative name to the certificate. This is usually a hostname or IP address.
++     * If no subject alternative names are added that extension will not be used.
++     */
++    public Builder subjectAlternativeName(String altName) {
++      altNames.add(altName);
++      return this;
++    }
++
+     public HeldCertificate build() throws GeneralSecurityException {
+       // Subject, public & private keys for this certificate.
+       KeyPair heldKeyPair = keyPair != null
+@@ -129,6 +146,19 @@ public HeldCertificate build() throws GeneralSecurityException {
+             new BasicConstraints(maxIntermediateCas));
+       }
+ 
++      if (!altNames.isEmpty()) {
++        ASN1Encodable[] encodableAltNames = new ASN1Encodable[altNames.size()];
++        for (int i = 0, size = altNames.size(); i < size; i++) {
++          String altName = altNames.get(i);
++          int tag = verifyAsIpAddress(altName)
++              ? GeneralName.iPAddress
++              : GeneralName.dNSName;
++          encodableAltNames[i] = new GeneralName(tag, altName);
++        }
++        generator.addExtension(X509Extensions.SubjectAlternativeName, true,
++            new DERSequence(encodableAltNames));
++      }
++
+       X509Certificate certificate = generator.generateX509Certificate(
+           signedByKeyPair.getPrivate(), "BC");
+       return new HeldCertificate(certificate, heldKeyPair);
+diff --git a/okhttp-tests/src/test/java/okhttp3/CallTest.java b/okhttp-tests/src/test/java/okhttp3/CallTest.java
+index b0e6c99d2c..fcea93e34f 100644
+--- a/okhttp-tests/src/test/java/okhttp3/CallTest.java
++++ b/okhttp-tests/src/test/java/okhttp3/CallTest.java
+@@ -63,6 +63,7 @@
+ import okhttp3.internal.Version;
+ import okhttp3.internal.http.RecordingProxySelector;
+ import okhttp3.internal.io.InMemoryFileSystem;
++import okhttp3.internal.tls.HeldCertificate;
+ import okhttp3.internal.tls.SslClient;
+ import okhttp3.mockwebserver.Dispatcher;
+ import okhttp3.mockwebserver.MockResponse;
+@@ -2709,6 +2710,43 @@ private RequestBody requestBody(final boolean chunked, final long size, final in
+     }
+   }
+ 
++  @Test public void httpsWithIpAddress() throws Exception {
++    String localIpAddress = InetAddress.getLoopbackAddress().getHostAddress();
++
++    // Create a certificate with an IP address in the subject alt name.
++    HeldCertificate heldCertificate = new HeldCertificate.Builder()
++        .commonName("example.com")
++        .subjectAlternativeName(localIpAddress)
++        .build();
++    SslClient sslClient = new SslClient.Builder()
++        .certificateChain(heldCertificate.keyPair, heldCertificate.certificate)
++        .addTrustedCertificate(heldCertificate.certificate)
++        .build();
++
++    // Use that certificate on the server and trust it on the client.
++    server.useHttps(sslClient.socketFactory, false);
++    client = client.newBuilder()
++        .sslSocketFactory(sslClient.socketFactory, sslClient.trustManager)
++        .hostnameVerifier(new RecordingHostnameVerifier())
++        .protocols(Collections.singletonList(Protocol.HTTP_1_1))
++        .build();
++
++    // Make a request.
++    server.enqueue(new MockResponse());
++    HttpUrl url = server.url("/").newBuilder()
++        .host(localIpAddress)
++        .build();
++    Request request = new Request.Builder()
++        .url(url)
++        .build();
++    executeSynchronously(request)
++        .assertCode(200);
++
++    // Confirm that the IP address was used in the host header.
++    RecordedRequest recordedRequest = server.takeRequest();
++    assertEquals(localIpAddress + ":" + server.getPort(), recordedRequest.getHeader("Host"));
++  }
++
+   private void makeFailingCall() {
+     RequestBody requestBody = new RequestBody() {
+       @Override public MediaType contentType() {
+diff --git a/okhttp-tests/src/test/java/okhttp3/internal/tls/ClientAuthTest.java b/okhttp-tests/src/test/java/okhttp3/internal/tls/ClientAuthTest.java
+index 6adbb51b69..3de1adba1d 100644
+--- a/okhttp-tests/src/test/java/okhttp3/internal/tls/ClientAuthTest.java
++++ b/okhttp-tests/src/test/java/okhttp3/internal/tls/ClientAuthTest.java
+@@ -40,7 +40,7 @@
+   @Rule public final MockWebServer server = new MockWebServer();
+ 
+   public enum ClientAuth {
+-    NONE, WANTS, NEEDS;
++    NONE, WANTS, NEEDS
+   }
+ 
+   private HeldCertificate serverRootCa;
+@@ -51,7 +51,7 @@
+   private HeldCertificate clientCert;
+ 
+   @Before
+-  public void initialise() throws GeneralSecurityException {
++  public void setUp() throws GeneralSecurityException {
+     serverRootCa = new HeldCertificate.Builder()
+         .serialNumber("1")
+         .ca(3)

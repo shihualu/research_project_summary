@@ -1,0 +1,269 @@
+diff --git a/java/dagger/internal/codegen/BindingMethodValidator.java b/java/dagger/internal/codegen/BindingMethodValidator.java
+index 32bc9f0fc..779a5800c 100644
+--- a/java/dagger/internal/codegen/BindingMethodValidator.java
++++ b/java/dagger/internal/codegen/BindingMethodValidator.java
+@@ -342,23 +342,35 @@ protected void checkMapKeys(ValidationReport.Builder<ExecutableElement> builder)
+   }
+ 
+   /**
+-   * Adds errors if the method has more than one {@linkplain MultibindingAnnotations multibinding
+-   * annotation} or if it has a multibinding annotation and its {@link Provides} or {@link Produces}
+-   * annotation has a {@code type} parameter.
++   * Adds errors if the method doesn't allow {@linkplain MultibindingAnnotations multibinding
++   * annotations} and has any, or if it does allow them but has more than one, or if it has a
++   * multibinding annotation and its {@link Provides} or {@link Produces} annotation has a {@code
++   * type} parameter.
+    */
+   protected void checkMultibindings(ValidationReport.Builder<ExecutableElement> builder) {
+-    if (!allowsMultibindings.allowsMultibindings()) {
+-      return;
+-    }
+     ImmutableSet<AnnotationMirror> multibindingAnnotations =
+         MultibindingAnnotations.forMethod(builder.getSubject());
+-    if (multibindingAnnotations.size() > 1) {
+-      for (AnnotationMirror annotation : multibindingAnnotations) {
+-        builder.addError(
+-            bindingMethods("cannot have more than one multibinding annotation"),
+-            builder.getSubject(),
+-            annotation);
+-      }
++
++    switch (allowsMultibindings) {
++      case NO_MULTIBINDINGS:
++        for (AnnotationMirror annotation : multibindingAnnotations) {
++          builder.addError(
++              bindingMethods("cannot have multibinding annotations"),
++              builder.getSubject(),
++              annotation);
++        }
++        break;
++
++      case ALLOWS_MULTIBINDINGS:
++        if (multibindingAnnotations.size() > 1) {
++          for (AnnotationMirror annotation : multibindingAnnotations) {
++            builder.addError(
++                bindingMethods("cannot have more than one multibinding annotation"),
++                builder.getSubject(),
++                annotation);
++          }
++        }
++        break;
+     }
+ 
+     AnnotationMirror bindingAnnotationMirror =
+diff --git a/java/dagger/internal/codegen/MultibindingAnnotationsProcessingStep.java b/java/dagger/internal/codegen/MultibindingAnnotationsProcessingStep.java
+index 4f9c31d95..3afa469d9 100644
+--- a/java/dagger/internal/codegen/MultibindingAnnotationsProcessingStep.java
++++ b/java/dagger/internal/codegen/MultibindingAnnotationsProcessingStep.java
+@@ -17,39 +17,35 @@
+ package dagger.internal.codegen;
+ 
+ import static dagger.internal.codegen.DaggerElements.getAnnotationMirror;
+-import static dagger.internal.codegen.DaggerElements.isAnyAnnotationPresent;
++import static javax.lang.model.util.ElementFilter.methodsIn;
+ 
+ import com.google.auto.common.BasicAnnotationProcessor.ProcessingStep;
+ import com.google.common.collect.ImmutableSet;
++import com.google.common.collect.Multimaps;
+ import com.google.common.collect.SetMultimap;
+-import dagger.Binds;
+-import dagger.Provides;
+ import dagger.multibindings.ElementsIntoSet;
+ import dagger.multibindings.IntoMap;
+ import dagger.multibindings.IntoSet;
+-import dagger.producers.Produces;
+ import java.lang.annotation.Annotation;
+-import java.util.Map.Entry;
+ import java.util.Set;
+ import javax.annotation.processing.Messager;
+ import javax.inject.Inject;
+-import javax.lang.model.element.AnnotationMirror;
+ import javax.lang.model.element.Element;
++import javax.lang.model.element.ExecutableElement;
+ import javax.tools.Diagnostic.Kind;
+ 
+ /**
+  * Processing step that verifies that {@link IntoSet}, {@link ElementsIntoSet} and {@link IntoMap}
+- * are not present on invalid elements.
++ * are not present on non-binding methods.
+  */
+ final class MultibindingAnnotationsProcessingStep implements ProcessingStep {
+-
+-  private static final ImmutableSet<Class<? extends Annotation>> VALID_BINDING_ANNOTATIONS =
+-      ImmutableSet.of(Provides.class, Produces.class, Binds.class);
+-
++  private final AnyBindingMethodValidator anyBindingMethodValidator;
+   private final Messager messager;
+ 
+   @Inject
+-  MultibindingAnnotationsProcessingStep(Messager messager) {
++  MultibindingAnnotationsProcessingStep(
++      AnyBindingMethodValidator anyBindingMethodValidator, Messager messager) {
++    this.anyBindingMethodValidator = anyBindingMethodValidator;
+     this.messager = messager;
+   }
+ 
+@@ -61,17 +57,20 @@
+   @Override
+   public Set<Element> process(
+       SetMultimap<Class<? extends Annotation>, Element> elementsByAnnotation) {
+-    for (Entry<Class<? extends Annotation>, Element> entry : elementsByAnnotation.entries()) {
+-      Element element = entry.getValue();
+-      if (!isAnyAnnotationPresent(element, VALID_BINDING_ANNOTATIONS)) {
+-        AnnotationMirror annotation = getAnnotationMirror(entry.getValue(), entry.getKey()).get();
+-        messager.printMessage(
+-            Kind.ERROR,
+-            "Multibinding annotations may only be on @Provides, @Produces, or @Binds methods",
+-            element,
+-            annotation);
+-      }
+-    }
++    Multimaps.asMap(elementsByAnnotation)
++        .forEach(
++            (annotation, elements) -> {
++              for (ExecutableElement method : methodsIn(elements)) {
++                if (!anyBindingMethodValidator.isBindingMethod(method)) {
++                  messager.printMessage(
++                      Kind.ERROR,
++                      "Multibinding annotations may only be on "
++                          + "@Provides, @Produces, or @Binds methods",
++                      method,
++                      getAnnotationMirror(method, annotation).get());
++                }
++              }
++            });
+     return ImmutableSet.of();
+   }
+ }
+diff --git a/javatests/dagger/internal/codegen/BindsOptionalOfMethodValidationTest.java b/javatests/dagger/internal/codegen/BindsOptionalOfMethodValidationTest.java
+index c268fa0ac..fa44a6e3d 100644
+--- a/javatests/dagger/internal/codegen/BindsOptionalOfMethodValidationTest.java
++++ b/javatests/dagger/internal/codegen/BindsOptionalOfMethodValidationTest.java
+@@ -16,10 +16,14 @@
+ 
+ package dagger.internal.codegen;
+ 
++import static com.google.testing.compile.CompilationSubject.assertThat;
++import static dagger.internal.codegen.Compilers.daggerCompiler;
+ import static dagger.internal.codegen.DaggerModuleMethodSubject.Factory.assertThatMethodInUnannotatedClass;
+ import static dagger.internal.codegen.DaggerModuleMethodSubject.Factory.assertThatModuleMethod;
+ 
+ import com.google.common.collect.ImmutableList;
++import com.google.testing.compile.Compilation;
++import com.google.testing.compile.JavaFileObjects;
+ import dagger.Module;
+ import dagger.producers.ProducerModule;
+ import java.lang.annotation.Annotation;
+@@ -27,6 +31,7 @@
+ import javax.inject.Inject;
+ import javax.inject.Qualifier;
+ import javax.inject.Singleton;
++import javax.tools.JavaFileObject;
+ import org.junit.Test;
+ import org.junit.runner.RunWith;
+ import org.junit.runners.Parameterized;
+@@ -97,19 +102,57 @@ public void tooManyQualifiers() {
+   @Test
+   public void intoSet() {
+     assertThatMethod("@BindsOptionalOf @IntoSet abstract String intoSet();")
+-        .hasError("Multibinding annotations");
++        .hasError("cannot have multibinding annotations");
+   }
+ 
+   @Test
+   public void elementsIntoSet() {
+     assertThatMethod("@BindsOptionalOf @ElementsIntoSet abstract Set<String> elementsIntoSet();")
+-        .hasError("Multibinding annotations");
++        .hasError("cannot have multibinding annotations");
+   }
+ 
+   @Test
+   public void intoMap() {
+     assertThatMethod("@BindsOptionalOf @IntoMap abstract String intoMap();")
+-        .hasError("Multibinding annotations");
++        .hasError("cannot have multibinding annotations");
++  }
++
++  /**
++   * Tests that @BindsOptionalOf @IntoMap actually causes module validation to fail.
++   *
++   * @see <a href="http://b/118434447">bug 118434447</a>
++   */
++  @Test
++  public void intoMapWithComponent() {
++    JavaFileObject module =
++        JavaFileObjects.forSourceLines(
++            "test.TestModule",
++            "package test;",
++            "",
++            "import dagger.BindsOptionalOf;",
++            "import dagger.Module;",
++            "import dagger.multibindings.IntoMap;",
++            "",
++            "@Module",
++            "interface TestModule {",
++            "  @BindsOptionalOf @IntoMap Object object();",
++            "}");
++    JavaFileObject component =
++        JavaFileObjects.forSourceLines(
++            "test.TestComponent",
++            "package test;",
++            "",
++            "import dagger.Component;",
++            "",
++            "@Component(modules = TestModule.class)",
++            "interface TestComponent {}");
++
++    Compilation compilation = daggerCompiler().compile(module, component);
++    assertThat(compilation).failed();
++    assertThat(compilation)
++        .hadErrorContaining("cannot have multibinding annotations")
++        .inFile(module)
++        .onLineContaining("object();");
+   }
+ 
+   /** An injectable value object. */
+diff --git a/javatests/dagger/internal/codegen/MultibindingTest.java b/javatests/dagger/internal/codegen/MultibindingTest.java
+index fb156cd57..2bf949470 100644
+--- a/javatests/dagger/internal/codegen/MultibindingTest.java
++++ b/javatests/dagger/internal/codegen/MultibindingTest.java
+@@ -58,7 +58,7 @@ public void providesWithTwoMultibindingAnnotations_failsToCompile() {
+ 
+   @Test
+   public void appliedOnInvalidMethods_failsToCompile() {
+-    JavaFileObject component =
++    JavaFileObject someType =
+         JavaFileObjects.forSourceLines(
+             "test.SomeType",
+             "package test;",
+@@ -76,23 +76,23 @@ public void appliedOnInvalidMethods_failsToCompile() {
+             "  @IntoMap Map<Integer, Double> map();",
+             "}");
+ 
+-    Compilation compilation = daggerCompiler().compile(component);
++    Compilation compilation = daggerCompiler().compile(someType);
+     assertThat(compilation).failed();
+     assertThat(compilation)
+         .hadErrorContaining(
+             "Multibinding annotations may only be on @Provides, @Produces, or @Binds methods")
+-        .inFile(component)
+-        .onLine(11);
++        .inFile(someType)
++        .onLineContaining("ints();");
+     assertThat(compilation)
+         .hadErrorContaining(
+             "Multibinding annotations may only be on @Provides, @Produces, or @Binds methods")
+-        .inFile(component)
+-        .onLine(12);
++        .inFile(someType)
++        .onLineContaining("doubles();");
+     assertThat(compilation)
+         .hadErrorContaining(
+             "Multibinding annotations may only be on @Provides, @Produces, or @Binds methods")
+-        .inFile(component)
+-        .onLine(13);
++        .inFile(someType)
++        .onLineContaining("map();");
+   }
+ 
+   @Test

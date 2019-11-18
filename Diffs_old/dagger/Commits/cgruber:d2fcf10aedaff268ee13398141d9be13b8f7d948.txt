@@ -1,0 +1,146 @@
+diff --git a/compiler/src/main/java/dagger/internal/codegen/GraphAnalysisProcessor.java b/compiler/src/main/java/dagger/internal/codegen/GraphAnalysisProcessor.java
+index 0f0c28093..8be0c9645 100644
+--- a/compiler/src/main/java/dagger/internal/codegen/GraphAnalysisProcessor.java
++++ b/compiler/src/main/java/dagger/internal/codegen/GraphAnalysisProcessor.java
+@@ -167,7 +167,7 @@ private void error(String message, Element element) {
+ 
+     Linker.ErrorHandler errorHandler = ignoreCompletenessErrors ? Linker.ErrorHandler.NULL
+         : new GraphAnalysisErrorHandler(processingEnv, rootModule.getQualifiedName().toString());
+-    Linker linker = new Linker(new GraphAnalysisLoader(processingEnv), errorHandler);
++    Linker linker = new Linker(null, new GraphAnalysisLoader(processingEnv), errorHandler);
+     // Linker requires synchronization for calls to requestBinding and linkAll.
+     // We know statically that we're single threaded, but we synchronize anyway
+     // to make the linker happy.
+diff --git a/core/src/main/java/dagger/ObjectGraph.java b/core/src/main/java/dagger/ObjectGraph.java
+index 61013bfe4..bbe7b0061 100644
+--- a/core/src/main/java/dagger/ObjectGraph.java
++++ b/core/src/main/java/dagger/ObjectGraph.java
+@@ -160,26 +160,8 @@ private static ObjectGraph makeGraph(DaggerObjectGraph base, Loader plugin, Obje
+       Map<String, Class<?>> injectableTypes = new LinkedHashMap<String, Class<?>>();
+       Map<Class<?>, StaticInjection> staticInjections
+           = new LinkedHashMap<Class<?>, StaticInjection>();
+-
+-      // Extract bindings in the 'base' and 'overrides' set. Within each set no
+-      // duplicates are permitted.
+-      UniqueMap<String, Binding<?>> baseBindings = new UniqueMap<String, Binding<?>>() {
+-        @Override public Binding<?> put(String key, Binding<?> value) {
+-          return super.put(key, (value instanceof SetBinding)
+-              ? new SetBinding<Object>((SetBinding<Object>) value) : value);
+-        }
+-      };
+-      if (base != null) {
+-        baseBindings.putAll(base.linkEverything()); // Add parent bindings
+-      }
+-      UniqueMap<String, Binding<?>> overrideBindings = new UniqueMap<String, Binding<?>>() {
+-        @Override public Binding<?> put(String key, Binding<?> value) {
+-          if (value instanceof SetBinding) {
+-            throw new IllegalArgumentException("Module overrides cannot contribute set bindings.");
+-          }
+-          return super.put(key, value);
+-        }
+-      };
++      UniqueMap<String, Binding<?>> baseBindings = initBaseBindings(base);
++      UniqueMap<String, Binding<?>> overrideBindings = initOverrideBindings();
+ 
+       Map<ModuleAdapter<?>, Object> loadedModules = Modules.loadModules(plugin, modules);
+       for (Entry<ModuleAdapter<?>, Object> loadedModule : loadedModules.entrySet()) {
+@@ -201,13 +183,50 @@ private static ObjectGraph makeGraph(DaggerObjectGraph base, Loader plugin, Obje
+       }
+ 
+       // Create a linker and install all of the user's bindings
+-      Linker linker = new Linker(plugin, new ThrowingErrorHandler());
++      Linker linker =
++          new Linker((base != null) ? base.linker : null, plugin, new ThrowingErrorHandler());
+       linker.installBindings(baseBindings);
+       linker.installBindings(overrideBindings);
+ 
+       return new DaggerObjectGraph(base, linker, plugin, staticInjections, injectableTypes);
+     }
+ 
++    /**
++     * Returns an empty {@code UniqueMap} which will throw errors if a SetBinding is added
++     * to it.
++     */
++    private static UniqueMap<String, Binding<?>> initOverrideBindings() {
++      return new UniqueMap<String, Binding<?>>() {
++        @Override public Binding<?> put(String key, Binding<?> value) {
++          if (value instanceof SetBinding) {
++            throw new IllegalArgumentException("Module overrides cannot contribute set bindings.");
++          }
++          return super.put(key, value);
++        }
++      };
++    }
++
++    /**
++     * Extract bindings in the 'base' and 'overrides' set. Within each set no
++     * duplicates are permitted.  Set-bindings are propagated (and cloned) from the parent
++     * to ensure that parent graph participants only see parent bindings, but the child
++     * graph sees parent+child contributions.
++     */
++    private static UniqueMap<String, Binding<?>> initBaseBindings(
++        DaggerObjectGraph base) {
++      UniqueMap<String, Binding<?>> baseBindings = new UniqueMap<String, Binding<?>>();
++      if (base != null) {
++        Map<String, Binding<?>> parentBindings = base.linkEverything();
++        for (Map.Entry<String, Binding<?>> bindingEntry : parentBindings.entrySet()) {
++          if (bindingEntry.getValue() instanceof SetBinding) {
++            baseBindings.put(bindingEntry.getKey(),
++                new SetBinding<Object>((SetBinding<Object>) bindingEntry.getValue()));
++          }
++        }
++      }
++      return baseBindings;
++    }
++
+     @Override public ObjectGraph plus(Object... modules) {
+       return makeGraph(this, plugin, modules);
+     }
+diff --git a/core/src/main/java/dagger/internal/Linker.java b/core/src/main/java/dagger/internal/Linker.java
+index 3c6f05ab6..aacb7a9d3 100644
+--- a/core/src/main/java/dagger/internal/Linker.java
++++ b/core/src/main/java/dagger/internal/Linker.java
+@@ -31,6 +31,13 @@
+ public final class Linker {
+   private static final Object UNINITIALIZED = new Object();
+ 
++  /**
++   * The base {@code Linker} which will be consulted to satisfy bindings not
++   * otherwise satisfiable from this {@code Linker}. The top-most {@code Linker}
++   * in a chain will have a null base linker.
++   */
++  private final Linker base;
++
+   /** Bindings requiring a call to attach(). May contain deferred bindings. */
+   private final Queue<Binding<?>> toLink = new LinkedList<Binding<?>>();
+ 
+@@ -55,10 +62,11 @@
+ 
+   private final ErrorHandler errorHandler;
+ 
+-  public Linker(Loader plugin, ErrorHandler errorHandler) {
++  public Linker(Linker base, Loader plugin, ErrorHandler errorHandler) {
+     if (plugin == null) throw new NullPointerException("plugin");
+     if (errorHandler == null) throw new NullPointerException("errorHandler");
+ 
++    this.base = base;
+     this.plugin = plugin;
+     this.errorHandler = errorHandler;
+   }
+@@ -258,7 +266,15 @@ private void assertLockHeld() {
+       boolean mustHaveInjections, boolean library) {
+     assertLockHeld();
+ 
+-    Binding<?> binding = bindings.get(key);
++    Binding<?> binding = null;
++    for (Linker linker = this; linker != null; linker = linker.base) {
++      binding = linker.bindings.get(key);
++      if (binding != null) {
++        if (linker != this && !binding.isLinked()) throw new AssertionError();
++        break;
++      }
++    }
++
+     if (binding == null) {
+       // We can't satisfy this binding. Make sure it'll work next time!
+       Binding<?> deferredBinding =

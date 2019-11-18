@@ -1,0 +1,1388 @@
+diff --git a/compiler/src/main/java/dagger/internal/codegen/AppConfig.java b/compiler/src/main/java/dagger/internal/codegen/AppConfig.java
+new file mode 100644
+index 000000000..ec23dac0a
+--- /dev/null
++++ b/compiler/src/main/java/dagger/internal/codegen/AppConfig.java
+@@ -0,0 +1,64 @@
++package dagger.internal.codegen;
++
++import com.google.auto.common.MoreElements;
++import com.google.auto.common.MoreTypes;
++import dagger.Config;
++
++import javax.lang.model.element.TypeElement;
++import javax.lang.model.type.MirroredTypeException;
++import javax.lang.model.util.Elements;
++
++public class AppConfig {
++
++    private final TypeElement appClass;
++    private final TypeElement baseAppClass;
++
++    public AppConfig(TypeElement appClass, TypeElement baseAppClass) {
++        this.appClass = appClass;
++        this.baseAppClass = baseAppClass;
++    }
++
++    public TypeElement getAppClass() {
++        return appClass;
++    }
++
++    public TypeElement getBaseAppClass() {
++        return baseAppClass;
++    }
++
++    static class Factory {
++
++        private Elements elements;
++
++        Factory(Elements elements) {
++            this.elements = elements;
++        }
++
++        public AppConfig create(Config config) {
++            final TypeElement appClass = extractAppClassElement(config);
++            final TypeElement baseAppClass = extractBaseAppClassElement(config);
++            return new AppConfig(appClass, baseAppClass);
++        }
++
++        private TypeElement extractAppClassElement(Config config) {
++            TypeElement element;
++            try {
++                element = elements.getTypeElement(config.applicationClass().getName());
++            }catch(MirroredTypeException e) {
++                element = MoreTypes.asTypeElement(e.getTypeMirror());
++            }
++            return element;
++        }
++
++        private TypeElement extractBaseAppClassElement(Config config) {
++            TypeElement element = elements.getTypeElement(config.baseApplicationClass());
++            if (element == null) {
++                throw new IllegalArgumentException(
++                        String.format("member baseApplicationClass with value \"%s\" in Config Annotation does not resolve to a valid class!", config.baseApplicationClass())
++                );
++            }
++            return element;
++        }
++    }
++
++}
+diff --git a/compiler/src/main/java/dagger/internal/codegen/ApplicationGenerator.java b/compiler/src/main/java/dagger/internal/codegen/ApplicationGenerator.java
+index 029d20729..6bbec4609 100644
+--- a/compiler/src/main/java/dagger/internal/codegen/ApplicationGenerator.java
++++ b/compiler/src/main/java/dagger/internal/codegen/ApplicationGenerator.java
+@@ -32,7 +32,7 @@
+ 
+     @Override
+     ClassName nameGeneratedType(DI input) {
+-        return ClassName.get(input.getAppClass()).topLevelClassName().peerClass(Util.SIMPKE_NAME_INJECTOR_APPLICATION);
++        return ClassName.get(input.getAppClass()).topLevelClassName().peerClass(Util.SIMPLE_NAME_INJECTOR_APPLICATION);
+     }
+ 
+     @Override
+@@ -43,7 +43,7 @@ ClassName nameGeneratedType(DI input) {
+     @Override
+     Optional<TypeSpec.Builder> write(ClassName generatedTypeName, DI di) {
+         final TypeSpec.Builder builder = TypeSpec.classBuilder(generatedTypeName);
+-        TypeName superclass = TYPENAME_ANDROID_APPLICATION;
++        TypeName superclass = ClassName.get(di.getBaseAppClass());
+         builder.addModifiers(Modifier.PUBLIC).superclass(superclass);
+         builder.addSuperinterface(TYPENAME_INJECTOR_SPEC);
+         final Set<TypeElement> components = di.getComponents();
+diff --git a/compiler/src/main/java/dagger/internal/codegen/BindingGraph.java b/compiler/src/main/java/dagger/internal/codegen/BindingGraph.java
+index cf07ab0a5..ca8ee0287 100644
+--- a/compiler/src/main/java/dagger/internal/codegen/BindingGraph.java
++++ b/compiler/src/main/java/dagger/internal/codegen/BindingGraph.java
+@@ -168,14 +168,34 @@ TypeElement componentType() {
+     return requirements.build();
+   }
+ 
++  @Memoized
++  ImmutableSet<ComponentRequirement> delegateInstanceRequirements() {
++    ImmutableSet.Builder<ComponentRequirement> requirements = ImmutableSet.builder();
++    if (componentDescriptor().builderSpec().isPresent()) {
++      componentDescriptor()
++              .builderSpec()
++              .get()
++              .requirementMethods()
++              .stream()
++              .map(BuilderRequirementMethod::requirement)
++              .filter(req -> req.kind().equals(ComponentRequirement.Kind.BINDING))
++              .forEach(requirements::add);
++    }
++    return requirements.build();
++  }
++
+   ImmutableSet<ContributionBinding> delegateRequirements() {
+-    return SUBGRAPH_TRAVERSER
++    final ImmutableSet<ContributionBinding> contributionBindings = SUBGRAPH_TRAVERSER
+             .preOrderTraversal(this)
+             .transformAndConcat(graph -> graph.resolvedBindings().values())
+             .filter(resolvedBindings -> resolvedBindings != null && resolvedBindings.owningComponent().equals(componentDescriptor()))
+             .transformAndConcat(ResolvedBindings::ownedContributionBindings)
+             .filter(Util::bindingSupportsTestDelegate)
+             .toSet();
++
++
++
++    return contributionBindings;
+   }
+   /**
+    * Returns the {@link ComponentDescriptor}s for this component and its subcomponents.
+diff --git a/compiler/src/main/java/dagger/internal/codegen/BuilderModuleStatement.java b/compiler/src/main/java/dagger/internal/codegen/BuilderModuleStatement.java
+deleted file mode 100644
+index 290146399..000000000
+--- a/compiler/src/main/java/dagger/internal/codegen/BuilderModuleStatement.java
++++ /dev/null
+@@ -1,129 +0,0 @@
+-package dagger.internal.codegen;
+-
+-import com.google.common.collect.ImmutableSet;
+-import com.squareup.javapoet.ClassName;
+-import com.squareup.javapoet.CodeBlock;
+-import dagger.internal.Preconditions;
+-
+-import javax.lang.model.element.*;
+-import javax.lang.model.type.TypeMirror;
+-import javax.lang.model.util.Types;
+-import java.util.ArrayList;
+-import java.util.HashMap;
+-import java.util.List;
+-import java.util.Map;
+-import java.util.function.Function;
+-import java.util.stream.Collectors;
+-
+-import static dagger.internal.codegen.CodeBlocks.makeParametersCodeBlock;
+-
+-/**
+- * Created by Andy on 06.05.2017.
+- */
+-public class BuilderModuleStatement extends ModuleStatement implements InitializationStatement {
+-
+-    private ExecutableElement executableElement;
+-
+-    public BuilderModuleStatement(Types types, TypeElement injector, ComponentDescriptor descriptor, Map<TypeElement, ExecutableElement> moduleMethodMap, Map<Key, VariableElement> providedParams) {
+-        super(types, injector, descriptor, moduleMethodMap, providedParams);
+-    }
+-
+-    public void setExecutableElement(ExecutableElement executableElement) {
+-        this.executableElement = executableElement;
+-    }
+-
+-    @Override
+-    public CodeBlock get() {
+-        List<CodeBlock> moduleInitStatements = new ArrayList<>();
+-        final ImmutableSet<ModuleDescriptor> modules = descriptor.modules();
+-
+-        if (isSubComponent() && !descriptor.builderSpec().isPresent()) {
+-
+-            final Map<Key, ModuleDescriptor> moduleDescriptorMap = modules.stream()
+-                    .collect(Collectors.toMap(p -> Key.builder(p.moduleElement().asType()).build(), Function.identity()));
+-
+-            final List<? extends VariableElement> parameters = executableElement.getParameters();
+-            for (VariableElement parameter : parameters) {
+-                final Key key = Key.builder(parameter.asType()).build();
+-                if (!moduleDescriptorMap.containsKey(key)) {
+-                    throw new IllegalStateException(String.format("%s | %s not found", moduleDescriptorMap.entrySet().toString(), parameter.asType().toString()));
+-                }
+-                final ModuleDescriptor moduleDescriptor = moduleDescriptorMap.get(key);
+-                moduleInitStatements.add(processModule(moduleDescriptor));
+-            }
+-        }
+-
+-        return makeParametersCodeBlock(moduleInitStatements);
+-    }
+-
+-    private CodeBlock processModule(ModuleDescriptor moduleDescriptor) {
+-        final CodeBlock.Builder codeBuilder = CodeBlock.builder();
+-        final TypeElement moduleElement = moduleDescriptor.moduleElement();
+-        final ExecutableElement method = moduleMethodMap.get(moduleElement);
+-        Map<Key, VariableElement> parameterMap;
+-        if (method != null) {
+-            parameterMap = buildParameterMapWithProvidingModuleMethod(method);
+-        }else {
+-            parameterMap = getConstructorParameterMap(moduleElement);
+-        }
+-        final List<CodeBlock> arguments = new ArrayList<>();
+-        for (Map.Entry<Key, VariableElement> entry : parameterMap.entrySet()) {
+-            if (resolvesToInjectorType(entry)) {
+-                arguments.add(CodeBlock.of("$L", "this"));
+-            } else {
+-                final VariableElement variableElement = providedParams.get(entry.getKey());
+-                if (variableElement == null) {
+-                    throw new IllegalStateException("parameter is null in providedParams in ModuleStatement for param:" + entry.getValue().asType().toString() + " in module: " + moduleElement.getSimpleName().toString());
+-                }
+-                arguments.add(CodeBlock.of("$L", variableElement.getSimpleName().toString()));
+-            }
+-        }
+-
+-        if (method != null) {
+-            codeBuilder.add("this.$L($L)",
+-                    method.getSimpleName().toString(),
+-                    makeParametersCodeBlock(arguments)
+-            );
+-        }else {
+-            codeBuilder.add("new $T($L)",
+-                    ClassName.get(moduleElement),
+-                    makeParametersCodeBlock(arguments)
+-            );
+-        }
+-        return codeBuilder.build();
+-    }
+-
+-    private boolean isSubComponent() {
+-        return descriptor.kind() == ComponentDescriptor.Kind.SUBCOMPONENT;
+-    }
+-
+-    private Map<Key, VariableElement> buildParameterMapWithProvidingModuleMethod(ExecutableElement providingModuleMethod) {
+-        return getMethodParameterMap(providingModuleMethod);
+-    }
+-
+-    private boolean resolvesToInjectorType(Map.Entry<Key, VariableElement> entry) {
+-        final TypeMirror type = entry.getKey().type();
+-        return types.isAssignable(injector.asType(), type);
+-    }
+-
+-    private Map<Key, VariableElement> getMethodParameterMap(ExecutableElement element) {
+-        return element.getParameters()
+-                .stream()
+-                .collect(Collectors.toMap(e -> Key.builder(e.asType()).build(), Function.identity()));
+-    }
+-
+-    private Map<Key, VariableElement> getConstructorParameterMap(TypeElement element) {
+-        Map<Key, VariableElement> result = new HashMap<>();
+-        final List<? extends Element> enclosedElements = element.getEnclosedElements();
+-        for (Element enclosedElement : enclosedElements) {
+-            if (enclosedElement.getKind() == ElementKind.CONSTRUCTOR) {
+-                ExecutableElement executableElement = (ExecutableElement) enclosedElement;
+-                final List<? extends VariableElement> parameters = executableElement.getParameters();
+-                for (VariableElement parameter : parameters) {
+-                    result.put(Key.builder(parameter.asType()).build(), parameter);
+-                }
+-            }
+-        }
+-        return result;
+-    }
+-}
+diff --git a/compiler/src/main/java/dagger/internal/codegen/BuilderStatement.java b/compiler/src/main/java/dagger/internal/codegen/BuilderStatement.java
+deleted file mode 100644
+index 1b316faf0..000000000
+--- a/compiler/src/main/java/dagger/internal/codegen/BuilderStatement.java
++++ /dev/null
+@@ -1,94 +0,0 @@
+-package dagger.internal.codegen;
+-
+-import com.google.auto.common.MoreElements;
+-import com.google.auto.common.MoreTypes;
+-import com.google.common.collect.ImmutableBiMap;
+-import com.google.common.collect.ImmutableSet;
+-import com.squareup.javapoet.ClassName;
+-import com.squareup.javapoet.CodeBlock;
+-import dagger.Component;
+-import dagger.Subcomponent;
+-
+-import javax.lang.model.element.ExecutableElement;
+-import javax.lang.model.element.TypeElement;
+-import javax.lang.model.element.VariableElement;
+-import javax.lang.model.type.TypeMirror;
+-import java.util.List;
+-
+-public class BuilderStatement implements InitializationStatement {
+-
+-    private final BindingGraph.Factory graphFactory;
+-    private ComponentDescriptor descriptor;
+-    private ExecutableElement providingMethod;
+-    private BuilderModuleStatement builderModuleStatement;
+-
+-    public BuilderStatement(ComponentDescriptor descriptor, ExecutableElement providingMethod, BuilderModuleStatement builderModuleStatement, BindingGraph.Factory graphFactory) {
+-        this.descriptor = descriptor;
+-        this.providingMethod = providingMethod;
+-        this.builderModuleStatement = builderModuleStatement;
+-        this.graphFactory = graphFactory;
+-    }
+-
+-    @Override
+-    public CodeBlock get() {
+-        if (descriptor.kind() == ComponentDescriptor.Kind.SUBCOMPONENT) {
+-            CodeBlock.Builder codeBlockBuilder = CodeBlock.builder();
+-            final ComponentDescriptor parentDescriptor = descriptor.getParentDescriptor();
+-            final String subComponentClassName = resolveClassName(descriptor);
+-            final ClassName className = ClassName.bestGuess(subComponentClassName);
+-            codeBlockBuilder.add("(($T)", className);
+-            final List<? extends VariableElement> parameters = providingMethod.getParameters();
+-            for (VariableElement parameter : parameters) {
+-                final TypeElement element = MoreTypes.asTypeElement(parameter.asType());
+-                if (isComponentOrSubcomponent(element)) {
+-                    final ImmutableSet<ComponentDescriptor.ComponentMethodDescriptor> componentMethodDescriptors = parentDescriptor.componentMethods();
+-                    for (ComponentDescriptor.ComponentMethodDescriptor componentMethodDescriptor : componentMethodDescriptors) {
+-                        final ExecutableElement executableElement = componentMethodDescriptor.methodElement();
+-                        TypeMirror typeToSearch = descriptor.componentDefinitionType().asType();
+-                        if (descriptor.builderSpec().isPresent()) {
+-                            typeToSearch = descriptor.builderSpec().get().builderDefinitionType().asType();
+-                        }
+-                        if (executableElement.getReturnType().toString().equals(typeToSearch.toString())) {
+-                            final String parameterName = parameter.getSimpleName().toString();
+-                            final String methodName = executableElement.getSimpleName().toString();
+-                            if (!descriptor.builderSpec().isPresent() ) {
+-                                // check if method has parameters ...
+-                                builderModuleStatement.setExecutableElement(executableElement);
+-                                return codeBlockBuilder.add("$L.$L($L))\n", parameterName, methodName, builderModuleStatement.get()).build();
+-                            }else {
+-                                return codeBlockBuilder.add("$L.$L()\n", parameterName, methodName).build();
+-                            }
+-                        }
+-                    }
+-                }
+-            }
+-        }
+-        final ClassName componentClassName = Util.getDaggerComponentClassName(descriptor.componentDefinitionType());
+-        return CodeBlock.of("(($T)$T.builder()\n", componentClassName, componentClassName);
+-    }
+-
+-    private String resolveClassName(ComponentDescriptor descriptor) {
+-        if (descriptor.kind() == ComponentDescriptor.Kind.COMPONENT) {
+-            final ClassName daggerComponentClassName = Util.getDaggerComponentClassName(descriptor.componentDefinitionType());
+-            return daggerComponentClassName.packageName() + "." + daggerComponentClassName.simpleName();
+-        }else if (descriptor.kind() == ComponentDescriptor.Kind.SUBCOMPONENT) {
+-            final String parentClassName = resolveClassName(descriptor.getParentDescriptor());
+-            final BindingGraph parentGraph = graphFactory.create(descriptor.getParentDescriptor());
+-            final ImmutableBiMap<ComponentDescriptor, String> subcomponentNamesMap =
+-                    new ComponentWriter.UniqueSubcomponentNamesGenerator(parentGraph).generate();
+-            final String s = subcomponentNamesMap.get(descriptor);
+-            if (s == null) {
+-                throw new NullPointerException("s is null | " + subcomponentNamesMap.values().toString() + "|" + descriptor.componentDefinitionType().asType().toString());
+-            }
+-            return parentClassName + "." + s + "Impl";
+-        }else {
+-            throw new IllegalStateException("unknown");
+-        }
+-    }
+-
+-    private boolean isComponentOrSubcomponent(TypeElement element) {
+-        return MoreElements.isAnnotationPresent(element, Component.class) || MoreElements.isAnnotationPresent(element, Subcomponent.class);
+-    }
+-
+-
+-}
+diff --git a/compiler/src/main/java/dagger/internal/codegen/ComponentProcessor.java b/compiler/src/main/java/dagger/internal/codegen/ComponentProcessor.java
+index cbb8a1daf..b8bdcd4a5 100644
+--- a/compiler/src/main/java/dagger/internal/codegen/ComponentProcessor.java
++++ b/compiler/src/main/java/dagger/internal/codegen/ComponentProcessor.java
+@@ -50,7 +50,7 @@
+ 
+   private Filer filer;
+   private Messager messager;
+-  private MultipleSourceFileGenerator multipleGenerator;
++  private MultipleSourceFileGenerator<ProvisionBinding> multipleGenerator;
+   private InjectBindingRegistry injectBindingRegistry;
+   private MembersInjectorGenerator membersInjectorGenerator;
+ 
+@@ -268,13 +268,18 @@ public SourceVersion getSupportedSourceVersion() {
+             new InjectorProcessingStep(
+                     types,
+                     messager,
+-                    new InjectorGenerator(filer, types, elements, componentDescriptorFactory, bindingGraphFactory, new TestClassGenerator.Factory(filer, elements), testRegistry, new Decorator.Factory(filer, elements, bindingGraphFactory, testRegistry)),
++                    new AppConfig.Factory(elements),
++                    new InjectorGenerator(filer, elements, componentDescriptorFactory,
++                            bindingGraphFactory, new TestClassGenerator.Factory(filer, elements),
++                            testRegistry, new Decorator.Factory(filer, elements, bindingGraphFactory, testRegistry)),
+                     ComponentDescriptor.Kind.COMPONENT,
+                     bindingGraphFactory,
+                     componentDescriptorFactory,
+                     new DependencySpecGenerator(filer, elements, componentDescriptorFactory, bindingGraphFactory),
+                     new DependencyInjectorGenerator(filer, elements, bindingGraphFactory, componentDescriptorFactory),
+-                    new ApplicationGenerator(filer, types, elements, bindingGraphFactory, componentDescriptorFactory)
++                    provisionBindingFactory,
++                    new ApplicationGenerator(filer, types, elements, bindingGraphFactory, componentDescriptorFactory),
++                    stubGenerator
+             )
+     );
+   }
+diff --git a/compiler/src/main/java/dagger/internal/codegen/ComponentStatement.java b/compiler/src/main/java/dagger/internal/codegen/ComponentStatement.java
+deleted file mode 100644
+index eb5c23a56..000000000
+--- a/compiler/src/main/java/dagger/internal/codegen/ComponentStatement.java
++++ /dev/null
+@@ -1,70 +0,0 @@
+-package dagger.internal.codegen;
+-
+-import com.google.common.collect.ImmutableSet;
+-import com.google.errorprone.annotations.Var;
+-import com.squareup.javapoet.CodeBlock;
+-
+-import javax.lang.model.element.*;
+-import javax.lang.model.util.Types;
+-import java.util.*;
+-
+-import static dagger.internal.codegen.CodeBlocks.makeParametersCodeBlock;
+-
+-/**
+- * Created by Andy on 06.05.2017.
+- */
+-public class ComponentStatement implements InitializationStatement{
+-
+-    private Types types;
+-    private TypeElement injector;
+-    private ComponentDescriptor.Factory factory;
+-    private ComponentDescriptor componentDescriptor;
+-    private Map<Key, VariableElement> providedParams;
+-
+-    public ComponentStatement(Types types, TypeElement injector, ComponentDescriptor.Factory factory, ComponentDescriptor componentDescriptor, Map<Key, VariableElement> providedParams) {
+-        this.types = types;
+-        this.injector = injector;
+-        this.factory = factory;
+-        this.componentDescriptor = componentDescriptor;
+-        this.providedParams = providedParams;
+-    }
+-
+-    @Override
+-    public CodeBlock get() {
+-        final CodeBlock.Builder builder = CodeBlock.builder();
+-        return builder.build();
+-        /*final ImmutableSet<TypeElement> dependencies = componentDescriptor.dependencies();
+-        for (TypeElement element : dependencies) {
+-            final ComponentDescriptor dependencyComponentDescriptor = factory.forComponent(element);
+-            final Optional<ComponentDescriptor.BuilderSpec> builderSpec = dependencyComponentDescriptor.builderSpec();
+-            String methodName = builderSpec.isPresent() ? builderSpec.get().methodMap().get(element).getSimpleName().toString() : Util.lowerCaseFirstLetter(element.getSimpleName().toString());
+-            final HashMap<String, ExecutableElement> providingMethods = Util.findProvidingMethods(types, injector);
+-            if (!providingMethods.containsKey(element.toString())) {
+-                throw new IllegalStateException(String.format("providing method not found for component: %s", element.getSimpleName().toString()));
+-            }
+-
+-            final Key componentKey = Key.builder(element.asType()).build();
+-            if (providedParams.containsKey(componentKey)) {
+-                builder.add(".$L($L)", CodeBlock.of(methodName), CodeBlock.of(providedParams.get(componentKey).getSimpleName().toString()));
+-                continue;
+-            }
+-
+-            final ExecutableElement executableElement = providingMethods.get(element.asType().toString());
+-
+-            List<CodeBlock> arguments = new ArrayList<>();
+-            final List<? extends VariableElement> parameters = executableElement.getParameters();
+-            for (VariableElement parameter : parameters) {
+-                final Key key = Key.builder(parameter.asType()).build();
+-                if (!providedParams.containsKey(key)) {
+-                    throw new IllegalStateException(String.format("parameter '%s' not found", parameter.getSimpleName().toString()));
+-                }
+-                final VariableElement variableElement = providedParams.get(key);
+-                arguments.add(CodeBlock.of("$L", CodeBlock.of(variableElement.getSimpleName().toString())));
+-            }
+-
+-            builder.add(".$L(this.$L($L))\n", CodeBlock.of(methodName), CodeBlock.of(executableElement.getSimpleName().toString()), makeParametersCodeBlock(arguments));
+-        }
+-        return builder.build();*/
+-    }
+-
+-}
+diff --git a/compiler/src/main/java/dagger/internal/codegen/DI.java b/compiler/src/main/java/dagger/internal/codegen/DI.java
+index a7ea36dbc..e1bf55f6e 100644
+--- a/compiler/src/main/java/dagger/internal/codegen/DI.java
++++ b/compiler/src/main/java/dagger/internal/codegen/DI.java
+@@ -1,6 +1,7 @@
+ package dagger.internal.codegen;
+ 
+ import com.squareup.javapoet.ClassName;
++import dagger.Config;
+ 
+ import javax.lang.model.element.Element;
+ import javax.lang.model.element.ExecutableElement;
+@@ -10,18 +11,18 @@
+ import java.util.Set;
+ 
+ public class DI {
+-    private TypeElement appClass;
+     private Set<TypeElement> components;
+     private List<InjectorType> injectorTypes;
++    private AppConfig config;
+ 
+-    public DI(TypeElement appClass, Set<TypeElement> components, List<InjectorType> injectorTypes) {
+-        this.appClass = appClass;
++    public DI(AppConfig config, Set<TypeElement> components, List<InjectorType> injectorTypes) {
++        this.config = config;
+         this.components = components;
+         this.injectorTypes = injectorTypes;
+     }
+ 
+     public ClassName getClassName() {
+-        final ClassName className = ClassName.bestGuess(appClass.asType().toString());
++        final ClassName className = ClassName.bestGuess(this.getAppClass().asType().toString());
+         return className.topLevelClassName().peerClass("Test" + className.simpleName());
+     }
+ 
+@@ -34,6 +35,8 @@ public ClassName getClassName() {
+     }
+ 
+     public TypeElement getAppClass() {
+-        return appClass;
++        return config.getAppClass();
+     }
++
++    public TypeElement getBaseAppClass() { return config.getBaseAppClass(); }
+ }
+diff --git a/compiler/src/main/java/dagger/internal/codegen/DelegateInitialization.java b/compiler/src/main/java/dagger/internal/codegen/DelegateInitialization.java
+deleted file mode 100644
+index d75a8e8bb..000000000
+--- a/compiler/src/main/java/dagger/internal/codegen/DelegateInitialization.java
++++ /dev/null
+@@ -1,46 +0,0 @@
+-package dagger.internal.codegen;
+-
+-import com.google.common.base.Optional;
+-import com.google.common.collect.ImmutableCollection;
+-import com.google.common.collect.ImmutableList;
+-import com.squareup.javapoet.ClassName;
+-import com.squareup.javapoet.CodeBlock;
+-import com.squareup.javapoet.FieldSpec;
+-import com.squareup.javapoet.MethodSpec;
+-
+-import javax.lang.model.element.Modifier;
+-
+-import java.util.HashMap;
+-
+-import static dagger.internal.codegen.Util.bindingSupportsTestDelegate;
+-import static dagger.internal.codegen.Util.getDelegateTypeName;
+-
+-/**
+- * Created by Andy on 06.05.2017.
+- */
+-public class DelegateInitialization implements InitializationStatement {
+-
+-    private ComponentDescriptor descriptor;
+-    private final BindingGraph graph;
+-
+-    public DelegateInitialization(ComponentDescriptor descriptor, BindingGraph graph) {
+-        this.descriptor = descriptor;
+-        this.graph = graph;
+-    }
+-
+-    @Override
+-    public CodeBlock get() {
+-        final CodeBlock.Builder codeBuilder = CodeBlock.builder();
+-        final ImmutableCollection<ContributionBinding> values = graph.delegateRequirements();
+-        for (ContributionBinding binding : values) {
+-            try {
+-                final String delegateFieldName = Util.getDelegateFieldName(binding.key());
+-                final ClassName delegateType = getDelegateTypeName(binding.key());
+-                final String methodName = Util.getDelegateMethodName(delegateType);
+-                codeBuilder.add(".$L($L)\n", methodName, delegateFieldName);
+-            } catch (Exception e) {
+-            }
+-        }
+-        return codeBuilder.build();
+-    }
+-}
+diff --git a/compiler/src/main/java/dagger/internal/codegen/DelegateRegistry.java b/compiler/src/main/java/dagger/internal/codegen/DelegateRegistry.java
+deleted file mode 100644
+index 8c1ef3e9a..000000000
+--- a/compiler/src/main/java/dagger/internal/codegen/DelegateRegistry.java
++++ /dev/null
+@@ -1,39 +0,0 @@
+-package dagger.internal.codegen;
+-
+-import com.google.auto.common.MoreTypes;
+-import com.squareup.javapoet.ClassName;
+-
+-import java.util.HashMap;
+-import java.util.Map;
+-
+-/**
+- * Created by Andy on 07.05.2017.
+- */
+-public class DelegateRegistry {
+-
+-    UniqueNameSet uniqueNameSet = new UniqueNameSet();
+-    private Map<Key, String> fieldMap = new HashMap<>();
+-    private Map<Key, ClassName> typeMap = new HashMap<>();
+-
+-    String getDelegateFieldName(Key key) {
+-        if (fieldMap.containsKey(key)) {
+-            return fieldMap.get(key);
+-        }
+-        final String s = MoreTypes.asTypeElement(key.type()).getSimpleName().toString();
+-        final String uniqueName = uniqueNameSet.getUniqueName(s + "Delegate");
+-        fieldMap.put(key, uniqueName);
+-        return uniqueName;
+-    }
+-
+-    ClassName getDelegateTypeName(Key key) {
+-        if (typeMap.containsKey(key)) {
+-            return typeMap.get(key);
+-        }
+-        final String s = key.type().toString();
+-        final String uniqueName = uniqueNameSet.getUniqueName(s + "Delegate");
+-        final ClassName className = ClassName.bestGuess(uniqueName);
+-        typeMap.put(key, className);
+-        return className;
+-    }
+-
+-}
+diff --git a/compiler/src/main/java/dagger/internal/codegen/DependencyInjectorGenerator.java b/compiler/src/main/java/dagger/internal/codegen/DependencyInjectorGenerator.java
+index fb1cfdf7d..ba9782b26 100644
+--- a/compiler/src/main/java/dagger/internal/codegen/DependencyInjectorGenerator.java
++++ b/compiler/src/main/java/dagger/internal/codegen/DependencyInjectorGenerator.java
+@@ -10,7 +10,8 @@
+ import javax.lang.model.element.TypeElement;
+ import javax.lang.model.util.Elements;
+ 
+-import static dagger.internal.codegen.Util.SIMPKE_NAME_INJECTOR_APPLICATION;
++import static dagger.internal.codegen.Util.SIMPLE_NAME_INJECTOR_APPLICATION;
++import static dagger.internal.codegen.Util.TYPENAME_INJECTOR_SPEC;
+ 
+ public class DependencyInjectorGenerator extends SourceFileGenerator<DI> {
+ 
+@@ -37,7 +38,7 @@ ClassName nameGeneratedType(DI input) {
+     @Override
+     Optional<TypeSpec.Builder> write(ClassName generatedTypeName, DI input) {
+         final TypeSpec.Builder builder = TypeSpec.classBuilder(generatedTypeName).addModifiers(Modifier.PUBLIC);
+-        final ClassName appType = ClassName.get(input.getAppClass()).topLevelClassName().peerClass(SIMPKE_NAME_INJECTOR_APPLICATION);
++        final ClassName appType = ClassName.get(input.getAppClass()).topLevelClassName().peerClass(SIMPLE_NAME_INJECTOR_APPLICATION);
+         builder.addMethod(MethodSpec.constructorBuilder()
+                 .addModifiers(Modifier.PUBLIC)
+                 .addParameter(appType, APP_FIELDNAME)
+@@ -48,6 +49,21 @@ ClassName nameGeneratedType(DI input) {
+             final GeneratorComponentInfo info = ComponentInfo.forGenerator(typeElement, componentDescriptorFactory, bindingGraphFactory);
+             info.process(builder);
+         }
++
++        final String st =
++                String.format("passed application class must implement the interface '%s'",
++                        Util.TYPENAME_INJECTOR_SPEC.toString()
++                );
++
++        final MethodSpec.Builder methodBuilder = MethodSpec.methodBuilder("get");
++        methodBuilder.addStatement("return (($T)$L).getInjector()", TYPENAME_INJECTOR_SPEC, APP_FIELDNAME);
++
++        builder.addMethod(methodBuilder
++                .addModifiers(Modifier.PUBLIC, Modifier.STATIC)
++                .addParameter(ClassName.bestGuess("android.app.Application"), "app")
++                .returns(Util.TYPENAME_INJECTOR)
++                .build());
++
+         return Optional.of(builder);
+     }
+ 
+diff --git a/compiler/src/main/java/dagger/internal/codegen/FinishBuilderStatement.java b/compiler/src/main/java/dagger/internal/codegen/FinishBuilderStatement.java
+deleted file mode 100644
+index 114924586..000000000
+--- a/compiler/src/main/java/dagger/internal/codegen/FinishBuilderStatement.java
++++ /dev/null
+@@ -1,26 +0,0 @@
+-package dagger.internal.codegen;
+-
+-import java.util.Optional;
+-import com.squareup.javapoet.CodeBlock;
+-
+-/**
+- * Created by Andy on 06.05.2017.
+- */
+-public class FinishBuilderStatement implements InitializationStatement{
+-
+-    private ComponentDescriptor descriptor;
+-
+-    public FinishBuilderStatement(ComponentDescriptor descriptor) {
+-        this.descriptor = descriptor;
+-    }
+-
+-    @Override
+-    public CodeBlock get() {
+-        final CodeBlock.Builder builder = CodeBlock.builder();
+-        if (descriptor.kind() == ComponentDescriptor.Kind.SUBCOMPONENT) {
+-            final Optional<ComponentDescriptor.BuilderSpec> builderSpec = this.descriptor.builderSpec();
+-            return (builderSpec.isPresent()) ? builder.add(".$L())\n", builderSpec.get().buildMethod().getSimpleName().toString()).build() : builder.build();
+-        }
+-        return CodeBlock.of(".build())\n");
+-    }
+-}
+diff --git a/compiler/src/main/java/dagger/internal/codegen/InitializationStatement.java b/compiler/src/main/java/dagger/internal/codegen/InitializationStatement.java
+deleted file mode 100644
+index c476fa4e3..000000000
+--- a/compiler/src/main/java/dagger/internal/codegen/InitializationStatement.java
++++ /dev/null
+@@ -1,7 +0,0 @@
+-package dagger.internal.codegen;
+-
+-import com.squareup.javapoet.CodeBlock;
+-
+-public interface InitializationStatement {
+-    CodeBlock get();
+-}
+diff --git a/compiler/src/main/java/dagger/internal/codegen/InjectorGenerator.java b/compiler/src/main/java/dagger/internal/codegen/InjectorGenerator.java
+index 93c380815..3b95225af 100644
+--- a/compiler/src/main/java/dagger/internal/codegen/InjectorGenerator.java
++++ b/compiler/src/main/java/dagger/internal/codegen/InjectorGenerator.java
+@@ -10,21 +10,18 @@
+ import java.io.IOException;
+ import java.util.*;
+ 
+-public class InjectorGenerator extends SourceFileGenerator<DI>{
++class InjectorGenerator extends SourceFileGenerator<DI>{
++
++    private static final String METHOD_NAME_PREFIX = "decorate";
+ 
+-    public static final String METHOD_NAME_PREFIX = "decorate";
+-    private Types types;
+-    private Elements elements;
+     private final ComponentDescriptor.Factory componentDescriptorFactory;
+     private final BindingGraph.Factory bindingGraphFactory;
+     private TestClassGenerator.Factory testClassGeneratorFactory;
+     private final TestRegistry registry;
+     private Decorator.Factory decoratorFactory;
+ 
+-    InjectorGenerator(Filer filer, Types types, Elements elements, ComponentDescriptor.Factory componentDescriptorFactory, BindingGraph.Factory bindingGraphFactory, TestClassGenerator.Factory testClassGeneratorFactoty, TestRegistry registry, Decorator.Factory decoratorFactory) {
++    InjectorGenerator(Filer filer, Elements elements, ComponentDescriptor.Factory componentDescriptorFactory, BindingGraph.Factory bindingGraphFactory, TestClassGenerator.Factory testClassGeneratorFactoty, TestRegistry registry, Decorator.Factory decoratorFactory) {
+         super(filer, elements);
+-        this.types = types;
+-        this.elements = elements;
+         this.componentDescriptorFactory = componentDescriptorFactory;
+         this.bindingGraphFactory = bindingGraphFactory;
+         this.testClassGeneratorFactory = testClassGeneratorFactoty;
+diff --git a/compiler/src/main/java/dagger/internal/codegen/InjectorProcessingStep.java b/compiler/src/main/java/dagger/internal/codegen/InjectorProcessingStep.java
+index 513d188e0..f2a57e7c3 100644
+--- a/compiler/src/main/java/dagger/internal/codegen/InjectorProcessingStep.java
++++ b/compiler/src/main/java/dagger/internal/codegen/InjectorProcessingStep.java
+@@ -19,46 +19,47 @@
+ import javax.tools.Diagnostic;
+ import java.lang.annotation.Annotation;
+ import java.util.*;
++import java.util.function.Consumer;
+ import java.util.function.Function;
+ import java.util.stream.Collectors;
+ 
+-/**
+- * Created by Andy on 05.05.2017.
+- */
+ public class InjectorProcessingStep implements BasicAnnotationProcessor.ProcessingStep {
+ 
+     private Types types;
+     private final Messager messager;
++    private AppConfig.Factory appConfigFactory;
+     private final InjectorGenerator injectorGenerator;
+     private final ComponentDescriptor.Kind component;
+     private final BindingGraph.Factory bindingGraphFactory;
+     private final ComponentDescriptor.Factory componentDescriptorFactory;
+     private DependencySpecGenerator dependencySpecGenerator;
+     private DependencyInjectorGenerator dependencyInjectorGenerator;
++    private ProvisionBinding.Factory provisionBindingFactory;
+     private ApplicationGenerator applicationGenerator;
+-    private Map<TypeElement, ExecutableElement> componentMethodMap;
+-    private Map<TypeElement, ExecutableElement> moduleMethodMap;
+-    private Map<TypeElement, ExecutableElement> subcomponentMethodMap;
++    private StubGenerator stubGenerator;
+     private HashSet<TypeElement> components = new HashSet<>();
+-    private TypeElement appClass;
+-    private static boolean done = false;
+ 
+     public InjectorProcessingStep(Types types, Messager messager,
++                                  AppConfig.Factory appConfigFactory,
+                                   InjectorGenerator injectorGenerator,
+                                   ComponentDescriptor.Kind component, BindingGraph.Factory bindingGraphFactory,
+                                   ComponentDescriptor.Factory componentDescriptorFactory,
+                                   DependencySpecGenerator dependencySpecGenerator,
+                                   DependencyInjectorGenerator dependencyInjectorGenerator,
+-                                  ApplicationGenerator applicationGenerator) {
++                                  ProvisionBinding.Factory provisionBindingFactory,
++                                  ApplicationGenerator applicationGenerator, StubGenerator stubGenerator) {
+         this.types = types;
+         this.messager = messager;
++        this.appConfigFactory = appConfigFactory;
+         this.injectorGenerator = injectorGenerator;
+         this.component = component;
+         this.bindingGraphFactory = bindingGraphFactory;
+         this.componentDescriptorFactory = componentDescriptorFactory;
+         this.dependencySpecGenerator = dependencySpecGenerator;
+         this.dependencyInjectorGenerator = dependencyInjectorGenerator;
++        this.provisionBindingFactory = provisionBindingFactory;
+         this.applicationGenerator = applicationGenerator;
++        this.stubGenerator = stubGenerator;
+     }
+ 
+     @Override
+@@ -69,48 +70,18 @@ public InjectorProcessingStep(Types types, Messager messager,
+     @Override
+     public Set<Element> process(SetMultimap<Class<? extends Annotation>, Element> elementsByAnnotation) {
+ 
+-        if (done) {
+-            return new HashSet<>();
+-        }
+-
+-        done = true;
+-
+         final Iterator<Element> it = elementsByAnnotation.get(Config.class).iterator();
+         if (!it.hasNext()) {
+             return ImmutableSet.of();
+         }
+ 
+-        if (appClass == null) {
+-            try {
+-                it.next().getAnnotation(Config.class).applicationClass();
+-            } catch (MirroredTypeException e) {
+-                try {
+-                    appClass = MoreTypes.asTypeElement(e.getTypeMirror());
+-                } catch (TypeNotPresentException ex) {
+-                    throw new IllegalStateException("application class could not be extracted: " + ex.toString());
+-                }
+-            } catch (Exception e) {
+-                throw new IllegalStateException("application class could not be extracted");
+-            }
+-        }
++        final Config configAnnotation = it.next().getAnnotation(Config.class);
+ 
+         Set<Element> rejectedElements = new LinkedHashSet<>();
+ 
+         components.addAll(elementsByAnnotation.get(Component.class).stream()
+                 .map(element -> (TypeElement) element).collect(Collectors.toSet()));
+ 
+-            /*this.moduleMethodMap =
+-                    this.buildProvideMethodMap(elementsByAnnotation.get(ProvidesModule.class));
+-
+-            this.subcomponentMethodMap =
+-                    this.buildProvideMethodMap(elementsByAnnotation.get(ProvidesSubcomponent.class));
+-
+-            this.componentMethodMap =
+-                    this.buildProvideMethodMap(elementsByAnnotation.get(ProvidesComponent.class));*/
+-
+-/*        final Map<TypeElement, ProvidingMethodOverrider> componentOverriderMap =
+-                this.buildProvideComponentMethodMap(elementsByAnnotation.get(ProvidesComponent.class), injector);*/
+-
+         List<InjectorType> injectorTypeList = new ArrayList<>();
+         for (Element element : elementsByAnnotation.get(component.annotationType())) {
+             TypeElement componentTypeElement = (TypeElement) element;
+@@ -120,10 +91,25 @@ public InjectorProcessingStep(Types types, Messager messager,
+             injectorTypeList.add(injectorType);
+         }
+         if (rejectedElements.isEmpty()) {
+-            final DI di = new DI(appClass, components, injectorTypeList);
++            for (TypeElement component : components) {
++                final ComponentDescriptor componentDescriptor = componentDescriptorFactory.forComponent(component);
++                final BindingGraph bindingGraph = bindingGraphFactory.create(componentDescriptor);
++                final ImmutableSet<ComponentDescriptor> componentDescriptors = bindingGraph.componentDescriptors();
++                componentDescriptors
++                        .stream()
++                        .filter(descriptor -> descriptor.builderSpec().isPresent())
++                        .map(descriptor -> descriptor.builderSpec().get())
++                        .map(ComponentDescriptor.BuilderSpec::requirementMethods)
++                        .flatMap(Collection::stream)
++                        .filter(method -> method.requirement().kind() == ComponentRequirement.Kind.BINDING)
++                        .forEach(method -> stubGenerator.generate(provisionBindingFactory.forBuilderBinding(method), messager));
++
++            }
++            final AppConfig appConfig = appConfigFactory.create(configAnnotation);
++            final DI di = new DI(appConfig, components, injectorTypeList);
+             this.applicationGenerator.generate(di, messager);
+-            this.dependencyInjectorGenerator.generate(di, messager);
+             this.dependencySpecGenerator.generate(components, messager);
++            this.dependencyInjectorGenerator.generate(di, messager);
+             this.injectorGenerator.generate(di, messager);
+         } else {
+             throw new IllegalStateException(rejectedElements.toString());
+@@ -132,26 +118,4 @@ public InjectorProcessingStep(Types types, Messager messager,
+         return rejectedElements;
+     }
+ 
+-    private Map<Key, VariableElement> toParameterMap(List<? extends VariableElement> parameters) {
+-        return parameters.stream()
+-                .collect(Collectors.toMap(p -> Key.builder(p.asType()).build(), Function.identity()));
+-    }
+-
+-    private List<InitializationStatement> createInitializationsStatements(TypeElement injector,
+-                                                                          ComponentDescriptor componentDescriptor,
+-                                                                          Map<TypeElement, ExecutableElement> moduleMethodMap,
+-                                                                          ExecutableElement providingMethod,
+-                                                                          BindingGraph bindingGraph) {
+-
+-        Map<Key, VariableElement> providedParams = toParameterMap(providingMethod.getParameters());
+-        BuilderModuleStatement builderModuleStatement =
+-                new BuilderModuleStatement(this.types, injector, componentDescriptor, moduleMethodMap, providedParams);
+-        return ImmutableList.of(
+-                new BuilderStatement(componentDescriptor, providingMethod, builderModuleStatement, bindingGraphFactory),
+-                new ComponentStatement(this.types, injector, componentDescriptorFactory, componentDescriptor, providedParams),
+-                new ModuleStatement(this.types, injector, componentDescriptor, moduleMethodMap, providedParams),
+-                new FinishBuilderStatement(componentDescriptor),
+-                new DelegateInitialization(componentDescriptor, bindingGraph)
+-        );
+-    }
+ }
+diff --git a/compiler/src/main/java/dagger/internal/codegen/ModuleStatement.java b/compiler/src/main/java/dagger/internal/codegen/ModuleStatement.java
+deleted file mode 100644
+index 757bcba41..000000000
+--- a/compiler/src/main/java/dagger/internal/codegen/ModuleStatement.java
++++ /dev/null
+@@ -1,135 +0,0 @@
+-package dagger.internal.codegen;
+-
+-import com.google.common.collect.ImmutableSet;
+-import com.squareup.javapoet.ClassName;
+-import com.squareup.javapoet.CodeBlock;
+-import dagger.Injector;
+-import dagger.internal.Preconditions;
+-
+-import javax.inject.Inject;
+-import javax.lang.model.element.*;
+-import javax.lang.model.type.TypeMirror;
+-import javax.lang.model.util.Types;
+-import java.util.ArrayList;
+-import java.util.HashMap;
+-import java.util.List;
+-import java.util.Map;
+-import java.util.function.Function;
+-import java.util.stream.Collectors;
+-
+-import static dagger.internal.codegen.CodeBlocks.makeParametersCodeBlock;
+-
+-/**
+- * Created by Andy on 06.05.2017.
+- */
+-public class ModuleStatement implements InitializationStatement {
+-
+-    protected Types types;
+-    protected TypeElement injector;
+-    protected ComponentDescriptor descriptor;
+-    protected Map<TypeElement, ExecutableElement> moduleMethodMap;
+-    protected Map<Key, VariableElement> providedParams;
+-
+-    public ModuleStatement(Types types, TypeElement injector, ComponentDescriptor descriptor, Map<TypeElement, ExecutableElement> moduleMethodMap, Map<Key, VariableElement> providedParams) {
+-        Preconditions.checkNotNull(types, "types is null!");
+-        this.types = types;
+-        Preconditions.checkNotNull(injector, "injector is null!");
+-        this.injector = injector;
+-        Preconditions.checkNotNull(descriptor, "descriptor is null!");
+-        this.descriptor = descriptor;
+-        Preconditions.checkNotNull(moduleMethodMap, "moduleMethodMap is null!");
+-        this.moduleMethodMap = moduleMethodMap;
+-        Preconditions.checkNotNull(providedParams, "providedParams is null!");
+-        this.providedParams = providedParams;
+-    }
+-
+-    @Override
+-    public CodeBlock get() {
+-        final CodeBlock.Builder codeBuilder = CodeBlock.builder();
+-        return codeBuilder.build();
+-        /*final ImmutableSet<ModuleDescriptor> modules = descriptor.modules();
+-
+-        if (isSubComponent() && !descriptor.builderSpec().isPresent()) {
+-            return CodeBlock.builder().build();
+-        }
+-
+-        for (ModuleDescriptor moduleDescriptor : modules) {
+-            final TypeElement moduleElement = moduleDescriptor.moduleElement();
+-            final ExecutableElement method = moduleMethodMap.get(moduleElement);
+-            Map<Key, VariableElement> parameterMap;
+-            if (method != null) {
+-                parameterMap = buildParameterMapWithProvidingModuleMethod(method);
+-            }else {
+-                parameterMap = getConstructorParameterMap(moduleElement);
+-            }
+-            final List<CodeBlock> arguments = new ArrayList<>();
+-            for (Map.Entry<Key, VariableElement> entry : parameterMap.entrySet()) {
+-                if (resolvesToInjectorType(entry)) {
+-                    arguments.add(CodeBlock.of("$L", "this"));
+-                } else {
+-                    final VariableElement variableElement = providedParams.get(entry.getKey());
+-                    if (variableElement == null) {
+-                        throw new IllegalStateException("parameter is null in providedParams in ModuleStatement for param:" + entry.getValue().asType().toString() + " in module: " + moduleElement.getSimpleName().toString());
+-                    }
+-                    arguments.add(CodeBlock.of("$L", variableElement.getSimpleName().toString()));
+-                }
+-            }
+-
+-            String methodName = Util.lowerCaseFirstLetter(moduleElement.getSimpleName().toString());
+-
+-            if (descriptor.builderSpec().isPresent()) {
+-                final ExecutableElement executableElement = descriptor.builderSpec().get().methodMap().get(moduleElement);
+-                methodName = executableElement.getSimpleName().toString();
+-            }
+-
+-            if (method != null) {
+-                codeBuilder.add(".$L(this.$L($L))\n",
+-                        methodName,
+-                        method.getSimpleName().toString(),
+-                        makeParametersCodeBlock(arguments)
+-                );
+-            }else {
+-                codeBuilder.add(".$L(new $T($L))\n",
+-                        methodName,
+-                        ClassName.get(moduleElement),
+-                        makeParametersCodeBlock(arguments)
+-                );
+-            }
+-        }
+-        return codeBuilder.build();*/
+-    }
+-
+-    private boolean isSubComponent() {
+-        return descriptor.kind() == ComponentDescriptor.Kind.SUBCOMPONENT;
+-    }
+-
+-    private Map<Key, VariableElement> buildParameterMapWithProvidingModuleMethod(ExecutableElement providingModuleMethod) {
+-        return getMethodParameterMap(providingModuleMethod);
+-    }
+-
+-    private boolean resolvesToInjectorType(Map.Entry<Key, VariableElement> entry) {
+-        final TypeMirror type = entry.getKey().type();
+-        return types.isAssignable(injector.asType(), type);
+-    }
+-
+-    private Map<Key, VariableElement> getMethodParameterMap(ExecutableElement element) {
+-        return element.getParameters()
+-                .stream()
+-                .collect(Collectors.toMap(e -> Key.builder(e.asType()).build(), Function.identity()));
+-    }
+-
+-    private Map<Key, VariableElement> getConstructorParameterMap(TypeElement element) {
+-        Map<Key, VariableElement> result = new HashMap<>();
+-        final List<? extends Element> enclosedElements = element.getEnclosedElements();
+-        for (Element enclosedElement : enclosedElements) {
+-            if (enclosedElement.getKind() == ElementKind.CONSTRUCTOR) {
+-                ExecutableElement executableElement = (ExecutableElement) enclosedElement;
+-                final List<? extends VariableElement> parameters = executableElement.getParameters();
+-                for (VariableElement parameter : parameters) {
+-                    result.put(Key.builder(parameter.asType()).build(), parameter);
+-                }
+-            }
+-        }
+-        return result;
+-    }
+-}
+diff --git a/compiler/src/main/java/dagger/internal/codegen/ProvidingMethodOverrider.java b/compiler/src/main/java/dagger/internal/codegen/ProvidingMethodOverrider.java
+deleted file mode 100644
+index cef08cc54..000000000
+--- a/compiler/src/main/java/dagger/internal/codegen/ProvidingMethodOverrider.java
++++ /dev/null
+@@ -1,82 +0,0 @@
+-package dagger.internal.codegen;
+-
+-import com.squareup.javapoet.ClassName;
+-import com.squareup.javapoet.CodeBlock;
+-import com.squareup.javapoet.MethodSpec;
+-import com.squareup.javapoet.TypeSpec;
+-
+-import javax.lang.model.element.ExecutableElement;
+-import javax.lang.model.element.TypeElement;
+-import java.util.ArrayList;
+-import java.util.List;
+-import java.util.Map;
+-
+-import static dagger.internal.codegen.Util.createDelegateFieldAndMethod;
+-
+-/**
+- * Created by Andy on 06.05.2017.
+- */
+-public class ProvidingMethodOverrider {
+-
+-    private final TypeElement component;
+-    private final ComponentDescriptor descriptor;
+-    private final ExecutableElement executableElement;
+-    private List<InitializationStatement> statements;
+-    private BindingGraph bindingGraph;
+-    private List<ProvidingMethodOverrider> subcomponentOverriders = new ArrayList<>();
+-
+-    public ProvidingMethodOverrider(TypeElement component, ComponentDescriptor descriptor, ExecutableElement executableElement, List<InitializationStatement> statements, BindingGraph bindingGraph) {
+-        this.component = component;
+-        this.descriptor = descriptor;
+-        this.executableElement = executableElement;
+-        this.statements = statements;
+-        this.bindingGraph = bindingGraph;
+-    }
+-
+-    public TypeElement getComponent() {
+-        return component;
+-    }
+-
+-    public ComponentDescriptor getDescriptor() {
+-        return descriptor;
+-    }
+-
+-    public ExecutableElement getExecutableElement() {
+-        return executableElement;
+-    }
+-
+-    public List<InitializationStatement> getStatements() {
+-        return statements;
+-    }
+-
+-    public void add(ProvidingMethodOverrider providingMethodOverrider) {
+-        subcomponentOverriders.add(providingMethodOverrider);
+-    }
+-
+-    public void process(TypeSpec.Builder builder, ClassName generatedTypeName, Map<Key, String> delegateFieldNames) {
+-        for (ProvidingMethodOverrider subcomponentOverrider : subcomponentOverriders) {
+-            subcomponentOverrider.process(builder, generatedTypeName, delegateFieldNames);
+-        }
+-
+-        this.getBindingGraph().resolvedBindings().values().forEach(resolvedBindings -> {
+-            if (!resolvedBindings.isEmpty() && resolvedBindings.bindingType() == BindingType.PROVISION && Util.bindingSupportsTestDelegate(resolvedBindings.contributionBinding())) {
+-                if (!delegateFieldNames.containsKey(resolvedBindings.key())) {
+-                    createDelegateFieldAndMethod(generatedTypeName, builder, resolvedBindings.contributionBinding(), delegateFieldNames, true);
+-                }
+-            }
+-        });
+-
+-        final MethodSpec.Builder methodSpec = MethodSpec.overriding(this.getExecutableElement());
+-        final List<InitializationStatement> statements = this.getStatements();
+-        final CodeBlock.Builder codeBuilder = CodeBlock.builder();
+-        for (InitializationStatement statement : statements) {
+-            codeBuilder.add(statement.get());
+-        }
+-        methodSpec.addStatement("return $L", codeBuilder.build());
+-        builder.addMethod(methodSpec.build());
+-    }
+-
+-    public BindingGraph getBindingGraph() {
+-        return bindingGraph;
+-    }
+-}
+diff --git a/compiler/src/main/java/dagger/internal/codegen/StubGenerator.java b/compiler/src/main/java/dagger/internal/codegen/StubGenerator.java
+index a3449951b..4012d9cf9 100644
+--- a/compiler/src/main/java/dagger/internal/codegen/StubGenerator.java
++++ b/compiler/src/main/java/dagger/internal/codegen/StubGenerator.java
+@@ -24,13 +24,10 @@
+ 
+ public class StubGenerator extends SourceFileGenerator<ProvisionBinding> {
+ 
+-    private final Types types;
+-
+     private final List<String> generated = new ArrayList<>();
+ 
+     StubGenerator(Filer filer, Elements elements, Types types) {
+         super(filer, elements);
+-        this.types = types;
+     }
+ 
+     @Override
+diff --git a/compiler/src/main/java/dagger/internal/codegen/TriggerComponentInfo.java b/compiler/src/main/java/dagger/internal/codegen/TriggerComponentInfo.java
+index 3f161ff7e..5e2717a68 100644
+--- a/compiler/src/main/java/dagger/internal/codegen/TriggerComponentInfo.java
++++ b/compiler/src/main/java/dagger/internal/codegen/TriggerComponentInfo.java
+@@ -12,9 +12,11 @@
+ 
+ public class TriggerComponentInfo extends ComponentInfo {
+ 
+-    private BindingGraph bindingGraph;
++    private static final String DECORATOR = "Decorator";
+     private static final String METHODNAME_DECORATE = "decorate";
+ 
++    private BindingGraph bindingGraph;
++
+     protected TriggerComponentInfo(TypeElement typeElement, ComponentDescriptor descriptor,
+                                    BindingGraph bindingGraph) {
+         super(typeElement, descriptor, bindingGraph);
+@@ -45,7 +47,7 @@ public void process(TypeSpec.Builder builder) {
+     }
+ 
+     protected String getDecoratorFieldName(TypeElement component) {
+-        return lowerCaseFirstLetter(component.getSimpleName().toString()) + "Decorator";
++        return lowerCaseFirstLetter(component.getSimpleName().toString()) + DECORATOR;
+     }
+ 
+     protected boolean noActionRequired() {
+diff --git a/compiler/src/main/java/dagger/internal/codegen/Util.java b/compiler/src/main/java/dagger/internal/codegen/Util.java
+index 251351d7c..d01fe8832 100644
+--- a/compiler/src/main/java/dagger/internal/codegen/Util.java
++++ b/compiler/src/main/java/dagger/internal/codegen/Util.java
+@@ -476,37 +476,6 @@ static TypeName box(PrimitiveType primitiveType) {
+         }
+     }
+ 
+-    private static java.util.Optional<? extends AnnotationMirror> getAnnotationMirror(Element element) {
+-        final ImmutableList<String> annotations =
+-                ImmutableList.of(Named.class.getName(), StringKey.class.getName(), IntKey.class.getName(), LongKey.class.getName(), MapKey.class.getName(), ClassKey.class.getName());
+-
+-        return element.getAnnotationMirrors().stream()
+-                .filter(e -> annotations.contains(e.getAnnotationType().asElement().asType().toString()))
+-                .findFirst();
+-    }
+-
+-    private static java.util.Optional<? extends AnnotationMirror> getAnnotationMirror(TypeMirror typeMirror) {
+-        final ImmutableList<String> annotations =
+-                ImmutableList.of(Named.class.getName(), StringKey.class.getName(), IntKey.class.getName(), LongKey.class.getName(), MapKey.class.getName(), ClassKey.class.getName());
+-
+-        return typeMirror.getAnnotationMirrors().stream()
+-                .filter(e -> annotations.contains(e.getAnnotationType().asElement().asType().toString()))
+-                .findFirst();
+-    }
+-
+-    private static String getCapitalizedAnnotationValue(AnnotationMirror annotation) {
+-        final Map<? extends ExecutableElement, ? extends AnnotationValue> elementValues = annotation.getElementValues();
+-        for (Map.Entry<? extends ExecutableElement, ? extends AnnotationValue> entry : elementValues.entrySet()) {
+-            if (entry.getKey().getSimpleName().toString().equals("value")) {
+-                final String original = entry.getValue().getValue().toString();
+-                if (!original.isEmpty()) {
+-                    return capitalize(original);
+-                }
+-            }
+-        }
+-        throw new IllegalStateException("value not found");
+-    }
+-
+     public static String capitalize(String original) {
+         if (original == null || original.length() == 0) {
+             return original;
+@@ -534,21 +503,6 @@ public static boolean bindingSupportsTestDelegate(ContributionBinding binding) {
+     private Util() {
+     }
+ 
+-    public static void createDelegateField(TypeSpec.Builder classBuilder, ContributionBinding binding, Map<Key, String> delegateFieldNames) {
+-        try {
+-            if (bindingSupportsTestDelegate(binding)) {
+-                final String delegateFieldName = Util.getDelegateFieldName(binding.key());
+-                final ClassName delegateType = getDelegateTypeName(binding.key());
+-                final FieldSpec.Builder builder = FieldSpec.builder(delegateType, delegateFieldName);
+-                builder.addModifiers(Modifier.PRIVATE);
+-                delegateFieldNames.put(binding.key(), delegateFieldName);
+-                final FieldSpec fieldSpec = builder.build();
+-                classBuilder.addField(fieldSpec);
+-            }
+-        } catch (Exception e) {
+-        }
+-    }
+-
+     public static void createDelegateMethod(TypeName generatedTypeName, TypeSpec.Builder classBuilder, ContributionBinding binding) {
+         try {
+             if (bindingSupportsTestDelegate(binding)) {
+@@ -593,32 +547,6 @@ public static void createDelegateFieldAndMethod(TypeName generatedTypeName, Type
+     }
+ 
+ 
+-    public static void createDelegateFieldAndMethod(ClassName generatedTypeName, TypeSpec.Builder classBuilder, ResolvedBindings resolvedBindings, Map<Key, String> delegateFieldNames) {
+-        if (resolvedBindings.isEmpty() || resolvedBindings.ownedBindings().isEmpty()) {
+-            return;
+-        }
+-        try {
+-            ContributionBinding binding = resolvedBindings.contributionBinding();
+-            if (bindingSupportsTestDelegate(binding)) {
+-                final String delegateFieldName = Util.getDelegateFieldName(binding.key());
+-                final ClassName delegateType = getDelegateTypeName(binding.key());
+-                final FieldSpec.Builder builder = FieldSpec.builder(delegateType, delegateFieldName);
+-                delegateFieldNames.put(binding.key(), delegateFieldName);
+-                final FieldSpec fieldSpec = builder.build();
+-                classBuilder.addField(fieldSpec);
+-                final String methodName = getDelegateMethodName(delegateType);
+-                classBuilder.addMethod(MethodSpec.methodBuilder(methodName)
+-                        .addModifiers(Modifier.PUBLIC)
+-                        .returns(generatedTypeName)
+-                        .addParameter(delegateType, delegateFieldName)
+-                        .addStatement("this.$N = $L", fieldSpec, CodeBlock.of(delegateFieldName))
+-                        .addStatement("return this")
+-                        .build());
+-            }
+-        } catch (Exception e) {
+-        }
+-    }
+-
+     public static String getDelegateMethodName(ClassName delegateType) {
+         return "with" + delegateType.simpleName().replaceAll("Delegate$", "");
+     }
+@@ -634,100 +562,11 @@ public static ClassName getDaggerComponentClassName(Element component) {
+         return getDaggerComponentClassName(ClassName.bestGuess(typeToString(component.asType())));
+     }
+ 
+-    public static HashMap<String, ExecutableElement> findProvidingMethodsOfModules(Types typeUtils, Element componentProvider) {
+-        HashMap<String, ExecutableElement> providingMethods = new HashMap<>();
+-        if (componentProvider.getKind() == ElementKind.CLASS) {
+-            TypeElement typeElement = (TypeElement) componentProvider;
+-            for (Map.Entry<String, ExecutableElement> e : findProvidingModuleMethodsInternal(typeElement, providingMethods).entrySet()) {
+-                if (!providingMethods.containsKey(e.getKey())) providingMethods.put(e.getKey(), e.getValue());
+-            }
+-            typeElement = (TypeElement) typeUtils.asElement(typeElement.getSuperclass());
+-            while (!typeElement.toString().equals(Object.class.getName())) {
+-                for (Map.Entry<String, ExecutableElement> e : findProvidingModuleMethodsInternal(typeElement, providingMethods).entrySet()) {
+-                    if (!providingMethods.containsKey(e.getKey())) providingMethods.put(e.getKey(), e.getValue());
+-                }
+-                typeElement = (TypeElement) typeUtils.asElement(typeElement.getSuperclass());
+-            }
+-        }
+-        return providingMethods;
+-    }
+-
+-    public static HashMap<String, ExecutableElement> findProvidingMethodsOfComponents(Types typeUtils, Element componentProvider) {
+-        HashMap<String, ExecutableElement> providingMethods = new HashMap<>();
+-        if (componentProvider.getKind() == ElementKind.CLASS) {
+-            TypeElement typeElement = (TypeElement) componentProvider;
+-            for (Map.Entry<String, ExecutableElement> e : findProvidingComponentMethodsInternal(typeElement, providingMethods).entrySet()) {
+-                if (!providingMethods.containsKey(e.getKey()))
+-                    providingMethods.put(e.getKey(), e.getValue());
+-            }
+-            typeElement = (TypeElement) typeUtils.asElement(typeElement.getSuperclass());
+-            while (!typeElement.toString().equals(Object.class.getName())) {
+-                for (Map.Entry<String, ExecutableElement> e : findProvidingComponentMethodsInternal(typeElement, providingMethods).entrySet()) {
+-                    if (!providingMethods.containsKey(e.getKey()))
+-                        providingMethods.put(e.getKey(), e.getValue());
+-                }
+-                typeElement = (TypeElement) typeUtils.asElement(typeElement.getSuperclass());
+-            }
+-        }
+-        return providingMethods;
+-    }
+-
+-    public static HashMap<String, ExecutableElement> findProvidingMethods(Types typeUtils, Element componentProvider) {
+-        HashMap<String, ExecutableElement> providingMethods = new HashMap<>();
+-        if (componentProvider.getKind() == ElementKind.CLASS) {
+-            TypeElement typeElement = (TypeElement) componentProvider;
+-            for (Map.Entry<String, ExecutableElement> e : findProvidingModuleMethodsInternal(typeElement, providingMethods).entrySet()) {
+-                if (!providingMethods.containsKey(e.getKey())) providingMethods.put(e.getKey(), e.getValue());
+-            }
+-            for (Map.Entry<String, ExecutableElement> e : findProvidingComponentMethodsInternal(typeElement, providingMethods).entrySet()) {
+-                if (!providingMethods.containsKey(e.getKey())) providingMethods.put(e.getKey(), e.getValue());
+-            }
+-            typeElement = (TypeElement) typeUtils.asElement(typeElement.getSuperclass());
+-            while (!typeElement.toString().equals(Object.class.getName())) {
+-                for (Map.Entry<String, ExecutableElement> e : findProvidingModuleMethodsInternal(typeElement, providingMethods).entrySet()) {
+-                    if (!providingMethods.containsKey(e.getKey())) providingMethods.put(e.getKey(), e.getValue());
+-                }
+-                for (Map.Entry<String, ExecutableElement> e : findProvidingComponentMethodsInternal(typeElement, providingMethods).entrySet()) {
+-                    if (!providingMethods.containsKey(e.getKey())) providingMethods.put(e.getKey(), e.getValue());
+-                }
+-                typeElement = (TypeElement) typeUtils.asElement(typeElement.getSuperclass());
+-            }
+-        }
+-        return providingMethods;
+-    }
+-
+-    private static HashMap<String, ExecutableElement> findProvidingModuleMethodsInternal(TypeElement element, HashMap<String, ExecutableElement> providingMethods) {
+-        List<? extends Element> enclosedElements = element.getEnclosedElements();
+-        for (Element enclosedElement : enclosedElements) {
+-            if (enclosedElement.getKind() == ElementKind.METHOD) {
+-                ProvidesModule providesModule = enclosedElement.getAnnotation(ProvidesModule.class);
+-                if (providesModule != null) {
+-                    ExecutableElement executableElement = (ExecutableElement) enclosedElement;
+-                    providingMethods.put(executableElement.getReturnType().toString(), executableElement);
+-                }
+-            }
+-        }
+-        return providingMethods;
+-    }
+-
+-    private static HashMap<String, ExecutableElement> findProvidingComponentMethodsInternal(TypeElement element, HashMap<String, ExecutableElement> providingMethods) {
+-        List<? extends Element> enclosedElements = element.getEnclosedElements();
+-        for (Element enclosedElement : enclosedElements) {
+-            if (enclosedElement.getKind() == ElementKind.METHOD) {
+-                ProvidesComponent providesComponent = enclosedElement.getAnnotation(ProvidesComponent.class);
+-                if (providesComponent != null) {
+-                    ExecutableElement executableElement = (ExecutableElement) enclosedElement;
+-                    providingMethods.put(executableElement.getReturnType().toString(), executableElement);
+-                }
+-            }
+-        }
+-        return providingMethods;
+-    }
+-
+     public static final String METHOD_NAME_GET_INJECTOR = "getInjector";
+     public static final ClassName TYPENAME_INJECTOR = ClassName.bestGuess("injector.Injector");
+-    public static final String SIMPKE_NAME_INJECTOR_APPLICATION = "DaggerApplication";
++    public static final String SIMPLE_NAME_INJECTOR_APPLICATION = "DaggerApplication";
+     public static final String FIELDNAME_INJECTOR = "injector";
+     public static final ClassName TYPENAME_INJECTOR_SPEC = ClassName.bestGuess("injector.InjectorSpec");
+     public static final ClassName TYPENAME_ANDROID_APPLICATION = ClassName.bestGuess("android.app.Application");
++    public static final ClassName TYPENAME_DAGGER_ANDROID_APPLICATION = TYPENAME_ANDROID_APPLICATION.topLevelClassName().peerClass("DaggerApplication");
+ }
+diff --git a/core/src/main/java/dagger/Config.java b/core/src/main/java/dagger/Config.java
+index 75f48b8b6..0273faa6c 100644
+--- a/core/src/main/java/dagger/Config.java
++++ b/core/src/main/java/dagger/Config.java
+@@ -12,4 +12,5 @@
+ @Documented
+ public @interface Config {
+     Class<?> applicationClass();
++    String baseApplicationClass() default "android.app.Application";
+ }

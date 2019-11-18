@@ -1,0 +1,890 @@
+diff --git a/java/dagger/internal/codegen/CodeBlocks.java b/java/dagger/internal/codegen/CodeBlocks.java
+index bc8fccd90..ee331b51a 100644
+--- a/java/dagger/internal/codegen/CodeBlocks.java
++++ b/java/dagger/internal/codegen/CodeBlocks.java
+@@ -25,9 +25,11 @@
+ 
+ import com.google.auto.common.MoreElements;
+ import com.google.auto.common.MoreTypes;
++import com.google.common.collect.Iterables;
+ import com.squareup.javapoet.ClassName;
+ import com.squareup.javapoet.CodeBlock;
+ import com.squareup.javapoet.MethodSpec;
++import com.squareup.javapoet.ParameterSpec;
+ import com.squareup.javapoet.TypeName;
+ import java.util.stream.Collector;
+ import javax.lang.model.element.ExecutableElement;
+@@ -55,6 +57,14 @@ static CodeBlock makeParametersCodeBlock(Iterable<CodeBlock> codeBlocks) {
+     return stream(codeBlocks.spliterator(), false).collect(toParametersCodeBlock());
+   }
+ 
++  /**
++   * Returns a comma-separated {@link CodeBlock} using the name of every parameter in {@code
++   * parameters}.
++   */
++  static CodeBlock parameterNames(Iterable<ParameterSpec> parameters) {
++    return makeParametersCodeBlock(Iterables.transform(parameters, p -> CodeBlock.of("$N", p)));
++  }
++
+   /**
+    * Returns one unified {@link CodeBlock} which joins each item in {@code codeBlocks} with a
+    * newline.
+diff --git a/java/dagger/internal/codegen/ComponentImplementation.java b/java/dagger/internal/codegen/ComponentImplementation.java
+index 56885c9b8..b57012278 100644
+--- a/java/dagger/internal/codegen/ComponentImplementation.java
++++ b/java/dagger/internal/codegen/ComponentImplementation.java
+@@ -87,6 +87,13 @@
+     /** The component constructor. */
+     CONSTRUCTOR,
+ 
++    /**
++     * In ahead-of-time subcomponents, this method coordinates the invocation of {@link
++     * #INITIALIZE_METHOD initialization methods} instead of constructors.
++     */
++    // TODO(b/117833324): try to merge this with other initialize() methods so it looks more natural
++    CONFIGURE_INITIALIZATION_METHOD,
++
+     /** A builder method for the component. (Only used by the root component.) */
+     BUILDER_METHOD,
+ 
+@@ -160,6 +167,7 @@
+   private final SetMultimap<BindingRequest, DependencyRequest> multibindingContributionsMade =
+       HashMultimap.create();
+   private ImmutableList<ParameterSpec> constructorParameters;
++  private Optional<MethodSpec> configureInitializationMethod = Optional.empty();
+ 
+   ComponentImplementation(
+       ComponentDescriptor componentDescriptor,
+@@ -240,6 +248,42 @@ boolean isAbstract() {
+     return constructorParameters;
+   }
+ 
++  /**
++   * Returns the {@link #configureInitializationMethod()} of the nearest supertype that defines one,
++   * if any.
++   *
++   * <p>Only returns a present value in {@link CompilerOptions#aheadOfTimeSubcomponents()}.
++   */
++  Optional<MethodSpec> superConfigureInitializationMethod() {
++    for (Optional<ComponentImplementation> currentSuper = superclassImplementation;
++        currentSuper.isPresent();
++        currentSuper = currentSuper.get().superclassImplementation) {
++      if (currentSuper.get().configureInitializationMethod.isPresent()) {
++        return currentSuper.get().configureInitializationMethod;
++      }
++    }
++    return Optional.empty();
++  }
++
++  /**
++   * Returns the {@link MethodSpecKind#CONFIGURE_INITIALIZATION_METHOD} of this implementation if
++   * there is one.
++   *
++   * <p>Only returns a present value in {@link CompilerOptions#aheadOfTimeSubcomponents()}.
++   */
++  Optional<MethodSpec> configureInitializationMethod() {
++    return configureInitializationMethod;
++  }
++
++  /**
++   * Set's this component implementation's {@code configureInitialization()} method and {@linkplain
++   * #addMethod(MethodSpecKind, MethodSpec) adds the method}.
++   */
++  void setConfigureInitializationMethod(MethodSpec method) {
++    configureInitializationMethod = Optional.of(method);
++    addMethod(MethodSpecKind.CONFIGURE_INITIALIZATION_METHOD, method);
++  }
++
+   /**
+    * Returns the name of the builder class for this component. It will be a sibling of this
+    * generated class unless this is a top-level component, in which case it will be nested.
+diff --git a/java/dagger/internal/codegen/ComponentImplementationFactory.java b/java/dagger/internal/codegen/ComponentImplementationFactory.java
+index d5cd976cf..af7acf5dc 100644
+--- a/java/dagger/internal/codegen/ComponentImplementationFactory.java
++++ b/java/dagger/internal/codegen/ComponentImplementationFactory.java
+@@ -23,6 +23,7 @@
+ import static com.squareup.javapoet.MethodSpec.methodBuilder;
+ import static dagger.internal.codegen.AnnotationSpecs.Suppression.UNCHECKED;
+ import static dagger.internal.codegen.BindingRequest.bindingRequest;
++import static dagger.internal.codegen.CodeBlocks.parameterNames;
+ import static dagger.internal.codegen.CodeBlocks.toParametersCodeBlock;
+ import static dagger.internal.codegen.ComponentGenerator.componentName;
+ import static dagger.internal.codegen.ComponentImplementation.MethodSpecKind.BUILDER_METHOD;
+@@ -289,7 +290,7 @@ final void addCancellationListenerImplementation() {
+         for (List<CodeBlock> partition : partitions) {
+           String methodName = componentImplementation.getUniqueMethodName("cancelProducers");
+           MethodSpec method =
+-              MethodSpec.methodBuilder(methodName)
++              methodBuilder(methodName)
+                   .addModifiers(PRIVATE)
+                   .addParameter(boolean.class, MAY_INTERRUPT_IF_RUNNING)
+                   .addCode(CodeBlocks.concat(partition))
+@@ -439,15 +440,30 @@ final void addConstructor() {
+                   constructor.addStatement(
+                       CodeBlock.of(
+                           "super($L)",
+-                          superclassImplementation.constructorParameters().stream()
+-                              .map(param -> CodeBlock.of("$N", param))
+-                              .collect(toParametersCodeBlock()))));
++                          parameterNames(superclassImplementation.constructorParameters()))));
++
++      Optional<MethodSpec.Builder> configureInitialization =
++          partitions.isEmpty() || !componentImplementation.isAbstract()
++              ? Optional.empty()
++              : Optional.of(configureInitializationMethodBuilder(constructorParameters));
++
++      if (componentImplementation.superConfigureInitializationMethod().isPresent()) {
++        MethodSpec superConfigureInitializationMethod =
++            componentImplementation.superConfigureInitializationMethod().get();
++        CodeBlock superInvocation =
++            CodeBlock.of(
++                "$N($L)",
++                superConfigureInitializationMethod,
++                parameterNames(superConfigureInitializationMethod.parameters));
++        if (configureInitialization.isPresent()) {
++          configureInitialization.get().addStatement("super.$L", superInvocation);
++        } else if (!componentImplementation.isAbstract()) {
++          constructor.addStatement(superInvocation);
++        }
++      }
+ 
+       ImmutableList<ParameterSpec> initializeParameters = initializeParameters();
+-      CodeBlock initializeParametersCodeBlock =
+-          constructorParameters.stream()
+-              .map(param -> CodeBlock.of("$N", param))
+-              .collect(toParametersCodeBlock());
++      CodeBlock initializeParametersCodeBlock = parameterNames(constructorParameters);
+ 
+       for (List<CodeBlock> partition : partitions) {
+         String methodName = componentImplementation.getUniqueMethodName("initialize");
+@@ -461,10 +477,47 @@ final void addConstructor() {
+                 .addAnnotation(AnnotationSpecs.suppressWarnings(UNCHECKED))
+                 .addCode(CodeBlocks.concat(partition));
+         initializeMethod.addParameters(initializeParameters);
+-        constructor.addStatement("$L($L)", methodName, initializeParametersCodeBlock);
++        configureInitialization
++            .orElse(constructor)
++            .addStatement("$L($L)", methodName, initializeParametersCodeBlock);
+         componentImplementation.addMethod(INITIALIZE_METHOD, initializeMethod.build());
+       }
+       componentImplementation.addMethod(CONSTRUCTOR, constructor.build());
++      configureInitialization.ifPresent(
++          method -> componentImplementation.setConfigureInitializationMethod(method.build()));
++    }
++
++    /**
++     * Returns a {@link MethodSpec.Builder} for the {@link
++     * ComponentImplementation#configureInitializationMethod()}.
++     */
++    private MethodSpec.Builder configureInitializationMethodBuilder(
++        ImmutableList<ParameterSpec> initializationMethodParameters) {
++      String methodName = componentImplementation.getUniqueMethodName("configureInitialization");
++      MethodSpec.Builder configureInitialization =
++          methodBuilder(methodName)
++              .addModifiers(PROTECTED)
++              .addParameters(initializationMethodParameters);
++
++      // Checks all super configureInitialization() methods to see if they have the same signature
++      // as this one, and if so, adds as an @Override annotation
++      for (Optional<ComponentImplementation> currentSuperImplementation =
++              componentImplementation.superclassImplementation();
++          currentSuperImplementation.isPresent();
++          currentSuperImplementation =
++              currentSuperImplementation.get().superclassImplementation()) {
++        Optional<MethodSpec> superConfigureInitializationMethod =
++            currentSuperImplementation.get().configureInitializationMethod();
++        if (superConfigureInitializationMethod
++            .filter(superMethod -> superMethod.name.equals(methodName))
++            .filter(superMethod -> superMethod.parameters.equals(initializationMethodParameters))
++            .isPresent()) {
++          configureInitialization.addAnnotation(Override.class);
++          break;
++        }
++      }
++
++      return configureInitialization;
+     }
+ 
+     /** Returns the list of {@link ParameterSpec}s for the initialize methods. */
+diff --git a/java/dagger/internal/codegen/FrameworkFieldInitializer.java b/java/dagger/internal/codegen/FrameworkFieldInitializer.java
+index 159d5bbc3..a95b461c2 100644
+--- a/java/dagger/internal/codegen/FrameworkFieldInitializer.java
++++ b/java/dagger/internal/codegen/FrameworkFieldInitializer.java
+@@ -26,6 +26,7 @@
+ import com.squareup.javapoet.FieldSpec;
+ import com.squareup.javapoet.TypeName;
+ import dagger.internal.DelegateFactory;
++import dagger.producers.internal.DelegateProducer;
+ import java.util.Optional;
+ 
+ /**
+@@ -106,7 +107,22 @@ private void initializeField() {
+         CodeBlock fieldInitialization = frameworkInstanceCreationExpression.creationExpression();
+         CodeBlock initCode = CodeBlock.of("this.$N = $L;", getOrCreateField(), fieldInitialization);
+ 
+-        if (fieldInitializationState == InitializationState.DELEGATED) {
++        if (isReplacingSuperclassFrameworkInstance()) {
++          // TODO(ronshapiro): can we have DELEGATED share this branch? If we allow the FieldSpec
++          // to be modified in the ComponentImplementation, we can give it the same initializer to a
++          // delegate factory
++          CodeBlock delegateFactoryVariable = CodeBlock.of("$NDelegate", fieldSpec);
++          // TODO(ronshapiro): Use a type parameter here. Or even better, can a static method that
++          // accepts the delegate factory and the delegated instance infer the type parameters?
++          // And then we also don't need a cast.
++          codeBuilder
++              .add("$1T $2L = ($1T) $3N;", delegateType(), delegateFactoryVariable, fieldSpec)
++              .add(
++                  "$L.$N($L);",
++                  delegateFactoryVariable,
++                  setDelegateMethodName(),
++                  fieldInitialization);
++        } else if (fieldInitializationState == InitializationState.DELEGATED) {
+           // If we were recursively invoked, set the delegate factory as part of our initialization
+           CodeBlock delegateFactoryVariable = CodeBlock.of("$NDelegate", fieldSpec);
+           codeBuilder
+@@ -152,13 +168,16 @@ private FieldSpec getOrCreateField() {
+             resolvedBindings, frameworkInstanceCreationExpression.alternativeFrameworkClass());
+ 
+     TypeName fieldType;
+-    if (!fieldInitializationState.equals(InitializationState.DELEGATED)
++    boolean rawTypeUsed = false;
++    if (!isReplacingSuperclassFrameworkInstance()
++        && !fieldInitializationState.equals(InitializationState.DELEGATED)
+         && specificType().isPresent()) {
+       // For some larger components, this causes javac to compile much faster by getting the
+       // field type to exactly match the type of the expression being assigned to it.
+       fieldType = specificType().get();
+     } else if (useRawType) {
+       fieldType = contributionBindingField.type().rawType;
++      rawTypeUsed = true;
+     } else {
+       fieldType = contributionBindingField.type();
+     }
+@@ -167,15 +186,58 @@ private FieldSpec getOrCreateField() {
+         FieldSpec.builder(
+             fieldType, componentImplementation.getUniqueFieldName(contributionBindingField.name()));
+     contributionField.addModifiers(PRIVATE);
+-    if (useRawType && !specificType().isPresent()) {
++    if (rawTypeUsed) {
+       contributionField.addAnnotation(AnnotationSpecs.suppressWarnings(RAWTYPES));
+     }
++
++    if (isReplacingSuperclassFrameworkInstance()) {
++      // If a binding is modified in a subclass, the framework instance will be replaced in the
++      // subclass implementation. The superclass framework instance initialization will run first,
++      // however, and may refer to the modifiable binding method returning this type's modified
++      // framework instance before it is initialized, so we use a delegate factory as a placeholder
++      // until it has properly been initialized.
++      contributionField.initializer("new $T<>()", delegateType());
++    }
++
+     fieldSpec = contributionField.build();
+     componentImplementation.addField(FRAMEWORK_FIELD, fieldSpec);
+ 
+     return fieldSpec;
+   }
+ 
++  /**
++   * Returns true if this framework field is replacing a superclass's implementation of the
++   * framework field.
++   */
++  private boolean isReplacingSuperclassFrameworkInstance() {
++    return componentImplementation
++        .superclassImplementation()
++        .flatMap(
++            superclassImplementation ->
++                // TODO(b/117833324): can we constrain this further?
++                superclassImplementation.getModifiableBindingMethod(
++                    BindingRequest.bindingRequest(
++                        resolvedBindings.key(),
++                        FrameworkType.forBindingType(resolvedBindings.bindingType()))))
++        .isPresent();
++  }
++
++  private Class<?> delegateType() {
++    return isProvider() ? DelegateFactory.class : DelegateProducer.class;
++  }
++
++  private String setDelegateMethodName() {
++    return isProvider() ? "setDelegatedProvider" : "setDelegatedProducer";
++  }
++
++  private boolean isProvider() {
++    return resolvedBindings.bindingType().equals(BindingType.PROVISION)
++        && frameworkInstanceCreationExpression
++            .alternativeFrameworkClass()
++            .map(TypeNames.PROVIDER::equals)
++            .orElse(true);
++  }
++
+   /** Returns the type of the instance when it is a specific factory type. */
+   @Override
+   public Optional<TypeName> specificType() {
+diff --git a/java/dagger/internal/codegen/SetFactoryCreationExpression.java b/java/dagger/internal/codegen/SetFactoryCreationExpression.java
+index 5eb3d4005..d69f4a29b 100644
+--- a/java/dagger/internal/codegen/SetFactoryCreationExpression.java
++++ b/java/dagger/internal/codegen/SetFactoryCreationExpression.java
+@@ -62,7 +62,9 @@ public CodeBlock creationExpression() {
+     Optional<CodeBlock> superContributions = superContributions();
+     if (superContributions.isPresent()) {
+       // TODO(b/117833324): consider decomposing the Provider<Set<Provider>> and adding the
+-      // individual contributions separately from the collection contributions
++      // individual contributions separately from the collection contributions. Though this may
++      // actually not be doable/desirable if the super provider instance is a DelegateFactory or
++      // another internal type that is not SetFactory
+       builderMethodCalls.add(".addCollection$N($L)", methodNameSuffix, superContributions.get());
+       setProviders++;
+     }
+diff --git a/java/dagger/producers/internal/DelegateProducer.java b/java/dagger/producers/internal/DelegateProducer.java
+new file mode 100644
+index 000000000..896c3669a
+--- /dev/null
++++ b/java/dagger/producers/internal/DelegateProducer.java
+@@ -0,0 +1,88 @@
++/*
++ * Copyright (C) 2018 The Dagger Authors.
++ *
++ * Licensed under the Apache License, Version 2.0 (the "License");
++ * you may not use this file except in compliance with the License.
++ * You may obtain a copy of the License at
++ *
++ * http://www.apache.org/licenses/LICENSE-2.0
++ *
++ * Unless required by applicable law or agreed to in writing, software
++ * distributed under the License is distributed on an "AS IS" BASIS,
++ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++ * See the License for the specific language governing permissions and
++ * limitations under the License.
++ */
++
++package dagger.producers.internal;
++
++import com.google.common.util.concurrent.ListenableFuture;
++import dagger.internal.DoubleCheck;
++import dagger.producers.Producer;
++import javax.inject.Provider;
++
++/**
++ * A DelegateProducer that is used to stitch Producer indirection during initialization across
++ * partial subcomponent implementations.
++ */
++public final class DelegateProducer<T> implements CancellableProducer<T> {
++  private CancellableProducer<T> delegate;
++
++  @Override
++  public ListenableFuture<T> get() {
++    return delegate.get();
++  }
++
++  public void setDelegatedProducer(Producer<T> delegate) {
++    if (delegate == null) {
++      throw new IllegalArgumentException();
++    }
++    if (this.delegate != null) {
++      throw new IllegalStateException();
++    }
++    this.delegate = (CancellableProducer<T>) (CancellableProducer) delegate;
++  }
++
++  @Override
++  public void cancel(boolean mayInterruptIfRunning) {
++    delegate.cancel(mayInterruptIfRunning);
++  }
++
++  @Override
++  public Producer<T> newDependencyView() {
++    return new ProducerView<T>() {
++      @Override
++      Producer<T> createDelegate() {
++        return delegate.newDependencyView();
++      }
++    };
++  }
++
++  @Override
++  public Producer<T> newEntryPointView(final CancellationListener cancellationListener) {
++    return new ProducerView<T>() {
++      @Override
++      Producer<T> createDelegate() {
++        return delegate.newEntryPointView(cancellationListener);
++      }
++    };
++  }
++
++  private abstract static class ProducerView<T> implements Producer<T> {
++    private final Provider<Producer<T>> delegate =
++        DoubleCheck.provider(
++            new Provider<Producer<T>>() {
++              @Override
++              public Producer<T> get() {
++                return createDelegate();
++              }
++            });
++
++    abstract Producer<T> createDelegate();
++
++    @Override
++    public ListenableFuture<T> get() {
++      return delegate.get().get();
++    }
++  }
++}
+diff --git a/javatests/dagger/functional/aot/ModifiedFrameworkInstancesTest.java b/javatests/dagger/functional/aot/ModifiedFrameworkInstancesTest.java
+new file mode 100644
+index 000000000..7084f83af
+--- /dev/null
++++ b/javatests/dagger/functional/aot/ModifiedFrameworkInstancesTest.java
+@@ -0,0 +1,78 @@
++/*
++ * Copyright (C) 2018 The Dagger Authors.
++ *
++ * Licensed under the Apache License, Version 2.0 (the "License");
++ * you may not use this file except in compliance with the License.
++ * You may obtain a copy of the License at
++ *
++ * http://www.apache.org/licenses/LICENSE-2.0
++ *
++ * Unless required by applicable law or agreed to in writing, software
++ * distributed under the License is distributed on an "AS IS" BASIS,
++ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++ * See the License for the specific language governing permissions and
++ * limitations under the License.
++ */
++
++package dagger.functional.aot;
++
++import dagger.Component;
++import dagger.Module;
++import dagger.Provides;
++import dagger.Subcomponent;
++import dagger.multibindings.IntoSet;
++import java.util.Set;
++import javax.inject.Inject;
++import javax.inject.Provider;
++import org.junit.Test;
++import org.junit.runner.RunWith;
++import org.junit.runners.JUnit4;
++
++@RunWith(JUnit4.class)
++public final class ModifiedFrameworkInstancesTest {
++  static class DependsOnModifiableBinding {
++    @Inject
++    DependsOnModifiableBinding(Set<Integer> modifiableDependency) {}
++  }
++
++  @Module
++  interface ChildModule {
++    @Provides
++    @IntoSet
++    static int contribution() {
++      return 1;
++    }
++  }
++
++  @Subcomponent(modules = ChildModule.class)
++  interface Child {
++    Provider<DependsOnModifiableBinding> frameworkInstanceWithModifiedDependency();
++  }
++
++  @Module
++  interface ParentModule {
++    @Provides
++    @IntoSet
++    static int contribution() {
++      return 2;
++    }
++  }
++
++  @Component(modules = ParentModule.class)
++  interface Parent {
++    Child child();
++  }
++
++  @Test
++  public void dependsOnModifiedFrameworkInstance() {
++    DaggerModifiedFrameworkInstancesTest_Parent.create()
++        .child()
++        .frameworkInstanceWithModifiedDependency()
++        // Ensure that modified framework instances that are dependencies to other framework 
++        // instances from superclass implementations are initialized correctly. This fixes a
++        // regression where a null instance would be passed to the superclass initialization, and
++        // then a NullPointerException would be thrown when the factory attempted to satisfy the
++        // dependency in get(). If get() succeeds, this test should pass.
++        .get();
++  }
++}
+diff --git a/javatests/dagger/functional/producers/BUILD b/javatests/dagger/functional/producers/BUILD
+index a2c8dec65..3be99c262 100644
+--- a/javatests/dagger/functional/producers/BUILD
++++ b/javatests/dagger/functional/producers/BUILD
+@@ -43,16 +43,7 @@ GenJavaTests(
+ 
+ GenJavaTests(
+     name = "producers-functional-tests-with-aot",
+-    srcs = glob(
+-        ["**/*.java"],
+-        # TODO(b/72748365): Remove these exclusions
+-        exclude = [
+-            "subcomponent/*.java",
+-            "subcomponent/pruning/ProductionSubcomponentOnlyRequestedBySiblingTest.java",
+-            "cancellation/ProducerSubcomponentCancellationTest.java",
+-            "cancellation/CancellationPolicyTest.java",
+-        ],
+-    ),
++    srcs = glob(["**/*.java"]),
+     javacopts = SOURCE_7_TARGET_7 + DOCLINT_HTML_AND_SYNTAX + DOCLINT_REFERENCES,
+     with_aot = True,
+     deps = [
+diff --git a/javatests/dagger/internal/codegen/AheadOfTimeSubcomponentsTest.java b/javatests/dagger/internal/codegen/AheadOfTimeSubcomponentsTest.java
+index dd2628224..467fec178 100644
+--- a/javatests/dagger/internal/codegen/AheadOfTimeSubcomponentsTest.java
++++ b/javatests/dagger/internal/codegen/AheadOfTimeSubcomponentsTest.java
+@@ -387,7 +387,9 @@ public void moduleInstanceDependency() {
+             "public abstract class DaggerLeaf implements Leaf {",
+             "  private TestModule testModule;",
+             "",
+-            "  protected DaggerLeaf() {",
++            "  protected DaggerLeaf() {}",
++            "",
++            "  protected void configureInitialization() {",
+             "    initialize();",
+             "  }",
+             "",
+@@ -497,6 +499,7 @@ public void moduleInstanceDependency() {
+             "",
+             "      private LeafImpl() {",
+             "        super();",
++            "        configureInitialization();",
+             "        initialize();",
+             "      }",
+             "",
+@@ -558,7 +561,9 @@ public void moduleInstanceDependency_withModuleParams() {
+             "public abstract class DaggerLeaf implements Leaf {",
+             "  private TestModule testModule;",
+             "",
+-            "  protected DaggerLeaf() {",
++            "  protected DaggerLeaf() {}",
++            "",
++            "  protected void configureInitialization() {",
+             "    initialize();",
+             "  }",
+             "",
+@@ -670,6 +675,7 @@ public void moduleInstanceDependency_withModuleParams() {
+             "",
+             "      private LeafImpl(TestModule module) {",
+             "        super();",
++            "        configureInitialization();",
+             "        initialize(module);",
+             "      }",
+             "",
+@@ -2202,6 +2208,9 @@ public void setMultibinding_requestedAsInstanceInLeaf_requestedAsFrameworkInstan
+             "",
+             "    protected LeafImpl() { ",
+             "      super();",
++            "    }",
++            "",
++            "    protected void configureInitialization() { ",
+             "      initialize();",
+             "    }",
+             "",
+@@ -2285,7 +2294,9 @@ public void setMultibindings_contributionsInLeafAndAncestor_frameworkInstances()
+             "public abstract class DaggerLeaf implements Leaf {",
+             "  private Provider<Set<InEachSubcomponent>> setOfInEachSubcomponentProvider;",
+             "",
+-            "  protected DaggerLeaf() {",
++            "  protected DaggerLeaf() {}",
++            "",
++            "  protected void configureInitialization() {",
+             "    initialize();",
+             "  }",
+             "",
+@@ -2344,6 +2355,7 @@ public void setMultibindings_contributionsInLeafAndAncestor_frameworkInstances()
+             "test.DaggerAncestor",
+             "package test;",
+             "",
++            "import dagger.internal.DelegateFactory;",
+             "import dagger.internal.SetFactory;",
+             "import java.util.Set;",
+             IMPORT_GENERATED_ANNOTATION,
+@@ -2354,20 +2366,29 @@ public void setMultibindings_contributionsInLeafAndAncestor_frameworkInstances()
+             "  protected DaggerAncestor() {}",
+             "",
+             "  public abstract class LeafImpl extends DaggerLeaf {",
+-            "    private Provider<Set<InEachSubcomponent>> setOfInEachSubcomponentProvider;",
++            "    private Provider<Set<InEachSubcomponent>> setOfInEachSubcomponentProvider = ",
++            "        new DelegateFactory<>();",
+             "",
+             "    protected LeafImpl() {",
+             "      super();",
++            "    }",
++            "",
++            "    @Override",
++            "    protected void configureInitialization() {",
++            "      super.configureInitialization();",
+             "      initialize();",
+             "    }",
+             "",
+             "    @SuppressWarnings(\"unchecked\")",
+             "    private void initialize() {",
+-            "    this.setOfInEachSubcomponentProvider =",
+-            "        SetFactory.<InEachSubcomponent>builder(0, 2)",
+-            "            .addCollectionProvider(super.contributionsInEachSubcomponent())",
+-            "            .addCollectionProvider(AncestorModule_ProvideInAncestorFactory.create())",
+-            "            .build();",
++            "      DelegateFactory setOfInEachSubcomponentProviderDelegate =",
++            "          (DelegateFactory) setOfInEachSubcomponentProvider;",
++            "      setOfInEachSubcomponentProviderDelegate.setDelegatedProvider(",
++            "          SetFactory.<InEachSubcomponent>builder(0, 2)",
++            "              .addCollectionProvider(super.contributionsInEachSubcomponent())",
++            "              .addCollectionProvider(",
++            "                  AncestorModule_ProvideInAncestorFactory.create())",
++            "              .build());",
+             "    }",
+             "",
+             "    @Override",
+@@ -2713,7 +2734,9 @@ public void mapMultibindings_contributionsInLeafAndAncestor_frameworkInstance()
+             "  private Provider<Map<String, InEachSubcomponent>> ",
+             "    mapOfStringAndInEachSubcomponentProvider;",
+             "",
+-            "  protected DaggerLeaf() {",
++            "  protected DaggerLeaf() {}",
++            "",
++            "  protected void configureInitialization() {",
+             "    initialize();",
+             "  }",
+             "",
+@@ -2772,6 +2795,7 @@ public void mapMultibindings_contributionsInLeafAndAncestor_frameworkInstance()
+             "test.DaggerAncestor",
+             "package test;",
+             "",
++            "import dagger.internal.DelegateFactory;",
+             "import dagger.internal.MapFactory;",
+             "import java.util.Map;",
+             IMPORT_GENERATED_ANNOTATION,
+@@ -2783,21 +2807,29 @@ public void mapMultibindings_contributionsInLeafAndAncestor_frameworkInstance()
+             "",
+             "  public abstract class LeafImpl extends DaggerLeaf {",
+             "    private Provider<Map<String, InEachSubcomponent>> ",
+-            "      mapOfStringAndInEachSubcomponentProvider;",
++            "      mapOfStringAndInEachSubcomponentProvider = new DelegateFactory<>();",
+             "",
+             "    protected LeafImpl() { ",
+             "      super();",
++            "    }",
++            "",
++            "    @Override",
++            "    protected void configureInitialization() { ",
++            "      super.configureInitialization();",
+             "      initialize();",
+             "    }",
+             "",
+             "    @SuppressWarnings(\"unchecked\")",
+             "    private void initialize() { ",
+-            "      this.mapOfStringAndInEachSubcomponentProvider =",
++            "      DelegateFactory mapOfStringAndInEachSubcomponentProviderDelegate =",
++            "          (DelegateFactory) mapOfStringAndInEachSubcomponentProvider;",
++            "      mapOfStringAndInEachSubcomponentProviderDelegate.setDelegatedProvider(",
+             "          MapFactory.<String, InEachSubcomponent>builder(2)",
+             "              .putAll(super.contributionsInEachSubcomponent())",
+-            "              .put(\"ancestormodule\",",
++            "              .put(",
++            "                  \"ancestormodule\",",
+             "                  AncestorModule_ProvideInAncestorFactory.create())",
+-            "              .build();",
++            "              .build());",
+             "    }",
+             "",
+             "    @Override",
+@@ -3214,6 +3246,9 @@ public void mapMultibinding_requestedAsInstanceInLeaf_requestedAsFrameworkInstan
+             "",
+             "    protected LeafImpl() { ",
+             "      super();",
++            "    }",
++            "",
++            "    protected void configureInitialization() { ",
+             "      initialize();",
+             "    }",
+             "",
+@@ -3442,6 +3477,7 @@ public void emptyMultibinds_set_frameworkInstance() {
+             "test.DaggerAncestor",
+             "package test;",
+             "",
++            "import dagger.internal.DelegateFactory;",
+             "import dagger.internal.SetFactory;",
+             "import java.util.Set;",
+             IMPORT_GENERATED_ANNOTATION,
+@@ -3452,19 +3488,25 @@ public void emptyMultibinds_set_frameworkInstance() {
+             "  protected DaggerAncestor() {}",
+             "",
+             "  public abstract class LeafImpl extends DaggerLeaf {",
+-            "    private Provider<Set<Multibound>> setOfMultiboundProvider;",
++            "    private Provider<Set<Multibound>> setOfMultiboundProvider =",
++            "        new DelegateFactory<>();",
+             "",
+             "    protected LeafImpl() {",
+             "      super();",
++            "    }",
++            "",
++            "    protected void configureInitialization() {",
+             "      initialize();",
+             "    }",
+             "",
+             "    @SuppressWarnings(\"unchecked\")",
+             "    private void initialize() {",
+-            "      this.setOfMultiboundProvider =",
++            "      DelegateFactory setOfMultiboundProviderDelegate = ",
++            "          (DelegateFactory) setOfMultiboundProvider;",
++            "      setOfMultiboundProviderDelegate.setDelegatedProvider(",
+             "          SetFactory.<Multibound>builder(1, 0)",
+             "              .addProvider(AncestorModule_FromAncestorFactory.create())",
+-            "              .build();",
++            "              .build());",
+             "    }",
+             "",
+             "    @Override",
+@@ -3681,6 +3723,7 @@ public void emptyMultibinds_map_frameworkInstance() {
+             "test.DaggerAncestor",
+             "package test;",
+             "",
++            "import dagger.internal.DelegateFactory;",
+             "import dagger.internal.MapFactory;",
+             "import java.util.Map;",
+             IMPORT_GENERATED_ANNOTATION,
+@@ -3691,19 +3734,25 @@ public void emptyMultibinds_map_frameworkInstance() {
+             "  protected DaggerAncestor() {}",
+             "",
+             "  public abstract class LeafImpl extends DaggerLeaf {",
+-            "    private Provider<Map<Integer, Multibound>> mapOfIntegerAndMultiboundProvider;",
++            "    private Provider<Map<Integer, Multibound>> mapOfIntegerAndMultiboundProvider =",
++            "        new DelegateFactory<>()",
+             "",
+             "    protected LeafImpl() {",
+             "      super();",
++            "    }",
++            "",
++            "    protected void configureInitialization() {",
+             "      initialize();",
+             "    }",
+             "",
+             "    @SuppressWarnings(\"unchecked\")",
+             "    private void initialize() {",
+-            "      this.mapOfIntegerAndMultiboundProvider =",
++            "      DelegateFactory mapOfIntegerAndMultiboundProviderDelegate =",
++            "          (DelegateFactory) mapOfIntegerAndMultiboundProvider;",
++            "      mapOfIntegerAndMultiboundProviderDelegate.setDelegatedProvider(",
+             "          MapFactory.<Integer, Multibound>builder(1)",
+             "              .put(111, AncestorModule_FromAncestorFactory.create())",
+-            "              .build();",
++            "              .build());",
+             "    }",
+             "",
+             "    @Override",
+@@ -4280,7 +4329,11 @@ public void productionSubcomponentAndModifiableFrameworkInstance() {
+             "",
+             "  private Producer<Set<Response>> setOfResponseProducer;",
+             "",
+-            "  protected DaggerLeaf(Builder builder) {",
++            // TODO(b/72748365): Do configureInitialization methods render constructor parameters
++            // for AOT superimplementations useless?
++            "  protected DaggerLeaf(Builder builder) {}",
++            "",
++            "  protected void configureInitialization(Builder builder) {",
+             "    initialize(builder);",
+             "  }",
+             "",
+@@ -4292,8 +4345,6 @@ public void productionSubcomponentAndModifiableFrameworkInstance() {
+             "            getProductionComponentMonitorProvider(),",
+             "            getResponseDependencyProducer());",
+             "    this.setOfResponseProducer =",
+-            // TODO(b/72748365): This initialization should be encapsulated in a method to be
+-            // modified.
+             "        SetProducer.<Response>builder(1, 0)",
+             "            .addProducer(responseProducer).build();",
+             "    this.responsesEntryPoint =",
+@@ -4408,6 +4459,7 @@ public void productionSubcomponentAndModifiableFrameworkInstance() {
+             "import dagger.internal.SetFactory;",
+             "import dagger.producers.Producer;",
+             "import dagger.producers.internal.CancellationListener;",
++            "import dagger.producers.internal.DelegateProducer;",
+             "import dagger.producers.internal.Producers;",
+             "import dagger.producers.internal.SetProducer;",
+             "import dagger.producers.monitoring.ProductionComponentMonitor;",
+@@ -4515,16 +4567,19 @@ public void productionSubcomponentAndModifiableFrameworkInstance() {
+             "  }",
+             "",
+             "  public final class LeafImpl extends DaggerLeaf implements CancellationListener {",
+-            "    private Producer<Set<Response>> setOfResponseProducer;",
++            "    private Producer<Set<Response>> setOfResponseProducer = new DelegateProducer<>();",
+             "",
+             "    private LeafImpl(LeafBuilder builder) {",
+             "      super(builder);",
++            "      configureInitialization(builder);",
+             "      initialize(builder);",
+             "    }",
+             "",
+             "    @SuppressWarnings(\"unchecked\")",
+             "    private void initialize(final LeafBuilder builder) {",
+-            "      this.setOfResponseProducer =",
++            "      DelegateProducer setOfResponseProducerDelegate = ",
++            "          (DelegateProducer) setOfResponseProducer;",
++            "      setOfResponseProducerDelegate.setDelegatedProducer(",
+             "          SetProducer.<Response>builder(1, 1)",
+             "              .addCollectionProducer(super.getSetOfResponseProducer())",
+             "              .addProducer(DaggerRoot.this.responseProducer)",
+@@ -4726,7 +4781,9 @@ public void missingBindingAccessInLeafAndAncestor() {
+             "public abstract class DaggerLeaf implements Leaf {",
+             "  private LeafModule_TestFactory testProvider;",
+             "",
+-            "  protected DaggerLeaf() {",
++            "  protected DaggerLeaf() {}",
++            "",
++            "  protected void configureInitialization() {",
+             "    initialize();",
+             "  }",
+             "",
+@@ -4797,10 +4854,11 @@ public void missingBindingAccessInLeafAndAncestor() {
+             "}"));
+     JavaFileObject generatedAncestor =
+         JavaFileObjects.forSourceLines(
+-            "test.DaggerLeaf",
++            "test.DaggerAncestor",
+             "package test;",
+             "",
+             "import com.google.common.collect.ImmutableSet;",
++            "import dagger.internal.DelegateFactory;",
+             "import dagger.internal.SetFactory;",
+             "import java.util.Set;",
+             IMPORT_GENERATED_ANNOTATION,
+@@ -4815,10 +4873,17 @@ public void missingBindingAccessInLeafAndAncestor() {
+             "",
+             "    private Provider<Set<Object>> setOfObjectProvider;",
+             "",
+-            "    private AncestorModule_ProvidedInAncestorFactory providedInAncestorProvider;",
++            "    private Provider<ProvidedInAncestor_InducesSetBinding> ",
++            "        providedInAncestorProvider = ",
++            "            new DelegateFactory<>();",
+             "",
+             "    protected LeafImpl() {",
+             "      super();",
++            "    }",
++            "",
++            "    @Override",
++            "    protected void configureInitialization() {",
++            "      super.configureInitialization();",
+             "      initialize();",
+             "    }",
+             "",
+@@ -4836,8 +4901,11 @@ public void missingBindingAccessInLeafAndAncestor() {
+             "              .addProvider(AncestorModule_SetContributionFactory.create())",
+             "              .addProvider(unresolvedSetBindingProvider)",
+             "              .build();",
+-            "      this.providedInAncestorProvider =",
+-            "          AncestorModule_ProvidedInAncestorFactory.create(getSetOfObjectProvider());",
++            "      DelegateFactory providedInAncestorProviderDelegate =",
++            "          (DelegateFactory) providedInAncestorProvider;",
++            "      providedInAncestorProviderDelegate.setDelegatedProvider(",
++            "          AncestorModule_ProvidedInAncestorFactory.create(getSetOfObjectProvider()));",
++
+             "    }",
+             "",
+             "    public Set<Object> getSetOfObject() {",

@@ -1,0 +1,4296 @@
+diff --git a/okhttp-tests/src/test/java/com/squareup/okhttp/CacheTest.java b/okhttp-tests/src/test/java/com/squareup/okhttp/CacheTest.java
+index 03531184a7..f70026145e 100644
+--- a/okhttp-tests/src/test/java/com/squareup/okhttp/CacheTest.java
++++ b/okhttp-tests/src/test/java/com/squareup/okhttp/CacheTest.java
+@@ -1007,7 +1007,7 @@ private void assertNonIdentityEncodingCached(MockResponse response) throws Excep
+ 
+     assertEquals("A", get(server.url("/")).body().string());
+     assertEquals("A", get(server.url("/")).body().string());
+-    assertEquals(1, client.getConnectionPool().getConnectionCount());
++    assertEquals(1, client.getConnectionPool().getIdleConnectionCount());
+   }
+ 
+   @Test public void expiresDateBeforeModifiedDate() throws Exception {
+diff --git a/okhttp-tests/src/test/java/com/squareup/okhttp/CallTest.java b/okhttp-tests/src/test/java/com/squareup/okhttp/CallTest.java
+index 94a1ae15af..6d27939abe 100644
+--- a/okhttp-tests/src/test/java/com/squareup/okhttp/CallTest.java
++++ b/okhttp-tests/src/test/java/com/squareup/okhttp/CallTest.java
+@@ -837,25 +837,28 @@ private void postBodyRetransmittedAfterAuthorizationFail(String body) throws Exc
+   }
+ 
+   @Test public void recoverWhenRetryOnConnectionFailureIsTrue() throws Exception {
+-    server.enqueue(new MockResponse().setSocketPolicy(SocketPolicy.DISCONNECT_AT_START));
++    server.enqueue(new MockResponse().setBody("seed connection pool"));
++    server.enqueue(new MockResponse().setSocketPolicy(SocketPolicy.DISCONNECT_AFTER_REQUEST));
+     server.enqueue(new MockResponse().setBody("retry success"));
+ 
+     client.setDns(new DoubleInetAddressDns());
+     assertTrue(client.getRetryOnConnectionFailure());
+ 
+     Request request = new Request.Builder().url(server.url("/")).build();
+-    Response response = client.newCall(request).execute();
+-    assertEquals("retry success", response.body().string());
++    executeSynchronously(request).assertBody("seed connection pool");
++    executeSynchronously(request).assertBody("retry success");
+   }
+ 
+   @Test public void noRecoverWhenRetryOnConnectionFailureIsFalse() throws Exception {
+-    server.enqueue(new MockResponse().setSocketPolicy(SocketPolicy.DISCONNECT_AT_START));
++    server.enqueue(new MockResponse().setBody("seed connection pool"));
++    server.enqueue(new MockResponse().setSocketPolicy(SocketPolicy.DISCONNECT_AFTER_REQUEST));
+     server.enqueue(new MockResponse().setBody("unreachable!"));
+ 
+     client.setDns(new DoubleInetAddressDns());
+     client.setRetryOnConnectionFailure(false);
+ 
+     Request request = new Request.Builder().url(server.url("/")).build();
++    executeSynchronously(request).assertBody("seed connection pool");
+     try {
+       // If this succeeds, too many requests were made.
+       client.newCall(request).execute();
+diff --git a/okhttp-tests/src/test/java/com/squareup/okhttp/ConnectionPoolTest.java b/okhttp-tests/src/test/java/com/squareup/okhttp/ConnectionPoolTest.java
+deleted file mode 100644
+index 0bbaef1e89..0000000000
+--- a/okhttp-tests/src/test/java/com/squareup/okhttp/ConnectionPoolTest.java
++++ /dev/null
+@@ -1,585 +0,0 @@
+-/*
+- * Copyright (C) 2013 Square, Inc.
+- *
+- * Licensed under the Apache License, Version 2.0 (the "License");
+- * you may not use this file except in compliance with the License.
+- * You may obtain a copy of the License at
+- *
+- *      http://www.apache.org/licenses/LICENSE-2.0
+- *
+- * Unless required by applicable law or agreed to in writing, software
+- * distributed under the License is distributed on an "AS IS" BASIS,
+- * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+- * See the License for the specific language governing permissions and
+- * limitations under the License.
+- */
+-package com.squareup.okhttp;
+-
+-import com.squareup.okhttp.internal.Internal;
+-import com.squareup.okhttp.internal.SslContextBuilder;
+-import com.squareup.okhttp.internal.Util;
+-import com.squareup.okhttp.internal.http.AuthenticatorAdapter;
+-import com.squareup.okhttp.internal.http.RecordingProxySelector;
+-import com.squareup.okhttp.mockwebserver.MockWebServer;
+-import com.squareup.okhttp.testing.RecordingHostnameVerifier;
+-import java.io.IOException;
+-import java.net.InetAddress;
+-import java.net.InetSocketAddress;
+-import java.net.Proxy;
+-import java.util.Arrays;
+-import java.util.List;
+-import java.util.concurrent.Executor;
+-import javax.net.SocketFactory;
+-import javax.net.ssl.SSLContext;
+-import org.junit.After;
+-import org.junit.Before;
+-import org.junit.Test;
+-
+-import static org.junit.Assert.assertEquals;
+-import static org.junit.Assert.assertFalse;
+-import static org.junit.Assert.assertNotNull;
+-import static org.junit.Assert.assertNull;
+-import static org.junit.Assert.assertSame;
+-import static org.junit.Assert.assertTrue;
+-import static org.junit.Assert.fail;
+-
+-public final class ConnectionPoolTest {
+-  static {
+-    Internal.initializeInstanceForTests();
+-  }
+-
+-  private static final List<ConnectionSpec> CONNECTION_SPECS = Util.immutableList(
+-      ConnectionSpec.MODERN_TLS, ConnectionSpec.CLEARTEXT);
+-
+-  private static final int KEEP_ALIVE_DURATION_MS = 5000;
+-
+-  private SSLContext sslContext = SslContextBuilder.localhost();
+-  private MockWebServer spdyServer;
+-  private InetSocketAddress spdySocketAddress;
+-  private Address spdyAddress;
+-
+-  private MockWebServer httpServer;
+-  private Address httpAddress;
+-  private InetSocketAddress httpSocketAddress;
+-
+-  private ConnectionPool pool;
+-  private FakeExecutor cleanupExecutor;
+-  private Connection httpA;
+-  private Connection httpB;
+-  private Connection httpC;
+-  private Connection httpD;
+-  private Connection httpE;
+-  private Connection spdyA;
+-
+-  private Object owner;
+-
+-  @Before public void setUp() throws Exception {
+-    setUp(2);
+-  }
+-
+-  private void setUp(int poolSize) throws Exception {
+-    Dns dns = Dns.SYSTEM;
+-    SocketFactory socketFactory = SocketFactory.getDefault();
+-    RecordingProxySelector proxySelector = new RecordingProxySelector();
+-
+-    spdyServer = new MockWebServer();
+-    httpServer = new MockWebServer();
+-    spdyServer.useHttps(sslContext.getSocketFactory(), false);
+-
+-    httpServer.start();
+-    httpAddress = new Address(httpServer.getHostName(), httpServer.getPort(), dns, socketFactory,
+-        null, null, null, AuthenticatorAdapter.INSTANCE, null,
+-        Util.immutableList(Protocol.SPDY_3, Protocol.HTTP_1_1), CONNECTION_SPECS, proxySelector);
+-    httpSocketAddress = new InetSocketAddress(InetAddress.getByName(httpServer.getHostName()),
+-        httpServer.getPort());
+-
+-    spdyServer.start();
+-    spdyAddress = new Address(spdyServer.getHostName(), spdyServer.getPort(), dns, socketFactory,
+-        sslContext.getSocketFactory(), new RecordingHostnameVerifier(), CertificatePinner.DEFAULT,
+-        AuthenticatorAdapter.INSTANCE, null, Util.immutableList(Protocol.SPDY_3, Protocol.HTTP_1_1),
+-        CONNECTION_SPECS, proxySelector);
+-    spdySocketAddress = new InetSocketAddress(InetAddress.getByName(spdyServer.getHostName()),
+-        spdyServer.getPort());
+-
+-    Route httpRoute = new Route(httpAddress, Proxy.NO_PROXY, httpSocketAddress);
+-    Route spdyRoute = new Route(spdyAddress, Proxy.NO_PROXY, spdySocketAddress);
+-    pool = new ConnectionPool(poolSize, KEEP_ALIVE_DURATION_MS);
+-    // Disable the automatic execution of the cleanup.
+-    cleanupExecutor = new FakeExecutor();
+-    pool.replaceCleanupExecutorForTests(cleanupExecutor);
+-    httpA = new Connection(pool, httpRoute);
+-    httpA.connect(200, 200, 200, CONNECTION_SPECS, false /* connectionRetryEnabled */);
+-    httpB = new Connection(pool, httpRoute);
+-    httpB.connect(200, 200, 200, CONNECTION_SPECS, false /* connectionRetryEnabled */);
+-    httpC = new Connection(pool, httpRoute);
+-    httpC.connect(200, 200, 200, CONNECTION_SPECS, false /* connectionRetryEnabled */);
+-    httpD = new Connection(pool, httpRoute);
+-    httpD.connect(200, 200, 200, CONNECTION_SPECS, false /* connectionRetryEnabled */);
+-    httpE = new Connection(pool, httpRoute);
+-    httpE.connect(200, 200, 200, CONNECTION_SPECS, false /* connectionRetryEnabled */);
+-    spdyA = new Connection(pool, spdyRoute);
+-    spdyA.connect(20000, 20000, 2000, CONNECTION_SPECS, false /* connectionRetryEnabled */);
+-
+-    owner = new Object();
+-    httpA.setOwner(owner);
+-    httpB.setOwner(owner);
+-    httpC.setOwner(owner);
+-    httpD.setOwner(owner);
+-    httpE.setOwner(owner);
+-  }
+-
+-  @After public void tearDown() throws Exception {
+-    httpServer.shutdown();
+-    spdyServer.shutdown();
+-
+-    Util.closeQuietly(httpA.getSocket());
+-    Util.closeQuietly(httpB.getSocket());
+-    Util.closeQuietly(httpC.getSocket());
+-    Util.closeQuietly(httpD.getSocket());
+-    Util.closeQuietly(httpE.getSocket());
+-    Util.closeQuietly(spdyA.getSocket());
+-  }
+-
+-  private void resetWithPoolSize(int poolSize) throws Exception {
+-    tearDown();
+-    setUp(poolSize);
+-  }
+-
+-  @Test public void poolSingleHttpConnection() throws Exception {
+-    resetWithPoolSize(1);
+-    Connection connection = pool.get(httpAddress);
+-    assertNull(connection);
+-
+-    connection = new Connection(pool, new Route(httpAddress, Proxy.NO_PROXY, httpSocketAddress));
+-    connection.connect(200, 200, 200, CONNECTION_SPECS, false /* connectionRetryEnabled */);
+-    connection.setOwner(owner);
+-    assertEquals(0, pool.getConnectionCount());
+-
+-    pool.recycle(connection);
+-    assertNull(connection.getOwner());
+-    assertEquals(1, pool.getConnectionCount());
+-    assertEquals(1, pool.getHttpConnectionCount());
+-    assertEquals(0, pool.getMultiplexedConnectionCount());
+-
+-    Connection recycledConnection = pool.get(httpAddress);
+-    assertNull(connection.getOwner());
+-    assertEquals(connection, recycledConnection);
+-    assertTrue(recycledConnection.isAlive());
+-
+-    recycledConnection = pool.get(httpAddress);
+-    assertNull(recycledConnection);
+-  }
+-
+-  @Test public void getDoesNotScheduleCleanup() {
+-    Connection connection = pool.get(httpAddress);
+-    assertNull(connection);
+-    cleanupExecutor.assertExecutionScheduled(false);
+-  }
+-
+-  @Test public void recycleSchedulesCleanup() {
+-    cleanupExecutor.assertExecutionScheduled(false);
+-    pool.recycle(httpA);
+-    cleanupExecutor.assertExecutionScheduled(true);
+-  }
+-
+-  @Test public void shareSchedulesCleanup() {
+-    cleanupExecutor.assertExecutionScheduled(false);
+-    pool.share(spdyA);
+-    cleanupExecutor.assertExecutionScheduled(true);
+-  }
+-
+-  @Test public void poolPrefersMostRecentlyRecycled() throws Exception {
+-    pool.recycle(httpA);
+-    pool.recycle(httpB);
+-    pool.recycle(httpC);
+-    assertPooled(pool, httpC, httpB, httpA);
+-
+-    pool.performCleanup();
+-    assertPooled(pool, httpC, httpB);
+-  }
+-
+-  @Test public void getSpdyConnection() throws Exception {
+-    pool.share(spdyA);
+-    assertSame(spdyA, pool.get(spdyAddress));
+-    assertPooled(pool, spdyA);
+-  }
+-
+-  @Test public void getHttpConnection() throws Exception {
+-    pool.recycle(httpA);
+-    assertSame(httpA, pool.get(httpAddress));
+-    assertPooled(pool);
+-  }
+-
+-  @Test public void expiredConnectionNotReturned() throws Exception {
+-    pool.recycle(httpA);
+-
+-    // Allow enough time to pass so that the connection is now expired.
+-    Thread.sleep(KEEP_ALIVE_DURATION_MS * 2);
+-
+-    // The connection is held, but will not be returned.
+-    assertNull(pool.get(httpAddress));
+-    assertPooled(pool, httpA);
+-
+-    // The connection must be cleaned up.
+-    pool.performCleanup();
+-    assertPooled(pool);
+-  }
+-
+-  @Test public void maxIdleConnectionLimitIsEnforced() throws Exception {
+-    pool.recycle(httpA);
+-    pool.recycle(httpB);
+-    pool.recycle(httpC);
+-    pool.recycle(httpD);
+-    assertPooled(pool, httpD, httpC, httpB, httpA);
+-
+-    pool.performCleanup();
+-    assertPooled(pool, httpD, httpC);
+-  }
+-
+-  @Test public void expiredConnectionsAreEvicted() throws Exception {
+-    pool.recycle(httpA);
+-    pool.recycle(httpB);
+-
+-    // Allow enough time to pass so that the connections are now expired.
+-    Thread.sleep(2 * KEEP_ALIVE_DURATION_MS);
+-    assertPooled(pool, httpB, httpA);
+-
+-    // The connections must be cleaned up.
+-    pool.performCleanup();
+-    assertPooled(pool);
+-  }
+-
+-  @Test public void nonAliveConnectionNotReturned() throws Exception {
+-    pool.recycle(httpA);
+-
+-    // Close the connection. It is an ex-connection. It has ceased to be.
+-    httpA.getSocket().close();
+-    assertPooled(pool, httpA);
+-    assertNull(pool.get(httpAddress));
+-
+-    // The connection must be cleaned up.
+-    pool.performCleanup();
+-    assertPooled(pool);
+-  }
+-
+-  @Test public void differentAddressConnectionNotReturned() throws Exception {
+-    pool.recycle(httpA);
+-    assertNull(pool.get(spdyAddress));
+-    assertPooled(pool, httpA);
+-  }
+-
+-  @Test public void gettingSpdyConnectionPromotesItToFrontOfQueue() throws Exception {
+-    pool.share(spdyA);
+-    pool.recycle(httpA);
+-    assertPooled(pool, httpA, spdyA);
+-    assertSame(spdyA, pool.get(spdyAddress));
+-    assertPooled(pool, spdyA, httpA);
+-  }
+-
+-  @Test public void gettingConnectionReturnsOldestFirst() throws Exception {
+-    pool.recycle(httpA);
+-    pool.recycle(httpB);
+-    assertSame(httpA, pool.get(httpAddress));
+-  }
+-
+-  @Test public void recyclingNonAliveConnectionClosesThatConnection() throws Exception {
+-    httpA.getSocket().shutdownInput();
+-    pool.recycle(httpA); // Should close httpA.
+-    assertTrue(httpA.getSocket().isClosed());
+-
+-    // The pool should remain empty, and there is no need to schedule a cleanup.
+-    assertPooled(pool);
+-    cleanupExecutor.assertExecutionScheduled(false);
+-  }
+-
+-  @Test public void shareHttpConnectionFails() throws Exception {
+-    try {
+-      pool.share(httpA);
+-      fail();
+-    } catch (IllegalArgumentException expected) {
+-    }
+-    // The pool should remain empty, and there is no need to schedule a cleanup.
+-    assertPooled(pool);
+-    cleanupExecutor.assertExecutionScheduled(false);
+-  }
+-
+-  @Test public void recycleSpdyConnectionDoesNothing() throws Exception {
+-    pool.recycle(spdyA);
+-    // The pool should remain empty, and there is no need to schedule the cleanup.
+-    assertPooled(pool);
+-    cleanupExecutor.assertExecutionScheduled(false);
+-  }
+-
+-  @Test public void validateIdleSpdyConnectionTimeout() throws Exception {
+-    pool.share(spdyA);
+-    assertPooled(pool, spdyA); // Connection should be in the pool.
+-
+-    Thread.sleep((long) (KEEP_ALIVE_DURATION_MS * 0.7));
+-    pool.performCleanup();
+-    assertPooled(pool, spdyA); // Connection should still be in the pool.
+-
+-    Thread.sleep((long) (KEEP_ALIVE_DURATION_MS * 0.4));
+-    pool.performCleanup();
+-    assertPooled(pool); // Connection should have been removed.
+-  }
+-
+-  @Test public void validateIdleHttpConnectionTimeout() throws Exception {
+-    pool.recycle(httpA);
+-    assertPooled(pool, httpA); // Connection should be in the pool.
+-    cleanupExecutor.assertExecutionScheduled(true);
+-
+-    Thread.sleep((long) (KEEP_ALIVE_DURATION_MS * 0.7));
+-    pool.performCleanup();
+-    assertPooled(pool, httpA); // Connection should still be in the pool.
+-
+-    Thread.sleep((long) (KEEP_ALIVE_DURATION_MS * 0.4));
+-    pool.performCleanup();
+-    assertPooled(pool); // Connection should have been removed.
+-  }
+-
+-  @Test public void maxConnections() throws IOException, InterruptedException {
+-    // Pool should be empty.
+-    assertEquals(0, pool.getConnectionCount());
+-
+-    // http A should be added to the pool.
+-    pool.recycle(httpA);
+-    assertEquals(1, pool.getConnectionCount());
+-    assertEquals(1, pool.getHttpConnectionCount());
+-    assertEquals(0, pool.getMultiplexedConnectionCount());
+-
+-    // http B should be added to the pool.
+-    pool.recycle(httpB);
+-    assertEquals(2, pool.getConnectionCount());
+-    assertEquals(2, pool.getHttpConnectionCount());
+-    assertEquals(0, pool.getMultiplexedConnectionCount());
+-
+-    // http C should be added
+-    pool.recycle(httpC);
+-    assertEquals(3, pool.getConnectionCount());
+-    assertEquals(3, pool.getHttpConnectionCount());
+-    assertEquals(0, pool.getSpdyConnectionCount());
+-
+-    pool.performCleanup();
+-
+-    // http A should be removed by cleanup.
+-    assertEquals(2, pool.getConnectionCount());
+-    assertEquals(2, pool.getHttpConnectionCount());
+-    assertEquals(0, pool.getMultiplexedConnectionCount());
+-
+-    // spdy A should be added
+-    pool.share(spdyA);
+-    assertEquals(3, pool.getConnectionCount());
+-    assertEquals(2, pool.getHttpConnectionCount());
+-    assertEquals(1, pool.getSpdyConnectionCount());
+-
+-    pool.performCleanup();
+-
+-    // http B should be removed by cleanup.
+-    assertEquals(2, pool.getConnectionCount());
+-    assertEquals(1, pool.getHttpConnectionCount());
+-    assertEquals(1, pool.getMultiplexedConnectionCount());
+-
+-    // http C should be returned.
+-    Connection recycledHttpConnection = pool.get(httpAddress);
+-    recycledHttpConnection.setOwner(owner);
+-    assertNotNull(recycledHttpConnection);
+-    assertTrue(recycledHttpConnection.isAlive());
+-    assertEquals(1, pool.getConnectionCount());
+-    assertEquals(0, pool.getHttpConnectionCount());
+-    assertEquals(1, pool.getMultiplexedConnectionCount());
+-
+-    // spdy A will be returned but also kept in the pool.
+-    Connection sharedSpdyConnection = pool.get(spdyAddress);
+-    assertNotNull(sharedSpdyConnection);
+-    assertEquals(spdyA, sharedSpdyConnection);
+-    assertEquals(1, pool.getConnectionCount());
+-    assertEquals(0, pool.getHttpConnectionCount());
+-    assertEquals(1, pool.getMultiplexedConnectionCount());
+-
+-    // http C should be added to the pool
+-    pool.recycle(httpC);
+-    assertEquals(2, pool.getConnectionCount());
+-    assertEquals(1, pool.getHttpConnectionCount());
+-    assertEquals(1, pool.getMultiplexedConnectionCount());
+-
+-    // An http connection should be removed from the pool.
+-    recycledHttpConnection = pool.get(httpAddress);
+-    assertNotNull(recycledHttpConnection);
+-    assertTrue(recycledHttpConnection.isAlive());
+-    assertEquals(1, pool.getConnectionCount());
+-    assertEquals(0, pool.getHttpConnectionCount());
+-    assertEquals(1, pool.getMultiplexedConnectionCount());
+-
+-    // spdy A will be returned but also kept in the pool.
+-    sharedSpdyConnection = pool.get(spdyAddress);
+-    assertEquals(spdyA, sharedSpdyConnection);
+-    assertNotNull(sharedSpdyConnection);
+-    assertEquals(1, pool.getConnectionCount());
+-    assertEquals(0, pool.getHttpConnectionCount());
+-    assertEquals(1, pool.getMultiplexedConnectionCount());
+-
+-    // http D should be added to the pool.
+-    pool.recycle(httpD);
+-    assertEquals(2, pool.getConnectionCount());
+-    assertEquals(1, pool.getHttpConnectionCount());
+-    assertEquals(1, pool.getMultiplexedConnectionCount());
+-
+-    // http E should be added to the pool.
+-    pool.recycle(httpE);
+-    assertEquals(3, pool.getConnectionCount());
+-    assertEquals(2, pool.getHttpConnectionCount());
+-    assertEquals(1, pool.getSpdyConnectionCount());
+-
+-    pool.performCleanup();
+-
+-    // spdy A should be removed from the pool by cleanup.
+-    assertEquals(2, pool.getConnectionCount());
+-    assertEquals(2, pool.getHttpConnectionCount());
+-    assertEquals(0, pool.getMultiplexedConnectionCount());
+-  }
+-
+-  @Test public void connectionCleanup() throws Exception {
+-    ConnectionPool pool = new ConnectionPool(10, KEEP_ALIVE_DURATION_MS);
+-
+-    // Add 3 connections to the pool.
+-    pool.recycle(httpA);
+-    pool.recycle(httpB);
+-    pool.share(spdyA);
+-
+-    // Give the cleanup callable time to run and settle down.
+-    Thread.sleep(100);
+-
+-    // Kill http A.
+-    Util.closeQuietly(httpA.getSocket());
+-
+-    assertEquals(3, pool.getConnectionCount());
+-    assertEquals(2, pool.getHttpConnectionCount());
+-    assertEquals(1, pool.getSpdyConnectionCount());
+-
+-    // Http A should be removed.
+-    pool.performCleanup();
+-    assertPooled(pool, spdyA, httpB);
+-    assertEquals(2, pool.getConnectionCount());
+-    assertEquals(1, pool.getHttpConnectionCount());
+-    assertEquals(1, pool.getMultiplexedConnectionCount());
+-
+-    // Now let enough time pass for the connections to expire.
+-    Thread.sleep(2 * KEEP_ALIVE_DURATION_MS);
+-
+-    // All remaining connections should be removed.
+-    pool.performCleanup();
+-    assertEquals(0, pool.getConnectionCount());
+-  }
+-
+-  @Test public void maxIdleConnectionsLimitEnforced() throws Exception {
+-    ConnectionPool pool = new ConnectionPool(2, KEEP_ALIVE_DURATION_MS);
+-
+-    // Hit the max idle connections limit of 2.
+-    pool.recycle(httpA);
+-    pool.recycle(httpB);
+-    Thread.sleep(100); // Give the cleanup callable time to run.
+-    assertPooled(pool, httpB, httpA);
+-
+-    // Adding httpC bumps httpA.
+-    pool.recycle(httpC);
+-    Thread.sleep(100); // Give the cleanup callable time to run.
+-    assertPooled(pool, httpC, httpB);
+-
+-    // Adding httpD bumps httpB.
+-    pool.recycle(httpD);
+-    Thread.sleep(100); // Give the cleanup callable time to run.
+-    assertPooled(pool, httpD, httpC);
+-
+-    // Adding httpE bumps httpC.
+-    pool.recycle(httpE);
+-    Thread.sleep(100); // Give the cleanup callable time to run.
+-    assertPooled(pool, httpE, httpD);
+-  }
+-
+-  @Test public void evictAllConnections() throws Exception {
+-    resetWithPoolSize(10);
+-    pool.recycle(httpA);
+-    Util.closeQuietly(httpA.getSocket()); // Include a closed connection in the pool.
+-    pool.recycle(httpB);
+-    pool.share(spdyA);
+-    int connectionCount = pool.getConnectionCount();
+-    assertTrue(connectionCount == 2 || connectionCount == 3);
+-
+-    pool.evictAll();
+-    assertEquals(0, pool.getConnectionCount());
+-  }
+-
+-  @Test public void closeIfOwnedBy() throws Exception {
+-    httpA.closeIfOwnedBy(owner);
+-    assertFalse(httpA.isAlive());
+-    assertFalse(httpA.clearOwner());
+-  }
+-
+-  @Test public void closeIfOwnedByDoesNothingIfNotOwner() throws Exception {
+-    httpA.closeIfOwnedBy(new Object());
+-    assertTrue(httpA.isAlive());
+-    assertTrue(httpA.clearOwner());
+-  }
+-
+-  @Test public void closeIfOwnedByFailsForSpdyConnections() throws Exception {
+-    try {
+-      spdyA.closeIfOwnedBy(owner);
+-      fail();
+-    } catch (IllegalStateException expected) {
+-    }
+-  }
+-
+-  @Test public void cleanupRunnableStopsEventually() throws Exception {
+-    pool.recycle(httpA);
+-    pool.share(spdyA);
+-    assertPooled(pool, spdyA, httpA);
+-
+-    // The cleanup should terminate once the pool is empty again.
+-    cleanupExecutor.fakeExecute();
+-    assertPooled(pool);
+-
+-    cleanupExecutor.assertExecutionScheduled(false);
+-
+-    // Adding a new connection should cause the cleanup to start up again.
+-    pool.recycle(httpB);
+-
+-    cleanupExecutor.assertExecutionScheduled(true);
+-
+-    // The cleanup should terminate once the pool is empty again.
+-    cleanupExecutor.fakeExecute();
+-    assertPooled(pool);
+-  }
+-
+-  private void assertPooled(ConnectionPool pool, Connection... connections) throws Exception {
+-    assertEquals(Arrays.asList(connections), pool.getConnections());
+-  }
+-
+-  /**
+-   * An executor that does not actually execute anything by default. See
+-   * {@link #fakeExecute()}.
+-   */
+-  private static class FakeExecutor implements Executor {
+-
+-    private Runnable runnable;
+-
+-    @Override
+-    public void execute(Runnable runnable) {
+-      // This is a bonus assertion for the invariant: At no time should two runnables be scheduled.
+-      assertNull(this.runnable);
+-      this.runnable = runnable;
+-    }
+-
+-    public void assertExecutionScheduled(boolean expected) {
+-      assertEquals(expected, runnable != null);
+-    }
+-
+-    /**
+-     * Executes the runnable.
+-     */
+-    public void fakeExecute() {
+-      Runnable toRun = this.runnable;
+-      this.runnable = null;
+-      toRun.run();
+-    }
+-  }
+-}
+diff --git a/okhttp-tests/src/test/java/com/squareup/okhttp/URLConnectionTest.java b/okhttp-tests/src/test/java/com/squareup/okhttp/URLConnectionTest.java
+index 31b85a8f28..576c8b5d8e 100644
+--- a/okhttp-tests/src/test/java/com/squareup/okhttp/URLConnectionTest.java
++++ b/okhttp-tests/src/test/java/com/squareup/okhttp/URLConnectionTest.java
+@@ -1276,7 +1276,7 @@ private void testClientConfiguredGzipContentEncodingAndConnectionReuse(TransferK
+ 
+     HttpURLConnection connection = client.open(server.getUrl("/"));
+     assertContent("{}", connection);
+-    assertEquals(0, client.client().getConnectionPool().getConnectionCount());
++    assertEquals(0, client.client().getConnectionPool().getIdleConnectionCount());
+   }
+ 
+   @Test public void earlyDisconnectDoesntHarmPoolingWithChunkedEncoding() throws Exception {
+@@ -1958,7 +1958,7 @@ private void redirectToAnotherOriginServer(boolean https) throws Exception {
+ 
+     assertContent("This is the 2nd server!", client.open(server.getUrl("/a")));
+ 
+-    assertEquals(Arrays.asList(server.getUrl("/a").toURI(), server2.getUrl("/b").toURI()),
++    assertEquals(Arrays.asList(server.getUrl("/").toURI(), server2.getUrl("/").toURI()),
+         proxySelectionRequests);
+   }
+ 
+diff --git a/okhttp-tests/src/test/java/com/squareup/okhttp/internal/http/HeadersTest.java b/okhttp-tests/src/test/java/com/squareup/okhttp/internal/http/HeadersTest.java
+index e78a2c87ba..ea6e024575 100644
+--- a/okhttp-tests/src/test/java/com/squareup/okhttp/internal/http/HeadersTest.java
++++ b/okhttp-tests/src/test/java/com/squareup/okhttp/internal/http/HeadersTest.java
+@@ -41,7 +41,7 @@
+         ":status", "200 OK",
+         ":version", "HTTP/1.1");
+     Request request = new Request.Builder().url("http://square.com/").build();
+-    Response response = FramedTransport.readSpdy3HeadersList(headerBlock).request(request).build();
++    Response response = Http2xStream.readSpdy3HeadersList(headerBlock).request(request).build();
+     Headers headers = response.headers();
+     assertEquals(3, headers.size());
+     assertEquals(Protocol.SPDY_3, response.protocol());
+@@ -65,7 +65,7 @@
+         ":version", "HTTP/1.1",
+         "connection", "close");
+     Request request = new Request.Builder().url("http://square.com/").build();
+-    Response response = FramedTransport.readSpdy3HeadersList(headerBlock).request(request).build();
++    Response response = Http2xStream.readSpdy3HeadersList(headerBlock).request(request).build();
+     Headers headers = response.headers();
+     assertEquals(0, headers.size());
+   }
+@@ -76,7 +76,7 @@
+         ":version", "HTTP/1.1",
+         "connection", "close");
+     Request request = new Request.Builder().url("http://square.com/").build();
+-    Response response = FramedTransport.readHttp2HeadersList(headerBlock).request(request).build();
++    Response response = Http2xStream.readHttp2HeadersList(headerBlock).request(request).build();
+     Headers headers = response.headers();
+     assertEquals(1, headers.size());
+     assertEquals(":version", headers.name(0));
+@@ -91,7 +91,7 @@
+         .addHeader("set-cookie", "Cookie2")
+         .header(":status", "200 OK")
+         .build();
+-    List<Header> headerBlock = FramedTransport.spdy3HeadersList(request);
++    List<Header> headerBlock = Http2xStream.spdy3HeadersList(request);
+     List<Header> expected = headerEntries(
+         ":method", "GET",
+         ":path", "/",
+@@ -116,7 +116,7 @@
+         ":version", "HTTP/1.1",
+         ":host", "square.com",
+         ":scheme", "http");
+-    assertEquals(expected, FramedTransport.spdy3HeadersList(request));
++    assertEquals(expected, Http2xStream.spdy3HeadersList(request));
+   }
+ 
+   @Test public void http2HeadersListDropsForbiddenHeadersHttp2() {
+@@ -130,7 +130,7 @@
+         ":path", "/",
+         ":authority", "square.com",
+         ":scheme", "http");
+-    assertEquals(expected, FramedTransport.http2HeadersList(request));
++    assertEquals(expected, Http2xStream.http2HeadersList(request));
+   }
+ 
+   @Test public void ofTrims() {
+diff --git a/okhttp-tests/src/test/java/com/squareup/okhttp/internal/http/RouteSelectorTest.java b/okhttp-tests/src/test/java/com/squareup/okhttp/internal/http/RouteSelectorTest.java
+index 82602dd732..8560e0ffad 100644
+--- a/okhttp-tests/src/test/java/com/squareup/okhttp/internal/http/RouteSelectorTest.java
++++ b/okhttp-tests/src/test/java/com/squareup/okhttp/internal/http/RouteSelectorTest.java
+@@ -17,13 +17,9 @@
+ 
+ import com.squareup.okhttp.Address;
+ import com.squareup.okhttp.Authenticator;
+-import com.squareup.okhttp.ConnectionPool;
+ import com.squareup.okhttp.ConnectionSpec;
+-import com.squareup.okhttp.OkHttpClient;
+ import com.squareup.okhttp.Protocol;
+-import com.squareup.okhttp.Request;
+ import com.squareup.okhttp.Route;
+-import com.squareup.okhttp.internal.Internal;
+ import com.squareup.okhttp.internal.RouteDatabase;
+ import com.squareup.okhttp.internal.SslContextBuilder;
+ import com.squareup.okhttp.internal.Util;
+@@ -56,14 +52,14 @@
+       ConnectionSpec.CLEARTEXT);
+ 
+   private static final int proxyAPort = 1001;
+-  private static final String proxyAHost = "proxyA";
++  private static final String proxyAHost = "proxya";
+   private static final Proxy proxyA =
+-      new Proxy(Proxy.Type.HTTP, new InetSocketAddress(proxyAHost, proxyAPort));
++      new Proxy(Proxy.Type.HTTP, InetSocketAddress.createUnresolved(proxyAHost, proxyAPort));
+   private static final int proxyBPort = 1002;
+-  private static final String proxyBHost = "proxyB";
++  private static final String proxyBHost = "proxyb";
+   private static final Proxy proxyB =
+-      new Proxy(Proxy.Type.HTTP, new InetSocketAddress(proxyBHost, proxyBPort));
+-  private String uriHost = "hostA";
++      new Proxy(Proxy.Type.HTTP, InetSocketAddress.createUnresolved(proxyBHost, proxyBPort));
++  private String uriHost = "hosta";
+   private int uriPort = 1003;
+ 
+   private SocketFactory socketFactory;
+@@ -75,39 +71,16 @@
+   private final List<Protocol> protocols = Arrays.asList(Protocol.HTTP_1_1);
+   private final FakeDns dns = new FakeDns();
+   private final RecordingProxySelector proxySelector = new RecordingProxySelector();
+-  private OkHttpClient client;
+-  private RouteDatabase routeDatabase;
+-  private Request httpRequest;
+-  private Request httpsRequest;
++  private RouteDatabase routeDatabase = new RouteDatabase();
+ 
+   @Before public void setUp() throws Exception {
+     socketFactory = SocketFactory.getDefault();
+     hostnameVerifier = HttpsURLConnection.getDefaultHostnameVerifier();
+-
+-    client = new OkHttpClient()
+-        .setDns(dns)
+-        .setAuthenticator(authenticator)
+-        .setProxySelector(proxySelector)
+-        .setSocketFactory(socketFactory)
+-        .setSslSocketFactory(sslSocketFactory)
+-        .setHostnameVerifier(hostnameVerifier)
+-        .setProtocols(protocols)
+-        .setConnectionSpecs(connectionSpecs)
+-        .setConnectionPool(ConnectionPool.getDefault());
+-
+-    routeDatabase = Internal.instance.routeDatabase(client);
+-
+-    httpRequest = new Request.Builder()
+-        .url("http://" + uriHost + ":" + uriPort + "/path")
+-        .build();
+-    httpsRequest = new Request.Builder()
+-        .url("https://" + uriHost + ":" + uriPort + "/path")
+-        .build();
+   }
+ 
+   @Test public void singleRoute() throws Exception {
+     Address address = httpAddress();
+-    RouteSelector routeSelector = RouteSelector.get(address, httpRequest, client);
++    RouteSelector routeSelector = new RouteSelector(address, routeDatabase);
+ 
+     assertTrue(routeSelector.hasNext());
+     dns.addresses(makeFakeAddresses(255, 1));
+@@ -124,13 +97,13 @@
+ 
+   @Test public void singleRouteReturnsFailedRoute() throws Exception {
+     Address address = httpAddress();
+-    RouteSelector routeSelector = RouteSelector.get(address, httpRequest, client);
++    RouteSelector routeSelector = new RouteSelector(address, routeDatabase);
+ 
+     assertTrue(routeSelector.hasNext());
+     dns.addresses(makeFakeAddresses(255, 1));
+     Route route = routeSelector.next();
+     routeDatabase.failed(route);
+-    routeSelector = RouteSelector.get(address, httpRequest, client);
++    routeSelector = new RouteSelector(address, routeDatabase);
+     assertRoute(routeSelector.next(), address, NO_PROXY, dns.address(0), uriPort);
+     assertFalse(routeSelector.hasNext());
+     try {
+@@ -143,8 +116,7 @@
+   @Test public void explicitProxyTriesThatProxysAddressesOnly() throws Exception {
+     Address address = new Address(uriHost, uriPort, dns, socketFactory, null, null, null,
+         authenticator, proxyA, protocols, connectionSpecs, proxySelector);
+-    client.setProxy(proxyA);
+-    RouteSelector routeSelector = RouteSelector.get(address, httpRequest, client);
++    RouteSelector routeSelector = new RouteSelector(address, routeDatabase);
+ 
+     assertTrue(routeSelector.hasNext());
+     dns.addresses(makeFakeAddresses(255, 2));
+@@ -159,8 +131,7 @@
+   @Test public void explicitDirectProxy() throws Exception {
+     Address address = new Address(uriHost, uriPort, dns, socketFactory, null, null, null,
+         authenticator, NO_PROXY, protocols, connectionSpecs, proxySelector);
+-    client.setProxy(NO_PROXY);
+-    RouteSelector routeSelector = RouteSelector.get(address, httpRequest, client);
++    RouteSelector routeSelector = new RouteSelector(address, routeDatabase);
+ 
+     assertTrue(routeSelector.hasNext());
+     dns.addresses(makeFakeAddresses(255, 2));
+@@ -176,8 +147,8 @@
+     Address address = httpAddress();
+ 
+     proxySelector.proxies = null;
+-    RouteSelector routeSelector = RouteSelector.get(address, httpRequest, client);
+-    proxySelector.assertRequests(httpRequest.uri());
++    RouteSelector routeSelector = new RouteSelector(address, routeDatabase);
++    proxySelector.assertRequests(address.url().uri());
+ 
+     assertTrue(routeSelector.hasNext());
+     dns.addresses(makeFakeAddresses(255, 1));
+@@ -189,7 +160,7 @@
+ 
+   @Test public void proxySelectorReturnsNoProxies() throws Exception {
+     Address address = httpAddress();
+-    RouteSelector routeSelector = RouteSelector.get(address, httpRequest, client);
++    RouteSelector routeSelector = new RouteSelector(address, routeDatabase);
+ 
+     assertTrue(routeSelector.hasNext());
+     dns.addresses(makeFakeAddresses(255, 2));
+@@ -198,7 +169,7 @@
+ 
+     assertFalse(routeSelector.hasNext());
+     dns.assertRequests(uriHost);
+-    proxySelector.assertRequests(httpRequest.uri());
++    proxySelector.assertRequests(address.url().uri());
+   }
+ 
+   @Test public void proxySelectorReturnsMultipleProxies() throws Exception {
+@@ -206,8 +177,8 @@
+ 
+     proxySelector.proxies.add(proxyA);
+     proxySelector.proxies.add(proxyB);
+-    RouteSelector routeSelector = RouteSelector.get(address, httpRequest, client);
+-    proxySelector.assertRequests(httpRequest.uri());
++    RouteSelector routeSelector = new RouteSelector(address, routeDatabase);
++    proxySelector.assertRequests(address.url().uri());
+ 
+     // First try the IP addresses of the first proxy, in sequence.
+     assertTrue(routeSelector.hasNext());
+@@ -235,8 +206,8 @@
+     Address address = httpAddress();
+ 
+     proxySelector.proxies.add(NO_PROXY);
+-    RouteSelector routeSelector = RouteSelector.get(address, httpRequest, client);
+-    proxySelector.assertRequests(httpRequest.uri());
++    RouteSelector routeSelector = new RouteSelector(address, routeDatabase);
++    proxySelector.assertRequests(address.url().uri());
+ 
+     // Only the origin server will be attempted.
+     assertTrue(routeSelector.hasNext());
+@@ -253,8 +224,8 @@
+     proxySelector.proxies.add(proxyA);
+     proxySelector.proxies.add(proxyB);
+     proxySelector.proxies.add(proxyA);
+-    RouteSelector routeSelector = RouteSelector.get(address, httpRequest, client);
+-    proxySelector.assertRequests(httpRequest.uri());
++    RouteSelector routeSelector = new RouteSelector(address, routeDatabase);
++    proxySelector.assertRequests(address.url().uri());
+ 
+     assertTrue(routeSelector.hasNext());
+     dns.addresses(makeFakeAddresses(255, 1));
+@@ -287,7 +258,7 @@
+     Address address = httpsAddress();
+     proxySelector.proxies.add(proxyA);
+     proxySelector.proxies.add(proxyB);
+-    RouteSelector routeSelector = RouteSelector.get(address, httpsRequest, client);
++    RouteSelector routeSelector = new RouteSelector(address, routeDatabase);
+ 
+     // Proxy A
+     dns.addresses(makeFakeAddresses(255, 2));
+@@ -312,8 +283,7 @@
+ 
+   @Test public void failedRoutesAreLast() throws Exception {
+     Address address = httpsAddress();
+-    client.setProxy(Proxy.NO_PROXY);
+-    RouteSelector routeSelector = RouteSelector.get(address, httpsRequest, client);
++    RouteSelector routeSelector = new RouteSelector(address, routeDatabase);
+ 
+     final int numberOfAddresses = 2;
+     dns.addresses(makeFakeAddresses(255, numberOfAddresses));
+@@ -329,7 +299,7 @@
+     // Add first regular route as failed.
+     routeDatabase.failed(regularRoutes.get(0));
+     // Reset selector
+-    routeSelector = RouteSelector.get(address, httpsRequest, client);
++    routeSelector = new RouteSelector(address, routeDatabase);
+ 
+     List<Route> routesWithFailedRoute = new ArrayList<>();
+     while (routeSelector.hasNext()) {
+diff --git a/okhttp-urlconnection/src/main/java/com/squareup/okhttp/internal/huc/HttpURLConnectionImpl.java b/okhttp-urlconnection/src/main/java/com/squareup/okhttp/internal/huc/HttpURLConnectionImpl.java
+index 583dcfbea3..fb26a64149 100644
+--- a/okhttp-urlconnection/src/main/java/com/squareup/okhttp/internal/huc/HttpURLConnectionImpl.java
++++ b/okhttp-urlconnection/src/main/java/com/squareup/okhttp/internal/huc/HttpURLConnectionImpl.java
+@@ -39,6 +39,7 @@
+ import com.squareup.okhttp.internal.http.RetryableSink;
+ import com.squareup.okhttp.internal.http.RouteException;
+ import com.squareup.okhttp.internal.http.StatusLine;
++import com.squareup.okhttp.internal.http.StreamAllocation;
+ import java.io.FileNotFoundException;
+ import java.io.IOException;
+ import java.io.InputStream;
+@@ -123,7 +124,7 @@ public HttpURLConnectionImpl(URL url, OkHttpClient client) {
+     // Calling disconnect() before a connection exists should have no effect.
+     if (httpEngine == null) return;
+ 
+-    httpEngine.disconnect();
++    httpEngine.cancel();
+ 
+     // This doesn't close the stream because doing so would require all stream
+     // access to be synchronized. It's expected that the thread using the
+@@ -327,8 +328,9 @@ private void initHttpEngine() throws IOException {
+     }
+   }
+ 
+-  private HttpEngine newHttpEngine(String method, Connection connection, RetryableSink requestBody,
+-      Response priorResponse) throws MalformedURLException, UnknownHostException {
++  private HttpEngine newHttpEngine(String method, StreamAllocation streamAllocation,
++      RetryableSink requestBody, Response priorResponse)
++      throws MalformedURLException, UnknownHostException {
+     // OkHttp's Call API requires a placeholder body; the real body will be streamed separately.
+     RequestBody placeholderBody = HttpMethod.requiresRequestBody(method)
+         ? EMPTY_REQUEST_BODY
+@@ -372,7 +374,7 @@ private HttpEngine newHttpEngine(String method, Connection connection, Retryable
+       engineClient = client.clone().setCache(null);
+     }
+ 
+-    return new HttpEngine(engineClient, request, bufferRequestBody, true, false, connection, null,
++    return new HttpEngine(engineClient, request, bufferRequestBody, true, false, streamAllocation,
+         requestBody, priorResponse);
+   }
+ 
+@@ -402,7 +404,7 @@ private HttpEngine getResponse() throws IOException {
+       Request followUp = httpEngine.followUpRequest();
+ 
+       if (followUp == null) {
+-        httpEngine.releaseConnection();
++        httpEngine.releaseStreamAllocation();
+         return httpEngine;
+       }
+ 
+@@ -426,12 +428,13 @@ private HttpEngine getResponse() throws IOException {
+         throw new HttpRetryException("Cannot retry streamed HTTP body", responseCode);
+       }
+ 
++      StreamAllocation streamAllocation = httpEngine.close();
+       if (!httpEngine.sameConnection(followUp.httpUrl())) {
+-        httpEngine.releaseConnection();
++        streamAllocation.release();
++        streamAllocation = null;
+       }
+ 
+-      Connection connection = httpEngine.close();
+-      httpEngine = newHttpEngine(followUp.method(), connection, (RetryableSink) requestBody,
++      httpEngine = newHttpEngine(followUp.method(), streamAllocation, (RetryableSink) requestBody,
+           response);
+     }
+   }
+@@ -444,10 +447,14 @@ private HttpEngine getResponse() throws IOException {
+   private boolean execute(boolean readResponse) throws IOException {
+     try {
+       httpEngine.sendRequest();
+-      route = httpEngine.getRoute();
+-      handshake = httpEngine.getConnection() != null
+-          ? httpEngine.getConnection().getHandshake()
+-          : null;
++      Connection connection = httpEngine.getConnection();
++      if (connection != null) {
++        route = connection.getRoute();
++        handshake = connection.getHandshake();
++      } else {
++        route = null;
++        handshake = null;
++      }
+       if (readResponse) {
+         httpEngine.readResponse();
+       }
+diff --git a/okhttp-urlconnection/src/test/java/com/squareup/okhttp/UrlConnectionCacheTest.java b/okhttp-urlconnection/src/test/java/com/squareup/okhttp/UrlConnectionCacheTest.java
+index 172d586986..66bf7c2f4c 100644
+--- a/okhttp-urlconnection/src/test/java/com/squareup/okhttp/UrlConnectionCacheTest.java
++++ b/okhttp-urlconnection/src/test/java/com/squareup/okhttp/UrlConnectionCacheTest.java
+@@ -855,7 +855,7 @@ private void assertNonIdentityEncodingCached(MockResponse response) throws Excep
+ 
+     assertEquals("A", readAscii(client.open(server.getUrl("/"))));
+     assertEquals("A", readAscii(client.open(server.getUrl("/"))));
+-    assertEquals(1, client.client().getConnectionPool().getConnectionCount());
++    assertEquals(1, client.client().getConnectionPool().getIdleConnectionCount());
+   }
+ 
+   @Test public void expiresDateBeforeModifiedDate() throws Exception {
+diff --git a/okhttp-ws/src/main/java/com/squareup/okhttp/ws/WebSocketCall.java b/okhttp-ws/src/main/java/com/squareup/okhttp/ws/WebSocketCall.java
+index 805d9515db..5950850ca4 100644
+--- a/okhttp-ws/src/main/java/com/squareup/okhttp/ws/WebSocketCall.java
++++ b/okhttp-ws/src/main/java/com/squareup/okhttp/ws/WebSocketCall.java
+@@ -17,12 +17,12 @@
+ 
+ import com.squareup.okhttp.Call;
+ import com.squareup.okhttp.Callback;
+-import com.squareup.okhttp.Connection;
+ import com.squareup.okhttp.OkHttpClient;
+ import com.squareup.okhttp.Request;
+ import com.squareup.okhttp.Response;
+ import com.squareup.okhttp.internal.Internal;
+ import com.squareup.okhttp.internal.Util;
++import com.squareup.okhttp.internal.http.StreamAllocation;
+ import com.squareup.okhttp.internal.ws.RealWebSocket;
+ import com.squareup.okhttp.internal.ws.WebSocketProtocol;
+ import java.io.IOException;
+@@ -33,8 +33,6 @@
+ import java.util.concurrent.ExecutorService;
+ import java.util.concurrent.LinkedBlockingDeque;
+ import java.util.concurrent.ThreadPoolExecutor;
+-import okio.BufferedSink;
+-import okio.BufferedSource;
+ import okio.ByteString;
+ 
+ import static java.util.concurrent.TimeUnit.SECONDS;
+@@ -116,11 +114,9 @@ public void cancel() {
+     call.cancel();
+   }
+ 
+-  private void createWebSocket(Response response, WebSocketListener listener)
+-      throws IOException {
++  private void createWebSocket(Response response, WebSocketListener listener) throws IOException {
+     if (response.code() != 101) {
+-      // TODO call.engine.releaseConnection();
+-      Internal.instance.callEngineReleaseConnection(call);
++      Util.closeQuietly(response.body());
+       throw new ProtocolException("Expected HTTP 101 response but was '"
+           + response.code()
+           + " "
+@@ -148,21 +144,9 @@ private void createWebSocket(Response response, WebSocketListener listener)
+           + "'");
+     }
+ 
+-    // TODO connection = call.engine.getConnection();
+-    Connection connection = Internal.instance.callEngineGetConnection(call);
+-    // TODO if (!connection.clearOwner()) {
+-    if (!Internal.instance.clearOwner(connection)) {
+-      throw new IllegalStateException("Unable to take ownership of connection.");
+-    }
+-
+-    BufferedSource source = Internal.instance.connectionRawSource(connection);
+-    BufferedSink sink = Internal.instance.connectionRawSink(connection);
+-
+-    final RealWebSocket webSocket =
+-        ConnectionWebSocket.create(response, connection, source, sink, random, listener);
+-
+-    // TODO connection.setOwner(webSocket);
+-    Internal.instance.connectionSetOwner(connection, webSocket);
++    StreamAllocation streamAllocation = Internal.instance.callEngineGetStreamAllocation(call);
++    RealWebSocket webSocket = StreamWebSocket.create(
++        streamAllocation, response, random, listener);
+ 
+     listener.onOpen(webSocket, response);
+ 
+@@ -171,33 +155,33 @@ private void createWebSocket(Response response, WebSocketListener listener)
+   }
+ 
+   // Keep static so that the WebSocketCall instance can be garbage collected.
+-  private static class ConnectionWebSocket extends RealWebSocket {
+-    static RealWebSocket create(Response response, Connection connection, BufferedSource source,
+-        BufferedSink sink, Random random, WebSocketListener listener) {
++  private static class StreamWebSocket extends RealWebSocket {
++    static RealWebSocket create(StreamAllocation streamAllocation, Response response,
++        Random random, WebSocketListener listener) {
+       String url = response.request().urlString();
+       ThreadPoolExecutor replyExecutor =
+           new ThreadPoolExecutor(1, 1, 1, SECONDS, new LinkedBlockingDeque<Runnable>(),
+               Util.threadFactory(String.format("OkHttp %s WebSocket", url), true));
+       replyExecutor.allowCoreThreadTimeOut(true);
+ 
+-      return new ConnectionWebSocket(connection, source, sink, random, replyExecutor, listener,
+-          url);
++      return new StreamWebSocket(streamAllocation, random, replyExecutor, listener, url);
+     }
+ 
+-    private final Connection connection;
++    private final StreamAllocation streamAllocation;
+     private final ExecutorService replyExecutor;
+ 
+-    private ConnectionWebSocket(Connection connection, BufferedSource source, BufferedSink sink,
++    private StreamWebSocket(StreamAllocation streamAllocation,
+         Random random, ExecutorService replyExecutor, WebSocketListener listener, String url) {
+-      super(true /* is client */, source, sink, random, replyExecutor, listener, url);
+-      this.connection = connection;
++      super(true /* is client */, streamAllocation.connection().source,
++          streamAllocation.connection().sink, random, replyExecutor, listener, url);
++      this.streamAllocation = streamAllocation;
+       this.replyExecutor = replyExecutor;
+     }
+ 
+     @Override protected void close() throws IOException {
+       replyExecutor.shutdown();
+-      // TODO connection.closeIfOwnedBy(this);
+-      Internal.instance.closeIfOwnedBy(connection, this);
++      streamAllocation.noNewStreams();
++      streamAllocation.streamFinished(streamAllocation.stream());
+     }
+   }
+ }
+diff --git a/okhttp/src/main/java/com/squareup/okhttp/Address.java b/okhttp/src/main/java/com/squareup/okhttp/Address.java
+index dee5ad11b5..9efdf28050 100644
+--- a/okhttp/src/main/java/com/squareup/okhttp/Address.java
++++ b/okhttp/src/main/java/com/squareup/okhttp/Address.java
+@@ -36,8 +36,7 @@
+  * {@link Connection}.
+  */
+ public final class Address {
+-  final String uriHost;
+-  final int uriPort;
++  final HttpUrl url;
+   final Dns dns;
+   final SocketFactory socketFactory;
+   final Authenticator authenticator;
+@@ -53,11 +52,11 @@ public Address(String uriHost, int uriPort, Dns dns, SocketFactory socketFactory
+       SSLSocketFactory sslSocketFactory, HostnameVerifier hostnameVerifier,
+       CertificatePinner certificatePinner, Authenticator authenticator, Proxy proxy,
+       List<Protocol> protocols, List<ConnectionSpec> connectionSpecs, ProxySelector proxySelector) {
+-    if (uriHost == null) throw new NullPointerException("uriHost == null");
+-    this.uriHost = uriHost;
+-
+-    if (uriPort <= 0) throw new IllegalArgumentException("uriPort <= 0: " + uriPort);
+-    this.uriPort = uriPort;
++    this.url = new HttpUrl.Builder()
++        .scheme(sslSocketFactory != null ? "https" : "http")
++        .host(uriHost)
++        .port(uriPort)
++        .build();
+ 
+     if (dns == null) throw new IllegalArgumentException("dns == null");
+     this.dns = dns;
+@@ -83,17 +82,33 @@ public Address(String uriHost, int uriPort, Dns dns, SocketFactory socketFactory
+     this.certificatePinner = certificatePinner;
+   }
+ 
+-  /** Returns the hostname of the origin server. */
++  /**
++   * Returns a URL with the hostname and port of the origin server. The path, query, and fragment of
++   * this URL are always empty, since they are not significant for planning a route.
++   */
++  public HttpUrl url() {
++    return url;
++  }
++
++  /**
++   * Returns the hostname of the origin server.
++   *
++   * @deprecated prefer {@code address.url().host()}.
++   */
++  @Deprecated
+   public String getUriHost() {
+-    return uriHost;
++    return url.host();
+   }
+ 
+   /**
+    * Returns the port of the origin server; typically 80 or 443. Unlike
+    * may {@code getPort()} accessors, this method never returns -1.
++   *
++   * @deprecated prefer {@code address.url().port()}.
+    */
++  @Deprecated
+   public int getUriPort() {
+-    return uriPort;
++    return url.port();
+   }
+ 
+   /** Returns the service that will be used to resolve IP addresses for hostnames. */
+@@ -157,8 +172,7 @@ public CertificatePinner getCertificatePinner() {
+   @Override public boolean equals(Object other) {
+     if (other instanceof Address) {
+       Address that = (Address) other;
+-      return this.uriHost.equals(that.uriHost)
+-          && this.uriPort == that.uriPort
++      return this.url.equals(that.url)
+           && this.dns.equals(that.dns)
+           && this.authenticator.equals(that.authenticator)
+           && this.protocols.equals(that.protocols)
+@@ -174,8 +188,7 @@ public CertificatePinner getCertificatePinner() {
+ 
+   @Override public int hashCode() {
+     int result = 17;
+-    result = 31 * result + uriHost.hashCode();
+-    result = 31 * result + uriPort;
++    result = 31 * result + url.hashCode();
+     result = 31 * result + dns.hashCode();
+     result = 31 * result + authenticator.hashCode();
+     result = 31 * result + protocols.hashCode();
+diff --git a/okhttp/src/main/java/com/squareup/okhttp/Call.java b/okhttp/src/main/java/com/squareup/okhttp/Call.java
+index 1b6f9928c9..a55216c849 100644
+--- a/okhttp/src/main/java/com/squareup/okhttp/Call.java
++++ b/okhttp/src/main/java/com/squareup/okhttp/Call.java
+@@ -19,6 +19,7 @@
+ import com.squareup.okhttp.internal.http.HttpEngine;
+ import com.squareup.okhttp.internal.http.RequestException;
+ import com.squareup.okhttp.internal.http.RouteException;
++import com.squareup.okhttp.internal.http.StreamAllocation;
+ import java.io.IOException;
+ import java.net.ProtocolException;
+ import java.util.logging.Level;
+@@ -119,7 +120,7 @@ void enqueue(Callback responseCallback, boolean forWebSocket) {
+    */
+   public void cancel() {
+     canceled = true;
+-    if (engine != null) engine.disconnect();
++    if (engine != null) engine.cancel();
+   }
+ 
+   /**
+@@ -271,12 +272,12 @@ Response getResponse(Request request, boolean forWebSocket) throws IOException {
+     }
+ 
+     // Create the initial HTTP engine. Retries and redirects need new engine for each attempt.
+-    engine = new HttpEngine(client, request, false, false, forWebSocket, null, null, null, null);
++    engine = new HttpEngine(client, request, false, false, forWebSocket, null, null, null);
+ 
+     int followUpCount = 0;
+     while (true) {
+       if (canceled) {
+-        engine.releaseConnection();
++        engine.releaseStreamAllocation();
+         throw new IOException("Canceled");
+       }
+ 
+@@ -312,7 +313,7 @@ Response getResponse(Request request, boolean forWebSocket) throws IOException {
+ 
+       if (followUp == null) {
+         if (!forWebSocket) {
+-          engine.releaseConnection();
++          engine.releaseStreamAllocation();
+         }
+         return response;
+       }
+@@ -321,13 +322,14 @@ Response getResponse(Request request, boolean forWebSocket) throws IOException {
+         throw new ProtocolException("Too many follow-up requests: " + followUpCount);
+       }
+ 
++      StreamAllocation streamAllocation = engine.close();
+       if (!engine.sameConnection(followUp.httpUrl())) {
+-        engine.releaseConnection();
++        streamAllocation.release();
++        streamAllocation = null;
+       }
+ 
+-      Connection connection = engine.close();
+       request = followUp;
+-      engine = new HttpEngine(client, request, false, false, forWebSocket, connection, null, null,
++      engine = new HttpEngine(client, request, false, false, forWebSocket, streamAllocation, null,
+           response);
+     }
+   }
+diff --git a/okhttp/src/main/java/com/squareup/okhttp/Connection.java b/okhttp/src/main/java/com/squareup/okhttp/Connection.java
+index 262a623fc3..203b510c53 100644
+--- a/okhttp/src/main/java/com/squareup/okhttp/Connection.java
++++ b/okhttp/src/main/java/com/squareup/okhttp/Connection.java
+@@ -16,483 +16,69 @@
+  */
+ package com.squareup.okhttp;
+ 
+-import com.squareup.okhttp.internal.ConnectionSpecSelector;
+-import com.squareup.okhttp.internal.Platform;
+-import com.squareup.okhttp.internal.Util;
+-import com.squareup.okhttp.internal.Version;
+-import com.squareup.okhttp.internal.framed.FramedConnection;
+-import com.squareup.okhttp.internal.http.FramedTransport;
+-import com.squareup.okhttp.internal.http.HttpConnection;
+-import com.squareup.okhttp.internal.http.HttpEngine;
+-import com.squareup.okhttp.internal.http.HttpTransport;
+-import com.squareup.okhttp.internal.http.OkHeaders;
+-import com.squareup.okhttp.internal.http.RouteException;
+-import com.squareup.okhttp.internal.http.Transport;
+-import com.squareup.okhttp.internal.tls.OkHostnameVerifier;
+-import java.io.IOException;
+-import java.net.Proxy;
+ import java.net.Socket;
+-import java.net.UnknownServiceException;
+-import java.security.cert.X509Certificate;
+-import java.util.List;
+-import java.util.concurrent.TimeUnit;
+-import javax.net.ssl.SSLPeerUnverifiedException;
+-import javax.net.ssl.SSLSocket;
+-import javax.net.ssl.SSLSocketFactory;
+-import okio.BufferedSink;
+-import okio.BufferedSource;
+-import okio.Source;
+-
+-import static com.squareup.okhttp.internal.Util.closeQuietly;
+-import static java.net.HttpURLConnection.HTTP_OK;
+-import static java.net.HttpURLConnection.HTTP_PROXY_AUTH;
+ 
+ /**
+- * The sockets and streams of an HTTP, HTTPS, or HTTPS+SPDY connection. May be
+- * used for multiple HTTP request/response exchanges. Connections may be direct
+- * to the origin server or via a proxy.
++ * The sockets and streams of an HTTP, HTTPS, or HTTPS+SPDY connection. May be used for multiple
++ * HTTP request/response exchanges. Connections may be direct to the origin server or via a proxy.
+  *
+- * <p>Typically instances of this class are created, connected and exercised
+- * automatically by the HTTP client. Applications may use this class to monitor
+- * HTTP connections as members of a {@linkplain ConnectionPool connection pool}.
++ * <p>Typically instances of this class are created, connected and exercised automatically by the
++ * HTTP client. Applications may use this class to monitor HTTP connections as members of a
++ * {@linkplain ConnectionPool connection pool}.
+  *
+- * <p>Do not confuse this class with the misnamed {@code HttpURLConnection},
+- * which isn't so much a connection as a single request/response exchange.
++ * <p>Do not confuse this class with the misnamed {@code HttpURLConnection}, which isn't so much a
++ * connection as a single request/response exchange.
+  *
+  * <h3>Modern TLS</h3>
+- * There are tradeoffs when selecting which options to include when negotiating
+- * a secure connection to a remote host. Newer TLS options are quite useful:
++ * There are tradeoffs when selecting which options to include when negotiating a secure connection
++ * to a remote host. Newer TLS options are quite useful:
+  * <ul>
+- *   <li>Server Name Indication (SNI) enables one IP address to negotiate secure
+- *       connections for multiple domain names.
+- *   <li>Application Layer Protocol Negotiation (ALPN) enables the HTTPS port
+- *       (443) to be used for different HTTP and SPDY protocols.
++ *   <li>Server Name Indication (SNI) enables one IP address to negotiate secure connections for
++ *       multiple domain names.
++ *   <li>Application Layer Protocol Negotiation (ALPN) enables the HTTPS port (443) to be used for
++ *       different HTTP and SPDY protocols.
+  * </ul>
+- * Unfortunately, older HTTPS servers refuse to connect when such options are
+- * presented. Rather than avoiding these options entirely, this class allows a
+- * connection to be attempted with modern options and then retried without them
+- * should the attempt fail.
++ * Unfortunately, older HTTPS servers refuse to connect when such options are presented. Rather than
++ * avoiding these options entirely, this class allows a connection to be attempted with modern
++ * options and then retried without them should the attempt fail.
++ *
++ * <h3>Connection Reuse</h3>
++ * <p>Each connection can carry a varying number streams, depending on the underlying protocol being
++ * used. HTTP/1.x connections can carry either zero or one streams. HTTP/2 connections can carry any
++ * number of streams, dynamically configured with {@code SETTINGS_MAX_CONCURRENT_STREAMS}. A
++ * connection currently carrying zero streams is an idle stream. We keep it alive because reusing an
++ * existing connection is typically faster than establishing a new one.
++ *
++ * <p>When a single logical call requires multiple streams due to redirects or authorization
++ * challenges, we prefer to use the same physical connection for all streams in the sequence. There
++ * are potential performance and behavior consequences to this preference. To support this feature,
++ * this class separates <i>allocations</i> from <i>streams</i>. An allocation is created by a call,
++ * used for one or more streams, and then released. An allocated connection won't be stolen by
++ * other calls while a redirect or authorization challenge is being handled.
++ *
++ * <p>When the maximum concurrent streams limit is reduced, some allocations will be rescinded.
++ * Attempting to create new streams on these allocations will fail.
++ *
++ * <p>Note that an allocation may be released before its stream is completed. This is intended to
++ * make bookkeeping easier for the caller: releasing the allocation as soon as the terminal stream
++ * has been found. But only complete the stream once its data stream has been exhausted.
+  */
+-public final class Connection {
+-  private final ConnectionPool pool;
+-  private final Route route;
+-
+-  private Socket socket;
+-  private Handshake handshake;
+-  private Protocol protocol;
+-  private HttpConnection httpConnection;
+-  private FramedConnection framedConnection;
+-  private long idleStartTimeNs;
+-  private int recycleCount;
+-
+-  /**
+-   * The object that owns this connection. Null if it is shared (for SPDY),
+-   * belongs to a pool, or has been discarded. Guarded by {@code pool}, which
+-   * clears the owner when an incoming connection is recycled.
+-   */
+-  private Object owner;
+-
+-  public Connection(ConnectionPool pool, Route route) {
+-    this.pool = pool;
+-    this.route = route;
+-  }
+-
+-  Object getOwner() {
+-    synchronized (pool) {
+-      return owner;
+-    }
+-  }
+-
+-  void setOwner(Object owner) {
+-    if (isFramed()) return; // Framed connections are shared.
+-    synchronized (pool) {
+-      if (this.owner != null) throw new IllegalStateException("Connection already has an owner!");
+-      this.owner = owner;
+-    }
+-  }
+-
+-  /**
+-   * Attempts to clears the owner of this connection. Returns true if the owner
+-   * was cleared and the connection can be pooled or reused. This will return
+-   * false if the connection cannot be pooled or reused, such as if it was
+-   * closed with {@link #closeIfOwnedBy}.
+-   */
+-  boolean clearOwner() {
+-    synchronized (pool) {
+-      if (owner == null) {
+-        // No owner? Don't reuse this connection.
+-        return false;
+-      }
+-
+-      owner = null;
+-      return true;
+-    }
+-  }
+-
+-  /**
+-   * Closes this connection if it is currently owned by {@code owner}. This also
+-   * strips the ownership of the connection so it cannot be pooled or reused.
+-   */
+-  void closeIfOwnedBy(Object owner) throws IOException {
+-    if (isFramed()) throw new IllegalStateException();
+-    synchronized (pool) {
+-      if (this.owner != owner) {
+-        return; // Wrong owner. Perhaps a late disconnect?
+-      }
+-
+-      this.owner = null; // Drop the owner so the connection won't be reused.
+-    }
+-
+-    // Don't close() inside the synchronized block.
+-    if (socket != null) {
+-      socket.close();
+-    }
+-  }
+-
+-  void connect(int connectTimeout, int readTimeout, int writeTimeout,
+-      List<ConnectionSpec> connectionSpecs, boolean connectionRetryEnabled) throws RouteException {
+-    if (protocol != null) throw new IllegalStateException("already connected");
+-
+-    RouteException routeException = null;
+-    ConnectionSpecSelector connectionSpecSelector = new ConnectionSpecSelector(connectionSpecs);
+-    Proxy proxy = route.getProxy();
+-    Address address = route.getAddress();
+-
+-    if (route.address.getSslSocketFactory() == null
+-        && !connectionSpecs.contains(ConnectionSpec.CLEARTEXT)) {
+-      throw new RouteException(new UnknownServiceException(
+-          "CLEARTEXT communication not supported: " + connectionSpecs));
+-    }
+-
+-    while (protocol == null) {
+-      try {
+-        socket = proxy.type() == Proxy.Type.DIRECT || proxy.type() == Proxy.Type.HTTP
+-            ? address.getSocketFactory().createSocket()
+-            : new Socket(proxy);
+-        connectSocket(connectTimeout, readTimeout, writeTimeout, connectionSpecSelector);
+-      } catch (IOException e) {
+-        Util.closeQuietly(socket);
+-        socket = null;
+-        handshake = null;
+-        protocol = null;
+-        httpConnection = null;
+-        framedConnection = null;
+-
+-        if (routeException == null) {
+-          routeException = new RouteException(e);
+-        } else {
+-          routeException.addConnectException(e);
+-        }
+-
+-        if (!connectionRetryEnabled || !connectionSpecSelector.connectionFailed(e)) {
+-          throw routeException;
+-        }
+-      }
+-    }
+-  }
+-
+-  /** Does all the work necessary to build a full HTTP or HTTPS connection on a raw socket. */
+-  private void connectSocket(int connectTimeout, int readTimeout, int writeTimeout,
+-      ConnectionSpecSelector connectionSpecSelector) throws IOException {
+-    socket.setSoTimeout(readTimeout);
+-    Platform.get().connectSocket(socket, route.getSocketAddress(), connectTimeout);
+-
+-    if (route.address.getSslSocketFactory() != null) {
+-      connectTls(readTimeout, writeTimeout, connectionSpecSelector);
+-    } else {
+-      protocol = Protocol.HTTP_1_1;
+-    }
+-
+-    if (protocol == Protocol.SPDY_3 || protocol == Protocol.HTTP_2) {
+-      socket.setSoTimeout(0); // Framed connection timeouts are set per-stream.
+-      framedConnection = new FramedConnection.Builder(route.address.uriHost, true, socket)
+-          .protocol(protocol).build();
+-      framedConnection.sendConnectionPreface();
+-    } else {
+-      httpConnection = new HttpConnection(pool, this, socket);
+-    }
+-  }
+-
+-  private void connectTls(int readTimeout, int writeTimeout,
+-      ConnectionSpecSelector connectionSpecSelector) throws IOException {
+-    if (route.requiresTunnel()) {
+-      createTunnel(readTimeout, writeTimeout);
+-    }
+-
+-    Address address = route.getAddress();
+-    SSLSocketFactory sslSocketFactory = address.getSslSocketFactory();
+-    boolean success = false;
+-    SSLSocket sslSocket = null;
+-    try {
+-      // Create the wrapper over the connected socket.
+-      sslSocket = (SSLSocket) sslSocketFactory.createSocket(
+-          socket, address.getUriHost(), address.getUriPort(), true /* autoClose */);
+-
+-      // Configure the socket's ciphers, TLS versions, and extensions.
+-      ConnectionSpec connectionSpec = connectionSpecSelector.configureSecureSocket(sslSocket);
+-      if (connectionSpec.supportsTlsExtensions()) {
+-        Platform.get().configureTlsExtensions(
+-            sslSocket, address.getUriHost(), address.getProtocols());
+-      }
+-
+-      // Force handshake. This can throw!
+-      sslSocket.startHandshake();
+-      Handshake unverifiedHandshake = Handshake.get(sslSocket.getSession());
+-
+-      // Verify that the socket's certificates are acceptable for the target host.
+-      if (!address.getHostnameVerifier().verify(address.getUriHost(), sslSocket.getSession())) {
+-        X509Certificate cert = (X509Certificate) unverifiedHandshake.peerCertificates().get(0);
+-        throw new SSLPeerUnverifiedException("Hostname " + address.getUriHost() + " not verified:"
+-            + "\n    certificate: " + CertificatePinner.pin(cert)
+-            + "\n    DN: " + cert.getSubjectDN().getName()
+-            + "\n    subjectAltNames: " + OkHostnameVerifier.allSubjectAltNames(cert));
+-      }
+-
+-      // Check that the certificate pinner is satisfied by the certificates presented.
+-      address.getCertificatePinner().check(address.getUriHost(),
+-          unverifiedHandshake.peerCertificates());
+-
+-      // Success! Save the handshake and the ALPN protocol.
+-      String maybeProtocol = connectionSpec.supportsTlsExtensions()
+-          ? Platform.get().getSelectedProtocol(sslSocket)
+-          : null;
+-      socket = sslSocket;
+-      handshake = unverifiedHandshake;
+-      protocol = maybeProtocol != null
+-          ? Protocol.get(maybeProtocol)
+-          : Protocol.HTTP_1_1;
+-      success = true;
+-    } catch (AssertionError e) {
+-      if (Util.isAndroidGetsocknameError(e)) throw new IOException(e);
+-      throw e;
+-    } finally {
+-      if (sslSocket != null) {
+-        Platform.get().afterHandshake(sslSocket);
+-      }
+-      if (!success) {
+-        closeQuietly(sslSocket);
+-      }
+-    }
+-  }
+-
+-  /**
+-   * To make an HTTPS connection over an HTTP proxy, send an unencrypted
+-   * CONNECT request to create the proxy connection. This may need to be
+-   * retried if the proxy requires authorization.
+-   */
+-  private void createTunnel(int readTimeout, int writeTimeout) throws IOException {
+-    // Make an SSL Tunnel on the first message pair of each SSL + proxy connection.
+-    Request tunnelRequest = createTunnelRequest();
+-    HttpConnection tunnelConnection = new HttpConnection(pool, this, socket);
+-    tunnelConnection.setTimeouts(readTimeout, writeTimeout);
+-    HttpUrl url = tunnelRequest.httpUrl();
+-    String requestLine = "CONNECT " + url.host() + ":" + url.port() + " HTTP/1.1";
+-    while (true) {
+-      tunnelConnection.writeRequest(tunnelRequest.headers(), requestLine);
+-      tunnelConnection.flush();
+-      Response response = tunnelConnection.readResponse().request(tunnelRequest).build();
+-      // The response body from a CONNECT should be empty, but if it is not then we should consume
+-      // it before proceeding.
+-      long contentLength = OkHeaders.contentLength(response);
+-      if (contentLength == -1L) {
+-        contentLength = 0L;
+-      }
+-      Source body = tunnelConnection.newFixedLengthSource(contentLength);
+-      Util.skipAll(body, Integer.MAX_VALUE, TimeUnit.MILLISECONDS);
+-      body.close();
+-
+-      switch (response.code()) {
+-        case HTTP_OK:
+-          // Assume the server won't send a TLS ServerHello until we send a TLS ClientHello. If
+-          // that happens, then we will have buffered bytes that are needed by the SSLSocket!
+-          // This check is imperfect: it doesn't tell us whether a handshake will succeed, just
+-          // that it will almost certainly fail because the proxy has sent unexpected data.
+-          if (tunnelConnection.bufferSize() > 0) {
+-            throw new IOException("TLS tunnel buffered too many bytes!");
+-          }
+-          return;
+-
+-        case HTTP_PROXY_AUTH:
+-          tunnelRequest = OkHeaders.processAuthHeader(
+-              route.getAddress().getAuthenticator(), response, route.getProxy());
+-          if (tunnelRequest != null) continue;
+-          throw new IOException("Failed to authenticate with proxy");
+-
+-        default:
+-          throw new IOException(
+-              "Unexpected response code for CONNECT: " + response.code());
+-      }
+-    }
+-  }
+-
+-  /**
+-   * Returns a request that creates a TLS tunnel via an HTTP proxy, or null if
+-   * no tunnel is necessary. Everything in the tunnel request is sent
+-   * unencrypted to the proxy server, so tunnels include only the minimum set of
+-   * headers. This avoids sending potentially sensitive data like HTTP cookies
+-   * to the proxy unencrypted.
+-   */
+-  private Request createTunnelRequest() throws IOException {
+-    HttpUrl tunnelUrl = new HttpUrl.Builder()
+-        .scheme("https")
+-        .host(route.address.uriHost)
+-        .port(route.address.uriPort)
+-        .build();
+-    return new Request.Builder()
+-        .url(tunnelUrl)
+-        .header("Host", Util.hostHeader(tunnelUrl))
+-        .header("Proxy-Connection", "Keep-Alive")
+-        .header("User-Agent", Version.userAgent()) // For HTTP/1.0 proxies like Squid.
+-        .build();
+-  }
+-
+-  /**
+-   * Connects this connection if it isn't already. This creates tunnels, shares
+-   * the connection with the connection pool, and configures timeouts.
+-   */
+-  void connectAndSetOwner(OkHttpClient client, Object owner) throws RouteException {
+-    setOwner(owner);
+-
+-    if (!isConnected()) {
+-      List<ConnectionSpec> connectionSpecs = route.address.getConnectionSpecs();
+-      connect(client.getConnectTimeout(), client.getReadTimeout(), client.getWriteTimeout(),
+-          connectionSpecs, client.getRetryOnConnectionFailure());
+-      if (isFramed()) {
+-        client.getConnectionPool().share(this);
+-      }
+-      client.routeDatabase().connected(getRoute());
+-    }
+-
+-    setTimeouts(client.getReadTimeout(), client.getWriteTimeout());
+-  }
+-
+-  /** Returns true if {@link #connect} has been attempted on this connection. */
+-  boolean isConnected() {
+-    return protocol != null;
+-  }
+-
++public interface Connection {
+   /** Returns the route used by this connection. */
+-  public Route getRoute() {
+-    return route;
+-  }
++  Route getRoute();
+ 
+   /**
+    * Returns the socket that this connection uses, or null if the connection
+    * is not currently connected.
+    */
+-  public Socket getSocket() {
+-    return socket;
+-  }
++  Socket getSocket();
+ 
+-  BufferedSource rawSource() {
+-    if (httpConnection == null) throw new UnsupportedOperationException();
+-    return httpConnection.rawSource();
+-  }
+-
+-  BufferedSink rawSink() {
+-    if (httpConnection == null) throw new UnsupportedOperationException();
+-    return httpConnection.rawSink();
+-  }
+-
+-  /** Returns true if this connection is alive. */
+-  boolean isAlive() {
+-    return !socket.isClosed() && !socket.isInputShutdown() && !socket.isOutputShutdown();
+-  }
+-
+-  /**
+-   * Returns true if we are confident that we can read data from this
+-   * connection. This is more expensive and more accurate than {@link
+-   * #isAlive()}; callers should check {@link #isAlive()} first.
+-   */
+-  boolean isReadable() {
+-    if (httpConnection != null) return httpConnection.isReadable();
+-    return true; // Framed connections, and connections before connect() are both optimistic.
+-  }
+-
+-  void resetIdleStartTime() {
+-    if (framedConnection != null) throw new IllegalStateException("framedConnection != null");
+-    this.idleStartTimeNs = System.nanoTime();
+-  }
+-
+-  /** Returns true if this connection is idle. */
+-  boolean isIdle() {
+-    return framedConnection == null || framedConnection.isIdle();
+-  }
+-
+-  /**
+-   * Returns the time in ns when this connection became idle. Undefined if
+-   * this connection is not idle.
+-   */
+-  long getIdleStartTimeNs() {
+-    return framedConnection == null ? idleStartTimeNs : framedConnection.getIdleStartTimeNs();
+-  }
+-
+-  public Handshake getHandshake() {
+-    return handshake;
+-  }
+-
+-  /** Returns the transport appropriate for this connection. */
+-  Transport newTransport(HttpEngine httpEngine) throws IOException {
+-    return (framedConnection != null)
+-        ? new FramedTransport(httpEngine, framedConnection)
+-        : new HttpTransport(httpEngine, httpConnection);
+-  }
+-
+-  /**
+-   * Returns true if this is a SPDY connection. Such connections can be used
+-   * in multiple HTTP requests simultaneously.
+-   */
+-  boolean isFramed() {
+-    return framedConnection != null;
+-  }
++  Handshake getHandshake();
+ 
+   /**
+    * Returns the protocol negotiated by this connection, or {@link Protocol#HTTP_1_1} if no protocol
+    * has been negotiated. This method returns {@link Protocol#HTTP_1_1} even if the remote peer is
+    * using {@link Protocol#HTTP_1_0}.
+    */
+-  public Protocol getProtocol() {
+-    return protocol != null ? protocol : Protocol.HTTP_1_1;
+-  }
+-
+-  void setTimeouts(int readTimeoutMillis, int writeTimeoutMillis)
+-      throws RouteException {
+-    if (protocol == null) throw new IllegalStateException("not connected");
+-
+-    // Don't set timeouts on shared SPDY connections.
+-    if (httpConnection != null) {
+-      try {
+-        socket.setSoTimeout(readTimeoutMillis);
+-      } catch (IOException e) {
+-        throw new RouteException(e);
+-      }
+-      httpConnection.setTimeouts(readTimeoutMillis, writeTimeoutMillis);
+-    }
+-  }
+-
+-  void incrementRecycleCount() {
+-    recycleCount++;
+-  }
+-
+-  /**
+-   * Returns the number of times this connection has been returned to the
+-   * connection pool.
+-   */
+-  int recycleCount() {
+-    return recycleCount;
+-  }
+-
+-  @Override public String toString() {
+-    return "Connection{"
+-        + route.address.uriHost + ":" + route.address.uriPort
+-        + ", proxy="
+-        + route.proxy
+-        + " hostAddress="
+-        + route.inetSocketAddress
+-        + " cipherSuite="
+-        + (handshake != null ? handshake.cipherSuite() : "none")
+-        + " protocol="
+-        + protocol
+-        + '}';
+-  }
++  Protocol getProtocol();
+ }
+diff --git a/okhttp/src/main/java/com/squareup/okhttp/ConnectionPool.java b/okhttp/src/main/java/com/squareup/okhttp/ConnectionPool.java
+index a7c52449e5..ee3f9ba885 100644
+--- a/okhttp/src/main/java/com/squareup/okhttp/ConnectionPool.java
++++ b/okhttp/src/main/java/com/squareup/okhttp/ConnectionPool.java
+@@ -16,24 +16,20 @@
+  */
+ package com.squareup.okhttp;
+ 
+-import com.squareup.okhttp.internal.Platform;
++import com.squareup.okhttp.internal.RouteDatabase;
+ import com.squareup.okhttp.internal.Util;
+-import java.net.SocketException;
++import com.squareup.okhttp.internal.io.RealConnection;
+ import java.util.ArrayDeque;
+ import java.util.ArrayList;
+ import java.util.Deque;
+ import java.util.Iterator;
+ import java.util.List;
+-import java.util.concurrent.Executor;
+-import java.util.concurrent.LinkedBlockingQueue;
+-import java.util.concurrent.ThreadPoolExecutor;
+-import java.util.concurrent.TimeUnit;
+ 
+ /**
+  * Manages reuse of HTTP and SPDY connections for reduced network latency. HTTP
+  * requests that share the same {@link com.squareup.okhttp.Address} may share a
+- * {@link com.squareup.okhttp.Connection}. This class implements the policy of
+- * which connections to keep open for future use.
++ * {@link Connection}. This class implements the policy of which connections to
++ * keep open for future use.
+  *
+  * <p>The {@link #getDefault() system-wide default} uses system properties for
+  * tuning parameters:
+@@ -76,28 +72,8 @@
+   private final int maxIdleConnections;
+   private final long keepAliveDurationNs;
+ 
+-  private final Deque<Connection> connections = new ArrayDeque<>();
+-
+-  /**
+-   * A background thread is used to cleanup expired connections. There will be, at most, a single
+-   * thread running per connection pool.
+-   *
+-   * <p>A {@link ThreadPoolExecutor} is used and not a
+-   * {@link java.util.concurrent.ScheduledThreadPoolExecutor}; ScheduledThreadPoolExecutors do not
+-   * shrink. This executor shrinks the thread pool after a period of inactivity, and starts threads
+-   * as needed. Delays are instead handled by the {@link #connectionsCleanupRunnable}. It is
+-   * important that the {@link #connectionsCleanupRunnable} stops eventually, otherwise it will pin
+-   * the thread, and thus the connection pool, in memory.
+-   */
+-  private Executor executor = new ThreadPoolExecutor(
+-      0 /* corePoolSize */, 1 /* maximumPoolSize */, 60L /* keepAliveTime */, TimeUnit.SECONDS,
+-      new LinkedBlockingQueue<Runnable>(), Util.threadFactory("OkHttp ConnectionPool", true));
+-
+-  private final Runnable connectionsCleanupRunnable = new Runnable() {
+-    @Override public void run() {
+-      runCleanupUntilPoolIsEmpty();
+-    }
+-  };
++  private final Deque<RealConnection> connections = new ArrayDeque<>();
++  final RouteDatabase routeDatabase = new RouteDatabase();
+ 
+   public ConnectionPool(int maxIdleConnections, long keepAliveDurationMs) {
+     this.maxIdleConnections = maxIdleConnections;
+@@ -108,7 +84,21 @@ public static ConnectionPool getDefault() {
+     return systemDefault;
+   }
+ 
+-  /** Returns total number of connections in the pool. */
++  /** Returns the number of idle connections in the pool. */
++  public synchronized int getIdleConnectionCount() {
++    int total = 0;
++    for (RealConnection connection : connections) {
++      if (connection.allocationCount == 0) total++;
++    }
++    return total;
++  }
++
++  /**
++   * Returns total number of connections in the pool. Note that prior to OkHttp 2.7 this included
++   * only idle connections and SPDY connections. In OkHttp 2.7 this includes all connections, both
++   * active and inactive. Use {@link #getIdleConnectionCount()} to count connections not currently
++   * in use.
++   */
+   public synchronized int getConnectionCount() {
+     return connections.size();
+   }
+@@ -122,8 +112,8 @@ public synchronized int getSpdyConnectionCount() {
+   /** Returns total number of multiplexed connections in the pool. */
+   public synchronized int getMultiplexedConnectionCount() {
+     int total = 0;
+-    for (Connection connection : connections) {
+-      if (connection.isFramed()) total++;
++    for (RealConnection connection : connections) {
++      if (connection.isMultiplexed()) total++;
+     }
+     return total;
+   }
+@@ -135,202 +125,43 @@ public synchronized int getHttpConnectionCount() {
+ 
+   /** Returns a recycled connection to {@code address}, or null if no such connection exists. */
+   public synchronized Connection get(Address address) {
+-    Connection foundConnection = null;
+-    for (Iterator<Connection> i = connections.descendingIterator(); i.hasNext(); ) {
+-      Connection connection = i.next();
+-      if (!connection.getRoute().getAddress().equals(address)
+-          || !connection.isAlive()
+-          || System.nanoTime() - connection.getIdleStartTimeNs() >= keepAliveDurationNs) {
+-        continue;
+-      }
+-      i.remove();
+-      if (!connection.isFramed()) {
+-        try {
+-          Platform.get().tagSocket(connection.getSocket());
+-        } catch (SocketException e) {
+-          Util.closeQuietly(connection.getSocket());
+-          // When unable to tag, skip recycling and close
+-          Platform.get().logW("Unable to tagSocket(): " + e);
+-          continue;
+-        }
++    for (RealConnection connection : connections) {
++      if (connection.allocationCount < connection.allocationLimit
++          && address.equals(connection.getRoute().address)
++          && !connection.noNewStreams) {
++        connection.allocationCount++;
++        return connection;
+       }
+-      foundConnection = connection;
+-      break;
+     }
+-
+-    if (foundConnection != null && foundConnection.isFramed()) {
+-      connections.addFirst(foundConnection); // Add it back after iteration.
+-    }
+-
+-    return foundConnection;
++    return null;
+   }
+ 
+-  /**
+-   * Gives {@code connection} to the pool. The pool may store the connection,
+-   * or close it, as its policy describes.
+-   *
+-   * <p>It is an error to use {@code connection} after calling this method.
+-   */
+-  void recycle(Connection connection) {
+-    if (connection.isFramed()) {
+-      return;
+-    }
+-
+-    if (!connection.clearOwner()) {
+-      return; // This connection isn't eligible for reuse.
+-    }
+-
+-    if (!connection.isAlive()) {
+-      Util.closeQuietly(connection.getSocket());
+-      return;
+-    }
+-
+-    try {
+-      Platform.get().untagSocket(connection.getSocket());
+-    } catch (SocketException e) {
+-      // When unable to remove tagging, skip recycling and close.
+-      Platform.get().logW("Unable to untagSocket(): " + e);
+-      Util.closeQuietly(connection.getSocket());
+-      return;
+-    }
+-
+-    synchronized (this) {
+-      addConnection(connection);
+-      connection.incrementRecycleCount();
+-      connection.resetIdleStartTime();
+-    }
+-  }
+-
+-  private void addConnection(Connection connection) {
+-    boolean empty = connections.isEmpty();
+-    connections.addFirst(connection);
+-    if (empty) {
+-      executor.execute(connectionsCleanupRunnable);
+-    } else {
+-      notifyAll();
+-    }
++  // TODO(jwilson): reduce visibility.
++  public synchronized void put(RealConnection connection) {
++    connections.add(connection);
+   }
+ 
+-  /**
+-   * Shares the SPDY connection with the pool. Callers to this method may
+-   * continue to use {@code connection}.
+-   */
+-  void share(Connection connection) {
+-    if (!connection.isFramed()) throw new IllegalArgumentException();
+-    if (!connection.isAlive()) return;
+-    synchronized (this) {
+-      addConnection(connection);
+-    }
++  // TODO(jwilson): reduce visibility.
++  public synchronized void remove(RealConnection connection) {
++    connections.remove(connection);
+   }
+ 
+-  /** Close and remove all connections in the pool. */
++  /** Close and remove all idle connections in the pool. */
+   public void evictAll() {
+-    List<Connection> toEvict;
+-    synchronized (this) {
+-      toEvict = new ArrayList<>(connections);
+-      connections.clear();
+-      notifyAll();
+-    }
+-
+-    for (int i = 0, size = toEvict.size(); i < size; i++) {
+-      Util.closeQuietly(toEvict.get(i).getSocket());
+-    }
+-  }
+-
+-  private void runCleanupUntilPoolIsEmpty() {
+-    while (true) {
+-      if (!performCleanup()) return; // Halt cleanup.
+-    }
+-  }
+-
+-  /**
+-   * Attempts to make forward progress on connection eviction. There are three possible outcomes:
+-   *
+-   * <h3>The pool is empty.</h3>
+-   * In this case, this method returns false and the eviction job should exit because there are no
+-   * further cleanup tasks coming. (If additional connections are added to the pool, another cleanup
+-   * job must be enqueued.)
+-   *
+-   * <h3>Connections were evicted.</h3>
+-   * At least one connections was eligible for immediate eviction and was evicted. The method
+-   * returns true and cleanup should continue.
+-   *
+-   * <h3>We waited to evict.</h3>
+-   * None of the pooled connections were eligible for immediate eviction. Instead, we waited until
+-   * either a connection became eligible for eviction, or the connections list changed. In either
+-   * case, the method returns true and cleanup should continue.
+-   */
+-  // VisibleForTesting
+-  boolean performCleanup() {
+-    List<Connection> evictableConnections;
+-
++    List<RealConnection> evictedConnections = new ArrayList<>();
+     synchronized (this) {
+-      if (connections.isEmpty()) return false; // Halt cleanup.
+-
+-      evictableConnections = new ArrayList<>();
+-      int idleConnectionCount = 0;
+-      long now = System.nanoTime();
+-      long nanosUntilNextEviction = keepAliveDurationNs;
+-
+-      // Collect connections eligible for immediate eviction.
+-      for (Iterator<Connection> i = connections.descendingIterator(); i.hasNext(); ) {
+-        Connection connection = i.next();
+-        long nanosUntilEviction = connection.getIdleStartTimeNs() + keepAliveDurationNs - now;
+-        if (nanosUntilEviction <= 0 || !connection.isAlive()) {
++      for (Iterator<RealConnection> i = connections.iterator(); i.hasNext(); ) {
++        RealConnection connection = i.next();
++        if (connection.allocationCount == 0) {
++          connection.noNewStreams = true;
++          evictedConnections.add(connection);
+           i.remove();
+-          evictableConnections.add(connection);
+-        } else if (connection.isIdle()) {
+-          idleConnectionCount++;
+-          nanosUntilNextEviction = Math.min(nanosUntilNextEviction, nanosUntilEviction);
+-        }
+-      }
+-
+-      // If the pool has too many idle connections, gather more! Oldest to newest.
+-      for (Iterator<Connection> i = connections.descendingIterator();
+-          i.hasNext() && idleConnectionCount > maxIdleConnections; ) {
+-        Connection connection = i.next();
+-        if (connection.isIdle()) {
+-          evictableConnections.add(connection);
+-          i.remove();
+-          --idleConnectionCount;
+-        }
+-      }
+-
+-      // If there's nothing to evict, wait. (This will be interrupted if connections are added.)
+-      if (evictableConnections.isEmpty()) {
+-        try {
+-          long millisUntilNextEviction = nanosUntilNextEviction / (1000 * 1000);
+-          long remainderNanos = nanosUntilNextEviction - millisUntilNextEviction * (1000 * 1000);
+-          this.wait(millisUntilNextEviction, (int) remainderNanos);
+-          return true; // Cleanup continues.
+-        } catch (InterruptedException ignored) {
+         }
+       }
+     }
+ 
+-    // Actually do the eviction. Note that we avoid synchronized() when closing sockets.
+-    for (int i = 0, size = evictableConnections.size(); i < size; i++) {
+-      Connection expiredConnection = evictableConnections.get(i);
+-      Util.closeQuietly(expiredConnection.getSocket());
++    for (RealConnection connection : evictedConnections) {
++      Util.closeQuietly(connection.getSocket());
+     }
+-
+-    return true; // Cleanup continues.
+-  }
+-
+-  /**
+-   * Replace the default {@link Executor} with a different one. Only use in tests.
+-   */
+-  // VisibleForTesting
+-  void replaceCleanupExecutorForTests(Executor cleanupExecutor) {
+-    this.executor = cleanupExecutor;
+-  }
+-
+-  /**
+-   * Returns a snapshot of the connections in this pool, ordered from newest to
+-   * oldest. Only use in tests.
+-   */
+-  // VisibleForTesting
+-  synchronized List<Connection> getConnections() {
+-    return new ArrayList<>(connections);
+   }
+ }
+diff --git a/okhttp/src/main/java/com/squareup/okhttp/Dispatcher.java b/okhttp/src/main/java/com/squareup/okhttp/Dispatcher.java
+index a9346701fb..a669b94d49 100644
+--- a/okhttp/src/main/java/com/squareup/okhttp/Dispatcher.java
++++ b/okhttp/src/main/java/com/squareup/okhttp/Dispatcher.java
+@@ -125,7 +125,7 @@ public synchronized void cancel(Object tag) {
+       if (Util.equal(tag, call.tag())) {
+         call.get().canceled = true;
+         HttpEngine engine = call.get().engine;
+-        if (engine != null) engine.disconnect();
++        if (engine != null) engine.cancel();
+       }
+     }
+ 
+diff --git a/okhttp/src/main/java/com/squareup/okhttp/OkHttpClient.java b/okhttp/src/main/java/com/squareup/okhttp/OkHttpClient.java
+index 02485c48e6..9af08452d2 100644
+--- a/okhttp/src/main/java/com/squareup/okhttp/OkHttpClient.java
++++ b/okhttp/src/main/java/com/squareup/okhttp/OkHttpClient.java
+@@ -20,11 +20,8 @@
+ import com.squareup.okhttp.internal.RouteDatabase;
+ import com.squareup.okhttp.internal.Util;
+ import com.squareup.okhttp.internal.http.AuthenticatorAdapter;
+-import com.squareup.okhttp.internal.http.HttpEngine;
+-import com.squareup.okhttp.internal.http.RouteException;
+-import com.squareup.okhttp.internal.http.Transport;
++import com.squareup.okhttp.internal.http.StreamAllocation;
+ import com.squareup.okhttp.internal.tls.OkHostnameVerifier;
+-import java.io.IOException;
+ import java.net.CookieHandler;
+ import java.net.MalformedURLException;
+ import java.net.Proxy;
+@@ -40,8 +37,6 @@
+ import javax.net.ssl.SSLContext;
+ import javax.net.ssl.SSLSocket;
+ import javax.net.ssl.SSLSocketFactory;
+-import okio.BufferedSink;
+-import okio.BufferedSource;
+ 
+ /**
+  * Configures and creates HTTP connections. Most applications can use a single
+@@ -63,31 +58,6 @@
+ 
+   static {
+     Internal.instance = new Internal() {
+-      @Override public Transport newTransport(
+-          Connection connection, HttpEngine httpEngine) throws IOException {
+-        return connection.newTransport(httpEngine);
+-      }
+-
+-      @Override public boolean clearOwner(Connection connection) {
+-        return connection.clearOwner();
+-      }
+-
+-      @Override public void closeIfOwnedBy(Connection connection, Object owner) throws IOException {
+-        connection.closeIfOwnedBy(owner);
+-      }
+-
+-      @Override public int recycleCount(Connection connection) {
+-        return connection.recycleCount();
+-      }
+-
+-      @Override public void setOwner(Connection connection, HttpEngine httpEngine) {
+-        connection.setOwner(httpEngine);
+-      }
+-
+-      @Override public boolean isReadable(Connection pooled) {
+-        return pooled.isReadable();
+-      }
+-
+       @Override public void addLenient(Headers.Builder builder, String line) {
+         builder.addLenient(line);
+       }
+@@ -104,17 +74,8 @@
+         return client.internalCache();
+       }
+ 
+-      @Override public void recycle(ConnectionPool pool, Connection connection) {
+-        pool.recycle(connection);
+-      }
+-
+-      @Override public RouteDatabase routeDatabase(OkHttpClient client) {
+-        return client.routeDatabase();
+-      }
+-
+-      @Override public void connectAndSetOwner(OkHttpClient client, Connection connection,
+-          HttpEngine owner) throws RouteException {
+-        connection.connectAndSetOwner(client, owner);
++      @Override public RouteDatabase routeDatabase(ConnectionPool connectionPool) {
++        return connectionPool.routeDatabase;
+       }
+ 
+       @Override
+@@ -122,24 +83,8 @@ public void callEnqueue(Call call, Callback responseCallback, boolean forWebSock
+         call.enqueue(responseCallback, forWebSocket);
+       }
+ 
+-      @Override public void callEngineReleaseConnection(Call call) throws IOException {
+-        call.engine.releaseConnection();
+-      }
+-
+-      @Override public Connection callEngineGetConnection(Call call) {
+-        return call.engine.getConnection();
+-      }
+-
+-      @Override public BufferedSource connectionRawSource(Connection connection) {
+-        return connection.rawSource();
+-      }
+-
+-      @Override public BufferedSink connectionRawSink(Connection connection) {
+-        return connection.rawSink();
+-      }
+-
+-      @Override public void connectionSetOwner(Connection connection, Object owner) {
+-        connection.setOwner(owner);
++      @Override public StreamAllocation callEngineGetStreamAllocation(Call call) {
++        return call.engine.streamAllocation;
+       }
+ 
+       @Override
+diff --git a/okhttp/src/main/java/com/squareup/okhttp/internal/Internal.java b/okhttp/src/main/java/com/squareup/okhttp/internal/Internal.java
+index 5fc857794a..58eb0cf63c 100644
+--- a/okhttp/src/main/java/com/squareup/okhttp/internal/Internal.java
++++ b/okhttp/src/main/java/com/squareup/okhttp/internal/Internal.java
+@@ -17,22 +17,16 @@
+ 
+ import com.squareup.okhttp.Call;
+ import com.squareup.okhttp.Callback;
+-import com.squareup.okhttp.Connection;
+ import com.squareup.okhttp.ConnectionPool;
+ import com.squareup.okhttp.ConnectionSpec;
+ import com.squareup.okhttp.Headers;
+ import com.squareup.okhttp.HttpUrl;
+ import com.squareup.okhttp.OkHttpClient;
+-import com.squareup.okhttp.internal.http.HttpEngine;
+-import com.squareup.okhttp.internal.http.RouteException;
+-import com.squareup.okhttp.internal.http.Transport;
+-import java.io.IOException;
++import com.squareup.okhttp.internal.http.StreamAllocation;
+ import java.net.MalformedURLException;
+ import java.net.UnknownHostException;
+ import java.util.logging.Logger;
+ import javax.net.ssl.SSLSocket;
+-import okio.BufferedSink;
+-import okio.BufferedSource;
+ 
+ /**
+  * Escalate internal APIs in {@code com.squareup.okhttp} so they can be used
+@@ -49,19 +43,6 @@ public static void initializeInstanceForTests() {
+ 
+   public static Internal instance;
+ 
+-  public abstract Transport newTransport(Connection connection, HttpEngine httpEngine)
+-      throws IOException;
+-
+-  public abstract boolean clearOwner(Connection connection);
+-
+-  public abstract void closeIfOwnedBy(Connection connection, Object owner) throws IOException;
+-
+-  public abstract int recycleCount(Connection connection);
+-
+-  public abstract void setOwner(Connection connection, HttpEngine httpEngine);
+-
+-  public abstract boolean isReadable(Connection pooled);
+-
+   public abstract void addLenient(Headers.Builder builder, String line);
+ 
+   public abstract void addLenient(Headers.Builder builder, String name, String value);
+@@ -70,12 +51,7 @@ public abstract Transport newTransport(Connection connection, HttpEngine httpEng
+ 
+   public abstract InternalCache internalCache(OkHttpClient client);
+ 
+-  public abstract void recycle(ConnectionPool pool, Connection connection);
+-
+-  public abstract RouteDatabase routeDatabase(OkHttpClient client);
+-
+-  public abstract void connectAndSetOwner(OkHttpClient client, Connection connection,
+-      HttpEngine owner) throws RouteException;
++  public abstract RouteDatabase routeDatabase(ConnectionPool connectionPool);
+ 
+   public abstract void apply(ConnectionSpec tlsConfiguration, SSLSocket sslSocket,
+       boolean isFallback);
+@@ -85,9 +61,5 @@ public abstract HttpUrl getHttpUrlChecked(String url)
+ 
+   // TODO delete the following when web sockets move into the main package.
+   public abstract void callEnqueue(Call call, Callback responseCallback, boolean forWebSocket);
+-  public abstract void callEngineReleaseConnection(Call call) throws IOException;
+-  public abstract Connection callEngineGetConnection(Call call);
+-  public abstract BufferedSource connectionRawSource(Connection connection);
+-  public abstract BufferedSink connectionRawSink(Connection connection);
+-  public abstract void connectionSetOwner(Connection connection, Object owner);
++  public abstract StreamAllocation callEngineGetStreamAllocation(Call call);
+ }
+diff --git a/okhttp/src/main/java/com/squareup/okhttp/internal/http/HttpConnection.java b/okhttp/src/main/java/com/squareup/okhttp/internal/http/Http1xStream.java
+similarity index 77%
+rename from okhttp/src/main/java/com/squareup/okhttp/internal/http/HttpConnection.java
+rename to okhttp/src/main/java/com/squareup/okhttp/internal/http/Http1xStream.java
+index ffd31c3191..3db4629297 100644
+--- a/okhttp/src/main/java/com/squareup/okhttp/internal/http/HttpConnection.java
++++ b/okhttp/src/main/java/com/squareup/okhttp/internal/http/Http1xStream.java
+@@ -16,17 +16,16 @@
+ 
+ package com.squareup.okhttp.internal.http;
+ 
+-import com.squareup.okhttp.Connection;
+-import com.squareup.okhttp.ConnectionPool;
+ import com.squareup.okhttp.Headers;
++import com.squareup.okhttp.Request;
+ import com.squareup.okhttp.Response;
++import com.squareup.okhttp.ResponseBody;
+ import com.squareup.okhttp.internal.Internal;
+ import com.squareup.okhttp.internal.Util;
++import com.squareup.okhttp.internal.io.RealConnection;
+ import java.io.EOFException;
+ import java.io.IOException;
+ import java.net.ProtocolException;
+-import java.net.Socket;
+-import java.net.SocketTimeoutException;
+ import okio.Buffer;
+ import okio.BufferedSink;
+ import okio.BufferedSource;
+@@ -38,7 +37,6 @@
+ 
+ import static com.squareup.okhttp.internal.Util.checkOffsetAndCount;
+ import static com.squareup.okhttp.internal.http.StatusLine.HTTP_CONTINUE;
+-import static com.squareup.okhttp.internal.http.Transport.DISCARD_STREAM_TIMEOUT_MILLIS;
+ import static java.util.concurrent.TimeUnit.MILLISECONDS;
+ 
+ /**
+@@ -60,7 +58,7 @@
+  * #newFixedLengthSource(long) newFixedLengthSource(0)} and may skip reading and
+  * closing that source.
+  */
+-public final class HttpConnection {
++public final class Http1xStream implements HttpStream {
+   private static final int STATE_IDLE = 0; // Idle connections are ready to write request headers.
+   private static final int STATE_OPEN_REQUEST_BODY = 1;
+   private static final int STATE_WRITING_REQUEST_BODY = 2;
+@@ -69,63 +67,89 @@
+   private static final int STATE_READING_RESPONSE_BODY = 5;
+   private static final int STATE_CLOSED = 6;
+ 
+-  private static final int ON_IDLE_HOLD = 0;
+-  private static final int ON_IDLE_POOL = 1;
+-  private static final int ON_IDLE_CLOSE = 2;
+-
+-  private final ConnectionPool pool;
+-  private final Connection connection;
+-  private final Socket socket;
++  /** The stream allocation that owns this stream. May be null for HTTPS proxy tunnels. */
++  private final StreamAllocation streamAllocation;
+   private final BufferedSource source;
+   private final BufferedSink sink;
+-
++  private HttpEngine httpEngine;
+   private int state = STATE_IDLE;
+-  private int onIdle = ON_IDLE_HOLD;
+-
+-  public HttpConnection(ConnectionPool pool, Connection connection, Socket socket)
+-      throws IOException {
+-    this.pool = pool;
+-    this.connection = connection;
+-    this.socket = socket;
+-    this.source = Okio.buffer(Okio.source(socket));
+-    this.sink = Okio.buffer(Okio.sink(socket));
++
++  public Http1xStream(StreamAllocation streamAllocation, BufferedSource source, BufferedSink sink) {
++    this.streamAllocation = streamAllocation;
++    this.source = source;
++    this.sink = sink;
++  }
++
++  @Override public void setHttpEngine(HttpEngine httpEngine) {
++    this.httpEngine = httpEngine;
+   }
+ 
+-  public void setTimeouts(int readTimeoutMillis, int writeTimeoutMillis) {
+-    if (readTimeoutMillis != 0) {
+-      source.timeout().timeout(readTimeoutMillis, MILLISECONDS);
++  @Override public Sink createRequestBody(Request request, long contentLength) throws IOException {
++    if ("chunked".equalsIgnoreCase(request.header("Transfer-Encoding"))) {
++      // Stream a request body of unknown length.
++      return newChunkedSink();
+     }
+-    if (writeTimeoutMillis != 0) {
+-      sink.timeout().timeout(writeTimeoutMillis, MILLISECONDS);
++
++    if (contentLength != -1) {
++      // Stream a request body of a known length.
++      return newFixedLengthSink(contentLength);
+     }
++
++    throw new IllegalStateException(
++        "Cannot stream a request body without chunked encoding or a known content length!");
++  }
++
++  @Override public void cancel() {
++    RealConnection connection = streamAllocation.connection();
++    if (connection != null) connection.cancel();
+   }
+ 
+   /**
+-   * Configure this connection to put itself back into the connection pool when
+-   * the HTTP response body is exhausted.
++   * Prepares the HTTP headers and sends them to the server.
++   *
++   * <p>For streaming requests with a body, headers must be prepared
++   * <strong>before</strong> the output stream has been written to. Otherwise
++   * the body would need to be buffered!
++   *
++   * <p>For non-streaming requests with a body, headers must be prepared
++   * <strong>after</strong> the output stream has been written to and closed.
++   * This ensures that the {@code Content-Length} header field receives the
++   * proper value.
+    */
+-  public void poolOnIdle() {
+-    onIdle = ON_IDLE_POOL;
++  @Override public void writeRequestHeaders(Request request) throws IOException {
++    httpEngine.writingRequestHeaders();
++    String requestLine = RequestLine.get(
++        request, httpEngine.getConnection().getRoute().getProxy().type());
++    writeRequest(request.headers(), requestLine);
++  }
+ 
+-    // If we're already idle, go to the pool immediately.
+-    if (state == STATE_IDLE) {
+-      onIdle = ON_IDLE_HOLD; // Set the on idle policy back to the default.
+-      Internal.instance.recycle(pool, connection);
+-    }
++  @Override public Response.Builder readResponseHeaders() throws IOException {
++    return readResponse();
+   }
+ 
+-  /**
+-   * Configure this connection to close itself when the HTTP response body is
+-   * exhausted.
+-   */
+-  public void closeOnIdle() throws IOException {
+-    onIdle = ON_IDLE_CLOSE;
++  @Override public ResponseBody openResponseBody(Response response) throws IOException {
++    Source source = getTransferStream(response);
++    return new RealResponseBody(response.headers(), Okio.buffer(source));
++  }
+ 
+-    // If we're already idle, close immediately.
+-    if (state == STATE_IDLE) {
+-      state = STATE_CLOSED;
+-      connection.getSocket().close();
++  private Source getTransferStream(Response response) throws IOException {
++    if (!HttpEngine.hasBody(response)) {
++      return newFixedLengthSource(0);
+     }
++
++    if ("chunked".equalsIgnoreCase(response.header("Transfer-Encoding"))) {
++      return newChunkedSource(httpEngine);
++    }
++
++    long contentLength = OkHeaders.contentLength(response);
++    if (contentLength != -1) {
++      return newFixedLengthSource(contentLength);
++    }
++
++    // Wrap the input stream from the connection (rather than just returning
++    // "socketIn" directly here), so that we can control its use after the
++    // reference escapes.
++    return newUnknownLengthSource();
+   }
+ 
+   /** Returns true if this connection is closed. */
+@@ -133,39 +157,10 @@ public boolean isClosed() {
+     return state == STATE_CLOSED;
+   }
+ 
+-  public void closeIfOwnedBy(Object owner) throws IOException {
+-    Internal.instance.closeIfOwnedBy(connection, owner);
+-  }
+-
+-  public void flush() throws IOException {
++  @Override public void finishRequest() throws IOException {
+     sink.flush();
+   }
+ 
+-  /** Returns the number of buffered bytes immediately readable. */
+-  public long bufferSize() {
+-    return source.buffer().size();
+-  }
+-
+-  /** Test for a stale socket. */
+-  public boolean isReadable() {
+-    try {
+-      int readTimeout = socket.getSoTimeout();
+-      try {
+-        socket.setSoTimeout(1);
+-        if (source.exhausted()) {
+-          return false; // Stream is exhausted; socket is closed.
+-        }
+-        return true;
+-      } finally {
+-        socket.setSoTimeout(readTimeout);
+-      }
+-    } catch (SocketTimeoutException ignored) {
+-      return true; // Read timed out; socket is good.
+-    } catch (IOException e) {
+-      return false; // Couldn't read; socket is closed.
+-    }
+-  }
+-
+   /** Returns bytes of a request header for sending on an HTTP transport. */
+   public void writeRequest(Headers headers, String requestLine) throws IOException {
+     if (state != STATE_IDLE) throw new IllegalStateException("state: " + state);
+@@ -203,8 +198,7 @@ public void writeRequest(Headers headers, String requestLine) throws IOException
+       }
+     } catch (EOFException e) {
+       // Provide more context if the server ends the stream before sending a response.
+-      IOException exception = new IOException("unexpected end of stream on " + connection
+-          + " (recycle count=" + Internal.instance.recycleCount(connection) + ")");
++      IOException exception = new IOException("unexpected end of stream on " + streamAllocation);
+       exception.initCause(e);
+       throw exception;
+     }
+@@ -232,7 +226,7 @@ public Sink newFixedLengthSink(long contentLength) {
+     return new FixedLengthSink(contentLength);
+   }
+ 
+-  public void writeRequestBody(RetryableSink requestBody) throws IOException {
++  @Override public void writeRequestBody(RetryableSink requestBody) throws IOException {
+     if (state != STATE_OPEN_REQUEST_BODY) throw new IllegalStateException("state: " + state);
+     state = STATE_READ_RESPONSE_HEADERS;
+     requestBody.writeToSocket(sink);
+@@ -252,18 +246,12 @@ public Source newChunkedSource(HttpEngine httpEngine) throws IOException {
+ 
+   public Source newUnknownLengthSource() throws IOException {
+     if (state != STATE_OPEN_RESPONSE_BODY) throw new IllegalStateException("state: " + state);
++    if (streamAllocation == null) throw new IllegalStateException("streamAllocation == null");
+     state = STATE_READING_RESPONSE_BODY;
++    streamAllocation.noNewStreamsOnConnection();
+     return new UnknownLengthSource();
+   }
+ 
+-  public BufferedSink rawSink() {
+-    return sink;
+-  }
+-
+-  public BufferedSource rawSource() {
+-    return source;
+-  }
+-
+   /**
+    * Sets the delegate of {@code timeout} to {@link Timeout#NONE} and resets its underlying timeout
+    * to the default configuration. Use this to avoid unexpected sharing of timeouts between pooled
+@@ -364,36 +352,25 @@ private FixedLengthSink(long bytesRemaining) {
+      * Closes the cache entry and makes the socket available for reuse. This
+      * should be invoked when the end of the body has been reached.
+      */
+-    protected final void endOfInput(boolean recyclable) throws IOException {
++    protected final void endOfInput() throws IOException {
+       if (state != STATE_READING_RESPONSE_BODY) throw new IllegalStateException("state: " + state);
+ 
+       detachTimeout(timeout);
+ 
+-      state = STATE_IDLE;
+-      if (recyclable && onIdle == ON_IDLE_POOL) {
+-        onIdle = ON_IDLE_HOLD; // Set the on idle policy back to the default.
+-        Internal.instance.recycle(pool, connection);
+-      } else if (onIdle == ON_IDLE_CLOSE) {
+-        state = STATE_CLOSED;
+-        connection.getSocket().close();
++      state = STATE_CLOSED;
++      if (streamAllocation != null) {
++        streamAllocation.streamFinished(Http1xStream.this);
+       }
+     }
+ 
+-    /**
+-     * Calls abort on the cache entry and disconnects the socket. This
+-     * should be invoked when the connection is closed unexpectedly to
+-     * invalidate the cache entry and to prevent the HTTP connection from
+-     * being reused. HTTP messages are sent in serial so whenever a message
+-     * cannot be read to completion, subsequent messages cannot be read
+-     * either and the connection must be discarded.
+-     *
+-     * <p>An earlier implementation skipped the remaining bytes, but this
+-     * requires that the entire transfer be completed. If the intention was
+-     * to cancel the transfer, closing the connection is the only solution.
+-     */
+     protected final void unexpectedEndOfInput() {
+-      Util.closeQuietly(connection.getSocket());
++      if (state == STATE_CLOSED) return;
++
+       state = STATE_CLOSED;
++      if (streamAllocation != null) {
++        streamAllocation.noNewStreamsOnConnection();
++        streamAllocation.streamFinished(Http1xStream.this);
++      }
+     }
+   }
+ 
+@@ -404,7 +381,7 @@ protected final void unexpectedEndOfInput() {
+     public FixedLengthSource(long length) throws IOException {
+       bytesRemaining = length;
+       if (bytesRemaining == 0) {
+-        endOfInput(true);
++        endOfInput();
+       }
+     }
+ 
+@@ -421,7 +398,7 @@ public FixedLengthSource(long length) throws IOException {
+ 
+       bytesRemaining -= read;
+       if (bytesRemaining == 0) {
+-        endOfInput(true);
++        endOfInput();
+       }
+       return read;
+     }
+@@ -486,7 +463,7 @@ private void readChunkSize() throws IOException {
+       if (bytesRemainingInChunk == 0L) {
+         hasMoreChunks = false;
+         httpEngine.receiveHeaders(readHeaders());
+-        endOfInput(true);
++        endOfInput();
+       }
+     }
+ 
+@@ -512,7 +489,7 @@ private void readChunkSize() throws IOException {
+       long read = source.read(sink, byteCount);
+       if (read == -1) {
+         inputExhausted = true;
+-        endOfInput(false);
++        endOfInput();
+         return -1;
+       }
+       return read;
+diff --git a/okhttp/src/main/java/com/squareup/okhttp/internal/http/FramedTransport.java b/okhttp/src/main/java/com/squareup/okhttp/internal/http/Http2xStream.java
+similarity index 91%
+rename from okhttp/src/main/java/com/squareup/okhttp/internal/http/FramedTransport.java
+rename to okhttp/src/main/java/com/squareup/okhttp/internal/http/Http2xStream.java
+index e03e66d63a..040e258b3b 100644
+--- a/okhttp/src/main/java/com/squareup/okhttp/internal/http/FramedTransport.java
++++ b/okhttp/src/main/java/com/squareup/okhttp/internal/http/Http2xStream.java
+@@ -35,8 +35,10 @@
+ import java.util.Set;
+ import java.util.concurrent.TimeUnit;
+ import okio.ByteString;
++import okio.ForwardingSource;
+ import okio.Okio;
+ import okio.Sink;
++import okio.Source;
+ 
+ import static com.squareup.okhttp.internal.framed.Header.RESPONSE_STATUS;
+ import static com.squareup.okhttp.internal.framed.Header.TARGET_AUTHORITY;
+@@ -46,7 +48,8 @@
+ import static com.squareup.okhttp.internal.framed.Header.TARGET_SCHEME;
+ import static com.squareup.okhttp.internal.framed.Header.VERSION;
+ 
+-public final class FramedTransport implements Transport {
++/** An HTTP stream for HTTP/2 and SPDY. */
++public final class Http2xStream implements HttpStream {
+   private static final ByteString CONNECTION = ByteString.encodeUtf8("connection");
+   private static final ByteString HOST = ByteString.encodeUtf8("host");
+   private static final ByteString KEEP_ALIVE = ByteString.encodeUtf8("keep-alive");
+@@ -102,15 +105,20 @@
+       ENCODING,
+       UPGRADE);
+ 
+-  private final HttpEngine httpEngine;
++  private final StreamAllocation streamAllocation;
+   private final FramedConnection framedConnection;
++  private HttpEngine httpEngine;
+   private FramedStream stream;
+ 
+-  public FramedTransport(HttpEngine httpEngine, FramedConnection framedConnection) {
+-    this.httpEngine = httpEngine;
++  public Http2xStream(StreamAllocation streamAllocation, FramedConnection framedConnection) {
++    this.streamAllocation = streamAllocation;
+     this.framedConnection = framedConnection;
+   }
+ 
++  @Override public void setHttpEngine(HttpEngine httpEngine) {
++    this.httpEngine = httpEngine;
++  }
++
+   @Override public Sink createRequestBody(Request request, long contentLength) throws IOException {
+     return stream.getSink();
+   }
+@@ -126,6 +134,7 @@ public FramedTransport(HttpEngine httpEngine, FramedConnection framedConnection)
+     boolean hasResponseBody = true;
+     stream = framedConnection.newStream(requestHeaders, permitsRequestBody, hasResponseBody);
+     stream.readTimeout().timeout(httpEngine.client.getReadTimeout(), TimeUnit.MILLISECONDS);
++    stream.writeTimeout().timeout(httpEngine.client.getWriteTimeout(), TimeUnit.MILLISECONDS);
+   }
+ 
+   @Override public void writeRequestBody(RetryableSink requestBody) throws IOException {
+@@ -266,17 +275,22 @@ private static String joinOnNull(String first, String second) {
+   }
+ 
+   @Override public ResponseBody openResponseBody(Response response) throws IOException {
+-    return new RealResponseBody(response.headers(), Okio.buffer(stream.getSource()));
++    Source source = new StreamFinishingSource(stream.getSource());
++    return new RealResponseBody(response.headers(), Okio.buffer(source));
+   }
+ 
+-  @Override public void releaseConnectionOnIdle() {
++  @Override public void cancel() {
++    if (stream != null) stream.closeLater(ErrorCode.CANCEL);
+   }
+ 
+-  @Override public void disconnect(HttpEngine engine) throws IOException {
+-    if (stream != null) stream.close(ErrorCode.CANCEL);
+-  }
++  class StreamFinishingSource extends ForwardingSource {
++    public StreamFinishingSource(Source delegate) {
++      super(delegate);
++    }
+ 
+-  @Override public boolean canReuseConnection() {
+-    return true; // TODO: framedConnection.isClosed() ?
++    @Override public void close() throws IOException {
++      streamAllocation.streamFinished(Http2xStream.this);
++      super.close();
++    }
+   }
+ }
+diff --git a/okhttp/src/main/java/com/squareup/okhttp/internal/http/HttpEngine.java b/okhttp/src/main/java/com/squareup/okhttp/internal/http/HttpEngine.java
+index 27aca16612..bc7ae109ef 100644
+--- a/okhttp/src/main/java/com/squareup/okhttp/internal/http/HttpEngine.java
++++ b/okhttp/src/main/java/com/squareup/okhttp/internal/http/HttpEngine.java
+@@ -20,7 +20,6 @@
+ import com.squareup.okhttp.Address;
+ import com.squareup.okhttp.CertificatePinner;
+ import com.squareup.okhttp.Connection;
+-import com.squareup.okhttp.ConnectionPool;
+ import com.squareup.okhttp.Headers;
+ import com.squareup.okhttp.HttpUrl;
+ import com.squareup.okhttp.Interceptor;
+@@ -36,18 +35,13 @@
+ import com.squareup.okhttp.internal.Util;
+ import com.squareup.okhttp.internal.Version;
+ import java.io.IOException;
+-import java.io.InterruptedIOException;
+ import java.net.CookieHandler;
+ import java.net.ProtocolException;
+ import java.net.Proxy;
+-import java.net.SocketTimeoutException;
+-import java.security.cert.CertificateException;
+ import java.util.Date;
+ import java.util.List;
+ import java.util.Map;
+ import javax.net.ssl.HostnameVerifier;
+-import javax.net.ssl.SSLHandshakeException;
+-import javax.net.ssl.SSLPeerUnverifiedException;
+ import javax.net.ssl.SSLSocketFactory;
+ import okio.Buffer;
+ import okio.BufferedSink;
+@@ -111,13 +105,9 @@
+ 
+   final OkHttpClient client;
+ 
+-  private Connection connection;
+-  private Address address;
+-  private RouteSelector routeSelector;
+-  private Route route;
++  public final StreamAllocation streamAllocation;
+   private final Response priorResponse;
+-
+-  private Transport transport;
++  private HttpStream httpStream;
+ 
+   /** The time when the request headers were written, or -1 if they haven't been written yet. */
+   long sentRequestMillis = -1;
+@@ -178,30 +168,20 @@
+    * @param callerWritesRequestBody true for the {@code HttpURLConnection}-style interaction
+    *     model where control flow is returned to the calling application to write the request body
+    *     before the response body is readable.
+-   * @param connection the connection used for an intermediate response immediately prior to this
+-   *     request/response pair, such as a same-host redirect. This engine assumes ownership of the
+-   *     connection and must release it when it is unneeded.
+-   * @param routeSelector the route selector used for a failed attempt immediately preceding this
+    */
+   public HttpEngine(OkHttpClient client, Request request, boolean bufferRequestBody,
+-      boolean callerWritesRequestBody, boolean forWebSocket, Connection connection,
+-      RouteSelector routeSelector, RetryableSink requestBodyOut, Response priorResponse) {
++      boolean callerWritesRequestBody, boolean forWebSocket, StreamAllocation streamAllocation,
++      RetryableSink requestBodyOut, Response priorResponse) {
+     this.client = client;
+     this.userRequest = request;
+     this.bufferRequestBody = bufferRequestBody;
+     this.callerWritesRequestBody = callerWritesRequestBody;
+     this.forWebSocket = forWebSocket;
+-    this.connection = connection;
+-    this.routeSelector = routeSelector;
++    this.streamAllocation = streamAllocation != null
++        ? streamAllocation
++        : new StreamAllocation(client.getConnectionPool(), createAddress(client, request));
+     this.requestBodyOut = requestBodyOut;
+     this.priorResponse = priorResponse;
+-
+-    if (connection != null) {
+-      Internal.instance.setOwner(connection, this);
+-      this.route = connection.getRoute();
+-    } else {
+-      this.route = null;
+-    }
+   }
+ 
+   /**
+@@ -218,7 +198,7 @@ public HttpEngine(OkHttpClient client, Request request, boolean bufferRequestBod
+    */
+   public void sendRequest() throws RequestException, RouteException, IOException {
+     if (cacheStrategy != null) return; // Already sent.
+-    if (transport != null) throw new IllegalStateException();
++    if (httpStream != null) throw new IllegalStateException();
+ 
+     Request request = networkRequest(userRequest);
+ 
+@@ -241,12 +221,8 @@ public void sendRequest() throws RequestException, RouteException, IOException {
+     }
+ 
+     if (networkRequest != null) {
+-      // Open a connection unless we inherited one from a redirect.
+-      if (connection == null) {
+-        connect();
+-      }
+-
+-      transport = Internal.instance.newTransport(connection, this);
++      httpStream = connect();
++      httpStream.setHttpEngine(this);
+ 
+       // If the caller's control flow writes the request body, we need to create that stream
+       // immediately. And that means we need to immediately write the request headers, so we can
+@@ -262,7 +238,7 @@ public void sendRequest() throws RequestException, RouteException, IOException {
+ 
+           if (contentLength != -1) {
+             // Buffer a request body of a known length.
+-            transport.writeRequestHeaders(networkRequest);
++            httpStream.writeRequestHeaders(networkRequest);
+             requestBodyOut = new RetryableSink((int) contentLength);
+           } else {
+             // Buffer a request body of an unknown length. Don't write request
+@@ -271,17 +247,13 @@ public void sendRequest() throws RequestException, RouteException, IOException {
+             requestBodyOut = new RetryableSink();
+           }
+         } else {
+-          transport.writeRequestHeaders(networkRequest);
+-          requestBodyOut = transport.createRequestBody(networkRequest, contentLength);
++          httpStream.writeRequestHeaders(networkRequest);
++          requestBodyOut = httpStream.createRequestBody(networkRequest, contentLength);
+         }
+       }
+ 
+     } else {
+-      // We aren't using the network. Recycle a connection we may have inherited from a redirect.
+-      if (connection != null) {
+-        Internal.instance.recycle(client.getConnectionPool(), connection);
+-        connection = null;
+-      }
++      streamAllocation.release();
+ 
+       if (cacheResponse != null) {
+         // We have a valid cached response. Promote it to the user response immediately.
+@@ -306,48 +278,19 @@ public void sendRequest() throws RequestException, RouteException, IOException {
+     }
+   }
+ 
++  private HttpStream connect() throws RouteException, RequestException, IOException {
++    boolean doExtensiveHealthChecks = !networkRequest.method().equals("GET");
++    return streamAllocation.newStream(client.getConnectTimeout(),
++        client.getReadTimeout(), client.getWriteTimeout(),
++        client.getRetryOnConnectionFailure(), doExtensiveHealthChecks);
++  }
++
+   private static Response stripBody(Response response) {
+     return response != null && response.body() != null
+         ? response.newBuilder().body(null).build()
+         : response;
+   }
+ 
+-  /** Connect to the origin server either directly or via a proxy. */
+-  private void connect() throws RequestException, RouteException {
+-    if (connection != null) throw new IllegalStateException();
+-
+-    if (routeSelector == null) {
+-      address = createAddress(client, networkRequest);
+-      try {
+-        routeSelector = RouteSelector.get(address, networkRequest, client);
+-      } catch (IOException e) {
+-        throw new RequestException(e);
+-      }
+-    }
+-
+-    connection = createNextConnection();
+-    Internal.instance.connectAndSetOwner(client, connection, this);
+-    route = connection.getRoute();
+-  }
+-
+-  private Connection createNextConnection() throws RouteException {
+-    ConnectionPool pool = client.getConnectionPool();
+-
+-    // Always prefer pooled connections over new connections.
+-    for (Connection pooled; (pooled = pool.get(address)) != null; ) {
+-      if (networkRequest.method().equals("GET") || Internal.instance.isReadable(pooled)) {
+-        return pooled;
+-      }
+-      closeQuietly(pooled.getSocket());
+-    }
+-
+-    try {
+-      Route route = routeSelector.next();
+-      return new Connection(pool, route);
+-    } catch (IOException e) {
+-      throw new RouteException(e);
+-    }
+-  }
+ 
+   /**
+    * Called immediately before the transport transmits HTTP request headers.
+@@ -393,7 +336,7 @@ public Response getResponse() {
+   }
+ 
+   public Connection getConnection() {
+-    return connection;
++    return streamAllocation.connection();
+   }
+ 
+   /**
+@@ -402,64 +345,19 @@ public Connection getConnection() {
+    * there are no more routes to try.
+    */
+   public HttpEngine recover(RouteException e) {
+-    if (routeSelector != null && connection != null) {
+-      connectFailed(routeSelector, e.getLastConnectException());
++    if (!streamAllocation.recover(e)) {
++      return null;
+     }
+ 
+-    if (routeSelector == null && connection == null // No connection.
+-        || routeSelector != null && !routeSelector.hasNext() // No more routes to attempt.
+-        || !isRecoverable(e)) {
++    if (!client.getRetryOnConnectionFailure()) {
+       return null;
+     }
+ 
+-    Connection connection = close();
++    StreamAllocation streamAllocation = close();
+ 
+     // For failure recovery, use the same route selector with a new connection.
+     return new HttpEngine(client, userRequest, bufferRequestBody, callerWritesRequestBody,
+-        forWebSocket, connection, routeSelector, (RetryableSink) requestBodyOut, priorResponse);
+-  }
+-
+-  private boolean isRecoverable(RouteException e) {
+-    // If the application has opted-out of recovery, don't recover.
+-    if (!client.getRetryOnConnectionFailure()) {
+-      return false;
+-    }
+-
+-    // Problems with a route may mean the connection can be retried with a new route, or may
+-    // indicate a client-side or server-side issue that should not be retried. To tell, we must look
+-    // at the cause.
+-
+-    IOException ioe = e.getLastConnectException();
+-
+-    // If there was a protocol problem, don't recover.
+-    if (ioe instanceof ProtocolException) {
+-      return false;
+-    }
+-
+-    // If there was an interruption don't recover, but if there was a timeout
+-    // we should try the next route (if there is one).
+-    if (ioe instanceof InterruptedIOException) {
+-      return ioe instanceof SocketTimeoutException;
+-    }
+-
+-    // Look for known client-side or negotiation errors that are unlikely to be fixed by trying
+-    // again with a different route.
+-    if (ioe instanceof SSLHandshakeException) {
+-      // If the problem was a CertificateException from the X509TrustManager,
+-      // do not retry.
+-      if (ioe.getCause() instanceof CertificateException) {
+-        return false;
+-      }
+-    }
+-    if (ioe instanceof SSLPeerUnverifiedException) {
+-      // e.g. a certificate pinning error.
+-      return false;
+-    }
+-
+-    // An example of one we might want to retry with a different route is a problem connecting to a
+-    // proxy and would manifest as a standard IOException. Unless it is one we know we should not
+-    // retry, we return true and try a new route.
+-    return true;
++        forWebSocket, streamAllocation, (RetryableSink) requestBodyOut, priorResponse);
+   }
+ 
+   /**
+@@ -469,63 +367,25 @@ private boolean isRecoverable(RouteException e) {
+    * body is buffered.
+    */
+   public HttpEngine recover(IOException e, Sink requestBodyOut) {
+-    if (routeSelector != null && connection != null) {
+-      connectFailed(routeSelector, e);
++    if (!streamAllocation.recover(e, requestBodyOut)) {
++      return null;
+     }
+ 
+-    boolean canRetryRequestBody = requestBodyOut == null || requestBodyOut instanceof RetryableSink;
+-    if (routeSelector == null && connection == null // No connection.
+-        || routeSelector != null && !routeSelector.hasNext() // No more routes to attempt.
+-        || !isRecoverable(e)
+-        || !canRetryRequestBody) {
++    if (!client.getRetryOnConnectionFailure()) {
+       return null;
+     }
+ 
+-    Connection connection = close();
++    StreamAllocation streamAllocation = close();
+ 
+     // For failure recovery, use the same route selector with a new connection.
+     return new HttpEngine(client, userRequest, bufferRequestBody, callerWritesRequestBody,
+-        forWebSocket, connection, routeSelector, (RetryableSink) requestBodyOut, priorResponse);
+-  }
+-
+-  private void connectFailed(RouteSelector routeSelector, IOException e) {
+-    // If this is a recycled connection, don't count its failure against the route.
+-    if (Internal.instance.recycleCount(connection) > 0) return;
+-    Route failedRoute = connection.getRoute();
+-    routeSelector.connectFailed(failedRoute, e);
++        forWebSocket, streamAllocation, (RetryableSink) requestBodyOut, priorResponse);
+   }
+ 
+   public HttpEngine recover(IOException e) {
+     return recover(e, requestBodyOut);
+   }
+ 
+-  private boolean isRecoverable(IOException e) {
+-    // If the application has opted-out of recovery, don't recover.
+-    if (!client.getRetryOnConnectionFailure()) {
+-      return false;
+-    }
+-
+-    // If there was a protocol problem, don't recover.
+-    if (e instanceof ProtocolException) {
+-      return false;
+-    }
+-
+-    // If there was an interruption or timeout, don't recover.
+-    if (e instanceof InterruptedIOException) {
+-      return false;
+-    }
+-
+-    return true;
+-  }
+-
+-  /**
+-   * Returns the route used to retrieve the response. Null if we haven't
+-   * connected yet, or if no connection was necessary.
+-   */
+-  public Route getRoute() {
+-    return route;
+-  }
+-
+   private void maybeCache() throws IOException {
+     InternalCache responseCache = Internal.instance.internalCache(client);
+     if (responseCache == null) return;
+@@ -551,11 +411,8 @@ private void maybeCache() throws IOException {
+    * either exhausted or closed. If it is unneeded when this is called, it will
+    * be released immediately.
+    */
+-  public void releaseConnection() throws IOException {
+-    if (transport != null && connection != null) {
+-      transport.releaseConnectionOnIdle();
+-    }
+-    connection = null;
++  public void releaseStreamAllocation() throws IOException {
++    streamAllocation.release();
+   }
+ 
+   /**
+@@ -567,25 +424,15 @@ public void releaseConnection() throws IOException {
+    * transport layer connection has been established (such as a HTTP/2 stream) that is terminated.
+    * Otherwise if a socket connection is being established, that is terminated.
+    */
+-  public void disconnect() {
+-    try {
+-      if (transport != null) {
+-        transport.disconnect(this);
+-      } else {
+-        Connection connection = this.connection;
+-        if (connection != null) {
+-          Internal.instance.closeIfOwnedBy(connection, this);
+-        }
+-      }
+-    } catch (IOException ignored) {
+-    }
++  public void cancel() {
++    streamAllocation.cancel();
+   }
+ 
+   /**
+-   * Release any resources held by this engine. If a connection is still held by
+-   * this engine, it is returned.
++   * Release any resources held by this engine. Returns the stream allocation held by this engine,
++   * which itself must be used or released.
+    */
+-  public Connection close() {
++  public StreamAllocation close() {
+     if (bufferedRequestBody != null) {
+       // This also closes the wrapped requestBodyOut.
+       closeQuietly(bufferedRequestBody);
+@@ -593,31 +440,14 @@ public Connection close() {
+       closeQuietly(requestBodyOut);
+     }
+ 
+-    // If this engine never achieved a response body, its connection cannot be reused.
+-    if (userResponse == null) {
+-      if (connection != null) closeQuietly(connection.getSocket()); // TODO: does this break SPDY?
+-      connection = null;
+-      return null;
+-    }
+-
+-    // Close the response body. This will recycle the connection if it is eligible.
+-    closeQuietly(userResponse.body());
+-
+-    // Close the connection if it cannot be reused.
+-    if (transport != null && connection != null && !transport.canReuseConnection()) {
+-      closeQuietly(connection.getSocket());
+-      connection = null;
+-      return null;
+-    }
+-
+-    // Prevent this engine from disconnecting a connection it no longer owns.
+-    if (connection != null && !Internal.instance.clearOwner(connection)) {
+-      connection = null;
++    if (userResponse != null) {
++      closeQuietly(userResponse.body());
++    } else {
++      // If this engine never achieved a response body, its stream allocation is dead.
++      streamAllocation.noNewStreams();
+     }
+ 
+-    Connection result = connection;
+-    connection = null;
+-    return result;
++    return streamAllocation;
+   }
+ 
+   /**
+@@ -741,7 +571,7 @@ public void readResponse() throws IOException {
+     Response networkResponse;
+ 
+     if (forWebSocket) {
+-      transport.writeRequestHeaders(networkRequest);
++      httpStream.writeRequestHeaders(networkRequest);
+       networkResponse = readNetworkResponse();
+ 
+     } else if (!callerWritesRequestBody) {
+@@ -762,7 +592,7 @@ public void readResponse() throws IOException {
+               .header("Content-Length", Long.toString(contentLength))
+               .build();
+         }
+-        transport.writeRequestHeaders(networkRequest);
++        httpStream.writeRequestHeaders(networkRequest);
+       }
+ 
+       // Write the request body to the socket.
+@@ -774,7 +604,7 @@ public void readResponse() throws IOException {
+           requestBodyOut.close();
+         }
+         if (requestBodyOut instanceof RetryableSink) {
+-          transport.writeRequestBody((RetryableSink) requestBodyOut);
++          httpStream.writeRequestBody((RetryableSink) requestBodyOut);
+         }
+       }
+ 
+@@ -794,7 +624,7 @@ public void readResponse() throws IOException {
+             .networkResponse(stripBody(networkResponse))
+             .build();
+         networkResponse.body().close();
+-        releaseConnection();
++        releaseStreamAllocation();
+ 
+         // Update the cache after combining headers but before stripping the
+         // Content-Encoding header (as performed by initContentStream()).
+@@ -832,7 +662,7 @@ public void readResponse() throws IOException {
+     }
+ 
+     @Override public Connection connection() {
+-      return connection;
++      return streamAllocation.connection();
+     }
+ 
+     @Override public Request request() {
+@@ -879,13 +709,13 @@ public void readResponse() throws IOException {
+         return interceptedResponse;
+       }
+ 
+-      transport.writeRequestHeaders(request);
++      httpStream.writeRequestHeaders(request);
+ 
+       //Update the networkRequest with the possibly updated interceptor request.
+       networkRequest = request;
+ 
+       if (permitsRequestBody(request) && request.body() != null) {
+-        Sink requestBodyOut = transport.createRequestBody(request, request.body().contentLength());
++        Sink requestBodyOut = httpStream.createRequestBody(request, request.body().contentLength());
+         BufferedSink bufferedRequestBody = Okio.buffer(requestBodyOut);
+         request.body().writeTo(bufferedRequestBody);
+         bufferedRequestBody.close();
+@@ -904,21 +734,26 @@ public void readResponse() throws IOException {
+   }
+ 
+   private Response readNetworkResponse() throws IOException {
+-    transport.finishRequest();
++    httpStream.finishRequest();
+ 
+-    Response networkResponse = transport.readResponseHeaders()
++    Response networkResponse = httpStream.readResponseHeaders()
+         .request(networkRequest)
+-        .handshake(connection.getHandshake())
++        .handshake(streamAllocation.connection().getHandshake())
+         .header(OkHeaders.SENT_MILLIS, Long.toString(sentRequestMillis))
+         .header(OkHeaders.RECEIVED_MILLIS, Long.toString(System.currentTimeMillis()))
+         .build();
+ 
+     if (!forWebSocket) {
+       networkResponse = networkResponse.newBuilder()
+-          .body(transport.openResponseBody(networkResponse))
++          .body(httpStream.openResponseBody(networkResponse))
+           .build();
+     }
+ 
++    if ("close".equalsIgnoreCase(networkResponse.request().header("Connection"))
++        || "close".equalsIgnoreCase(networkResponse.header("Connection"))) {
++      streamAllocation.noNewStreamsOnConnection();
++    }
++
+     return networkResponse;
+   }
+ 
+@@ -971,7 +806,7 @@ private Response cacheWritingResponse(final CacheRequest cacheRequest, Response
+ 
+       @Override public void close() throws IOException {
+         if (!cacheRequestClosed
+-            && !Util.discard(this, Transport.DISCARD_STREAM_TIMEOUT_MILLIS, MILLISECONDS)) {
++            && !Util.discard(this, HttpStream.DISCARD_STREAM_TIMEOUT_MILLIS, MILLISECONDS)) {
+           cacheRequestClosed = true;
+           cacheRequest.abort();
+         }
+@@ -1053,8 +888,12 @@ public void receiveHeaders(Headers headers) throws IOException {
+    */
+   public Request followUpRequest() throws IOException {
+     if (userResponse == null) throw new IllegalStateException();
+-    Proxy selectedProxy = getRoute() != null
+-        ? getRoute().getProxy()
++    Connection connection = streamAllocation.connection();
++    Route route = connection != null
++        ? connection.getRoute()
++        : null;
++    Proxy selectedProxy = route != null
++        ? route.getProxy()
+         : client.getProxy();
+     int responseCode = userResponse.code();
+ 
+diff --git a/okhttp/src/main/java/com/squareup/okhttp/internal/http/Transport.java b/okhttp/src/main/java/com/squareup/okhttp/internal/http/HttpStream.java
+similarity index 82%
+rename from okhttp/src/main/java/com/squareup/okhttp/internal/http/Transport.java
+rename to okhttp/src/main/java/com/squareup/okhttp/internal/http/HttpStream.java
+index 77f7c9e746..ef1deb7a1f 100644
+--- a/okhttp/src/main/java/com/squareup/okhttp/internal/http/Transport.java
++++ b/okhttp/src/main/java/com/squareup/okhttp/internal/http/HttpStream.java
+@@ -22,7 +22,7 @@
+ import java.io.IOException;
+ import okio.Sink;
+ 
+-public interface Transport {
++public interface HttpStream {
+   /**
+    * The timeout to use while discarding a stream of input data. Since this is
+    * used for connection reuse, this timeout should be significantly less than
+@@ -51,17 +51,11 @@
+   /** Returns a stream that reads the response body. */
+   ResponseBody openResponseBody(Response response) throws IOException;
+ 
+-  /**
+-   * Configures the response body to pool or close the socket connection when
+-   * the response body is closed.
+-   */
+-  void releaseConnectionOnIdle() throws IOException;
+-
+-  void disconnect(HttpEngine engine) throws IOException;
++  void setHttpEngine(HttpEngine httpEngine);
+ 
+   /**
+-   * Returns true if the socket connection held by this transport can be reused
+-   * for a follow-up exchange.
++   * Cancel this stream. Resources held by this stream will be cleaned up, though not synchronously.
++   * That may happen later by the connection pool thread.
+    */
+-  boolean canReuseConnection();
++  void cancel();
+ }
+diff --git a/okhttp/src/main/java/com/squareup/okhttp/internal/http/HttpTransport.java b/okhttp/src/main/java/com/squareup/okhttp/internal/http/HttpTransport.java
+deleted file mode 100644
+index f56eb248df..0000000000
+--- a/okhttp/src/main/java/com/squareup/okhttp/internal/http/HttpTransport.java
++++ /dev/null
+@@ -1,136 +0,0 @@
+-/*
+- * Copyright (C) 2012 The Android Open Source Project
+- *
+- * Licensed under the Apache License, Version 2.0 (the "License");
+- * you may not use this file except in compliance with the License.
+- * You may obtain a copy of the License at
+- *
+- *      http://www.apache.org/licenses/LICENSE-2.0
+- *
+- * Unless required by applicable law or agreed to in writing, software
+- * distributed under the License is distributed on an "AS IS" BASIS,
+- * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+- * See the License for the specific language governing permissions and
+- * limitations under the License.
+- */
+-
+-package com.squareup.okhttp.internal.http;
+-
+-import com.squareup.okhttp.Request;
+-import com.squareup.okhttp.Response;
+-import com.squareup.okhttp.ResponseBody;
+-import java.io.IOException;
+-import okio.Okio;
+-import okio.Sink;
+-import okio.Source;
+-
+-public final class HttpTransport implements Transport {
+-  private final HttpEngine httpEngine;
+-  private final HttpConnection httpConnection;
+-
+-  public HttpTransport(HttpEngine httpEngine, HttpConnection httpConnection) {
+-    this.httpEngine = httpEngine;
+-    this.httpConnection = httpConnection;
+-  }
+-
+-  @Override public Sink createRequestBody(Request request, long contentLength) throws IOException {
+-    if ("chunked".equalsIgnoreCase(request.header("Transfer-Encoding"))) {
+-      // Stream a request body of unknown length.
+-      return httpConnection.newChunkedSink();
+-    }
+-
+-    if (contentLength != -1) {
+-      // Stream a request body of a known length.
+-      return httpConnection.newFixedLengthSink(contentLength);
+-    }
+-
+-    throw new IllegalStateException(
+-        "Cannot stream a request body without chunked encoding or a known content length!");
+-  }
+-
+-  @Override public void finishRequest() throws IOException {
+-    httpConnection.flush();
+-  }
+-
+-  @Override public void writeRequestBody(RetryableSink requestBody) throws IOException {
+-    httpConnection.writeRequestBody(requestBody);
+-  }
+-
+-  /**
+-   * Prepares the HTTP headers and sends them to the server.
+-   *
+-   * <p>For streaming requests with a body, headers must be prepared
+-   * <strong>before</strong> the output stream has been written to. Otherwise
+-   * the body would need to be buffered!
+-   *
+-   * <p>For non-streaming requests with a body, headers must be prepared
+-   * <strong>after</strong> the output stream has been written to and closed.
+-   * This ensures that the {@code Content-Length} header field receives the
+-   * proper value.
+-   */
+-  public void writeRequestHeaders(Request request) throws IOException {
+-    httpEngine.writingRequestHeaders();
+-    String requestLine = RequestLine.get(
+-        request, httpEngine.getConnection().getRoute().getProxy().type());
+-    httpConnection.writeRequest(request.headers(), requestLine);
+-  }
+-
+-  @Override public Response.Builder readResponseHeaders() throws IOException {
+-    return httpConnection.readResponse();
+-  }
+-
+-  @Override public void releaseConnectionOnIdle() throws IOException {
+-    if (canReuseConnection()) {
+-      httpConnection.poolOnIdle();
+-    } else {
+-      httpConnection.closeOnIdle();
+-    }
+-  }
+-
+-  @Override public boolean canReuseConnection() {
+-    // If the request specified that the connection shouldn't be reused, don't reuse it.
+-    if ("close".equalsIgnoreCase(httpEngine.getRequest().header("Connection"))) {
+-      return false;
+-    }
+-
+-    // If the response specified that the connection shouldn't be reused, don't reuse it.
+-    if ("close".equalsIgnoreCase(httpEngine.getResponse().header("Connection"))) {
+-      return false;
+-    }
+-
+-    if (httpConnection.isClosed()) {
+-      return false;
+-    }
+-
+-    return true;
+-  }
+-
+-  @Override public ResponseBody openResponseBody(Response response) throws IOException {
+-    Source source = getTransferStream(response);
+-    return new RealResponseBody(response.headers(), Okio.buffer(source));
+-  }
+-
+-  private Source getTransferStream(Response response) throws IOException {
+-    if (!HttpEngine.hasBody(response)) {
+-      return httpConnection.newFixedLengthSource(0);
+-    }
+-
+-    if ("chunked".equalsIgnoreCase(response.header("Transfer-Encoding"))) {
+-      return httpConnection.newChunkedSource(httpEngine);
+-    }
+-
+-    long contentLength = OkHeaders.contentLength(response);
+-    if (contentLength != -1) {
+-      return httpConnection.newFixedLengthSource(contentLength);
+-    }
+-
+-    // Wrap the input stream from the connection (rather than just returning
+-    // "socketIn" directly here), so that we can control its use after the
+-    // reference escapes.
+-    return httpConnection.newUnknownLengthSource();
+-  }
+-
+-  @Override public void disconnect(HttpEngine engine) throws IOException {
+-    httpConnection.closeIfOwnedBy(engine);
+-  }
+-}
+diff --git a/okhttp/src/main/java/com/squareup/okhttp/internal/http/RouteSelector.java b/okhttp/src/main/java/com/squareup/okhttp/internal/http/RouteSelector.java
+index 30195c7dd1..3365914ce9 100644
+--- a/okhttp/src/main/java/com/squareup/okhttp/internal/http/RouteSelector.java
++++ b/okhttp/src/main/java/com/squareup/okhttp/internal/http/RouteSelector.java
+@@ -17,10 +17,7 @@
+ 
+ import com.squareup.okhttp.Address;
+ import com.squareup.okhttp.HttpUrl;
+-import com.squareup.okhttp.OkHttpClient;
+-import com.squareup.okhttp.Request;
+ import com.squareup.okhttp.Route;
+-import com.squareup.okhttp.internal.Internal;
+ import com.squareup.okhttp.internal.RouteDatabase;
+ import java.io.IOException;
+ import java.net.InetAddress;
+@@ -40,8 +37,6 @@
+  */
+ public final class RouteSelector {
+   private final Address address;
+-  private final HttpUrl url;
+-  private final OkHttpClient client;
+   private final RouteDatabase routeDatabase;
+ 
+   /* The most recently attempted route. */
+@@ -59,18 +54,11 @@
+   /* State for negotiating failed routes */
+   private final List<Route> postponedRoutes = new ArrayList<>();
+ 
+-  private RouteSelector(Address address, HttpUrl url, OkHttpClient client) {
++  public RouteSelector(Address address, RouteDatabase routeDatabase) {
+     this.address = address;
+-    this.url = url;
+-    this.client = client;
+-    this.routeDatabase = Internal.instance.routeDatabase(client);
++    this.routeDatabase = routeDatabase;
+ 
+-    resetNextProxy(url, address.getProxy());
+-  }
+-
+-  public static RouteSelector get(Address address, Request request, OkHttpClient client)
+-      throws IOException {
+-    return new RouteSelector(address, request.httpUrl(), client);
++    resetNextProxy(address.url(), address.getProxy());
+   }
+ 
+   /**
+@@ -114,7 +102,7 @@ public void connectFailed(Route failedRoute, IOException failure) {
+     if (failedRoute.getProxy().type() != Proxy.Type.DIRECT && address.getProxySelector() != null) {
+       // Tell the proxy selector when we fail to connect on a fresh connection.
+       address.getProxySelector().connectFailed(
+-          url.uri(), failedRoute.getProxy().address(), failure);
++          address.url().uri(), failedRoute.getProxy().address(), failure);
+     }
+ 
+     routeDatabase.failed(failedRoute);
+@@ -129,7 +117,7 @@ private void resetNextProxy(HttpUrl url, Proxy proxy) {
+       // Try each of the ProxySelector choices until one connection succeeds. If none succeed
+       // then we'll try a direct connection below.
+       proxies = new ArrayList<>();
+-      List<Proxy> selectedProxies = client.getProxySelector().select(url.uri());
++      List<Proxy> selectedProxies = address.getProxySelector().select(url.uri());
+       if (selectedProxies != null) proxies.addAll(selectedProxies);
+       // Finally try a direct connection. We only try it once!
+       proxies.removeAll(Collections.singleton(Proxy.NO_PROXY));
+diff --git a/okhttp/src/main/java/com/squareup/okhttp/internal/http/StreamAllocation.java b/okhttp/src/main/java/com/squareup/okhttp/internal/http/StreamAllocation.java
+new file mode 100644
+index 0000000000..32b59485aa
+--- /dev/null
++++ b/okhttp/src/main/java/com/squareup/okhttp/internal/http/StreamAllocation.java
+@@ -0,0 +1,381 @@
++/*
++ * Copyright (C) 2015 Square, Inc.
++ *
++ * Licensed under the Apache License, Version 2.0 (the "License");
++ * you may not use this file except in compliance with the License.
++ * You may obtain a copy of the License at
++ *
++ *      http://www.apache.org/licenses/LICENSE-2.0
++ *
++ * Unless required by applicable law or agreed to in writing, software
++ * distributed under the License is distributed on an "AS IS" BASIS,
++ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++ * See the License for the specific language governing permissions and
++ * limitations under the License.
++ */
++package com.squareup.okhttp.internal.http;
++
++import com.squareup.okhttp.Address;
++import com.squareup.okhttp.ConnectionPool;
++import com.squareup.okhttp.Route;
++import com.squareup.okhttp.internal.Internal;
++import com.squareup.okhttp.internal.RouteDatabase;
++import com.squareup.okhttp.internal.Util;
++import com.squareup.okhttp.internal.io.RealConnection;
++import java.io.IOException;
++import java.io.InterruptedIOException;
++import java.net.ProtocolException;
++import java.net.SocketTimeoutException;
++import java.security.cert.CertificateException;
++import javax.net.ssl.SSLHandshakeException;
++import javax.net.ssl.SSLPeerUnverifiedException;
++import okio.Sink;
++
++import static java.util.concurrent.TimeUnit.MILLISECONDS;
++
++/**
++ * This class coordinates the relationship between three entities:
++ *
++ * <ul>
++ *   <li><strong>Connections:</strong> physical socket connections to remote servers. These are
++ *       potentially slow to establish so it is necessary to be able to cancel a connection
++ *       currently being connected.
++ *   <li><strong>Streams:</strong> logical HTTP request/response pairs that are layered on
++ *       connections. Each connection has its own allocation limit, which defines how many
++ *       concurrent streams that connection can carry. HTTP/1.x connections can carry 1 stream
++ *       at a time, SPDY and HTTP/2 typically carry multiple.
++ *   <li><strong>Calls:</strong> a logical sequence of streams, typically an initial request and
++ *       its follow up requests. We prefer to keep all streams of a single call on the same
++ *       connection for better behavior and locality.
++ * </ul>
++ *
++ * <p>Instances of this class act on behalf of the call, using one or more streams over one or
++ * more connections. This class has APIs to release each of the above resources:
++ *
++ * <ul>
++ *   <li>{@link #noNewStreams()} prevents the connection from being used for new streams in the
++ *       future. Use this after a {@code Connection: close} header, or when the connection may be
++ *       inconsistent.
++ *   <li>{@link #streamFinished streamFinished()} releases the active stream from this allocation.
++ *       Note that only one stream may be active at a given time, so it is necessary to call {@link
++ *       #streamFinished streamFinished()} before creating a subsequent stream with {@link
++ *       #newStream newStream()}.
++ *   <li>{@link #release()} removes the call's hold on the connection. Note that this won't
++ *       immediately free the connection if there is a stream still lingering. That happens when a
++ *       call is complete but its response body has yet to be fully consumed.
++ * </ul>
++ *
++ * <p>This class supports {@linkplain #cancel asynchronous canceling}. This is intended to have
++ * the smallest blast radius possible. If an HTTP/2 stream is active, canceling will cancel that
++ * stream but not the other streams sharing its connection. But if the TLS handshake is still in
++ * progress then canceling may break the entire connection.
++ */
++public final class StreamAllocation {
++  public final Address address;
++  private final ConnectionPool connectionPool;
++
++  // State guarded by connectionPool.
++  private RouteSelector routeSelector;
++  private RealConnection connection;
++  private boolean released;
++  private boolean canceled;
++  private HttpStream stream;
++
++  public StreamAllocation(ConnectionPool connectionPool, Address address) {
++    this.connectionPool = connectionPool;
++    this.address = address;
++  }
++
++  public HttpStream newStream(int connectTimeout, int readTimeout, int writeTimeout,
++      boolean connectionRetryEnabled, boolean doExtensiveHealthChecks)
++      throws RouteException, IOException {
++    try {
++      RealConnection resultConnection = findHealthyConnection(connectTimeout, readTimeout,
++          writeTimeout, connectionRetryEnabled, doExtensiveHealthChecks);
++
++      HttpStream resultStream;
++      if (resultConnection.framedConnection != null) {
++        resultStream = new Http2xStream(this, resultConnection.framedConnection);
++      } else {
++        resultConnection.getSocket().setSoTimeout(readTimeout);
++        resultConnection.source.timeout().timeout(readTimeout, MILLISECONDS);
++        resultConnection.sink.timeout().timeout(writeTimeout, MILLISECONDS);
++        resultStream = new Http1xStream(this, resultConnection.source, resultConnection.sink);
++      }
++
++      synchronized (connectionPool) {
++        resultConnection.streamCount++;
++        stream = resultStream;
++        return resultStream;
++      }
++    } catch (IOException e) {
++      throw new RouteException(e);
++    }
++  }
++
++  /**
++   * Finds a connection and returns it if it is healthy. If it is unhealthy the process is repeated
++   * until a healthy connection is found.
++   */
++  private RealConnection findHealthyConnection(int connectTimeout, int readTimeout,
++      int writeTimeout, boolean connectionRetryEnabled, boolean doExtensiveHealthChecks)
++      throws IOException, RouteException {
++    while (true) {
++      RealConnection candidate = findConnection(
++          connectTimeout, readTimeout, writeTimeout, connectionRetryEnabled);
++      if (connection.isHealthy(doExtensiveHealthChecks)) {
++        return candidate;
++      }
++      deallocate(true, false, true);
++    }
++  }
++
++  /**
++   * Returns a connection to host a new stream. This prefers the existing connection if it exists,
++   * then the pool, finally building a new connection.
++   */
++  private RealConnection findConnection(int connectTimeout, int readTimeout, int writeTimeout,
++      boolean connectionRetryEnabled) throws IOException, RouteException {
++    synchronized (connectionPool) {
++      if (released) throw new IllegalStateException("released");
++      if (stream != null) throw new IllegalStateException("stream != null");
++      if (canceled) throw new IOException("Canceled");
++
++      RealConnection allocatedConnection = this.connection;
++      if (allocatedConnection != null && !allocatedConnection.noNewStreams) {
++        return allocatedConnection;
++      }
++    }
++
++    // Attempt to get a connection from the pool.
++    RealConnection pooledConnection = (RealConnection) connectionPool.get(address);
++    if (pooledConnection != null) {
++      synchronized (connectionPool) {
++        this.connection = pooledConnection;
++        if (canceled) throw new IOException("Canceled");
++        return pooledConnection;
++      }
++    }
++
++    // Attempt to create a connection.
++    synchronized (connectionPool) {
++      if (routeSelector == null) {
++        routeSelector = new RouteSelector(address, routeDatabase());
++      }
++    }
++    Route route = routeSelector.next();
++    RealConnection newConnection = new RealConnection(route);
++    synchronized (connectionPool) {
++      connectionPool.put(newConnection);
++      this.connection = newConnection;
++      if (canceled) throw new IOException("Canceled");
++    }
++
++    newConnection.connect(connectTimeout, readTimeout, writeTimeout, address.getConnectionSpecs(),
++        connectionRetryEnabled);
++    routeDatabase().connected(newConnection.getRoute());
++
++    synchronized (connectionPool) {
++      // TODO(jwilson): what should this limit be?
++      newConnection.allocationLimit = newConnection.isMultiplexed() ? 100 : 1;
++      newConnection.allocationCount++;
++    }
++
++    return newConnection;
++  }
++
++  public void streamFinished(HttpStream stream) {
++    synchronized (connectionPool) {
++      if (stream == null || stream != this.stream) {
++        throw new IllegalStateException("expected " + this.stream + " but was " + stream);
++      }
++    }
++    deallocate(false, false, true);
++  }
++
++  public HttpStream stream() {
++    synchronized (connectionPool) {
++      return stream;
++    }
++  }
++
++  private RouteDatabase routeDatabase() {
++    return Internal.instance.routeDatabase(connectionPool);
++  }
++
++  public synchronized RealConnection connection() {
++    return connection;
++  }
++
++  public void release() {
++    deallocate(false, true, false);
++  }
++
++  /** Forbid new streams from being created on the connection that hosts this allocation. */
++  public void noNewStreamsOnConnection() {
++    deallocate(true, false, false);
++  }
++
++  /** Forbid new streams from being created on this allocation. */
++  public void noNewStreams() {
++    // TODO(jwilson): fix this for HTTP/2 to not nuke the socket connection.
++    deallocate(true, false, false);
++  }
++
++  /**
++   * Releases resources held by this allocation. If sufficient resources are allocated, the
++   * connection will be detached or closed.
++   */
++  private void deallocate(boolean noNewStreams, boolean released, boolean streamFinished) {
++    RealConnection connectionToClose = null;
++    synchronized (connectionPool) {
++      if (streamFinished) {
++        this.stream = null;
++      }
++      if (released) {
++        this.released = true;
++      }
++      if (connection != null) {
++        if (noNewStreams) {
++          connection.noNewStreams = true;
++        }
++        if (this.stream == null && (this.released || connection.noNewStreams)) {
++          connection.allocationCount--;
++          if (connection.streamCount > 0) {
++            routeSelector = null;
++          }
++          if (connection.noNewStreams && connection.allocationCount == 0) {
++            connectionPool.remove(connection);
++            connectionToClose = connection;
++          }
++          connection = null;
++        }
++      }
++    }
++    if (connectionToClose != null) {
++      Util.closeQuietly(connectionToClose.getSocket());
++    }
++  }
++
++  public void cancel() {
++    HttpStream streamToCancel;
++    RealConnection connectionToCancel;
++    synchronized (connectionPool) {
++      canceled = true;
++      streamToCancel = stream;
++      connectionToCancel = connection;
++    }
++    if (streamToCancel != null) {
++      streamToCancel.cancel();
++    } else if (connectionToCancel != null) {
++      connectionToCancel.cancel();
++    }
++  }
++
++  private void connectionFailed(IOException e) {
++    synchronized (connectionPool) {
++      if (routeSelector != null) {
++        if (connection.streamCount == 0) {
++          // Record the failure on a fresh route.
++          Route failedRoute = connection.getRoute();
++          routeSelector.connectFailed(failedRoute, e);
++        } else {
++          // We saw a failure on a recycled connection, reset this allocation with a fresh route.
++          routeSelector = null;
++        }
++      }
++    }
++    deallocate(true, false, true);
++  }
++
++  public boolean recover(RouteException e) {
++    if (connection != null) {
++      connectionFailed(e.getLastConnectException());
++    }
++
++    if ((routeSelector != null && !routeSelector.hasNext()) // No more routes to attempt.
++        || !isRecoverable(e)) {
++      return false;
++    }
++
++    return true;
++  }
++
++  public boolean recover(IOException e, Sink requestBodyOut) {
++    if (connection != null) {
++      int streamCount = connection.streamCount;
++      connectionFailed(e);
++
++      if (streamCount == 1) {
++        // This isn't a recycled connection.
++        // TODO(jwilson): find a better way for this.
++        return false;
++      }
++    }
++
++    boolean canRetryRequestBody = requestBodyOut == null || requestBodyOut instanceof RetryableSink;
++    if ((routeSelector != null && !routeSelector.hasNext()) // No more routes to attempt.
++        || !isRecoverable(e)
++        || !canRetryRequestBody) {
++      return false;
++    }
++
++    return true;
++  }
++
++  private boolean isRecoverable(IOException e) {
++    // If there was a protocol problem, don't recover.
++    if (e instanceof ProtocolException) {
++      return false;
++    }
++
++    // If there was an interruption or timeout, don't recover.
++    if (e instanceof InterruptedIOException) {
++      return false;
++    }
++
++    return true;
++  }
++
++  private boolean isRecoverable(RouteException e) {
++    // Problems with a route may mean the connection can be retried with a new route, or may
++    // indicate a client-side or server-side issue that should not be retried. To tell, we must look
++    // at the cause.
++
++    IOException ioe = e.getLastConnectException();
++
++    // If there was a protocol problem, don't recover.
++    if (ioe instanceof ProtocolException) {
++      return false;
++    }
++
++    // If there was an interruption don't recover, but if there was a timeout
++    // we should try the next route (if there is one).
++    if (ioe instanceof InterruptedIOException) {
++      return ioe instanceof SocketTimeoutException;
++    }
++
++    // Look for known client-side or negotiation errors that are unlikely to be fixed by trying
++    // again with a different route.
++    if (ioe instanceof SSLHandshakeException) {
++      // If the problem was a CertificateException from the X509TrustManager,
++      // do not retry.
++      if (ioe.getCause() instanceof CertificateException) {
++        return false;
++      }
++    }
++    if (ioe instanceof SSLPeerUnverifiedException) {
++      // e.g. a certificate pinning error.
++      return false;
++    }
++
++    // An example of one we might want to retry with a different route is a problem connecting to a
++    // proxy and would manifest as a standard IOException. Unless it is one we know we should not
++    // retry, we return true and try a new route.
++    return true;
++  }
++
++  @Override public String toString() {
++    return address.toString();
++  }
++}
+diff --git a/okhttp/src/main/java/com/squareup/okhttp/internal/io/RealConnection.java b/okhttp/src/main/java/com/squareup/okhttp/internal/io/RealConnection.java
+new file mode 100644
+index 0000000000..f2e443a1e8
+--- /dev/null
++++ b/okhttp/src/main/java/com/squareup/okhttp/internal/io/RealConnection.java
+@@ -0,0 +1,356 @@
++/*
++ *  Licensed to the Apache Software Foundation (ASF) under one or more
++ *  contributor license agreements.  See the NOTICE file distributed with
++ *  this work for additional information regarding copyright ownership.
++ *  The ASF licenses this file to You under the Apache License, Version 2.0
++ *  (the "License"); you may not use this file except in compliance with
++ *  the License.  You may obtain a copy of the License at
++ *
++ *     http://www.apache.org/licenses/LICENSE-2.0
++ *
++ *  Unless required by applicable law or agreed to in writing, software
++ *  distributed under the License is distributed on an "AS IS" BASIS,
++ *  WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++ *  See the License for the specific language governing permissions and
++ *  limitations under the License.
++ */
++package com.squareup.okhttp.internal.io;
++
++import com.squareup.okhttp.Address;
++import com.squareup.okhttp.CertificatePinner;
++import com.squareup.okhttp.Connection;
++import com.squareup.okhttp.ConnectionSpec;
++import com.squareup.okhttp.Handshake;
++import com.squareup.okhttp.HttpUrl;
++import com.squareup.okhttp.Protocol;
++import com.squareup.okhttp.Request;
++import com.squareup.okhttp.Response;
++import com.squareup.okhttp.Route;
++import com.squareup.okhttp.internal.ConnectionSpecSelector;
++import com.squareup.okhttp.internal.Platform;
++import com.squareup.okhttp.internal.Util;
++import com.squareup.okhttp.internal.Version;
++import com.squareup.okhttp.internal.framed.FramedConnection;
++import com.squareup.okhttp.internal.http.Http1xStream;
++import com.squareup.okhttp.internal.http.OkHeaders;
++import com.squareup.okhttp.internal.http.RouteException;
++import com.squareup.okhttp.internal.tls.OkHostnameVerifier;
++import java.io.IOException;
++import java.net.ConnectException;
++import java.net.Proxy;
++import java.net.Socket;
++import java.net.SocketTimeoutException;
++import java.net.UnknownServiceException;
++import java.security.cert.X509Certificate;
++import java.util.List;
++import java.util.concurrent.TimeUnit;
++import javax.net.ssl.SSLPeerUnverifiedException;
++import javax.net.ssl.SSLSocket;
++import javax.net.ssl.SSLSocketFactory;
++import okio.BufferedSink;
++import okio.BufferedSource;
++import okio.Okio;
++import okio.Source;
++
++import static com.squareup.okhttp.internal.Util.closeQuietly;
++import static java.net.HttpURLConnection.HTTP_OK;
++import static java.net.HttpURLConnection.HTTP_PROXY_AUTH;
++import static java.util.concurrent.TimeUnit.MILLISECONDS;
++
++public final class RealConnection implements Connection {
++  private final Route route;
++  private Socket socket;
++  private Handshake handshake;
++  private Protocol protocol;
++  public FramedConnection framedConnection;
++  public int streamCount;
++  public BufferedSource source;
++  public BufferedSink sink;
++  public int allocationLimit;
++  public int allocationCount;
++  public boolean noNewStreams;
++
++  public RealConnection(Route route) {
++    this.route = route;
++  }
++
++  // TODO(jwilson): make non public.
++  public void connect(int connectTimeout, int readTimeout, int writeTimeout,
++      List<ConnectionSpec> connectionSpecs, boolean connectionRetryEnabled) throws RouteException {
++    if (protocol != null) throw new IllegalStateException("already connected");
++
++    RouteException routeException = null;
++    ConnectionSpecSelector connectionSpecSelector = new ConnectionSpecSelector(connectionSpecs);
++    Proxy proxy = route.getProxy();
++    Address address = route.getAddress();
++
++    if (route.getAddress().getSslSocketFactory() == null
++        && !connectionSpecs.contains(ConnectionSpec.CLEARTEXT)) {
++      throw new RouteException(new UnknownServiceException(
++          "CLEARTEXT communication not supported: " + connectionSpecs));
++    }
++
++    while (protocol == null) {
++      try {
++        socket = proxy.type() == Proxy.Type.DIRECT || proxy.type() == Proxy.Type.HTTP
++            ? address.getSocketFactory().createSocket()
++            : new Socket(proxy);
++        connectSocket(connectTimeout, readTimeout, writeTimeout, connectionSpecSelector);
++      } catch (IOException e) {
++        Util.closeQuietly(socket);
++        socket = null;
++        source = null;
++        sink = null;
++        handshake = null;
++        protocol = null;
++        framedConnection = null;
++
++        if (routeException == null) {
++          routeException = new RouteException(e);
++        } else {
++          routeException.addConnectException(e);
++        }
++
++        if (!connectionRetryEnabled || !connectionSpecSelector.connectionFailed(e)) {
++          throw routeException;
++        }
++      }
++    }
++  }
++
++  /** Does all the work necessary to build a full HTTP or HTTPS connection on a raw socket. */
++  private void connectSocket(int connectTimeout, int readTimeout, int writeTimeout,
++      ConnectionSpecSelector connectionSpecSelector) throws IOException {
++    socket.setSoTimeout(readTimeout);
++    try {
++      Platform.get().connectSocket(socket, route.getSocketAddress(), connectTimeout);
++    } catch (ConnectException e) {
++      throw new ConnectException("Failed to connect to " + route.getSocketAddress());
++    }
++    source = Okio.buffer(Okio.source(socket));
++    sink = Okio.buffer(Okio.sink(socket));
++
++    if (route.getAddress().getSslSocketFactory() != null) {
++      connectTls(readTimeout, writeTimeout, connectionSpecSelector);
++    } else {
++      protocol = Protocol.HTTP_1_1;
++    }
++
++    if (protocol == Protocol.SPDY_3 || protocol == Protocol.HTTP_2) {
++      socket.setSoTimeout(0); // Framed connection timeouts are set per-stream.
++      framedConnection = new FramedConnection.Builder(route.getAddress().url().host(), true, socket)
++          .protocol(protocol).build();
++      framedConnection.sendConnectionPreface();
++    }
++  }
++
++  private void connectTls(int readTimeout, int writeTimeout,
++      ConnectionSpecSelector connectionSpecSelector) throws IOException {
++    if (route.requiresTunnel()) {
++      createTunnel(readTimeout, writeTimeout);
++    }
++
++    Address address = route.getAddress();
++    SSLSocketFactory sslSocketFactory = address.getSslSocketFactory();
++    boolean success = false;
++    SSLSocket sslSocket = null;
++    try {
++      // Create the wrapper over the connected socket.
++      sslSocket = (SSLSocket) sslSocketFactory.createSocket(
++          socket, address.getUriHost(), address.getUriPort(), true /* autoClose */);
++
++      // Configure the socket's ciphers, TLS versions, and extensions.
++      ConnectionSpec connectionSpec = connectionSpecSelector.configureSecureSocket(sslSocket);
++      if (connectionSpec.supportsTlsExtensions()) {
++        Platform.get().configureTlsExtensions(
++            sslSocket, address.getUriHost(), address.getProtocols());
++      }
++
++      // Force handshake. This can throw!
++      sslSocket.startHandshake();
++      Handshake unverifiedHandshake = Handshake.get(sslSocket.getSession());
++
++      // Verify that the socket's certificates are acceptable for the target host.
++      if (!address.getHostnameVerifier().verify(address.getUriHost(), sslSocket.getSession())) {
++        X509Certificate cert = (X509Certificate) unverifiedHandshake.peerCertificates().get(0);
++        throw new SSLPeerUnverifiedException("Hostname " + address.getUriHost() + " not verified:"
++            + "\n    certificate: " + CertificatePinner.pin(cert)
++            + "\n    DN: " + cert.getSubjectDN().getName()
++            + "\n    subjectAltNames: " + OkHostnameVerifier.allSubjectAltNames(cert));
++      }
++
++      // Check that the certificate pinner is satisfied by the certificates presented.
++      address.getCertificatePinner().check(address.getUriHost(),
++          unverifiedHandshake.peerCertificates());
++
++      // Success! Save the handshake and the ALPN protocol.
++      String maybeProtocol = connectionSpec.supportsTlsExtensions()
++          ? Platform.get().getSelectedProtocol(sslSocket)
++          : null;
++      socket = sslSocket;
++      source = Okio.buffer(Okio.source(socket));
++      sink = Okio.buffer(Okio.sink(socket));
++      handshake = unverifiedHandshake;
++      protocol = maybeProtocol != null
++          ? Protocol.get(maybeProtocol)
++          : Protocol.HTTP_1_1;
++      success = true;
++    } catch (AssertionError e) {
++      if (Util.isAndroidGetsocknameError(e)) throw new IOException(e);
++      throw e;
++    } finally {
++      if (sslSocket != null) {
++        Platform.get().afterHandshake(sslSocket);
++      }
++      if (!success) {
++        closeQuietly(sslSocket);
++      }
++    }
++  }
++
++  /**
++   * To make an HTTPS connection over an HTTP proxy, send an unencrypted
++   * CONNECT request to create the proxy connection. This may need to be
++   * retried if the proxy requires authorization.
++   */
++  private void createTunnel(int readTimeout, int writeTimeout) throws IOException {
++    // Make an SSL Tunnel on the first message pair of each SSL + proxy connection.
++    Request tunnelRequest = createTunnelRequest();
++    HttpUrl url = tunnelRequest.httpUrl();
++    String requestLine = "CONNECT " + url.host() + ":" + url.port() + " HTTP/1.1";
++    while (true) {
++      Http1xStream tunnelConnection = new Http1xStream(null, source, sink);
++      source.timeout().timeout(readTimeout, MILLISECONDS);
++      sink.timeout().timeout(writeTimeout, MILLISECONDS);
++      tunnelConnection.writeRequest(tunnelRequest.headers(), requestLine);
++      tunnelConnection.finishRequest();
++      Response response = tunnelConnection.readResponse().request(tunnelRequest).build();
++      // The response body from a CONNECT should be empty, but if it is not then we should consume
++      // it before proceeding.
++      long contentLength = OkHeaders.contentLength(response);
++      if (contentLength == -1L) {
++        contentLength = 0L;
++      }
++      Source body = tunnelConnection.newFixedLengthSource(contentLength);
++      Util.skipAll(body, Integer.MAX_VALUE, TimeUnit.MILLISECONDS);
++      body.close();
++
++      switch (response.code()) {
++        case HTTP_OK:
++          // Assume the server won't send a TLS ServerHello until we send a TLS ClientHello. If
++          // that happens, then we will have buffered bytes that are needed by the SSLSocket!
++          // This check is imperfect: it doesn't tell us whether a handshake will succeed, just
++          // that it will almost certainly fail because the proxy has sent unexpected data.
++          if (!source.buffer().exhausted() || !sink.buffer().exhausted()) {
++            throw new IOException("TLS tunnel buffered too many bytes!");
++          }
++          return;
++
++        case HTTP_PROXY_AUTH:
++          tunnelRequest = OkHeaders.processAuthHeader(
++              route.getAddress().getAuthenticator(), response, route.getProxy());
++          if (tunnelRequest != null) continue;
++          throw new IOException("Failed to authenticate with proxy");
++
++        default:
++          throw new IOException(
++              "Unexpected response code for CONNECT: " + response.code());
++      }
++    }
++  }
++
++  /**
++   * Returns a request that creates a TLS tunnel via an HTTP proxy, or null if
++   * no tunnel is necessary. Everything in the tunnel request is sent
++   * unencrypted to the proxy server, so tunnels include only the minimum set of
++   * headers. This avoids sending potentially sensitive data like HTTP cookies
++   * to the proxy unencrypted.
++   */
++  private Request createTunnelRequest() throws IOException {
++    return new Request.Builder()
++        .url(route.getAddress().url())
++        .header("Host", Util.hostHeader(route.getAddress().url()))
++        .header("Proxy-Connection", "Keep-Alive")
++        .header("User-Agent", Version.userAgent()) // For HTTP/1.0 proxies like Squid.
++        .build();
++  }
++
++  /** Returns true if {@link #connect} has been attempted on this connection. */
++  boolean isConnected() {
++    return protocol != null;
++  }
++
++  @Override public Route getRoute() {
++    return route;
++  }
++
++  public void cancel() {
++    Util.closeQuietly(socket);
++  }
++
++  @Override public Socket getSocket() {
++    return socket;
++  }
++
++  /** Returns true if this connection is ready to host new streams. */
++  public boolean isHealthy(boolean doExtensiveChecks) {
++    if (socket.isClosed() || socket.isInputShutdown() || socket.isOutputShutdown()) {
++      return false;
++    }
++
++    if (framedConnection != null) {
++      return true; // TODO: check framedConnection.shutdown.
++    }
++
++    if (doExtensiveChecks) {
++      try {
++        int readTimeout = socket.getSoTimeout();
++        try {
++          socket.setSoTimeout(1);
++          if (source.exhausted()) {
++            return false; // Stream is exhausted; socket is closed.
++          }
++          return true;
++        } finally {
++          socket.setSoTimeout(readTimeout);
++        }
++      } catch (SocketTimeoutException ignored) {
++        // Read timed out; socket is good.
++      } catch (IOException e) {
++        return false; // Couldn't read; socket is closed.
++      }
++    }
++
++    return true;
++  }
++
++  @Override public Handshake getHandshake() {
++    return handshake;
++  }
++
++  /**
++   * Returns true if this is a SPDY connection. Such connections can be used
++   * in multiple HTTP requests simultaneously.
++   */
++  public boolean isMultiplexed() {
++    return framedConnection != null;
++  }
++
++  @Override public Protocol getProtocol() {
++    return protocol != null ? protocol : Protocol.HTTP_1_1;
++  }
++
++  @Override public String toString() {
++    return "Connection{"
++        + route.getAddress().url().host() + ":" + route.getAddress().url().port()
++        + ", proxy="
++        + route.getProxy()
++        + " hostAddress="
++        + route.getSocketAddress()
++        + " cipherSuite="
++        + (handshake != null ? handshake.cipherSuite() : "none")
++        + " protocol="
++        + protocol
++        + '}';
++  }
++}

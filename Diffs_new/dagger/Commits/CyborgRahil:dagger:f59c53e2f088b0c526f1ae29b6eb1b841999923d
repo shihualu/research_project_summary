@@ -1,0 +1,264 @@
+diff --git a/java/dagger/internal/codegen/ComponentImplementationFactory.java b/java/dagger/internal/codegen/ComponentImplementationFactory.java
+index 9f8623021..470623191 100644
+--- a/java/dagger/internal/codegen/ComponentImplementationFactory.java
++++ b/java/dagger/internal/codegen/ComponentImplementationFactory.java
+@@ -114,7 +114,8 @@ ComponentImplementation createComponentImplementation(BindingGraph bindingGraph)
+             componentImplementation, bindingGraph, elements, types);
+     componentImplementation.setCreatorImplementation(componentCreatorImplementation);
+     ComponentRequirementExpressions componentRequirementExpressions =
+-        new ComponentRequirementExpressions(bindingGraph, componentImplementation, types, elements);
++        new ComponentRequirementExpressions(
++            bindingGraph, componentImplementation, types, elements, compilerOptions);
+     ComponentBindingExpressions bindingExpressions =
+         new ComponentBindingExpressions(
+             bindingGraph,
+@@ -374,9 +375,9 @@ private void implementModifiableModuleMethod(ComponentRequirement module, String
+               .addModifiers(PROTECTED)
+               .returns(TypeName.get(module.type()))
+               .addStatement(
+-                  "return $L",
+-                  componentRequirementExpressions.getExpression(
+-                      module, componentImplementation.name()))
++                  componentRequirementExpressions
++                      .getExpression(module)
++                      .getModifiableModuleMethodExpression(componentImplementation.name()))
+               .build());
+     }
+ 
+diff --git a/java/dagger/internal/codegen/ComponentRequirementExpression.java b/java/dagger/internal/codegen/ComponentRequirementExpression.java
+index 540d00cff..a4c1d3c05 100644
+--- a/java/dagger/internal/codegen/ComponentRequirementExpression.java
++++ b/java/dagger/internal/codegen/ComponentRequirementExpression.java
+@@ -43,4 +43,12 @@
+   default CodeBlock getExpressionDuringInitialization(ClassName requestingClass) {
+     return getExpression(requestingClass);
+   }
++
++  /**
++   * Returns the expression for the {@link ComponentRequirement} to be used when reimplementing a
++   * modifiable module method.
++   */
++  default CodeBlock getModifiableModuleMethodExpression(ClassName requestingClass) {
++    return CodeBlock.of("return $L", getExpression(requestingClass));
++  }
+ }
+diff --git a/java/dagger/internal/codegen/ComponentRequirementExpressions.java b/java/dagger/internal/codegen/ComponentRequirementExpressions.java
+index 0638167f3..ccf328e2b 100644
+--- a/java/dagger/internal/codegen/ComponentRequirementExpressions.java
++++ b/java/dagger/internal/codegen/ComponentRequirementExpressions.java
+@@ -57,18 +57,21 @@
+   private final ComponentImplementation componentImplementation;
+   private final DaggerTypes types;
+   private final DaggerElements elements;
++  private final CompilerOptions compilerOptions;
+ 
+   private ComponentRequirementExpressions(
+       Optional<ComponentRequirementExpressions> parent,
+       BindingGraph graph,
+       ComponentImplementation componentImplementation,
+       DaggerTypes types,
+-      DaggerElements elements) {
++      DaggerElements elements,
++      CompilerOptions compilerOptions) {
+     this.parent = parent;
+     this.graph = graph;
+     this.componentImplementation = componentImplementation;
+     this.types = types;
+     this.elements = elements;
++    this.compilerOptions = compilerOptions;
+   }
+ 
+   // TODO(ronshapiro): give ComponentImplementation a graph() method
+@@ -76,8 +79,9 @@ private ComponentRequirementExpressions(
+       BindingGraph graph,
+       ComponentImplementation componentImplementation,
+       DaggerTypes types,
+-      DaggerElements elements) {
+-    this(Optional.empty(), graph, componentImplementation, types, elements);
++      DaggerElements elements,
++      CompilerOptions compilerOptions) {
++    this(Optional.empty(), graph, componentImplementation, types, elements, compilerOptions);
+   }
+ 
+   /**
+@@ -86,7 +90,7 @@ private ComponentRequirementExpressions(
+   ComponentRequirementExpressions forChildComponent(
+       BindingGraph graph, ComponentImplementation componentImplementation) {
+     return new ComponentRequirementExpressions(
+-        Optional.of(this), graph, componentImplementation, types, elements);
++        Optional.of(this), graph, componentImplementation, types, elements, compilerOptions);
+   }
+ 
+   /**
+@@ -118,6 +122,11 @@ ComponentRequirementExpression getExpression(ComponentRequirement componentRequi
+     if (parent.isPresent()) {
+       return parent.get().getExpression(componentRequirement);
+     }
++
++    if (componentRequirement.kind().isModule() && compilerOptions.aheadOfTimeSubcomponents()) {
++      return new PrunedModifiableModule(componentRequirement);
++    }
++
+     throw new IllegalStateException(
+         "no component requirement expression found for " + componentRequirement);
+   }
+@@ -304,4 +313,27 @@ private String createMethod() {
+       return methodName;
+     }
+   }
++
++  private static final class PrunedModifiableModule implements ComponentRequirementExpression {
++    private final ComponentRequirement module;
++
++    private PrunedModifiableModule(ComponentRequirement module) {
++      checkArgument(module.kind().isModule());
++      this.module = module;
++    }
++
++    @Override
++    public CodeBlock getExpression(ClassName requestingClass) {
++      throw new UnsupportedOperationException(module + " is pruned - it cannot be requested");
++    }
++
++    @Override
++    public CodeBlock getModifiableModuleMethodExpression(ClassName requestingClass) {
++      return CodeBlock.of(
++          "throw new UnsupportedOperationException($T.class + $S)",
++          module.typeElement(),
++          " has been pruned from the final resolved binding graph. If this exception is thrown, "
++              + "it is a cause of a Dagger bug - please report it!");
++    }
++  }
+ }
+diff --git a/javatests/dagger/internal/codegen/AheadOfTimeSubcomponentsTest.java b/javatests/dagger/internal/codegen/AheadOfTimeSubcomponentsTest.java
+index e27bfbbfc..6809edd7d 100644
+--- a/javatests/dagger/internal/codegen/AheadOfTimeSubcomponentsTest.java
++++ b/javatests/dagger/internal/codegen/AheadOfTimeSubcomponentsTest.java
+@@ -7066,6 +7066,127 @@ public void rootScopedAtInjectConstructor_effectivelyMissingInSubcomponent() {
+         .containsElementsIn(generatedRoot);
+   }
+ 
++  @Test
++  public void prunedModuleWithInstanceState() {
++    ImmutableList.Builder<JavaFileObject> filesToCompile = ImmutableList.builder();
++    createAncillaryClasses(filesToCompile, "Pruned");
++    filesToCompile.add(
++        JavaFileObjects.forSourceLines(
++            "test.Modified",
++            "package test;",
++            "",
++            "import javax.inject.Inject;",
++            "",
++            "class Modified {",
++            "  @Inject Modified(Pruned pruned) {}",
++            "}"),
++        JavaFileObjects.forSourceLines(
++            "test.LeafModule",
++            "package test;",
++            "",
++            "import dagger.Module;",
++            "import dagger.Provides;",
++            "",
++            "@Module",
++            "class LeafModule {",
++            "  @Provides",
++            "  Pruned pruned() {",
++            "    return new Pruned();",
++            "  }",
++            "}"),
++        JavaFileObjects.forSourceLines(
++            "test.Leaf",
++            "package test;",
++            "",
++            "import dagger.Subcomponent;",
++            "",
++            "@Subcomponent(modules = LeafModule.class)",
++            "interface Leaf {",
++            "  Modified modified();",
++            "}"));
++
++    JavaFileObject generatedLeaf =
++        JavaFileObjects.forSourceLines(
++            "test.DaggerLeaf",
++            "package test;",
++            "",
++            IMPORT_GENERATED_ANNOTATION,
++            "",
++            GENERATED_ANNOTATION,
++            "public abstract class DaggerLeaf implements Leaf {",
++            "  protected DaggerLeaf() {}",
++            "",
++            "  @Override",
++            "  public Modified modified() {",
++            "    return new Modified(LeafModule_PrunedFactory.proxyPruned(leafModule()));",
++            "  }",
++            "",
++            "  protected abstract LeafModule leafModule();",
++            "}");
++    Compilation compilation = compile(filesToCompile.build());
++    assertThat(compilation).succeededWithoutWarnings();
++    assertThat(compilation)
++        .generatedSourceFile("test.DaggerLeaf")
++        .hasSourceEquivalentTo(generatedLeaf);
++
++    filesToCompile.add(
++        JavaFileObjects.forSourceLines(
++            "test.RootModule",
++            "package test;",
++            "",
++            "import dagger.Module;",
++            "import dagger.Provides;",
++            "",
++            "@Module",
++            "class RootModule {",
++            "  @Provides",
++            "  static Modified modified() {",
++            "    return new Modified(null);",
++            "  }",
++            "}"),
++        JavaFileObjects.forSourceLines(
++            "test.Root",
++            "package test;",
++            "",
++            "import dagger.Component;",
++            "",
++            "@Component(modules = RootModule.class)",
++            "interface Root {",
++            "  Leaf leaf();",
++            "}"));
++
++    String exceptionText =
++        " has been pruned from the final resolved binding graph. If this exception is thrown, it "
++            + "is a cause of a Dagger bug - please report it!";
++    JavaFileObject generatedRoot =
++        JavaFileObjects.forSourceLines(
++            "test.DaggerRoot",
++            "package test;",
++            "",
++            IMPORT_GENERATED_ANNOTATION,
++            "",
++            GENERATED_ANNOTATION,
++            "public final class DaggerRoot implements Root {",
++            "  protected final class LeafImpl extends DaggerLeaf {",
++            "    @Override",
++            "    public Modified modified() {",
++            "      return RootModule_ModifiedFactory.proxyModified();",
++            "    }",
++            "",
++            "    @Override",
++            "    protected LeafModule leafModule() {",
++            "      throw new UnsupportedOperationException(",
++            "          LeafModule.class + \"" + exceptionText + "\");",
++            "    }",
++            "  }",
++            "}");
++    compilation = compile(filesToCompile.build());
++    assertThat(compilation).succeededWithoutWarnings();
++    assertThat(compilation)
++        .generatedSourceFile("test.DaggerRoot")
++        .containsElementsIn(generatedRoot);
++  }
++
+   private void createAncillaryClasses(
+       ImmutableList.Builder<JavaFileObject> filesBuilder, String... ancillaryClasses) {
+     for (String className : ancillaryClasses) {

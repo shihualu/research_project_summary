@@ -1,0 +1,1318 @@
+diff --git a/java/dagger/internal/codegen/BUILD b/java/dagger/internal/codegen/BUILD
+index a1f8f20b1..a99ce7fe4 100644
+--- a/java/dagger/internal/codegen/BUILD
++++ b/java/dagger/internal/codegen/BUILD
+@@ -260,6 +260,7 @@ java_library(
+         "SubcomponentBuilderBindingExpression.java",
+         "SubcomponentBuilderProviderCreationExpression.java",
+         "SubcomponentNames.java",
++        "SwitchingProviders.java",
+         "UnwrappedMapKeyGenerator.java",
+     ],
+     plugins = CODEGEN_PLUGINS,
+diff --git a/java/dagger/internal/codegen/ComponentBindingExpressions.java b/java/dagger/internal/codegen/ComponentBindingExpressions.java
+index 234b8c412..94509b091 100644
+--- a/java/dagger/internal/codegen/ComponentBindingExpressions.java
++++ b/java/dagger/internal/codegen/ComponentBindingExpressions.java
+@@ -67,6 +67,7 @@
+   private final DaggerElements elements;
+   private final CompilerOptions compilerOptions;
+   private final MembersInjectionMethods membersInjectionMethods;
++  private final SwitchingProviders switchingProviders;
+   private final Table<Key, RequestKind, BindingExpression> expressions = HashBasedTable.create();
+ 
+   ComponentBindingExpressions(
+@@ -114,6 +115,7 @@ private ComponentBindingExpressions(
+     this.compilerOptions = checkNotNull(compilerOptions);
+     this.membersInjectionMethods =
+         new MembersInjectionMethods(generatedComponentModel, this, graph, elements, types);
++    this.switchingProviders = new SwitchingProviders(generatedComponentModel, this, graph, types);
+   }
+ 
+   /**
+@@ -583,20 +585,21 @@ private boolean canUseDirectInstanceExpression(ResolvedBindings resolvedBindings
+    *
+    * <p>In Android mode, if {@linkplain #instanceBindingExpression(ResolvedBindings) instance
+    * binding expressions} don't call {@code Provider.get()} on the provider binding expression, and
+-   * there's no {@linkplain #isFactorySimple(ResolvedBindings) simple factory}, then return an
+-   * {@link AnonymousProviderBindingExpression} wrapped in a method.
++   * there's no simple factory, then return a {@link SwitchingProviders} binding expression wrapped
++   * in a method.
+    *
+    * <p>Otherwise, return a {@link FrameworkInstanceBindingExpression}.
+    */
+   private BindingExpression providerBindingExpression(ResolvedBindings resolvedBindings) {
+     if (compilerOptions.experimentalAndroidMode()) {
+-      if (!isFactorySimple(resolvedBindings)
++      if (!frameworkInstanceCreationExpression(resolvedBindings).isSimpleFactory()
+           && !(instanceBindingExpression(resolvedBindings)
+               instanceof DerivedFromProviderBindingExpression)) {
++        // TODO(user): Cache the provider.
+         return wrapInMethod(
+             resolvedBindings,
+             RequestKind.PROVIDER,
+-            new AnonymousProviderBindingExpression(resolvedBindings, this, types));
++            switchingProviders.newBindingExpression(resolvedBindings.key()));
+       }
+     } else if (resolvedBindings.contributionBinding().kind().equals(DELEGATE)
+         && !needsCaching(resolvedBindings)) {
+@@ -606,17 +609,6 @@ private BindingExpression providerBindingExpression(ResolvedBindings resolvedBin
+     return frameworkInstanceBindingExpression(resolvedBindings, RequestKind.PROVIDER);
+   }
+ 
+-  /**
+-   * Returns {@code true} if the factory created for a binding is not worth inlining because it's a
+-   * singleton or an {@link dagger.internal.InstanceFactory} or a nested {@code Provider} for a
+-   * component dependency provision method.
+-   */
+-  // TODO(dpb): Lazily create the component dependency provision method provider.
+-  private boolean isFactorySimple(ResolvedBindings resolvedBindings) {
+-    return staticFactoryCreation(resolvedBindings).isPresent()
+-        || frameworkInstanceCreationExpression(resolvedBindings).isSimpleFactory();
+-  }
+-
+   /**
+    * Returns a binding expression that uses a given one as the body of a method that users call. If
+    * a component provision method matches it, it will be the method implemented. If not, a new
+diff --git a/java/dagger/internal/codegen/GeneratedComponentModel.java b/java/dagger/internal/codegen/GeneratedComponentModel.java
+index 32ad46ef3..2ad4bd98f 100644
+--- a/java/dagger/internal/codegen/GeneratedComponentModel.java
++++ b/java/dagger/internal/codegen/GeneratedComponentModel.java
+@@ -16,12 +16,14 @@
+ 
+ package dagger.internal.codegen;
+ 
++import static com.google.common.base.Preconditions.checkState;
+ import static com.squareup.javapoet.TypeSpec.classBuilder;
+ import static dagger.internal.codegen.Accessibility.isTypeAccessibleFrom;
+ import static javax.lang.model.element.Modifier.FINAL;
+ import static javax.lang.model.element.Modifier.PRIVATE;
+ import static javax.lang.model.element.Modifier.PUBLIC;
+ 
++import com.google.common.base.Supplier;
+ import com.google.common.collect.ImmutableList;
+ import com.google.common.collect.ListMultimap;
+ import com.google.common.collect.MultimapBuilder;
+@@ -33,6 +35,7 @@
+ import dagger.internal.ReferenceReleasingProviderManager;
+ import java.util.ArrayList;
+ import java.util.List;
++import java.util.Optional;
+ import javax.lang.model.element.Modifier;
+ import javax.lang.model.element.Name;
+ import javax.lang.model.element.TypeElement;
+@@ -44,6 +47,7 @@
+   // TODO(user, dpb): Move component requirements and reference managers to top? The order should
+   // be component requirements, referencemanagers, framework fields, private method fields, ... etc
+   static enum FieldSpecKind {
++
+     /**
+      * A field for the lock and cached value for {@linkplain PrivateMethodBindingExpression
+      * private-method scoped bindings}.
+@@ -116,6 +120,7 @@
+       MultimapBuilder.enumKeys(MethodSpecKind.class).arrayListValues().build();
+   private final ListMultimap<TypeSpecKind, TypeSpec> typeSpecsMap =
+       MultimapBuilder.enumKeys(TypeSpecKind.class).arrayListValues().build();
++  private Optional<Supplier<TypeSpec>> switchingProviderSupplier = Optional.empty();
+ 
+   private GeneratedComponentModel(ClassName name, Modifier... modifiers) {
+     this.name = name;
+@@ -177,6 +182,12 @@ void addTypes(TypeSpecKind typeKind, Iterable<TypeSpec> typeSpecs) {
+     typeSpecsMap.putAll(typeKind, typeSpecs);
+   }
+ 
++  /** Adds a {@link Supplier} for the SwitchingProvider for the component. */
++  void addSwitchingProvider(Supplier<TypeSpec> typeSpecSupplier) {
++    checkState(!switchingProviderSupplier.isPresent());
++    switchingProviderSupplier = Optional.of(typeSpecSupplier);
++  }
++
+   /** Adds the given code block to the initialize methods of the component. */
+   void addInitialization(CodeBlock codeBlock) {
+     initializations.add(codeBlock);
+@@ -207,6 +218,7 @@ void claimMethodName(Name name) {
+     fieldSpecsMap.asMap().values().forEach(component::addFields);
+     methodSpecsMap.asMap().values().forEach(component::addMethods);
+     typeSpecsMap.asMap().values().forEach(component::addTypes);
++    switchingProviderSupplier.map(Supplier::get).ifPresent(component::addType);
+     return component;
+   }
+ }
+diff --git a/java/dagger/internal/codegen/SwitchingProviders.java b/java/dagger/internal/codegen/SwitchingProviders.java
+new file mode 100644
+index 000000000..7840b58f2
+--- /dev/null
++++ b/java/dagger/internal/codegen/SwitchingProviders.java
+@@ -0,0 +1,151 @@
++/*
++ * Copyright (C) 2018 The Dagger Authors.
++ *
++ * Licensed under the Apache License, Version 2.0 (the "License");
++ * you may not use this file except in compliance with the License.
++ * You may obtain a copy of the License at
++ *
++ * http://www.apache.org/licenses/LICENSE-2.0
++ *
++ * Unless required by applicable law or agreed to in writing, software
++ * distributed under the License is distributed on an "AS IS" BASIS,
++ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++ * See the License for the specific language governing permissions and
++ * limitations under the License.
++ */
++
++package dagger.internal.codegen;
++
++import static com.google.common.base.Preconditions.checkNotNull;
++import static com.squareup.javapoet.MethodSpec.constructorBuilder;
++import static com.squareup.javapoet.MethodSpec.methodBuilder;
++import static com.squareup.javapoet.TypeSpec.classBuilder;
++import static dagger.internal.codegen.AnnotationSpecs.Suppression.UNCHECKED;
++import static dagger.internal.codegen.AnnotationSpecs.suppressWarnings;
++import static dagger.internal.codegen.CodeBlocks.toConcatenatedCodeBlock;
++import static dagger.internal.codegen.TypeNames.providerOf;
++import static dagger.model.RequestKind.INSTANCE;
++import static javax.lang.model.element.Modifier.FINAL;
++import static javax.lang.model.element.Modifier.PRIVATE;
++import static javax.lang.model.element.Modifier.PUBLIC;
++
++import com.squareup.javapoet.ClassName;
++import com.squareup.javapoet.CodeBlock;
++import com.squareup.javapoet.TypeName;
++import com.squareup.javapoet.TypeSpec;
++import com.squareup.javapoet.TypeVariableName;
++import dagger.model.Key;
++import java.util.HashMap;
++import java.util.Map;
++import java.util.TreeMap;
++import javax.inject.Provider;
++
++/**
++ * Keeps track of all provider expression requests for a component.
++ *
++ * <p>The provider expression request will be satisfied by a single generated {@code Provider} inner
++ * class that can provide instances for all types by switching on an id.
++ */
++final class SwitchingProviders {
++  private static final TypeVariableName T = TypeVariableName.get("T");
++
++  // Keep the switch cases ordered by switch id.
++  private final Map<Integer, CodeBlock> switchCases = new TreeMap<>();
++  private final Map<Key, Integer> switchIds = new HashMap<>();
++
++  private final ComponentBindingExpressions componentBindingExpressions;
++  private final BindingGraph graph;
++  private final GeneratedComponentModel generatedComponentModel;
++  private final ClassName owningComponent;
++  private final ClassName switchingProviderType;
++  private final DaggerTypes types;
++
++  SwitchingProviders(
++      GeneratedComponentModel generatedComponentModel,
++      ComponentBindingExpressions componentBindingExpressions,
++      BindingGraph graph,
++      DaggerTypes types) {
++    this.generatedComponentModel = checkNotNull(generatedComponentModel);
++    this.componentBindingExpressions = checkNotNull(componentBindingExpressions);
++    this.graph = checkNotNull(graph);
++    this.types = checkNotNull(types);
++    this.owningComponent = checkNotNull(generatedComponentModel).name();
++    this.switchingProviderType = owningComponent.nestedClass("SwitchingProvider");
++  }
++
++  /**
++   * Returns the binding expression for a binding that satisfies its {link Provider} requests with
++   * the generated {@code SwitchingProvider}.
++   */
++  BindingExpression newBindingExpression(Key key) {
++    return new BindingExpression() {
++      @Override
++      Expression getDependencyExpression(ClassName requestingClass) {
++        if (!switchIds.containsKey(key)) {
++          // Register the SwitchingProvider creation method the first time it's requested.
++          if (switchIds.isEmpty()) {
++            generatedComponentModel.addSwitchingProvider(
++                SwitchingProviders.this::createSwitchingProviderType);
++          }
++
++          int switchId = switchIds.size();
++          switchIds.put(key, switchId);
++          switchCases.put(switchId, createSwitchCaseCodeBlock(key));
++        }
++
++        return Expression.create(
++            types.wrapType(key.type(), Provider.class),
++            CodeBlock.of("new $T<>($L)", switchingProviderType, switchIds.get(key)));
++      }
++    };
++  }
++
++  private CodeBlock createSwitchCaseCodeBlock(Key key) {
++    Expression instanceExpression =
++        componentBindingExpressions.getDependencyExpression(key, INSTANCE, owningComponent);
++
++    CodeBlock instanceCodeBlock = instanceExpression.codeBlock();
++
++    // Primitives cannot be cast directly to the method's parameterized type, T. We have to first
++    // cast them to their boxed type.
++    if (binding(key).contributedPrimitiveType().isPresent()) {
++      TypeName boxedType = TypeName.get(binding(key).contributedType()).box();
++      instanceCodeBlock = CodeBlock.of("($T) $L", boxedType, instanceCodeBlock);
++    }
++
++    return CodeBlock.builder()
++        // TODO(user): Is there something else more useful than the key?
++        .addStatement("// @$L", key)
++        .addStatement("case $L: return ($T) $L", switchIds.get(key), T, instanceCodeBlock)
++        .build();
++  }
++
++  private TypeSpec createSwitchingProviderType() {
++    return classBuilder(switchingProviderType)
++        .addModifiers(PRIVATE, FINAL)
++        .addTypeVariable(T)
++        .addSuperinterface(providerOf(T))
++        .addField(TypeName.INT, "id", PRIVATE, FINAL)
++        .addMethod(
++            constructorBuilder()
++                .addParameter(TypeName.INT, "id")
++                .addStatement("this.id = id")
++                .build())
++        .addMethod(
++            methodBuilder("get")
++                .addModifiers(PUBLIC)
++                .addAnnotation(suppressWarnings(UNCHECKED))
++                .addAnnotation(Override.class)
++                .returns(T)
++                .beginControlFlow("switch (id)")
++                .addCode(switchCases.values().stream().collect(toConcatenatedCodeBlock()))
++                .addStatement("default: throw new $T(id)", AssertionError.class)
++                .endControlFlow()
++                .build())
++        .build();
++  }
++
++  private ContributionBinding binding(Key key) {
++    return graph.contributionBindings().get(key).contributionBinding();
++  }
++}
+diff --git a/javatests/dagger/internal/codegen/ComponentProcessorTest.java b/javatests/dagger/internal/codegen/ComponentProcessorTest.java
+index fdb8b44c8..b46b1b17b 100644
+--- a/javatests/dagger/internal/codegen/ComponentProcessorTest.java
++++ b/javatests/dagger/internal/codegen/ComponentProcessorTest.java
+@@ -306,13 +306,25 @@ public void componentWithInvalidModule() {
+                 "  }",
+                 "",
+                 "  @Override",
+-                "  public Lazy<SomeInjectableType> lazySomeInjectableType() {",
+-                "    return DoubleCheck.lazy(SomeInjectableType_Factory.create());",
++                "  public Lazy<SomeInjectableType> lazySomeInjectableType() {")
++            .addLinesIn(
++                DEFAULT_MODE, //
++                "    return DoubleCheck.lazy(SomeInjectableType_Factory.create());")
++            .addLinesIn(
++                EXPERIMENTAL_ANDROID_MODE,
++                "    return DoubleCheck.lazy(someInjectableTypeProvider());")
++            .addLines(
+                 "  }",
+                 "",
+                 "  @Override",
+-                "  public Provider<SomeInjectableType> someInjectableTypeProvider() {",
+-                "    return SomeInjectableType_Factory.create();",
++                "  public Provider<SomeInjectableType> someInjectableTypeProvider() {")
++            .addLinesIn(
++                DEFAULT_MODE, //
++                "    return SomeInjectableType_Factory.create();")
++            .addLinesIn(
++                EXPERIMENTAL_ANDROID_MODE, //
++                "    return new SwitchingProvider<>(0);")
++            .addLines(
+                 "  }",
+                 "",
+                 "  public static final class Builder {",
+@@ -321,8 +333,25 @@ public void componentWithInvalidModule() {
+                 "    public SimpleComponent build() {",
+                 "      return new DaggerSimpleComponent(this);",
+                 "    }",
+-                "  }",
+-                "}")
++                "  }")
++            .addLinesIn(
++                EXPERIMENTAL_ANDROID_MODE,
++                "  private final class SwitchingProvider<T> implements Provider<T> {",
++                "    private final int id;",
++                "",
++                "    SwitchingProvider(int id) {",
++                "      this.id = id;",
++                "    }",
++                "",
++                "    @SuppressWarnings(\"unchecked\")",
++                "    @Override",
++                "    public T get() {",
++                "      switch (id) {",
++                "        case 0: return (T) new SomeInjectableType();",
++                "        default: throw new AssertionError(id);",
++                "      }",
++                "    }",
++                "  }")
+             .build();
+ 
+     Compilation compilation =
+@@ -417,19 +446,31 @@ public void componentWithInvalidModule() {
+                 "  @Override",
+                 "  public Provider<SomeInjectableType> someInjectableTypeProvider() {")
+             .addLinesIn(
+-                EXPERIMENTAL_ANDROID_MODE,
+-                "    return new Provider<SomeInjectableType>() {",
+-                "      @Override",
+-                "      public SomeInjectableType get() {",
+-                "        return someInjectableType();",
+-                "      }",
+-                "    };")
++                EXPERIMENTAL_ANDROID_MODE, //
++                "    return new SwitchingProvider<>(0);")
+             .addLinesIn(
+                 DEFAULT_MODE, //
+                 "    return someInjectableTypeProvider;")
+-            .addLines(
+-                "  }", //
+-                "}")
++            .addLines( //
++                "  }")
++            .addLinesIn(
++                EXPERIMENTAL_ANDROID_MODE,
++                "  private final class SwitchingProvider<T> implements Provider<T> {",
++                "    private final int id;",
++                "",
++                "    SwitchingProvider(int id) {",
++                "      this.id = id;",
++                "    }",
++                "",
++                "    @SuppressWarnings(\"unchecked\")",
++                "    @Override",
++                "    public T get() {",
++                "      switch (id) {",
++                "        case 0: return (T) someInjectableType();",
++                "        default: throw new AssertionError(id);",
++                "      }",
++                "    }",
++                "  }")
+             .build();
+     Compilation compilation =
+         daggerCompiler()
+diff --git a/javatests/dagger/internal/codegen/DelegateBindingExpressionTest.java b/javatests/dagger/internal/codegen/DelegateBindingExpressionTest.java
+index cdd0cfbdf..918d52cda 100644
+--- a/javatests/dagger/internal/codegen/DelegateBindingExpressionTest.java
++++ b/javatests/dagger/internal/codegen/DelegateBindingExpressionTest.java
+@@ -379,6 +379,10 @@ public void toReleasableCheck() {
+                     "    }",
+                     "    return (ReusableScoped) reusableScoped;",
+                     "  }",
++                    "",
++                    "  private Provider<Unscoped> getUnscopedProvider() {",
++                    "    return new SwitchingProvider<>(0);",
++                    "  }",
+                     "")
+                 .addLines(
+                     "  @SuppressWarnings(\"unchecked\")",
+@@ -394,8 +398,14 @@ public void toReleasableCheck() {
+                     "         ReferenceReleasingProvider.create(",
+                     "             ReleasableScoped_Factory.create(), customScopeReferences);",
+                     "    this.unscopedProvider =",
+-                    "        ReferenceReleasingProvider.create(",
+-                    "            (Provider) Unscoped_Factory.create(), customScopeReferences);",
++                    "        ReferenceReleasingProvider.create(")
++                .addLinesIn(
++                    DEFAULT_MODE,
++                    "            (Provider) Unscoped_Factory.create(), customScopeReferences);")
++                .addLinesIn(
++                    EXPERIMENTAL_ANDROID_MODE,
++                    "            (Provider) getUnscopedProvider(), customScopeReferences);")
++                .addLines(
+                     "    this.forReleasableReferencesReleasableReferenceManagerProvider =",
+                     "        new Provider<ReleasableReferenceManager>() {",
+                     "          @Override",
+@@ -403,8 +413,20 @@ public void toReleasableCheck() {
+                     "            return customScopeReferences;",
+                     "          }",
+                     "        };",
+-                    "  }",
+-                    "}")
++                    "  }")
++                .addLinesIn(
++                    EXPERIMENTAL_ANDROID_MODE,
++                    "  private final class SwitchingProvider<T> implements Provider<T> {",
++                    "    @SuppressWarnings(\"unchecked\")",
++                    "    @Override",
++                    "    public T get() {",
++                    "      switch (id) {",
++                    "        case 0: return (T) new Unscoped();",
++                    "        default: throw new AssertionError(id);",
++                    "      }",
++                    "    }",
++                    "  }")
++                .addLines("}")
+                 .build());
+   }
+ 
+@@ -939,12 +961,18 @@ public void providerWhenBindsScopeGreaterThanDependencyScope() {
+                     "",
+                     "  @Override",
+                     "  public Provider<Object> getObject() {",
+-                    "    return new Provider<Object>() {",
+-                    "      @Override",
+-                    "      public Object get() {",
+-                    "        return getObject2();",
++                    "    return new SwitchingProvider<>(0);",
++                    "  }",
++                    "",
++                    "  private final class SwitchingProvider<T> implements Provider<T> {",
++                    "    @SuppressWarnings(\"unchecked\")",
++                    "    @Override",
++                    "    public T get() {",
++                    "      switch (id) {",
++                    "        case 0: return (T) getObject2();",
++                    "        default: throw new AssertionError(id);",
+                     "      }",
+-                    "    };",
++                    "    }",
+                     "  }")
+                 .build());
+   }
+diff --git a/javatests/dagger/internal/codegen/ElidedFactoriesTest.java b/javatests/dagger/internal/codegen/ElidedFactoriesTest.java
+index 93752837a..e41311f75 100644
+--- a/javatests/dagger/internal/codegen/ElidedFactoriesTest.java
++++ b/javatests/dagger/internal/codegen/ElidedFactoriesTest.java
+@@ -216,12 +216,7 @@ public void simpleComponent_injectsProviderOf_dependsOnScoped() {
+                 "  }",
+                 "",
+                 "  private Provider<DependsOnScoped> getDependsOnScopedProvider() {",
+-                "    return new Provider<DependsOnScoped>() {",
+-                "      @Override",
+-                "      public DependsOnScoped get() {",
+-                "        return getDependsOnScoped();",
+-                "      }",
+-                "    };",
++                "    return new SwitchingProvider<>(0);",
+                 "  }",
+                 "",
+                 "  @Override",
+@@ -236,6 +231,22 @@ public void simpleComponent_injectsProviderOf_dependsOnScoped() {
+                 "      return new DaggerSimpleComponent(this);",
+                 "    }",
+                 "  }",
++                "  private final class SwitchingProvider<T> implements Provider<T> {",
++                "    private final int id;",
++                "",
++                "    SwitchingProvider(int id) {",
++                "      this.id = id;",
++                "    }",
++                "",
++                "    @SuppressWarnings(\"unchecked\")",
++                "    @Override",
++                "    public T get() {",
++                "      switch (id) {",
++                "        case 0: return (T) getDependsOnScoped();",
++                "        default: throw new AssertionError(id);",
++                "      }",
++                "    }",
++                "  }",
+                 "}");
+         break;
+       default:
+diff --git a/javatests/dagger/internal/codegen/MapBindingComponentProcessorTest.java b/javatests/dagger/internal/codegen/MapBindingComponentProcessorTest.java
+index d6968b427..be6da4b8f 100644
+--- a/javatests/dagger/internal/codegen/MapBindingComponentProcessorTest.java
++++ b/javatests/dagger/internal/codegen/MapBindingComponentProcessorTest.java
+@@ -137,23 +137,11 @@ public void mapBindingsWithEnumKey() {
+                 "  private MapModuleTwo mapModuleTwo;",
+                 "",
+                 "  private Provider<Handler> getMapOfPathEnumAndProviderOfHandlerProvider() {",
+-                "    return new Provider<Handler>() {",
+-                "      @Override",
+-                "      public Handler get() {",
+-                "        return MapModuleOne_ProvideAdminHandlerFactory.proxyProvideAdminHandler(",
+-                "            mapModuleOne));",
+-                "      }",
+-                "    };",
++                "    return new SwitchingProvider<>(1);",
+                 "  }",
+                 "",
+                 "  private Provider<Handler> getMapOfPathEnumAndProviderOfHandlerProvider2() {",
+-                "    return new Provider<Handler>() {",
+-                "      @Override",
+-                "      public Handler get() {",
+-                "        return MapModuleTwo_ProvideLoginHandlerFactory.proxyProvideLoginHandler(",
+-                "            mapModuleTwo);",
+-                "      }",
+-                "    };",
++                "    return new SwitchingProvider<>(2);",
+                 "  }",
+                 "",
+                 "  private Map<PathEnum, Provider<Handler>>",
+@@ -165,12 +153,31 @@ public void mapBindingsWithEnumKey() {
+                 "",
+                 "  @Override",
+                 "  public Provider<Map<PathEnum, Provider<Handler>>> dispatcher() {",
+-                "    return new Provider<Map<PathEnum, Provider<Handler>>>() {",
+-                "      @Override",
+-                "      public Map<PathEnum, Provider<Handler>> get() {",
+-                "        return getMapOfPathEnumAndProviderOfHandler();",
++                "    return new SwitchingProvider<>(0);",
++                "  }",
++                "",
++                "  private final class SwitchingProvider<T> implements Provider<T> {",
++                "    private final int id;",
++                "",
++                "    SwitchingProvider(int id) {",
++                "      this.id = id;",
++                "    }",
++                "",
++                "    @SuppressWarnings(\"unchecked\")",
++                "    @Override",
++                "    public T get() {",
++                "      switch (id) {",
++                "        case 0:",
++                "            return (T) getMapOfPathEnumAndProviderOfHandler();",
++                "        case 1:",
++                "            return (T) MapModuleOne_ProvideAdminHandlerFactory",
++                "                .proxyProvideAdminHandler(mapModuleOne);",
++                "        case 2:",
++                "            return (T) MapModuleTwo_ProvideLoginHandlerFactory",
++                "                .proxyProvideLoginHandler(mapModuleTwo);",
++                "        default: throw new AssertionError(id);",
+                 "      }",
+-                "    };",
++                "    }",
+                 "  }",
+                 "}");
+         break;
+@@ -515,23 +522,11 @@ public void mapBindingsWithStringKey() {
+                 "  private MapModuleTwo mapModuleTwo;",
+                 "",
+                 "  private Provider<Handler> getMapOfStringAndProviderOfHandlerProvider() {",
+-                "    return new Provider<Handler>() {",
+-                "      @Override",
+-                "      public Handler get() {",
+-                "        return MapModuleOne_ProvideAdminHandlerFactory.proxyProvideAdminHandler(",
+-                "            mapModuleOne);",
+-                "      }",
+-                "    };",
++                "    return new SwitchingProvider<>(1);",
+                 "  }",
+                 "",
+                 "  private Provider<Handler> getMapOfStringAndProviderOfHandlerProvider2() {",
+-                "    return new Provider<Handler>() {",
+-                "      @Override",
+-                "      public Handler get() {",
+-                "        return MapModuleTwo_ProvideLoginHandlerFactory.proxyProvideLoginHandler(",
+-                "            mapModuleTwo);",
+-                "      }",
+-                "    };",
++                "    return new SwitchingProvider<>(2);",
+                 "  }",
+                 "",
+                 "  private Map<String, Provider<Handler>>",
+@@ -543,12 +538,31 @@ public void mapBindingsWithStringKey() {
+                 "",
+                 "  @Override",
+                 "  public Provider<Map<String, Provider<Handler>>> dispatcher() {",
+-                "    return new Provider<Map<String, Provider<Handler>>>() {",
+-                "      @Override",
+-                "      public Map<String, Provider<Handler>> get() {",
+-                "        return getMapOfStringAndProviderOfHandler();",
++                "    return new SwitchingProvider<>(0);",
++                "  }",
++                "",
++                "  private final class SwitchingProvider<T> implements Provider<T> {",
++                "    private final int id;",
++                "",
++                "    SwitchingProvider(int id) {",
++                "      this.id = id;",
++                "    }",
++                "",
++                "    @SuppressWarnings(\"unchecked\")",
++                "    @Override",
++                "    public T get() {",
++                "      switch (id) {",
++                "        case 0:",
++                "            return (T) getMapOfStringAndProviderOfHandler();",
++                "        case 1:",
++                "            return (T) MapModuleOne_ProvideAdminHandlerFactory",
++                "                .proxyProvideAdminHandler(mapModuleOne);",
++                "        case 2:",
++                "            return (T) MapModuleTwo_ProvideLoginHandlerFactory",
++                "                .proxyProvideLoginHandler(mapModuleTwo);",
++                "        default: throw new AssertionError(id);",
+                 "      }",
+-                "    };",
++                "    }",
+                 "  }",
+                 "}");
+         break;
+@@ -687,24 +701,12 @@ public void mapBindingsWithWrappedKey() {
+                 "",
+                 "  private Provider<Handler>",
+                 "        getMapOfWrappedClassKeyAndProviderOfHandlerProvider() {",
+-                "    return new Provider<Handler>() {",
+-                "      @Override",
+-                "      public Handler get() {",
+-                "        return MapModuleOne_ProvideAdminHandlerFactory.proxyProvideAdminHandler(",
+-                "            mapModuleOne);",
+-                "      }",
+-                "    };",
++                "    return new SwitchingProvider<>(1);",
+                 "  }",
+                 "",
+                 "  private Provider<Handler>",
+                 "        getMapOfWrappedClassKeyAndProviderOfHandlerProvider2() {",
+-                "    return new Provider<Handler>() {",
+-                "      @Override",
+-                "      public Handler get() {",
+-                "        return MapModuleTwo_ProvideLoginHandlerFactory.proxyProvideLoginHandler(",
+-                "            mapModuleTwo);",
+-                "      }",
+-                "    };",
++                "    return new SwitchingProvider<>(2);",
+                 "  }",
+                 "",
+                 "  private Map<WrappedClassKey, Provider<Handler>>",
+@@ -724,12 +726,31 @@ public void mapBindingsWithWrappedKey() {
+                 "",
+                 "  @Override",
+                 "  public Provider<Map<WrappedClassKey, Provider<Handler>>> dispatcher() {",
+-                "    return new Provider<Map<WrappedClassKey, Provider<Handler>>>() {",
+-                "      @Override",
+-                "      public Map<WrappedClassKey, Provider<Handler>> get() {",
+-                "        return getMapOfWrappedClassKeyAndProviderOfHandler();",
++                "    return new SwitchingProvider<>(0);",
++                "  }",
++                "",
++                "  private final class SwitchingProvider<T> implements Provider<T> {",
++                "    private final int id;",
++                "",
++                "    SwitchingProvider(int id) {",
++                "      this.id = id;",
++                "    }",
++                "",
++                "    @SuppressWarnings(\"unchecked\")",
++                "    @Override",
++                "    public T get() {",
++                "      switch (id) {",
++                "        case 0:",
++                "            return (T) getMapOfWrappedClassKeyAndProviderOfHandler();",
++                "        case 1:",
++                "            return (T) MapModuleOne_ProvideAdminHandlerFactory",
++                "                .proxyProvideAdminHandler(mapModuleOne);",
++                "        case 2:",
++                "            return (T) MapModuleTwo_ProvideLoginHandlerFactory",
++                "                .proxyProvideLoginHandler(mapModuleTwo);",
++                "        default: throw new AssertionError(id);",
+                 "      }",
+-                "    };",
++                "    }",
+                 "  }",
+                 "}");
+         break;
+@@ -882,12 +903,24 @@ public void mapBindingsWithNonProviderValue() {
+                 "",
+                 "  @Override",
+                 "  public Provider<Map<PathEnum, Handler>> dispatcher() {",
+-                "    return new Provider<Map<PathEnum, Handler>>() {",
+-                "      @Override",
+-                "      public Map<PathEnum, Handler> get() {",
+-                "        return getMapOfPathEnumAndHandler();",
++                "    return new SwitchingProvider<>(0);",
++                "  }",
++                "",
++                "  private final class SwitchingProvider<T> implements Provider<T> {",
++                "    private final int id;",
++                "",
++                "    SwitchingProvider(int id) {",
++                "      this.id = id;",
++                "    }",
++                "",
++                "    @SuppressWarnings(\"unchecked\")",
++                "    @Override",
++                "    public T get() {",
++                "      switch (id) {",
++                "        case 0: return (T) getMapOfPathEnumAndHandler();",
++                "        default: throw new AssertionError(id);",
+                 "      }",
+-                "    };",
++                "    }",
+                 "  }",
+                 "}");
+         break;
+diff --git a/javatests/dagger/internal/codegen/MapBindingExpressionTest.java b/javatests/dagger/internal/codegen/MapBindingExpressionTest.java
+index 8bf02a9c2..c77161752 100644
+--- a/javatests/dagger/internal/codegen/MapBindingExpressionTest.java
++++ b/javatests/dagger/internal/codegen/MapBindingExpressionTest.java
+@@ -17,6 +17,8 @@
+ package dagger.internal.codegen;
+ 
+ import static com.google.testing.compile.CompilationSubject.assertThat;
++import static dagger.internal.codegen.CompilerMode.DEFAULT_MODE;
++import static dagger.internal.codegen.CompilerMode.EXPERIMENTAL_ANDROID_MODE;
+ import static dagger.internal.codegen.Compilers.CLASS_PATH_WITHOUT_GUAVA_OPTION;
+ import static dagger.internal.codegen.Compilers.daggerCompiler;
+ import static dagger.internal.codegen.GeneratedLines.GENERATED_ANNOTATION;
+@@ -87,53 +89,107 @@ public void mapBindings() {
+         "  Map<Long, Provider<Long>> providerLongs();",
+         "}");
+     JavaFileObject generatedComponent =
+-        JavaFileObjects.forSourceLines(
+-            "test.DaggerTestComponent",
+-            "package test;",
+-            "",
+-            "import dagger.internal.MapBuilder;",
+-            "",
+-            GENERATED_ANNOTATION,
+-            "public final class DaggerTestComponent implements TestComponent {",
+-            "  @Override",
+-            "  public Map<String, String> strings() {",
+-            "    return Collections.<String, String>emptyMap();",
+-            "  }",
+-            "",
+-            "  @Override",
+-            "  public Map<String, Provider<String>> providerStrings() {",
+-            "    return Collections.<String, Provider<String>>emptyMap();",
+-            "  }",
+-            "",
+-            "  @Override",
+-            "  public Map<Integer, Integer> ints() {",
+-            "    return Collections.<Integer, Integer>singletonMap(0, MapModule.provideInt());",
+-            "  }",
+-            "",
+-            "  @Override",
+-            "  public Map<Integer, Provider<Integer>> providerInts() {",
+-            "    return Collections.<Integer, Provider<Integer>>singletonMap(",
+-            "        0, MapModule_ProvideIntFactory.create());",
+-            "  }",
+-            "",
+-            "  @Override",
+-            "  public Map<Long, Long> longs() {",
+-            "    return MapBuilder.<Long, Long>newMapBuilder(3)",
+-            "        .put(0L, MapModule.provideLong0())",
+-            "        .put(1L, MapModule.provideLong1())",
+-            "        .put(2L, MapModule.provideLong2())",
+-            "        .build();",
+-            "  }",
+-            "",
+-            "  @Override",
+-            "  public Map<Long, Provider<Long>> providerLongs() {",
+-            "    return MapBuilder.<Long, Provider<Long>>newMapBuilder(3)",
+-            "        .put(0L, MapModule_ProvideLong0Factory.create())",
+-            "        .put(1L, MapModule_ProvideLong1Factory.create())",
+-            "        .put(2L, MapModule_ProvideLong2Factory.create())",
+-            "        .build();",
+-            "  }",
+-            "}");
++        compilerMode
++            .javaFileBuilder("test.DaggerTestComponent")
++            .addLines(
++                "package test;",
++                "",
++                "import dagger.internal.MapBuilder;",
++                "",
++                GENERATED_ANNOTATION,
++                "public final class DaggerTestComponent implements TestComponent {")
++            .addLinesIn(
++                EXPERIMENTAL_ANDROID_MODE,
++                "  private Provider<Integer> getMapOfIntegerAndProviderOfIntegerProvider() {",
++                "    return new SwitchingProvider<>(0);",
++                "  }",
++                "",
++                "  private Provider<Long> getMapOfLongAndProviderOfLongProvider() {",
++                "    return new SwitchingProvider<>(1);",
++                "  }",
++                "",
++                "  private Provider<Long> getMapOfLongAndProviderOfLongProvider2() {",
++                "    return new SwitchingProvider<>(2);",
++                "  }",
++                "",
++                "  private Provider<Long> getMapOfLongAndProviderOfLongProvider3() {",
++                "    return new SwitchingProvider<>(3);",
++                "  }")
++            .addLines(
++                "  @Override",
++                "  public Map<String, String> strings() {",
++                "    return Collections.<String, String>emptyMap();",
++                "  }",
++                "",
++                "  @Override",
++                "  public Map<String, Provider<String>> providerStrings() {",
++                "    return Collections.<String, Provider<String>>emptyMap();",
++                "  }",
++                "",
++                "  @Override",
++                "  public Map<Integer, Integer> ints() {",
++                "    return Collections.<Integer, Integer>singletonMap(0, MapModule.provideInt());",
++                "  }",
++                "",
++                "  @Override",
++                "  public Map<Integer, Provider<Integer>> providerInts() {",
++                "    return Collections.<Integer, Provider<Integer>>singletonMap(")
++            .addLinesIn(
++                DEFAULT_MODE, //
++                "        0, MapModule_ProvideIntFactory.create());")
++            .addLinesIn(
++                EXPERIMENTAL_ANDROID_MODE,
++                "        0, getMapOfIntegerAndProviderOfIntegerProvider());")
++            .addLines(
++                "  }",
++                "",
++                "  @Override",
++                "  public Map<Long, Long> longs() {",
++                "    return MapBuilder.<Long, Long>newMapBuilder(3)",
++                "        .put(0L, MapModule.provideLong0())",
++                "        .put(1L, MapModule.provideLong1())",
++                "        .put(2L, MapModule.provideLong2())",
++                "        .build();",
++                "  }",
++                "",
++                "  @Override",
++                "  public Map<Long, Provider<Long>> providerLongs() {",
++                "    return MapBuilder.<Long, Provider<Long>>newMapBuilder(3)")
++            .addLinesIn(
++                DEFAULT_MODE,
++                "        .put(0L, MapModule_ProvideLong0Factory.create())",
++                "        .put(1L, MapModule_ProvideLong1Factory.create())",
++                "        .put(2L, MapModule_ProvideLong2Factory.create())")
++            .addLinesIn(
++                EXPERIMENTAL_ANDROID_MODE,
++                "        .put(0L, getMapOfLongAndProviderOfLongProvider())",
++                "        .put(1L, getMapOfLongAndProviderOfLongProvider2())",
++                "        .put(2L, getMapOfLongAndProviderOfLongProvider3())")
++            .addLines( //
++                "        .build();", "  }")
++            .addLinesIn(
++                EXPERIMENTAL_ANDROID_MODE,
++                "  private final class SwitchingProvider<T> implements Provider<T> {",
++                "    private final int id;",
++                "",
++                "    SwitchingProvider(int id) {",
++                "      this.id = id;",
++                "    }",
++                "",
++                "    @SuppressWarnings(\"unchecked\")",
++                "    @Override",
++                "    public T get() {",
++                "      switch (id) {",
++                "        case 0: return (T) (Integer) MapModule.provideInt();",
++                "        case 1: return (T) (Long) MapModule.provideLong0();",
++                "        case 2: return (T) (Long) MapModule.provideLong1();",
++                "        case 3: return (T) (Long) MapModule.provideLong2();",
++                "        default: throw new AssertionError(id);",
++                "      }",
++                "    }",
++                "  }",
++                "}")
++            .build();
+     Compilation compilation = daggerCompilerWithoutGuava().compile(mapModuleFile, componentFile);
+     assertThat(compilation).succeeded();
+     assertThat(compilation)
+diff --git a/javatests/dagger/internal/codegen/MapBindingExpressionWithGuavaTest.java b/javatests/dagger/internal/codegen/MapBindingExpressionWithGuavaTest.java
+index b17472914..5de328055 100644
+--- a/javatests/dagger/internal/codegen/MapBindingExpressionWithGuavaTest.java
++++ b/javatests/dagger/internal/codegen/MapBindingExpressionWithGuavaTest.java
+@@ -17,6 +17,8 @@
+ package dagger.internal.codegen;
+ 
+ import static com.google.testing.compile.CompilationSubject.assertThat;
++import static dagger.internal.codegen.CompilerMode.DEFAULT_MODE;
++import static dagger.internal.codegen.CompilerMode.EXPERIMENTAL_ANDROID_MODE;
+ import static dagger.internal.codegen.Compilers.daggerCompiler;
+ import static dagger.internal.codegen.GeneratedLines.GENERATED_ANNOTATION;
+ 
+@@ -120,12 +122,31 @@ public void mapBindings() {
+             "  Map<Long, Provider<Long>> providerLongs();",
+             "}");
+     JavaFileObject generatedComponent =
+-            JavaFileObjects.forSourceLines(
+-                "test.DaggerTestComponent",
++        compilerMode
++            .javaFileBuilder("test.DaggerTestComponent")
++            .addLines(
+                 "package test;",
+                 "",
+                 GENERATED_ANNOTATION,
+-                "public final class DaggerTestComponent implements TestComponent {",
++                "public final class DaggerTestComponent implements TestComponent {")
++            .addLinesIn(
++                EXPERIMENTAL_ANDROID_MODE,
++                "  private Provider<Integer> getMapOfIntegerAndProviderOfIntegerProvider() {",
++                "    return new SwitchingProvider<>(0);",
++                "  }",
++                "",
++                "  private Provider<Long> getMapOfLongAndProviderOfLongProvider() {",
++                "    return new SwitchingProvider<>(1);",
++                "  }",
++                "",
++                "  private Provider<Long> getMapOfLongAndProviderOfLongProvider2() {",
++                "    return new SwitchingProvider<>(2);",
++                "  }",
++                "",
++                "  private Provider<Long> getMapOfLongAndProviderOfLongProvider3() {",
++                "    return new SwitchingProvider<>(3);",
++                "  }")
++            .addLines(
+                 "  @Override",
+                 "  public Map<String, String> strings() {",
+                 "    return ImmutableMap.<String, String>of();",
+@@ -143,8 +164,14 @@ public void mapBindings() {
+                 "",
+                 "  @Override",
+                 "  public Map<Integer, Provider<Integer>> providerInts() {",
+-                "    return ImmutableMap.<Integer, Provider<Integer>>of(",
+-                "        0, MapModule_ProvideIntFactory.create());",
++                "    return ImmutableMap.<Integer, Provider<Integer>>of(")
++            .addLinesIn(
++                DEFAULT_MODE, //
++                "        0, MapModule_ProvideIntFactory.create());")
++            .addLinesIn(
++                EXPERIMENTAL_ANDROID_MODE,
++                "        0, getMapOfIntegerAndProviderOfIntegerProvider());")
++            .addLines(
+                 "  }",
+                 "",
+                 "  @Override",
+@@ -157,10 +184,18 @@ public void mapBindings() {
+                 "",
+                 "  @Override",
+                 "  public Map<Long, Provider<Long>> providerLongs() {",
+-                "    return ImmutableMap.<Long, Provider<Long>>of(",
++                "    return ImmutableMap.<Long, Provider<Long>>of(")
++            .addLinesIn(
++                DEFAULT_MODE,
+                 "      0L, MapModule_ProvideLong0Factory.create(),",
+                 "      1L, MapModule_ProvideLong1Factory.create(),",
+-                "      2L, MapModule_ProvideLong2Factory.create());",
++                "      2L, MapModule_ProvideLong2Factory.create());")
++            .addLinesIn(
++                EXPERIMENTAL_ANDROID_MODE,
++                "      0L, getMapOfLongAndProviderOfLongProvider(),",
++                "      1L, getMapOfLongAndProviderOfLongProvider2(),",
++                "      2L, getMapOfLongAndProviderOfLongProvider3());")
++            .addLines(
+                 "  }",
+                 "",
+                 "  @Override",
+@@ -169,8 +204,21 @@ public void mapBindings() {
+                 "  }",
+                 "",
+                 "  private final class SubImpl implements Sub {",
+-                "    private SubImpl() {}",
++                "    private SubImpl() {}")
++            .addLinesIn(
++                EXPERIMENTAL_ANDROID_MODE,
++                "    private Provider<Long> getMapOfLongAndProviderOfLongProvider() {",
++                "      return new SwitchingProvider<>(0);",
++                "    }",
+                 "",
++                "    private Provider<Long> getMapOfLongAndProviderOfLongProvider2() {",
++                "      return new SwitchingProvider<>(1);",
++                "    }",
++                "",
++                "    private Provider<Long> getMapOfLongAndProviderOfLongProvider3() {",
++                "      return new SwitchingProvider<>(2);",
++                "    }")
++            .addLines(
+                 "    @Override",
+                 "    public Map<Long, Long> longs() {",
+                 "      return ImmutableMap.<Long, Long>builderWithExpectedSize(6)",
+@@ -185,17 +233,71 @@ public void mapBindings() {
+                 "",
+                 "    @Override",
+                 "    public Map<Long, Provider<Long>> providerLongs() {",
+-                "      return ImmutableMap.<Long, Provider<Long>>builderWithExpectedSize(6)",
++                "      return ImmutableMap.<Long, Provider<Long>>builderWithExpectedSize(6)")
++            .addLinesIn(
++                DEFAULT_MODE,
+                 "          .put(0L, MapModule_ProvideLong0Factory.create())",
+                 "          .put(1L, MapModule_ProvideLong1Factory.create())",
+                 "          .put(2L, MapModule_ProvideLong2Factory.create())",
+                 "          .put(3L, SubcomponentMapModule_ProvideLong3Factory.create())",
+                 "          .put(4L, SubcomponentMapModule_ProvideLong4Factory.create())",
+-                "          .put(5L, SubcomponentMapModule_ProvideLong5Factory.create())",
+-                "          .build();",
++                "          .put(5L, SubcomponentMapModule_ProvideLong5Factory.create())")
++            .addLinesIn(
++                EXPERIMENTAL_ANDROID_MODE,
++                "          .put(0L, DaggerTestComponent.this",
++                "              .getMapOfLongAndProviderOfLongProvider())",
++                "          .put(1L, DaggerTestComponent.this",
++                "              .getMapOfLongAndProviderOfLongProvider2())",
++                "          .put(2L, DaggerTestComponent.this",
++                "              .getMapOfLongAndProviderOfLongProvider3())",
++                "          .put(3L, getMapOfLongAndProviderOfLongProvider())",
++                "          .put(4L, getMapOfLongAndProviderOfLongProvider2())",
++                "          .put(5L, getMapOfLongAndProviderOfLongProvider3())")
++            .addLines( //
++                "          .build();", "    }")
++            .addLinesIn(
++                EXPERIMENTAL_ANDROID_MODE,
++                "    private final class SwitchingProvider<T> implements Provider<T> {",
++                "      private final int id;",
++                "",
++                "      SwitchingProvider(int id) {",
++                "        this.id = id;",
++                "      }",
++                "",
++                "      @SuppressWarnings(\"unchecked\")",
++                "      @Override",
++                "      public T get() {",
++                "        switch (id) {",
++                "          case 0: return (T) (Long) SubcomponentMapModule.provideLong3();",
++                "          case 1: return (T) (Long) SubcomponentMapModule.provideLong4();",
++                "          case 2: return (T) (Long) SubcomponentMapModule.provideLong5();",
++                "          default: throw new AssertionError(id);",
++                "        }",
++                "      }",
++                "    }",
++                "  }",
++                "",
++                "  private final class SwitchingProvider<T> implements Provider<T> {",
++                "    private final int id;",
++                "",
++                "    SwitchingProvider(int id) {",
++                "      this.id = id;",
++                "    }",
++                "",
++                "    @SuppressWarnings(\"unchecked\")",
++                "    @Override",
++                "    public T get() {",
++                "      switch (id) {",
++                "        case 0: return (T) (Integer) MapModule.provideInt();",
++                "        case 1: return (T) (Long) MapModule.provideLong0();",
++                "        case 2: return (T) (Long) MapModule.provideLong1();",
++                "        case 3: return (T) (Long) MapModule.provideLong2();",
++                "        default: throw new AssertionError(id);",
++                "      }",
+                 "    }",
+                 "  }",
+-                "}");
++                "}")
++            .build();
+     Compilation compilation =
+         daggerCompiler()
+             .withOptions(compilerMode.javacopts())
+diff --git a/javatests/dagger/internal/codegen/OptionalBindingRequestFulfillmentTest.java b/javatests/dagger/internal/codegen/OptionalBindingRequestFulfillmentTest.java
+index 1d5f0f6e4..860b640aa 100644
+--- a/javatests/dagger/internal/codegen/OptionalBindingRequestFulfillmentTest.java
++++ b/javatests/dagger/internal/codegen/OptionalBindingRequestFulfillmentTest.java
+@@ -17,6 +17,8 @@
+ package dagger.internal.codegen;
+ 
+ import static com.google.testing.compile.CompilationSubject.assertThat;
++import static dagger.internal.codegen.CompilerMode.DEFAULT_MODE;
++import static dagger.internal.codegen.CompilerMode.EXPERIMENTAL_ANDROID_MODE;
+ import static dagger.internal.codegen.Compilers.daggerCompiler;
+ import static dagger.internal.codegen.GeneratedLines.GENERATED_ANNOTATION;
+ 
+@@ -103,37 +105,73 @@ public void inlinedOptionalBindings() {
+             "  Optional<DefinitelyNot> definitelyNot();",
+             "  Optional<Provider<Lazy<DefinitelyNot>>> providerOfLazyOfDefinitelyNot();",
+             "}");
++
+     JavaFileObject generatedComponent =
+-        JavaFileObjects.forSourceLines(
+-            "test.DaggerTestComponent",
+-            "package test;",
+-            "",
+-            "import com.google.common.base.Optional;",
+-            "",
+-            GENERATED_ANNOTATION,
+-            "public final class DaggerTestComponent implements TestComponent {",
+-            "  @Override",
+-            "  public Optional<Maybe> maybe() {",
+-            "    return Optional.of(Maybe_MaybeModule_ProvideMaybeFactory.proxyProvideMaybe());",
+-            "  }",
+-            "",
+-            "  @Override",
+-            "  public Optional<Provider<Lazy<Maybe>>> providerOfLazyOfMaybe() {",
+-            "    return Optional.of(",
+-            "        ProviderOfLazy.create(Maybe_MaybeModule_ProvideMaybeFactory.create()));",
+-            "  }",
+-            "",
+-            "  @Override",
+-            "  public Optional<DefinitelyNot> definitelyNot() {",
+-            "    return Optional.<DefinitelyNot>absent();",
+-            "  }",
+-            "",
+-            "  @Override",
+-            "  public Optional<Provider<Lazy<DefinitelyNot>>>",
+-            "      providerOfLazyOfDefinitelyNot() {",
+-            "    return Optional.<Provider<Lazy<DefinitelyNot>>>absent();",
+-            "  }",
+-            "}");
++        compilerMode
++            .javaFileBuilder("test.DaggerTestComponent")
++            .addLines(
++                "package test;",
++                "",
++                "import com.google.common.base.Optional;",
++                "",
++                GENERATED_ANNOTATION,
++                "public final class DaggerTestComponent implements TestComponent {")
++            .addLinesIn(
++                EXPERIMENTAL_ANDROID_MODE,
++                "  private Provider<Maybe> getMaybeProvider() {",
++                "    return new SwitchingProvider<>(0);",
++                "  }")
++            .addLines(
++                "  @Override",
++                "  public Optional<Maybe> maybe() {",
++                "    return Optional.of(",
++                "        Maybe_MaybeModule_ProvideMaybeFactory.proxyProvideMaybe());",
++                "  }",
++                "",
++                "  @Override",
++                "  public Optional<Provider<Lazy<Maybe>>> providerOfLazyOfMaybe() {",
++                "    return Optional.of(ProviderOfLazy.create(")
++            .addLinesIn(
++                DEFAULT_MODE,
++                "        Maybe_MaybeModule_ProvideMaybeFactory.create()));")
++            .addLinesIn(
++                EXPERIMENTAL_ANDROID_MODE,
++                "        getMaybeProvider()));")
++            .addLines(
++                "  }",
++                "",
++                "  @Override",
++                "  public Optional<DefinitelyNot> definitelyNot() {",
++                "    return Optional.<DefinitelyNot>absent();",
++                "  }",
++                "",
++                "  @Override",
++                "  public Optional<Provider<Lazy<DefinitelyNot>>>",
++                "      providerOfLazyOfDefinitelyNot() {",
++                "    return Optional.<Provider<Lazy<DefinitelyNot>>>absent();",
++                "  }")
++            .addLinesIn(
++                EXPERIMENTAL_ANDROID_MODE,
++                "  private final class SwitchingProvider<T> implements Provider<T> {",
++                "    private final int id;",
++                "",
++                "    SwitchingProvider(int id) {",
++                "      this.id = id;",
++                "    }",
++                "",
++                "    @SuppressWarnings(\"unchecked\")",
++                "    @Override",
++                "    public T get() {",
++                "      switch (id) {",
++                "        case 0:",
++                "          return (T) Maybe_MaybeModule_ProvideMaybeFactory.proxyProvideMaybe();",
++                "        default:",
++                "          throw new AssertionError(id);",
++                "      }",
++                "    }",
++                "  }",
++                "}")
++            .build();
+     Compilation compilation =
+         daggerCompiler()
+             .withOptions(compilerMode.javacopts())
+diff --git a/javatests/dagger/internal/codegen/ProductionComponentProcessorTest.java b/javatests/dagger/internal/codegen/ProductionComponentProcessorTest.java
+index ed8101f03..08a541f3b 100644
+--- a/javatests/dagger/internal/codegen/ProductionComponentProcessorTest.java
++++ b/javatests/dagger/internal/codegen/ProductionComponentProcessorTest.java
+@@ -226,14 +226,15 @@ public void simpleComponent() {
+                 "test.DaggerTestClass_SimpleComponent",
+                 "package test;",
+                 "",
++                "import com.google.common.collect.ImmutableSet;",
+                 "import com.google.common.util.concurrent.ListenableFuture;",
+                 "import dagger.internal.InstanceFactory;",
+                 "import dagger.internal.MemoizedSentinel;",
+                 "import dagger.internal.Preconditions;",
+-                "import dagger.internal.SetFactory;",
+                 "import dagger.producers.Producer;",
+                 "import dagger.producers.internal.Producers;",
+                 "import dagger.producers.monitoring.ProductionComponentMonitor;",
++                "import java.util.Set;",
+                 "import java.util.concurrent.Executor;",
+                 IMPORT_GENERATED_ANNOTATION,
+                 "import javax.inject.Provider;",
+@@ -278,12 +279,12 @@ public void simpleComponent() {
+                 "  }",
+                 "",
+                 "  private Provider<Executor> getProductionImplementationExecutorProvider() {",
+-                "    return new Provider<Executor>() {",
+-                "      @Override",
+-                "      public Executor get() {",
+-                "        return getProductionImplementationExecutor();",
+-                "      }",
+-                "    };",
++                "    return new SwitchingProvider<>(0);",
++                "  }",
++                "",
++                "  private Provider<Set<ProductionComponentMonitor.Factory>>",
++                "      getSetOfFactoryProvider() {",
++                "    return new SwitchingProvider<>(2);",
+                 "  }",
+                 "",
+                 "  private ProductionComponentMonitor getProductionComponentMonitor() {",
+@@ -295,7 +296,7 @@ public void simpleComponent() {
+                 "              TestClass_SimpleComponent_MonitoringModule_MonitorFactory",
+                 "                  .proxyMonitor(",
+                 "                      simpleComponentProvider,",
+-                "                      SetFactory.<ProductionComponentMonitor.Factory>empty());",
++                "                      getSetOfFactoryProvider());",
+                 "        }",
+                 "        local = productionComponentMonitor;",
+                 "      }",
+@@ -305,12 +306,7 @@ public void simpleComponent() {
+                 "",
+                 "  private Provider<ProductionComponentMonitor>",
+                 "      getProductionComponentMonitorProvider() {",
+-                "    return new Provider<ProductionComponentMonitor>() {",
+-                "      @Override",
+-                "      public ProductionComponentMonitor get() {",
+-                "        return getProductionComponentMonitor();",
+-                "      }",
+-                "    };",
++                "    return new SwitchingProvider<>(1);",
+                 "  }",
+                 "",
+                 "  private TestClass.B getB() {",
+@@ -318,12 +314,7 @@ public void simpleComponent() {
+                 "  }",
+                 "",
+                 "  private Provider<TestClass.B> getBProvider() {",
+-                "    return new Provider<TestClass.B>() {",
+-                "      @Override",
+-                "      public TestClass.B get() {",
+-                "        return getB();",
+-                "      }",
+-                "    };",
++                "    return new SwitchingProvider<>(3);",
+                 "  }",
+                 "",
+                 "  @SuppressWarnings(\"unchecked\")",
+@@ -381,6 +372,25 @@ public void simpleComponent() {
+                 "      return this;",
+                 "    }",
+                 "  }",
++                "  private final class SwitchingProvider<T> implements Provider<T> {",
++                "    private final int id;",
++                "",
++                "    SwitchingProvider(int id) {",
++                "      this.id = id;",
++                "    }",
++                "",
++                "    @SuppressWarnings(\"unchecked\")",
++                "    @Override",
++                "    public T get() {",
++                "      switch (id) {",
++                "        case 0: return (T) getProductionImplementationExecutor();",
++                "        case 1: return (T) getProductionComponentMonitor();",
++                "        case 2: return (T) ImmutableSet.<ProductionComponentMonitor.Factory>of();",
++                "        case 3: return (T) getB();",
++                "        default: throw new AssertionError(id);",
++                "      }",
++                "    }",
++                "  }",
+                 "}");
+         break;
+       default:

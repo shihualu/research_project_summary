@@ -1,0 +1,306 @@
+diff --git a/extensions/cronet/build.gradle b/extensions/cronet/build.gradle
+index a1beadb52c..0b75639d73 100644
+--- a/extensions/cronet/build.gradle
++++ b/extensions/cronet/build.gradle
+@@ -33,6 +33,10 @@ android {
+     lintOptions {
+         abortOnError false
+     }
++
++    sourceSets.main {
++        jniLibs.srcDirs = ['jniLibs']
++    }
+ }
+ 
+ dependencies {
+diff --git a/extensions/cronet/src/main/AndroidManifest.xml b/extensions/cronet/src/main/AndroidManifest.xml
+index 09739c2589..4de726be98 100644
+--- a/extensions/cronet/src/main/AndroidManifest.xml
++++ b/extensions/cronet/src/main/AndroidManifest.xml
+@@ -16,6 +16,8 @@
+ <manifest xmlns:android="http://schemas.android.com/apk/res/android"
+     package="com.google.android.exoplayer.ext.cronet">
+ 
++    <uses-permission android:name="android.permission.ACCESS_NETWORK_STATE"/>
++
+     <uses-sdk android:minSdkVersion="9" android:targetSdkVersion="23"/>
+ 
+ </manifest>
+diff --git a/extensions/cronet/src/main/java/com/google/android/exoplayer/ext/cronet/CronetDataSource.java b/extensions/cronet/src/main/java/com/google/android/exoplayer/ext/cronet/CronetDataSource.java
+index c7c24dab5a..7c26e93b1e 100644
+--- a/extensions/cronet/src/main/java/com/google/android/exoplayer/ext/cronet/CronetDataSource.java
++++ b/extensions/cronet/src/main/java/com/google/android/exoplayer/ext/cronet/CronetDataSource.java
+@@ -18,7 +18,6 @@
+ import android.os.ConditionVariable;
+ import android.text.TextUtils;
+ import android.util.Log;
+-
+ import com.google.android.exoplayer.C;
+ import com.google.android.exoplayer.upstream.DataSpec;
+ import com.google.android.exoplayer.upstream.HttpDataSource;
+@@ -27,7 +26,6 @@
+ import com.google.android.exoplayer.util.Clock;
+ import com.google.android.exoplayer.util.Predicate;
+ import com.google.android.exoplayer.util.TraceUtil;
+-
+ import java.io.IOException;
+ import java.net.SocketTimeoutException;
+ import java.net.UnknownHostException;
+@@ -41,7 +39,6 @@
+ import java.util.concurrent.atomic.AtomicLong;
+ import java.util.regex.Matcher;
+ import java.util.regex.Pattern;
+-
+ import org.chromium.net.CronetEngine;
+ import org.chromium.net.UrlRequest;
+ import org.chromium.net.UrlRequestException;
+@@ -77,16 +74,15 @@ public OpenException(String errorMessage, DataSpec dataSpec, int cronetConnectio
+   }
+ 
+   private static final String TAG = "CronetDataSource";
+-
+   private static final Pattern CONTENT_RANGE_HEADER_PATTERN =
+       Pattern.compile("^bytes (\\d+)-(\\d+)/(\\d+)$");
+   // The size of read buffer passed to cronet UrlRequest.read().
+   private static final int READ_BUFFER_SIZE_BYTES = 32 * 1024;
+ 
+   /* package */ static final int IDLE_CONNECTION = 5;
+-  /* package */static final int OPENING_CONNECTION = 2;
+-  /* package */static final int CONNECTED_CONNECTION = 3;
+-  /* package */static final int OPEN_CONNECTION = 4;
++  /* package */ static final int OPENING_CONNECTION = 2;
++  /* package */ static final int CONNECTED_CONNECTION = 3;
++  /* package */ static final int OPEN_CONNECTION = 4;
+ 
+   private final CronetEngine cronetEngine;
+   private final Executor executor;
+@@ -104,9 +100,9 @@ public OpenException(String errorMessage, DataSpec dataSpec, int cronetConnectio
+   private DataSpec currentDataSpec;
+   private UrlResponseInfo responseInfo;
+ 
+-  /* package */ TimeoutCheckerRunnable timeoutCheckerRunnable;
+   /* package */ volatile int connectionState;
+   private volatile String currentUrl;
++  private volatile long currentConnectTimeoutMs;
+   private volatile HttpDataSourceException exception;
+   private volatile long contentLength;
+   private volatile AtomicLong expectedBytesRemainingToRead;
+@@ -116,7 +112,7 @@ public OpenException(String errorMessage, DataSpec dataSpec, int cronetConnectio
+   /**
+    * @param cronetEngine A CronetEngine.
+    * @param executor The {@link java.util.concurrent.Executor} that will perform the request.
+-   * @param clock A {@link com.google.android.exoplayer.util.Clock} for keeping track of timeout
++   * @param clock A {@link com.google.android.exoplayer.util.Clock} for keeping track of timeout.
+    * @param contentTypePredicate A {@link Predicate}. If a content type is rejected by the
+    *     predicate then a
+    *     {@link com.google.android.exoplayer.upstream.HttpDataSource.InvalidContentTypeException}
+@@ -179,27 +175,20 @@ public long open(DataSpec dataSpec) throws HttpDataSourceException {
+         connectionState = OPENING_CONNECTION;
+       }
+ 
+-      createRequest(dataSpec);
+-
+-      if (resetTimeoutOnRedirects) {
+-        operation.close();
+-        timeoutCheckerRunnable = new TimeoutCheckerRunnable();
+-        executor.execute(timeoutCheckerRunnable);
+-        currentUrlRequest.start();
+-        operation.block();
+-      } else {
+-        operation.close();
+-        currentUrlRequest.start();
+-        operation.block(connectTimeoutMs);
+-      }
++      operation.close();
++      resetConnectTimeout();
++      startRequest(dataSpec);
++      boolean requestStarted = blockUntilConnectTimeout();
+ 
+       if (exception != null) {
++        // An error occurred opening the connection.
+         throw exception;
+-      } else if (connectionState != CONNECTED_CONNECTION) {
+-        // If the connection timed out. Get the last connection status then throw with exception.
++      } else if (!requestStarted) {
++        // The timeout was reached before the connection was opened.
+         throw new OpenException(new SocketTimeoutException(), dataSpec, getCurrentRequestStatus());
+       }
+ 
++      // Connection was opened.
+       if (transferListener != null) {
+         transferListener.onTransferStart();
+       }
+@@ -210,7 +199,7 @@ public long open(DataSpec dataSpec) throws HttpDataSourceException {
+     }
+   }
+ 
+-  private void createRequest(DataSpec dataSpec) throws HttpDataSourceException {
++  private void startRequest(DataSpec dataSpec) throws HttpDataSourceException {
+     currentUrl = dataSpec.uri.toString();
+     currentDataSpec = dataSpec;
+     UrlRequest.Builder urlRequestBuilder = new UrlRequest.Builder(currentUrl, this, executor,
+@@ -218,6 +207,7 @@ private void createRequest(DataSpec dataSpec) throws HttpDataSourceException {
+     fillCurrentRequestHeader(urlRequestBuilder);
+     fillCurrentRequestPostBody(urlRequestBuilder, dataSpec);
+     currentUrlRequest = urlRequestBuilder.build();
++    currentUrlRequest.start();
+   }
+ 
+   private void fillCurrentRequestHeader(UrlRequest.Builder urlRequestBuilder) {
+@@ -253,8 +243,8 @@ private void fillCurrentRequestPostBody(UrlRequest.Builder urlRequestBuilder, Da
+   }
+ 
+   @Override
+-  public synchronized void onFailed(
+-      UrlRequest request, UrlResponseInfo info, UrlRequestException error) {
++  public synchronized void onFailed(UrlRequest request, UrlResponseInfo info,
++      UrlRequestException error) {
+     if (request != currentUrlRequest) {
+       return;
+     }
+@@ -262,18 +252,12 @@ public synchronized void onFailed(
+       IOException cause = error.getErrorCode() == UrlRequestException.ERROR_HOSTNAME_NOT_RESOLVED
+           ? new UnknownHostException() : error;
+       exception = new OpenException(cause, currentDataSpec, getCurrentRequestStatus());
+-      if (timeoutCheckerRunnable != null) {
+-        timeoutCheckerRunnable.cancel();
+-        timeoutCheckerRunnable = null;
+-      }
+-      operation.open();
+-
+     } else if (connectionState == OPEN_CONNECTION) {
+       readBuffer.limit(0);
+-      exception = new HttpDataSourceException(
+-          error, currentDataSpec, HttpDataSourceException.TYPE_READ);
+-      operation.open();
++      exception = new HttpDataSourceException(error, currentDataSpec,
++          HttpDataSourceException.TYPE_READ);
+     }
++    operation.open();
+   }
+ 
+   @Override
+@@ -306,10 +290,6 @@ public synchronized void onResponseStarted(UrlRequest request, UrlResponseInfo i
+     } catch (HttpDataSourceException e) {
+       exception = e;
+     } finally {
+-      if (timeoutCheckerRunnable != null) {
+-        timeoutCheckerRunnable.cancel();
+-        timeoutCheckerRunnable = null;
+-      }
+       operation.open();
+       TraceUtil.endSection();
+     }
+@@ -324,7 +304,6 @@ private void validateResponse(UrlResponseInfo info) throws HttpDataSourceExcepti
+           info.getAllHeaders(),
+           currentDataSpec);
+     }
+-
+     // Check for a valid content type.
+     try {
+       String contentType = info.getAllHeaders().get("Content-Type").get(0);
+@@ -376,7 +355,6 @@ private long getContentLength(Map<String, List<String>> headers) {
+         }
+       }
+     }
+-
+     return contentLength;
+   }
+ 
+@@ -453,8 +431,8 @@ public void onRedirectReceived(UrlRequest request, UrlResponseInfo info, String
+         return;
+       }
+     }
+-    if (timeoutCheckerRunnable != null) {
+-      timeoutCheckerRunnable.resetTimeoutLimit();
++    if (resetTimeoutOnRedirects) {
++      resetConnectTimeout();
+     }
+     request.followRedirect();
+   }
+@@ -489,10 +467,6 @@ public synchronized void close() {
+         currentUrlRequest.cancel();
+         currentUrlRequest = null;
+       }
+-      if (timeoutCheckerRunnable != null) {
+-        timeoutCheckerRunnable.cancel();
+-        timeoutCheckerRunnable = null;
+-      }
+       readBuffer.clear();
+       currentDataSpec = null;
+       currentUrl = null;
+@@ -538,49 +512,18 @@ public void onStatus(int status) {
+     return result.get();
+   }
+ 
+-  class TimeoutCheckerRunnable implements Runnable {
+-
+-    private volatile long connectTimeoutElapsedTimeMs;
+-    private boolean cancelled;
+-
+-    private TimeoutCheckerRunnable() {
+-      resetTimeoutLimit();
+-    }
+-
+-    @Override
+-    public void run() {
+-      try {
+-        while (true) {
+-          if (checkTimeout()) {
+-            return;
+-          }
+-
+-          Thread.sleep(200);
+-        }
+-      } catch (InterruptedException e) {
+-        // Shouldn't happen but if it does, it results in timing out.
+-      }
+-    }
+-
+-    boolean checkTimeout() {
+-      if (cancelled) {
+-        return true;
+-      }
+-      if (clock.elapsedRealtime() > connectTimeoutElapsedTimeMs) {
+-        operation.open();
+-        return true;
+-      }
+-      return false;
+-    }
+-
+-    private void resetTimeoutLimit() {
+-      connectTimeoutElapsedTimeMs = clock.elapsedRealtime() + connectTimeoutMs;
+-    }
+-
+-    private void cancel() {
+-      cancelled = true;
++  private boolean blockUntilConnectTimeout() {
++    long now = clock.elapsedRealtime();
++    boolean opened = false;
++    while (!opened && now < currentConnectTimeoutMs) {
++      opened = operation.block(currentConnectTimeoutMs - now + 5 /* fudge factor */);
++      now = clock.elapsedRealtime();
+     }
++    return opened;
++  }
+ 
++  private void resetConnectTimeout() {
++    currentConnectTimeoutMs = clock.elapsedRealtime() + connectTimeoutMs;
+   }
+ 
+ }
+diff --git a/settings.gradle b/settings.gradle
+index 0d02abd274..969dac7a30 100644
+--- a/settings.gradle
++++ b/settings.gradle
+@@ -19,7 +19,9 @@ include ':extension-opus'
+ include ':extension-vp9'
+ include ':extension-okhttp'
+ include ':extension-flac'
+-include ':extension-cronet'
++
++// Uncomment the following line to use the Cronet Extension.
++// include ':extension-cronet'
+ 
+ project(':demo-ext').projectDir = new File(settingsDir, 'demo_ext')
+ project(':extension-opus').projectDir = new File(settingsDir, 'extensions/opus')

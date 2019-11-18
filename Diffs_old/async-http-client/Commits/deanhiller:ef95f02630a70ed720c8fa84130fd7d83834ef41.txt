@@ -1,0 +1,128 @@
+diff --git a/providers/channelmgr/src/main/java/com/ning/http/pool/AsyncConnectionPoolImpl.java b/providers/channelmgr/src/main/java/com/ning/http/pool/AsyncConnectionPoolImpl.java
+index 4dca9b570..cfd6ccd54 100644
+--- a/providers/channelmgr/src/main/java/com/ning/http/pool/AsyncConnectionPoolImpl.java
++++ b/providers/channelmgr/src/main/java/com/ning/http/pool/AsyncConnectionPoolImpl.java
+@@ -3,8 +3,6 @@
+ import java.util.ArrayList;
+ import java.util.List;
+ import java.util.concurrent.ConcurrentHashMap;
+-import java.util.concurrent.ConcurrentLinkedQueue;
+-import java.util.concurrent.Executors;
+ import java.util.concurrent.ScheduledExecutorService;
+ import java.util.concurrent.ScheduledFuture;
+ import java.util.concurrent.TimeUnit;
+@@ -12,10 +10,9 @@
+ import org.slf4j.Logger;
+ import org.slf4j.LoggerFactory;
+ 
+-import com.ning.http.client.providers.chanmgr.ChanMgrAsyncHttpProvider;
+ import com.ning.http.client.providers.chanmgr.ChanMgrConnectionsPool;
+ 
+-public class AsyncConnectionPoolImpl<T> implements AsyncConnectionPool<T> {
++public class AsyncConnectionPoolImpl<T> implements AsyncConnectionPool<T>, ConnectionCloseListener<T> {
+ 
+     private final static Logger log = LoggerFactory.getLogger(ChanMgrConnectionsPool.class);
+     private final ConcurrentHashMap<String, HostPool<T>> connectionsPool = new ConcurrentHashMap<String, HostPool<T>>();
+@@ -65,7 +62,7 @@ public void obtainConnection(String baseUrl, ConnectionAvailableListener<T> l) {
+ 	        	log.debug("Maximum number of requests reached for host="+baseUrl+" total="+maxConnectionPerHost+" We are waiting for release of connection now ms="+requestTimeout);
+ 	        	schedulePendingRequest(baseUrl, l);
+ 	        } else {
+-	        	Connection<T> connection = idleConnectionForHost.grabConnection(creator);
++	        	Connection<T> connection = idleConnectionForHost.grabConnection(creator, this);
+ 	        	connection.setBaseUrl(baseUrl);
+ 	        	l.connectionAvailable(connection);
+ 	        }
+@@ -155,8 +152,16 @@ private boolean process(PendingRequest<T> request, int maxPerHost, int max, Conn
+     	return true;
+ 	}
+ 
++	@Override
++	public void connectionClosed(Connection<T> conn) {
++		synchronized(this) {
++			HostPool<T> pool = fetchQueue(conn.getBaseUrl(), connectionsPool);
++			pool.connectionClosedFarEnd(conn);
++		}
++	}
++
+ 	private void grabConnection(PendingRequest<T> request, HostPool<T> pool) {
+-		Connection<T> connection = pool.grabConnection(creator);
++		Connection<T> connection = pool.grabConnection(creator, this);
+ 		connection.setBaseUrl(request.getBaseUrl());
+ 		request.connectionAvailable(connection);
+ 	}
+@@ -219,4 +224,8 @@ public int getNumInUseConnections() {
+ 		return total;
+ 	}
+ 	
++	public int getNumPools() {
++		return connectionsPool.size();
++	}
++
+ }
+diff --git a/providers/channelmgr/src/main/java/com/ning/http/pool/ConnectionCloseListener.java b/providers/channelmgr/src/main/java/com/ning/http/pool/ConnectionCloseListener.java
+new file mode 100644
+index 000000000..f2cda3d7a
+--- /dev/null
++++ b/providers/channelmgr/src/main/java/com/ning/http/pool/ConnectionCloseListener.java
+@@ -0,0 +1,6 @@
++package com.ning.http.pool;
++
++public interface ConnectionCloseListener<T> {
++
++	public void connectionClosed(Connection<T> conn);
++}
+diff --git a/providers/channelmgr/src/main/java/com/ning/http/pool/ConnectionCreator.java b/providers/channelmgr/src/main/java/com/ning/http/pool/ConnectionCreator.java
+index 4bea36715..d8ed45a3e 100644
+--- a/providers/channelmgr/src/main/java/com/ning/http/pool/ConnectionCreator.java
++++ b/providers/channelmgr/src/main/java/com/ning/http/pool/ConnectionCreator.java
+@@ -2,6 +2,6 @@
+ 
+ public interface ConnectionCreator<T> {
+ 
+-	Connection<T> createConnection();
++	Connection<T> createConnection(ConnectionCloseListener<T> l);
+ 
+ }
+diff --git a/providers/channelmgr/src/main/java/com/ning/http/pool/HostPool.java b/providers/channelmgr/src/main/java/com/ning/http/pool/HostPool.java
+index 49c1c2fb8..9da40ecfe 100644
+--- a/providers/channelmgr/src/main/java/com/ning/http/pool/HostPool.java
++++ b/providers/channelmgr/src/main/java/com/ning/http/pool/HostPool.java
+@@ -15,10 +15,10 @@ public String toString() {
+ 		return "[IDLE="+idleConnections+",   IN_USE="+inUseConnections+"]";
+ 	}
+ 
+-	public Connection<T> grabConnection(ConnectionCreator<T> creator) {
++	public Connection<T> grabConnection(ConnectionCreator<T> creator, ConnectionCloseListener<T> listener) {
+     	Connection<T> conn = idleConnections.poll();
+     	if(conn == null) {
+-    		conn = creator.createConnection();
++    		conn = creator.createConnection(listener);
+     	}
+     	
+ 		if(conn != null)
+@@ -37,6 +37,11 @@ public void closeConnection(Connection<T> conn) {
+ 		conn.close();
+ 	}
+ 	
++	public void connectionClosedFarEnd(Connection<T> conn) {
++		inUseConnections.remove(conn);
++		idleConnections.remove(conn);
++	}
++	
+ 	public int numIdle() {
+ 		return idleConnections.size();
+ 	}
+diff --git a/providers/channelmgr/src/test/java/com/ning/http/pool/PoolTests.java b/providers/channelmgr/src/test/java/com/ning/http/pool/PoolTests.java
+index 6cfbd5ed4..3b2feb4e8 100644
+--- a/providers/channelmgr/src/test/java/com/ning/http/pool/PoolTests.java
++++ b/providers/channelmgr/src/test/java/com/ning/http/pool/PoolTests.java
+@@ -132,7 +132,8 @@ public void testMaxTotal() {
+     	int inUse = pool.getNumInUseConnections();
+     	Assert.assertEquals(3, idle+inUse);
+     	
+-
++    	//check for memory issues on the map
++    	Assert.assertEquals(2, pool.getNumPools());
+     	System.out.println("poolStr="+poolStr);
+     }
+ }

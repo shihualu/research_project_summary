@@ -1,0 +1,352 @@
+diff --git a/marmoset/src/main/java/com/graphhopper/marmoset/Marmoset.java b/marmoset/src/main/java/com/graphhopper/marmoset/Marmoset.java
+index 5243d9916f..685959ea30 100644
+--- a/marmoset/src/main/java/com/graphhopper/marmoset/Marmoset.java
++++ b/marmoset/src/main/java/com/graphhopper/marmoset/Marmoset.java
+@@ -35,6 +35,7 @@ public static void run()
+                 public void run()
+                 {
+                     int i = 0;
++                    mh.startSimulation();
+                     while (true)
+                     {
+                         System.out.println("Running iteration " + i);
+diff --git a/marmoset/src/main/java/com/graphhopper/marmoset/MarmosetHopper.java b/marmoset/src/main/java/com/graphhopper/marmoset/MarmosetHopper.java
+index 07c884d1ae..36c7719f99 100644
+--- a/marmoset/src/main/java/com/graphhopper/marmoset/MarmosetHopper.java
++++ b/marmoset/src/main/java/com/graphhopper/marmoset/MarmosetHopper.java
+@@ -1,6 +1,7 @@
+ package com.graphhopper.marmoset;
+ 
+ import com.graphhopper.GraphHopper;
++import com.graphhopper.marmoset.util.CellsGraph;
+ import com.graphhopper.marmoset.util.Location;
+ import com.graphhopper.util.CmdArgs;
+ 
+@@ -8,6 +9,7 @@
+ import java.util.*;
+ import java.util.stream.Collectors;
+ import java.util.stream.IntStream;
++import java.util.stream.Stream;
+ 
+ /**
+  * Created by alexander on 15/02/2016.
+@@ -15,6 +17,7 @@
+ public class MarmosetHopper {
+ 
+     private GraphHopper hopper;
++    private CellsGraph cellsGraph;
+     private List<Vehicle> vehicles;
+ 
+     public MarmosetHopper() {
+@@ -38,6 +41,10 @@ public void init()
+         args.put("osmreader.osm", "british-isles-latest.osm.pbf");
+         hopper.init(args);
+         hopper.importOrLoad();
++
++        cellsGraph = new CellsGraph(hopper.getGraphHopperStorage(), 10);
++        cellsGraph.init();
++
+         int count = args.getInt("marmoset.vehicles", 1000);
+         Random latRan = new Random(123);
+         Random lonRan = new Random(456);
+@@ -50,8 +57,17 @@ public void init()
+                 .collect(Collectors.toCollection(ArrayList::new));
+     }
+ 
++    public void startSimulation()
++    {
++        vehicles.parallelStream().forEach(Vehicle::init);
++    }
++
+     public void timestep() {
+-        vehicles.parallelStream().forEach(Vehicle::calculateStep);
++        vehicles.stream().forEach(Vehicle::accelerationStep);
++        vehicles.stream().forEach(Vehicle::slowStep);
++        vehicles.stream().forEach(Vehicle::randomStep);
++        vehicles.stream().forEach(Vehicle::moveStep);
++        vehicles.stream().forEach(Vehicle::updateLocation);
+     }
+ 
+     public String getVehicleData() {
+@@ -63,4 +79,8 @@ public GraphHopper getGraphHopper()
+         return hopper;
+     }
+ 
++    public CellsGraph getCellsGraph()
++    {
++        return cellsGraph;
++    }
+ }
+diff --git a/marmoset/src/main/java/com/graphhopper/marmoset/Vehicle.java b/marmoset/src/main/java/com/graphhopper/marmoset/Vehicle.java
+index ac955c8ead..9717bcda16 100644
+--- a/marmoset/src/main/java/com/graphhopper/marmoset/Vehicle.java
++++ b/marmoset/src/main/java/com/graphhopper/marmoset/Vehicle.java
+@@ -1,15 +1,18 @@
+ package com.graphhopper.marmoset;
+ 
+-import com.graphhopper.GHRequest;
+-import com.graphhopper.GHResponse;
+ import com.graphhopper.GraphHopper;
+-import com.graphhopper.PathWrapper;
++import com.graphhopper.marmoset.util.CellsGraph;
+ import com.graphhopper.marmoset.util.Location;
+-import com.graphhopper.util.Instruction;
+-import com.graphhopper.util.InstructionList;
+-import com.graphhopper.util.PointList;
++import com.graphhopper.routing.util.EdgeFilter;
++import com.graphhopper.routing.util.FlagEncoder;
++import com.graphhopper.storage.GraphHopperStorage;
++import com.graphhopper.storage.index.LocationIndex;
++import com.graphhopper.storage.index.QueryResult;
++import com.graphhopper.util.*;
+ import com.graphhopper.util.shapes.GHPoint3D;
+ 
++import java.util.Random;
++
+ /**
+  * Created by alexander on 16/02/2016.
+  */
+@@ -24,11 +27,21 @@
+     private Location dest;
+     private boolean finished;
+ 
++    private int edgeId;
++    private int adjId;
++    private int cellId;
++
++    private byte v; // velocity
++    private float slowProb;
++    private byte maxVelocity = 5;
++
+     private long time;
++    private CellsGraph cg;
+ 
+     public Vehicle(MarmosetHopper hopper, Location start, Location dest)
+     {
+         time = 0;
++        slowProb = 0.5f;
+         this.hopper = hopper;
+         this.dest = dest;
+         this.loc = start;
+@@ -41,56 +54,97 @@ public boolean isFinished()
+         return finished;
+     }
+ 
+-    private InstructionList il;
+-    private int currInstr;
+-    private long instrStart;
+-    private PointList path;
+-    private int currStep;
+-    public void calculateStep()
++    public void init()
++    {
++        cellId = 0; // TODO: figure out which cell the vehicle should start at
++        v = 0;
++
++        cg = hopper.getCellsGraph();
++
++        GraphHopper gh = hopper.getGraphHopper();
++        LocationIndex locationIndex = gh.getLocationIndex();
++        QueryResult closest = locationIndex.findClosest(loc.getLat(), loc.getLon(), EdgeFilter.ALL_EDGES);
++        EdgeIteratorState e = closest.getClosestEdge();
++        System.out.println(e);
++        edgeId = closest.getClosestEdge().getEdge();
++        adjId = closest.getClosestEdge().getAdjNode();
++        GHPoint3D p = closest.getSnappedPoint();
++        loc.set(p.lat, p.lon);
++
++        cg.set(edgeId, cellId, v);
++    }
++
++    private int freeCells = -1;
++    public void accelerationStep()
++    {
++        freeCells = cg.freeCellsAhead(edgeId, cellId, v + 1);
++        System.out.println(id + "freecells:"+freeCells + "V:"+v);
++        if (freeCells >= v && v < maxVelocity)
++        {
++            v++;
++        }
++    }
++
++    public void slowStep()
++    {
++        if (freeCells < v)
++        {
++            v = (byte) (freeCells - 1);
++        }
++    }
++
++    public void randomStep()
+     {
+-        if (finished)
++        if (v > 0 && Math.random() > slowProb)
++        {
++            v--;
++        }
++    }
++
++    public void moveStep()
++    {
++        cg.set(edgeId, cellId, 0);
++        cellId += v;
++        cg.set(edgeId, cellId, v);
++    }
++
++    public void updateLocation()
++    {
++        double progress = cellId / (float) cg.getCellCount(edgeId);
++        GraphHopper gh = hopper.getGraphHopper();
++        GraphHopperStorage graph = gh.getGraphHopperStorage();
++        EdgeIteratorState edge = graph.getEdgeIteratorState(edgeId, adjId);
++
++        PointList path = edge.fetchWayGeometry(3);
++        if (path.isEmpty())
++        {
++            System.out.println("Path is empty, not moving...");
+             return;
+-        if (il == null)
++        }
++        System.out.println("size:" + path.getSize());
++
++        DistanceCalc dc = new DistanceCalc2D();
++        double dist = path.calcDistance(dc);
++        System.out.println("dist: " + dist);
++        double distTravelled = progress * dist;
++        double currDist = 0;
++        System.out.printf("start(%d): %f + %f\n", id,currDist,distTravelled);
++        int i = 0;
++        while (i < path.getSize()-1 && currDist <= distTravelled)
+         {
+-            GHRequest request = new GHRequest(loc.getLat(), loc.getLon(), dest.getLat(), dest.getLon());
+-            GraphHopper gh = hopper.getGraphHopper();
+-            GHResponse response = gh.route(request);
+-            if (response.hasErrors()) {
+-                System.out.println("Response has errors, dumping:");
+-                response.getErrors().stream().forEach(Throwable::printStackTrace);
+-                System.out.println();
+-                finished = true;
++            double nextDist = dc.calcDist(path.getLat(i), path.getLon(i), path.getLat(i + 1), path.getLon(i + 1));
++            System.out.printf("-%d|%d: %f + %f\n", id,i,currDist,nextDist);
++            if (currDist + nextDist > distTravelled)
++            {
++                double partProgress = (distTravelled - currDist)/nextDist;
++                double newLat = path.getLat(i) + partProgress * (path.getLat(i + 1) - path.getLat(i));
++                double newLon = path.getLon(i) + partProgress * (path.getLon(i + 1) - path.getLon(i));
++                loc.set(newLat, newLon);
+                 return;
+             }
+-            il = response.getBest().getInstructions();
+-            path = response.getBest().getPoints();
+-            currStep = 0;
+-            currInstr = 0;
+-            instrStart = 0;
+-        }
+-//        if (instrStart + il.get(currInstr).getTime() < time) {
+-//            instrStart += il.get(currInstr).getTime();
+-//            currInstr++;
+-//            if (currInstr >= il.getSize())
+-//            {
+-//                System.out.println("Finished moving vehicle " + id);
+-//                finished = true;
+-//                return;
+-//            }
+-//        }
+-//        Instruction inst = il.get(currInstr);
+-
+-//        final int speed = 60;
+-//        PointList path = inst.getPoints();
+-//        path.toGeoJson(false);
+-        if (currStep >= path.size()) {
+-            finished = true;
+-            return;
++            currDist += nextDist;
+         }
+ 
+-        loc.set(path.getLat(currStep), path.getLon(currStep));
+-        currStep++;
+-        time += DT;
+     }
+ 
+     @Override
+@@ -98,4 +152,5 @@ public String toString()
+     {
+         return String.format("%d|%s", id, loc.toString());
+     }
++
+ }
+diff --git a/marmoset/src/main/java/com/graphhopper/marmoset/util/CellsGraph.java b/marmoset/src/main/java/com/graphhopper/marmoset/util/CellsGraph.java
+new file mode 100644
+index 0000000000..2c20503cc4
+--- /dev/null
++++ b/marmoset/src/main/java/com/graphhopper/marmoset/util/CellsGraph.java
+@@ -0,0 +1,69 @@
++package com.graphhopper.marmoset.util;
++
++import com.graphhopper.routing.util.AllEdgesIterator;
++import com.graphhopper.storage.Graph;
++
++/**
++ * Created by alexander on 01/03/2016.
++ */
++public class CellsGraph {
++    private final int cellSize;
++    private Graph graph;
++    private byte[][] cells;
++
++    public CellsGraph(Graph graph, int cellSize) {
++        this.cellSize = cellSize;
++        this.graph = graph;
++    }
++
++    public void init()
++    {
++        AllEdgesIterator iterator = graph.getAllEdges();
++        double totalDist = 0;
++        cells = new byte[iterator.getMaxId()][];
++        while (iterator.next())
++        {
++            cells[iterator.getEdge()] = new byte[(int) (iterator.getDistance() / cellSize)];
++            totalDist += iterator.getDistance();
++        }
++    }
++
++    public int getCellCount(int edgeId)
++    {
++        if (edgeId >= cells.length)
++            throw new ArrayIndexOutOfBoundsException(
++                    String.format("EdgeId '%d' out of bounds (max %d)", edgeId, cells.length));
++        return cells[edgeId].length;
++    }
++
++    public int freeCellsAhead(int edgeId, int cellId, int max)
++    {
++        int move = 0;
++        while (cellId + move < cells[edgeId].length && move <= max)
++        {
++            if (cells[edgeId][cellId + move] == 0)
++                move++;
++            else
++                return move;
++        }
++
++        return move;
++    }
++
++    public void set(int edgeId, int cellId, int v)
++    {
++        set(edgeId, cellId, (byte) v);
++    }
++
++    public void set(int edgeId, int cellId, byte v)
++    {
++        if (edgeId >= cells.length)
++            throw new ArrayIndexOutOfBoundsException(
++                    String.format("EdgeId '%d' out of bounds (max %d)", edgeId, cells.length));
++        if (cellId >= cells[edgeId].length)
++            throw new ArrayIndexOutOfBoundsException(
++                    String.format("CellId '%d' out of bounds (max %d)", cellId, cells[edgeId].length));
++
++        cells[edgeId][cellId] = v;
++    }
++}

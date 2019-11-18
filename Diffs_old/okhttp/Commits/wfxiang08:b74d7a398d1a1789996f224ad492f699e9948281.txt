@@ -1,0 +1,177 @@
+diff --git a/mockwebserver/src/main/java/com/squareup/okhttp/mockwebserver/MockWebServer.java b/mockwebserver/src/main/java/com/squareup/okhttp/mockwebserver/MockWebServer.java
+index 458c6f9a5c..a2257ee594 100644
+--- a/mockwebserver/src/main/java/com/squareup/okhttp/mockwebserver/MockWebServer.java
++++ b/mockwebserver/src/main/java/com/squareup/okhttp/mockwebserver/MockWebServer.java
+@@ -670,7 +670,7 @@ private void handleWebSocketUpgrade(Socket socket, BufferedSource source, Buffer
+     final RealWebSocket webSocket =
+         new RealWebSocket(false /* is server */, source, sink, new SecureRandom(), replyExecutor,
+             listener, request.getPath()) {
+-          @Override protected void closeConnection() throws IOException {
++          @Override protected void close() throws IOException {
+             connectionClose.countDown();
+           }
+         };
+@@ -702,6 +702,7 @@ private void handleWebSocketUpgrade(Socket socket, BufferedSource source, Buffer
+       throw new RuntimeException(e);
+     }
+ 
++    replyExecutor.shutdown();
+     Util.closeQuietly(sink);
+     Util.closeQuietly(source);
+   }
+diff --git a/okhttp-ws-tests/src/test/java/com/squareup/okhttp/internal/ws/RealWebSocketTest.java b/okhttp-ws-tests/src/test/java/com/squareup/okhttp/internal/ws/RealWebSocketTest.java
+index febc1b5600..2ac84d6f9e 100644
+--- a/okhttp-ws-tests/src/test/java/com/squareup/okhttp/internal/ws/RealWebSocketTest.java
++++ b/okhttp-ws-tests/src/test/java/com/squareup/okhttp/internal/ws/RealWebSocketTest.java
+@@ -62,7 +62,7 @@
+ 
+     client = new RealWebSocket(true, server2client, client2Server, random, clientExecutor,
+         clientListener, url) {
+-      @Override protected void closeConnection() throws IOException {
++      @Override protected void close() throws IOException {
+         clientConnectionClosed = true;
+         if (clientConnectionCloseThrows) {
+           throw new IOException("Oops!");
+@@ -71,7 +71,7 @@
+     };
+     server = new RealWebSocket(false, client2Server, server2client, random, serverExecutor,
+         serverListener, url) {
+-      @Override protected void closeConnection() throws IOException {
++      @Override protected void close() throws IOException {
+       }
+     };
+   }
+@@ -316,7 +316,7 @@
+   @Test public void protocolErrorBeforeCloseSendsClose() throws IOException {
+     server2client.write(ByteString.decodeHex("0a00")); // Invalid non-final ping frame.
+ 
+-    client.readMessage(); // Detects error, send close.
++    client.readMessage(); // Detects error, send close, close connection.
+     clientListener.assertFailure(ProtocolException.class, "Control frames must be final.");
+     assertTrue(clientConnectionClosed);
+ 
+@@ -326,9 +326,10 @@
+ 
+   @Test public void protocolErrorAfterCloseDoesNotSendClose() throws IOException {
+     client.close(1000, "Hello!");
++    assertFalse(clientConnectionClosed); // Not closed until close reply is received.
+     server2client.write(ByteString.decodeHex("0a00")); // Invalid non-final ping frame.
+ 
+-    client.readMessage();
++    client.readMessage(); // Detects error, closes connection immediately since close already sent.
+     clientListener.assertFailure(ProtocolException.class, "Control frames must be final.");
+     assertTrue(clientConnectionClosed);
+ 
+diff --git a/okhttp-ws/src/main/java/com/squareup/okhttp/internal/ws/RealWebSocket.java b/okhttp-ws/src/main/java/com/squareup/okhttp/internal/ws/RealWebSocket.java
+index 3a56bf2276..fdc90f3b9b 100644
+--- a/okhttp-ws/src/main/java/com/squareup/okhttp/internal/ws/RealWebSocket.java
++++ b/okhttp-ws/src/main/java/com/squareup/okhttp/internal/ws/RealWebSocket.java
+@@ -147,18 +147,18 @@ public void sendPong(Buffer payload) throws IOException {
+   @Override public void close(int code, String reason) throws IOException {
+     if (writerSentClose) throw new IllegalStateException("closed");
+ 
+-    boolean closeConnection;
++    boolean performClose;
+     synchronized (closeLock) {
+       writerSentClose = true;
+ 
+       // If the reader has also indicated a desire to close we will close the connection.
+-      closeConnection = readerSentClose;
++      performClose = readerSentClose;
+     }
+ 
+     writer.writeClose(code, reason);
+ 
+-    if (closeConnection) {
+-      closeConnection();
++    if (performClose) {
++      close();
+     }
+   }
+ 
+@@ -172,7 +172,7 @@ private void peerClose(int code, String reason, boolean writeCloseResponse) {
+     }
+ 
+     try {
+-      closeConnection();
++      close();
+     } catch (IOException ignored) {
+     }
+ 
+@@ -181,32 +181,30 @@ private void peerClose(int code, String reason, boolean writeCloseResponse) {
+ 
+   /** Called on the reader thread when an error occurs. */
+   private void readerErrorClose(IOException e) {
+-    boolean writeCloseResponse;
++    boolean canSendClose;
+     synchronized (closeLock) {
+       readerSentClose = true;
+ 
+-      // If the writer has not closed we will close the connection.
+-      writeCloseResponse = !writerSentClose;
++      // If the writer has not closed we may inform the server of the close.
++      canSendClose = !writerSentClose;
+     }
+ 
+-    if (writeCloseResponse) {
+-      if (e instanceof ProtocolException) {
+-        // For protocol exceptions, try to inform the server of such.
+-        try {
+-          writer.writeClose(CLOSE_PROTOCOL_EXCEPTION, null);
+-        } catch (IOException ignored) {
+-        }
++    // For protocol exceptions, try to inform the server of such.
++    if (canSendClose && e instanceof ProtocolException) {
++      try {
++        writer.writeClose(CLOSE_PROTOCOL_EXCEPTION, null);
++      } catch (IOException ignored) {
+       }
+     }
+ 
+     try {
+-      closeConnection();
++      close();
+     } catch (IOException ignored) {
+     }
+ 
+     listener.onFailure(e, null);
+   }
+ 
+-  /** Perform any tear-down work on the connection (close the socket, recycle, etc.). */
+-  protected abstract void closeConnection() throws IOException;
++  /** Perform any tear-down work (close the connection, shutdown executors). */
++  protected abstract void close() throws IOException;
+ }
+diff --git a/okhttp-ws/src/main/java/com/squareup/okhttp/ws/WebSocketCall.java b/okhttp-ws/src/main/java/com/squareup/okhttp/ws/WebSocketCall.java
+index 46ee8a133e..fefe19ee5a 100644
+--- a/okhttp-ws/src/main/java/com/squareup/okhttp/ws/WebSocketCall.java
++++ b/okhttp-ws/src/main/java/com/squareup/okhttp/ws/WebSocketCall.java
+@@ -30,7 +30,7 @@
+ import java.security.SecureRandom;
+ import java.util.Collections;
+ import java.util.Random;
+-import java.util.concurrent.Executor;
++import java.util.concurrent.ExecutorService;
+ import java.util.concurrent.LinkedBlockingDeque;
+ import java.util.concurrent.ThreadPoolExecutor;
+ import okio.BufferedSink;
+@@ -187,14 +187,17 @@ static RealWebSocket create(Response response, Connection connection, BufferedSo
+     }
+ 
+     private final Connection connection;
++    private final ExecutorService replyExecutor;
+ 
+     private ConnectionWebSocket(Connection connection, BufferedSource source, BufferedSink sink,
+-        Random random, Executor replyExecutor, WebSocketListener listener, String url) {
++        Random random, ExecutorService replyExecutor, WebSocketListener listener, String url) {
+       super(true /* is client */, source, sink, random, replyExecutor, listener, url);
+       this.connection = connection;
++      this.replyExecutor = replyExecutor;
+     }
+ 
+-    @Override protected void closeConnection() throws IOException {
++    @Override protected void close() throws IOException {
++      replyExecutor.shutdown();
+       // TODO connection.closeIfOwnedBy(this);
+       Internal.instance.closeIfOwnedBy(connection, this);
+     }

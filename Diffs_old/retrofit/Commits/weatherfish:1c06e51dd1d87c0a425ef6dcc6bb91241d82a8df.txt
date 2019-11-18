@@ -1,0 +1,2827 @@
+diff --git a/pom.xml b/pom.xml
+index 2db7f19ba..a2309e176 100644
+--- a/pom.xml
++++ b/pom.xml
+@@ -49,7 +49,7 @@
+ 
+     <!-- Dependencies -->
+     <android.version>4.1.1.4</android.version>
+-    <okhttp.version>3.5.0</okhttp.version>
++    <okhttp.version>3.6.0</okhttp.version>
+     <animal.sniffer.version>1.14</animal.sniffer.version>
+ 
+     <!-- Adapter Dependencies -->
+diff --git a/retrofit-adapters/rxjava/src/main/java/retrofit2/adapter/rxjava/CallArbiter.java b/retrofit-adapters/rxjava/src/main/java/retrofit2/adapter/rxjava/CallArbiter.java
+new file mode 100644
+index 000000000..34b0b004a
+--- /dev/null
++++ b/retrofit-adapters/rxjava/src/main/java/retrofit2/adapter/rxjava/CallArbiter.java
+@@ -0,0 +1,149 @@
++/*
++ * Copyright (C) 2016 Jake Wharton
++ *
++ * Licensed under the Apache License, Version 2.0 (the "License");
++ * you may not use this file except in compliance with the License.
++ * You may obtain a copy of the License at
++ *
++ *      http://www.apache.org/licenses/LICENSE-2.0
++ *
++ * Unless required by applicable law or agreed to in writing, software
++ * distributed under the License is distributed on an "AS IS" BASIS,
++ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++ * See the License for the specific language governing permissions and
++ * limitations under the License.
++ */
++package retrofit2.adapter.rxjava;
++
++import java.util.concurrent.atomic.AtomicInteger;
++import retrofit2.Call;
++import retrofit2.Response;
++import rx.Producer;
++import rx.Subscriber;
++import rx.Subscription;
++import rx.exceptions.CompositeException;
++import rx.exceptions.Exceptions;
++import rx.plugins.RxJavaPlugins;
++
++final class CallArbiter<T> extends AtomicInteger implements Subscription, Producer {
++  private static final int STATE_WAITING = 0;
++  private static final int STATE_REQUESTED = 1;
++  private static final int STATE_HAS_RESPONSE = 2;
++  private static final int STATE_TERMINATED = 3;
++
++  private final Call<T> call;
++  private final Subscriber<? super Response<T>> subscriber;
++
++  private volatile Response<T> response;
++
++  CallArbiter(Call<T> call, Subscriber<? super Response<T>> subscriber) {
++    super(STATE_WAITING);
++
++    this.call = call;
++    this.subscriber = subscriber;
++  }
++
++  @Override public void unsubscribe() {
++    call.cancel();
++  }
++
++  @Override public boolean isUnsubscribed() {
++    return call.isCanceled();
++  }
++
++  @Override public void request(long amount) {
++    if (amount == 0) {
++      return;
++    }
++    while (true) {
++      int state = get();
++      switch (state) {
++        case STATE_WAITING:
++          if (compareAndSet(STATE_WAITING, STATE_REQUESTED)) {
++            return;
++          }
++          break; // State transition failed. Try again.
++
++        case STATE_HAS_RESPONSE:
++          if (compareAndSet(STATE_HAS_RESPONSE, STATE_TERMINATED)) {
++            deliverResponse(response);
++            return;
++          }
++          break; // State transition failed. Try again.
++
++        case STATE_REQUESTED:
++        case STATE_TERMINATED:
++          return; // Nothing to do.
++
++        default:
++          throw new IllegalStateException("Unknown state: " + state);
++      }
++    }
++  }
++
++  void emitResponse(Response<T> response) {
++    while (true) {
++      int state = get();
++      switch (state) {
++        case STATE_WAITING:
++          this.response = response;
++          if (compareAndSet(STATE_WAITING, STATE_HAS_RESPONSE)) {
++            return;
++          }
++          break; // State transition failed. Try again.
++
++        case STATE_REQUESTED:
++          if (compareAndSet(STATE_REQUESTED, STATE_TERMINATED)) {
++            deliverResponse(response);
++            return;
++          }
++          break; // State transition failed. Try again.
++
++        case STATE_HAS_RESPONSE:
++        case STATE_TERMINATED:
++          throw new AssertionError();
++
++        default:
++          throw new IllegalStateException("Unknown state: " + state);
++      }
++    }
++  }
++
++  private void deliverResponse(Response<T> response) {
++    try {
++      if (!isUnsubscribed()) {
++        subscriber.onNext(response);
++      }
++    } catch (Throwable t) {
++      Exceptions.throwIfFatal(t);
++      try {
++        subscriber.onError(t);
++      } catch (Throwable inner) {
++        Exceptions.throwIfFatal(inner);
++        CompositeException composite = new CompositeException(t, inner);
++        RxJavaPlugins.getInstance().getErrorHandler().handleError(composite);
++      }
++      return;
++    }
++    try {
++      subscriber.onCompleted();
++    } catch (Throwable t) {
++      Exceptions.throwIfFatal(t);
++      RxJavaPlugins.getInstance().getErrorHandler().handleError(t);
++    }
++  }
++
++  void emitError(Throwable t) {
++    set(STATE_TERMINATED);
++
++    if (!isUnsubscribed()) {
++      try {
++        subscriber.onError(t);
++      } catch (Throwable inner) {
++        Exceptions.throwIfFatal(inner);
++        CompositeException composite = new CompositeException(t, inner);
++        RxJavaPlugins.getInstance().getErrorHandler().handleError(composite);
++      }
++    }
++  }
++}
+diff --git a/retrofit-adapters/rxjava/src/main/java/retrofit2/adapter/rxjava/CallEnqueueOnSubscribe.java b/retrofit-adapters/rxjava/src/main/java/retrofit2/adapter/rxjava/CallEnqueueOnSubscribe.java
+new file mode 100644
+index 000000000..7dcf917c3
+--- /dev/null
++++ b/retrofit-adapters/rxjava/src/main/java/retrofit2/adapter/rxjava/CallEnqueueOnSubscribe.java
+@@ -0,0 +1,50 @@
++/*
++ * Copyright (C) 2016 Jake Wharton
++ *
++ * Licensed under the Apache License, Version 2.0 (the "License");
++ * you may not use this file except in compliance with the License.
++ * You may obtain a copy of the License at
++ *
++ *      http://www.apache.org/licenses/LICENSE-2.0
++ *
++ * Unless required by applicable law or agreed to in writing, software
++ * distributed under the License is distributed on an "AS IS" BASIS,
++ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++ * See the License for the specific language governing permissions and
++ * limitations under the License.
++ */
++package retrofit2.adapter.rxjava;
++
++import retrofit2.Call;
++import retrofit2.Callback;
++import retrofit2.Response;
++import rx.Observable.OnSubscribe;
++import rx.Subscriber;
++import rx.exceptions.Exceptions;
++
++final class CallEnqueueOnSubscribe<T> implements OnSubscribe<Response<T>> {
++  private final Call<T> originalCall;
++
++  CallEnqueueOnSubscribe(Call<T> originalCall) {
++    this.originalCall = originalCall;
++  }
++
++  @Override public void call(Subscriber<? super Response<T>> subscriber) {
++    // Since Call is a one-shot type, clone it for each new subscriber.
++    Call<T> call = originalCall.clone();
++    final CallArbiter<T> arbiter = new CallArbiter<>(call, subscriber);
++    subscriber.add(arbiter);
++    subscriber.setProducer(arbiter);
++
++    call.enqueue(new Callback<T>() {
++      @Override public void onResponse(Call<T> call, Response<T> response) {
++        arbiter.emitResponse(response);
++      }
++
++      @Override public void onFailure(Call<T> call, Throwable t) {
++        Exceptions.throwIfFatal(t);
++        arbiter.emitError(t);
++      }
++    });
++  }
++}
+diff --git a/retrofit-adapters/rxjava/src/main/java/retrofit2/adapter/rxjava/CallExecuteOnSubscribe.java b/retrofit-adapters/rxjava/src/main/java/retrofit2/adapter/rxjava/CallExecuteOnSubscribe.java
+new file mode 100644
+index 000000000..593770aa7
+--- /dev/null
++++ b/retrofit-adapters/rxjava/src/main/java/retrofit2/adapter/rxjava/CallExecuteOnSubscribe.java
+@@ -0,0 +1,48 @@
++/*
++ * Copyright (C) 2016 Jake Wharton
++ *
++ * Licensed under the Apache License, Version 2.0 (the "License");
++ * you may not use this file except in compliance with the License.
++ * You may obtain a copy of the License at
++ *
++ *      http://www.apache.org/licenses/LICENSE-2.0
++ *
++ * Unless required by applicable law or agreed to in writing, software
++ * distributed under the License is distributed on an "AS IS" BASIS,
++ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++ * See the License for the specific language governing permissions and
++ * limitations under the License.
++ */
++package retrofit2.adapter.rxjava;
++
++import retrofit2.Call;
++import retrofit2.Response;
++import rx.Observable.OnSubscribe;
++import rx.Subscriber;
++import rx.exceptions.Exceptions;
++
++final class CallExecuteOnSubscribe<T> implements OnSubscribe<Response<T>> {
++  private final Call<T> originalCall;
++
++  CallExecuteOnSubscribe(Call<T> originalCall) {
++    this.originalCall = originalCall;
++  }
++
++  @Override public void call(Subscriber<? super Response<T>> subscriber) {
++    // Since Call is a one-shot type, clone it for each new subscriber.
++    Call<T> call = originalCall.clone();
++    CallArbiter<T> arbiter = new CallArbiter<>(call, subscriber);
++    subscriber.add(arbiter);
++    subscriber.setProducer(arbiter);
++
++    Response<T> response;
++    try {
++      response = call.execute();
++    } catch (Throwable t) {
++      Exceptions.throwIfFatal(t);
++      arbiter.emitError(t);
++      return;
++    }
++    arbiter.emitResponse(response);
++  }
++}
+diff --git a/retrofit-adapters/rxjava/src/main/java/retrofit2/adapter/rxjava/CallOnSubscribe.java b/retrofit-adapters/rxjava/src/main/java/retrofit2/adapter/rxjava/CallOnSubscribe.java
+deleted file mode 100644
+index 7e0f53969..000000000
+--- a/retrofit-adapters/rxjava/src/main/java/retrofit2/adapter/rxjava/CallOnSubscribe.java
++++ /dev/null
+@@ -1,176 +0,0 @@
+-/*
+- * Copyright (C) 2016 Jake Wharton
+- *
+- * Licensed under the Apache License, Version 2.0 (the "License");
+- * you may not use this file except in compliance with the License.
+- * You may obtain a copy of the License at
+- *
+- *      http://www.apache.org/licenses/LICENSE-2.0
+- *
+- * Unless required by applicable law or agreed to in writing, software
+- * distributed under the License is distributed on an "AS IS" BASIS,
+- * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+- * See the License for the specific language governing permissions and
+- * limitations under the License.
+- */
+-package retrofit2.adapter.rxjava;
+-
+-import java.util.concurrent.atomic.AtomicInteger;
+-import retrofit2.Call;
+-import retrofit2.Response;
+-import rx.Observable.OnSubscribe;
+-import rx.Producer;
+-import rx.Subscriber;
+-import rx.Subscription;
+-import rx.exceptions.CompositeException;
+-import rx.exceptions.Exceptions;
+-import rx.plugins.RxJavaPlugins;
+-
+-final class CallOnSubscribe<T> implements OnSubscribe<Response<T>> {
+-  private final Call<T> originalCall;
+-
+-  CallOnSubscribe(Call<T> originalCall) {
+-    this.originalCall = originalCall;
+-  }
+-
+-  @Override public void call(Subscriber<? super Response<T>> subscriber) {
+-    // Since Call is a one-shot type, clone it for each new subscriber.
+-    Call<T> call = originalCall.clone();
+-    CallArbiter<T> arbiter = new CallArbiter<>(call, subscriber);
+-    subscriber.add(arbiter);
+-    subscriber.setProducer(arbiter);
+-
+-    Response<T> response;
+-    try {
+-      response = call.execute();
+-    } catch (Throwable t) {
+-      Exceptions.throwIfFatal(t);
+-      arbiter.emitError(t);
+-      return;
+-    }
+-    arbiter.emitResponse(response);
+-  }
+-
+-  static final class CallArbiter<T> extends AtomicInteger implements Subscription, Producer {
+-    private static final int STATE_WAITING = 0;
+-    private static final int STATE_REQUESTED = 1;
+-    private static final int STATE_HAS_RESPONSE = 2;
+-    private static final int STATE_TERMINATED = 3;
+-
+-    private final Call<T> call;
+-    private final Subscriber<? super Response<T>> subscriber;
+-
+-    private volatile Response<T> response;
+-
+-    CallArbiter(Call<T> call, Subscriber<? super Response<T>> subscriber) {
+-      super(STATE_WAITING);
+-
+-      this.call = call;
+-      this.subscriber = subscriber;
+-    }
+-
+-    @Override public void unsubscribe() {
+-      call.cancel();
+-    }
+-
+-    @Override public boolean isUnsubscribed() {
+-      return call.isCanceled();
+-    }
+-
+-    @Override public void request(long amount) {
+-      if (amount == 0) {
+-        return;
+-      }
+-      while (true) {
+-        int state = get();
+-        switch (state) {
+-          case STATE_WAITING:
+-            if (compareAndSet(STATE_WAITING, STATE_REQUESTED)) {
+-              return;
+-            }
+-            break; // State transition failed. Try again.
+-
+-          case STATE_HAS_RESPONSE:
+-            if (compareAndSet(STATE_HAS_RESPONSE, STATE_TERMINATED)) {
+-              deliverResponse(response);
+-              return;
+-            }
+-            break; // State transition failed. Try again.
+-
+-          case STATE_REQUESTED:
+-          case STATE_TERMINATED:
+-            return; // Nothing to do.
+-
+-          default:
+-            throw new IllegalStateException("Unknown state: " + state);
+-        }
+-      }
+-    }
+-
+-    void emitResponse(Response<T> response) {
+-      while (true) {
+-        int state = get();
+-        switch (state) {
+-          case STATE_WAITING:
+-            this.response = response;
+-            if (compareAndSet(STATE_WAITING, STATE_HAS_RESPONSE)) {
+-              return;
+-            }
+-            break; // State transition failed. Try again.
+-
+-          case STATE_REQUESTED:
+-            if (compareAndSet(STATE_REQUESTED, STATE_TERMINATED)) {
+-              deliverResponse(response);
+-              return;
+-            }
+-            break; // State transition failed. Try again.
+-
+-          case STATE_HAS_RESPONSE:
+-          case STATE_TERMINATED:
+-            throw new AssertionError();
+-
+-          default:
+-            throw new IllegalStateException("Unknown state: " + state);
+-        }
+-      }
+-    }
+-
+-    private void deliverResponse(Response<T> response) {
+-      try {
+-        if (!isUnsubscribed()) {
+-          subscriber.onNext(response);
+-        }
+-      } catch (Throwable t) {
+-        Exceptions.throwIfFatal(t);
+-        try {
+-          subscriber.onError(t);
+-        } catch (Throwable inner) {
+-          Exceptions.throwIfFatal(inner);
+-          CompositeException composite = new CompositeException(t, inner);
+-          RxJavaPlugins.getInstance().getErrorHandler().handleError(composite);
+-        }
+-        return;
+-      }
+-      try {
+-        subscriber.onCompleted();
+-      } catch (Throwable t) {
+-        Exceptions.throwIfFatal(t);
+-        RxJavaPlugins.getInstance().getErrorHandler().handleError(t);
+-      }
+-    }
+-
+-    void emitError(Throwable t) {
+-      set(STATE_TERMINATED);
+-
+-      if (!isUnsubscribed()) {
+-        try {
+-          subscriber.onError(t);
+-        } catch (Throwable inner) {
+-          Exceptions.throwIfFatal(inner);
+-          CompositeException composite = new CompositeException(t, inner);
+-          RxJavaPlugins.getInstance().getErrorHandler().handleError(composite);
+-        }
+-      }
+-    }
+-  }
+-}
+diff --git a/retrofit-adapters/rxjava/src/main/java/retrofit2/adapter/rxjava/RxJavaCallAdapter.java b/retrofit-adapters/rxjava/src/main/java/retrofit2/adapter/rxjava/RxJavaCallAdapter.java
+index 8d8f3776a..f14c47181 100644
+--- a/retrofit-adapters/rxjava/src/main/java/retrofit2/adapter/rxjava/RxJavaCallAdapter.java
++++ b/retrofit-adapters/rxjava/src/main/java/retrofit2/adapter/rxjava/RxJavaCallAdapter.java
+@@ -26,15 +26,17 @@
+ final class RxJavaCallAdapter<R> implements CallAdapter<R, Object> {
+   private final Type responseType;
+   private final Scheduler scheduler;
++  private final boolean isAsync;
+   private final boolean isResult;
+   private final boolean isBody;
+   private final boolean isSingle;
+   private final boolean isCompletable;
+ 
+-  RxJavaCallAdapter(Type responseType, Scheduler scheduler, boolean isResult, boolean isBody,
+-      boolean isSingle, boolean isCompletable) {
++  RxJavaCallAdapter(Type responseType, Scheduler scheduler, boolean isAsync, boolean isResult,
++      boolean isBody, boolean isSingle, boolean isCompletable) {
+     this.responseType = responseType;
+     this.scheduler = scheduler;
++    this.isAsync = isAsync;
+     this.isResult = isResult;
+     this.isBody = isBody;
+     this.isSingle = isSingle;
+@@ -46,7 +48,9 @@
+   }
+ 
+   @Override public Object adapt(Call<R> call) {
+-    OnSubscribe<Response<R>> callFunc = new CallOnSubscribe<>(call);
++    OnSubscribe<Response<R>> callFunc = isAsync
++        ? new CallEnqueueOnSubscribe<>(call)
++        : new CallExecuteOnSubscribe<>(call);
+ 
+     OnSubscribe<?> func;
+     if (isResult) {
+diff --git a/retrofit-adapters/rxjava/src/main/java/retrofit2/adapter/rxjava/RxJavaCallAdapterFactory.java b/retrofit-adapters/rxjava/src/main/java/retrofit2/adapter/rxjava/RxJavaCallAdapterFactory.java
+index 283451679..184750d05 100644
+--- a/retrofit-adapters/rxjava/src/main/java/retrofit2/adapter/rxjava/RxJavaCallAdapterFactory.java
++++ b/retrofit-adapters/rxjava/src/main/java/retrofit2/adapter/rxjava/RxJavaCallAdapterFactory.java
+@@ -61,7 +61,15 @@
+    * by default.
+    */
+   public static RxJavaCallAdapterFactory create() {
+-    return new RxJavaCallAdapterFactory(null);
++    return new RxJavaCallAdapterFactory(null, false);
++  }
++
++  /**
++   * Returns an instance which creates asynchronous observables. Applying
++   * {@link Observable#subscribeOn} has no effect on stream types created by this factory.
++   */
++  public static RxJavaCallAdapterFactory createAsync() {
++    return new RxJavaCallAdapterFactory(null, true);
+   }
+ 
+   /**
+@@ -70,13 +78,15 @@ public static RxJavaCallAdapterFactory create() {
+    */
+   public static RxJavaCallAdapterFactory createWithScheduler(Scheduler scheduler) {
+     if (scheduler == null) throw new NullPointerException("scheduler == null");
+-    return new RxJavaCallAdapterFactory(scheduler);
++    return new RxJavaCallAdapterFactory(scheduler, false);
+   }
+ 
+   private final Scheduler scheduler;
++  private final boolean isAsync;
+ 
+-  private RxJavaCallAdapterFactory(Scheduler scheduler) {
++  private RxJavaCallAdapterFactory(Scheduler scheduler, boolean isAsync) {
+     this.scheduler = scheduler;
++    this.isAsync = isAsync;
+   }
+ 
+   @Override
+@@ -89,7 +99,7 @@ private RxJavaCallAdapterFactory(Scheduler scheduler) {
+     }
+ 
+     if (isCompletable) {
+-      return new RxJavaCallAdapter(Void.class, scheduler, false, true, false, true);
++      return new RxJavaCallAdapter(Void.class, scheduler, isAsync, false, true, false, true);
+     }
+ 
+     boolean isResult = false;
+@@ -121,6 +131,7 @@ private RxJavaCallAdapterFactory(Scheduler scheduler) {
+       isBody = true;
+     }
+ 
+-    return new RxJavaCallAdapter(responseType, scheduler, isResult, isBody, isSingle, false);
++    return new RxJavaCallAdapter(responseType, scheduler, isAsync, isResult, isBody, isSingle,
++        false);
+   }
+ }
+diff --git a/retrofit-adapters/rxjava/src/test/java/retrofit2/adapter/rxjava/AsyncTest.java b/retrofit-adapters/rxjava/src/test/java/retrofit2/adapter/rxjava/AsyncTest.java
+new file mode 100644
+index 000000000..2c2703769
+--- /dev/null
++++ b/retrofit-adapters/rxjava/src/test/java/retrofit2/adapter/rxjava/AsyncTest.java
+@@ -0,0 +1,143 @@
++/*
++ * Copyright (C) 2017 Square, Inc.
++ *
++ * Licensed under the Apache License, Version 2.0 (the "License");
++ * you may not use this file except in compliance with the License.
++ * You may obtain a copy of the License at
++ *
++ *      http://www.apache.org/licenses/LICENSE-2.0
++ *
++ * Unless required by applicable law or agreed to in writing, software
++ * distributed under the License is distributed on an "AS IS" BASIS,
++ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++ * See the License for the specific language governing permissions and
++ * limitations under the License.
++ */
++package retrofit2.adapter.rxjava;
++
++import java.io.IOException;
++import java.util.concurrent.CountDownLatch;
++import java.util.concurrent.atomic.AtomicReference;
++import okhttp3.mockwebserver.MockResponse;
++import okhttp3.mockwebserver.MockWebServer;
++import org.junit.Before;
++import org.junit.Rule;
++import org.junit.Test;
++import org.junit.rules.TestRule;
++import retrofit2.Retrofit;
++import retrofit2.http.GET;
++import rx.Completable;
++import rx.exceptions.CompositeException;
++import rx.exceptions.Exceptions;
++import rx.observers.AsyncCompletableSubscriber;
++import rx.observers.TestSubscriber;
++import rx.plugins.RxJavaErrorHandler;
++import rx.plugins.RxJavaPlugins;
++
++import static java.util.concurrent.TimeUnit.SECONDS;
++import static okhttp3.mockwebserver.SocketPolicy.DISCONNECT_AFTER_REQUEST;
++import static org.assertj.core.api.Assertions.assertThat;
++import static org.junit.Assert.assertFalse;
++
++public final class AsyncTest {
++  @Rule public final MockWebServer server = new MockWebServer();
++  @Rule public final TestRule pluginsReset = new RxJavaPluginsResetRule();
++
++  interface Service {
++    @GET("/") Completable completable();
++  }
++
++  private Service service;
++  @Before public void setUp() {
++    Retrofit retrofit = new Retrofit.Builder()
++        .baseUrl(server.url("/"))
++        .addCallAdapterFactory(RxJavaCallAdapterFactory.createAsync())
++        .build();
++    service = retrofit.create(Service.class);
++  }
++
++  @Test public void success() throws InterruptedException {
++    TestSubscriber<Void> subscriber = new TestSubscriber<>();
++    service.completable().subscribe(subscriber);
++    assertFalse(subscriber.awaitValueCount(1, 1, SECONDS));
++
++    server.enqueue(new MockResponse());
++    subscriber.awaitTerminalEvent(1, SECONDS);
++    subscriber.assertCompleted();
++  }
++
++
++  @Test public void failure() throws InterruptedException {
++    TestSubscriber<Void> subscriber = new TestSubscriber<>();
++    service.completable().subscribe(subscriber);
++    assertFalse(subscriber.awaitValueCount(1, 1, SECONDS));
++
++    server.enqueue(new MockResponse().setSocketPolicy(DISCONNECT_AFTER_REQUEST));
++    subscriber.awaitTerminalEvent(1, SECONDS);
++    subscriber.assertError(IOException.class);
++  }
++
++  @Test public void throwingInOnCompleteDeliveredToPlugin() throws InterruptedException {
++    server.enqueue(new MockResponse());
++
++    final CountDownLatch latch = new CountDownLatch(1);
++    final AtomicReference<Throwable> errorRef = new AtomicReference<>();
++    RxJavaPlugins.getInstance().registerErrorHandler(new RxJavaErrorHandler() {
++      @Override public void handleError(Throwable throwable) {
++        if (!errorRef.compareAndSet(null, throwable)) {
++          throw Exceptions.propagate(throwable); // Don't swallow secondary errors!
++        }
++        latch.countDown();
++      }
++    });
++
++    final TestSubscriber<Void> subscriber = new TestSubscriber<>();
++    final RuntimeException e = new RuntimeException();
++    service.completable().unsafeSubscribe(new AsyncCompletableSubscriber() {
++      @Override public void onCompleted() {
++        throw e;
++      }
++
++      @Override public void onError(Throwable t) {
++        subscriber.onError(t);
++      }
++    });
++
++    latch.await(1, SECONDS);
++    assertThat(errorRef.get()).isSameAs(e);
++  }
++
++  @Test public void bodyThrowingInOnErrorDeliveredToPlugin() throws InterruptedException {
++    server.enqueue(new MockResponse().setResponseCode(404));
++
++    final CountDownLatch latch = new CountDownLatch(1);
++    final AtomicReference<Throwable> pluginRef = new AtomicReference<>();
++    RxJavaPlugins.getInstance().registerErrorHandler(new RxJavaErrorHandler() {
++      @Override public void handleError(Throwable throwable) {
++        if (!pluginRef.compareAndSet(null, throwable)) {
++          throw Exceptions.propagate(throwable); // Don't swallow secondary errors!
++        }
++        latch.countDown();
++      }
++    });
++
++    final TestSubscriber<Void> subscriber = new TestSubscriber<>();
++    final RuntimeException e = new RuntimeException();
++    final AtomicReference<Throwable> errorRef = new AtomicReference<>();
++    service.completable().unsafeSubscribe(new AsyncCompletableSubscriber() {
++      @Override public void onCompleted() {
++        subscriber.onCompleted();
++      }
++
++      @Override public void onError(Throwable t) {
++        errorRef.set(t);
++        throw e;
++      }
++    });
++
++    latch.await(1, SECONDS);
++    //noinspection ThrowableResultOfMethodCallIgnored
++    CompositeException composite = (CompositeException) pluginRef.get();
++    assertThat(composite.getExceptions()).containsExactly(errorRef.get(), e);
++  }
++}
+diff --git a/retrofit-adapters/rxjava2/src/main/java/retrofit2/adapter/rxjava2/CallEnqueueObservable.java b/retrofit-adapters/rxjava2/src/main/java/retrofit2/adapter/rxjava2/CallEnqueueObservable.java
+new file mode 100644
+index 000000000..aa5ca67a8
+--- /dev/null
++++ b/retrofit-adapters/rxjava2/src/main/java/retrofit2/adapter/rxjava2/CallEnqueueObservable.java
+@@ -0,0 +1,96 @@
++/*
++ * Copyright (C) 2016 Jake Wharton
++ *
++ * Licensed under the Apache License, Version 2.0 (the "License");
++ * you may not use this file except in compliance with the License.
++ * You may obtain a copy of the License at
++ *
++ *      http://www.apache.org/licenses/LICENSE-2.0
++ *
++ * Unless required by applicable law or agreed to in writing, software
++ * distributed under the License is distributed on an "AS IS" BASIS,
++ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++ * See the License for the specific language governing permissions and
++ * limitations under the License.
++ */
++package retrofit2.adapter.rxjava2;
++
++import io.reactivex.Observable;
++import io.reactivex.Observer;
++import io.reactivex.disposables.Disposable;
++import io.reactivex.exceptions.CompositeException;
++import io.reactivex.exceptions.Exceptions;
++import io.reactivex.plugins.RxJavaPlugins;
++import retrofit2.Call;
++import retrofit2.Callback;
++import retrofit2.Response;
++
++final class CallEnqueueObservable<T> extends Observable<Response<T>> {
++  private final Call<T> originalCall;
++
++  CallEnqueueObservable(Call<T> originalCall) {
++    this.originalCall = originalCall;
++  }
++
++  @Override protected void subscribeActual(Observer<? super Response<T>> observer) {
++    // Since Call is a one-shot type, clone it for each new observer.
++    Call<T> call = originalCall.clone();
++    CallCallback<T> callback = new CallCallback<>(call, observer);
++    observer.onSubscribe(callback);
++    call.enqueue(callback);
++  }
++
++  private static final class CallCallback<T> implements Disposable, Callback<T> {
++    private final Call<?> call;
++    private final Observer<? super Response<T>> observer;
++    boolean terminated = false;
++
++    CallCallback(Call<?> call, Observer<? super Response<T>> observer) {
++      this.call = call;
++      this.observer = observer;
++    }
++
++    @Override public void onResponse(Call<T> call, Response<T> response) {
++      if (call.isCanceled()) return;
++
++      try {
++        observer.onNext(response);
++
++        if (!call.isCanceled()) {
++          terminated = true;
++          observer.onComplete();
++        }
++      } catch (Throwable t) {
++        if (terminated) {
++          RxJavaPlugins.onError(t);
++        } else if (!call.isCanceled()) {
++          try {
++            observer.onError(t);
++          } catch (Throwable inner) {
++            Exceptions.throwIfFatal(inner);
++            RxJavaPlugins.onError(new CompositeException(t, inner));
++          }
++        }
++      }
++    }
++
++    @Override public void onFailure(Call<T> call, Throwable t) {
++      if (call.isCanceled()) return;
++
++      try {
++        observer.onError(t);
++      } catch (Throwable inner) {
++        Exceptions.throwIfFatal(inner);
++        RxJavaPlugins.onError(new CompositeException(t, inner));
++      }
++    }
++
++    @Override public void dispose() {
++      call.cancel();
++    }
++
++    @Override public boolean isDisposed() {
++      return call.isCanceled();
++    }
++  }
++}
+diff --git a/retrofit-adapters/rxjava2/src/main/java/retrofit2/adapter/rxjava2/CallObservable.java b/retrofit-adapters/rxjava2/src/main/java/retrofit2/adapter/rxjava2/CallExecuteObservable.java
+similarity index 94%
+rename from retrofit-adapters/rxjava2/src/main/java/retrofit2/adapter/rxjava2/CallObservable.java
+rename to retrofit-adapters/rxjava2/src/main/java/retrofit2/adapter/rxjava2/CallExecuteObservable.java
+index d7a4f7197..bf9453368 100644
+--- a/retrofit-adapters/rxjava2/src/main/java/retrofit2/adapter/rxjava2/CallObservable.java
++++ b/retrofit-adapters/rxjava2/src/main/java/retrofit2/adapter/rxjava2/CallExecuteObservable.java
+@@ -24,10 +24,10 @@
+ import retrofit2.Call;
+ import retrofit2.Response;
+ 
+-final class CallObservable<T> extends Observable<Response<T>> {
++final class CallExecuteObservable<T> extends Observable<Response<T>> {
+   private final Call<T> originalCall;
+ 
+-  CallObservable(Call<T> originalCall) {
++  CallExecuteObservable(Call<T> originalCall) {
+     this.originalCall = originalCall;
+   }
+ 
+diff --git a/retrofit-adapters/rxjava2/src/main/java/retrofit2/adapter/rxjava2/RxJava2CallAdapter.java b/retrofit-adapters/rxjava2/src/main/java/retrofit2/adapter/rxjava2/RxJava2CallAdapter.java
+index e6b7861cb..a585e3113 100644
+--- a/retrofit-adapters/rxjava2/src/main/java/retrofit2/adapter/rxjava2/RxJava2CallAdapter.java
++++ b/retrofit-adapters/rxjava2/src/main/java/retrofit2/adapter/rxjava2/RxJava2CallAdapter.java
+@@ -26,6 +26,7 @@
+ final class RxJava2CallAdapter<R> implements CallAdapter<R, Object> {
+   private final Type responseType;
+   private final Scheduler scheduler;
++  private final boolean isAsync;
+   private final boolean isResult;
+   private final boolean isBody;
+   private final boolean isFlowable;
+@@ -33,10 +34,12 @@
+   private final boolean isMaybe;
+   private final boolean isCompletable;
+ 
+-  RxJava2CallAdapter(Type responseType, Scheduler scheduler, boolean isResult, boolean isBody,
+-      boolean isFlowable, boolean isSingle, boolean isMaybe, boolean isCompletable) {
++  RxJava2CallAdapter(Type responseType, Scheduler scheduler, boolean isAsync, boolean isResult,
++      boolean isBody, boolean isFlowable, boolean isSingle, boolean isMaybe,
++      boolean isCompletable) {
+     this.responseType = responseType;
+     this.scheduler = scheduler;
++    this.isAsync = isAsync;
+     this.isResult = isResult;
+     this.isBody = isBody;
+     this.isFlowable = isFlowable;
+@@ -50,7 +53,9 @@
+   }
+ 
+   @Override public Object adapt(Call<R> call) {
+-    Observable<Response<R>> responseObservable = new CallObservable<>(call);
++    Observable<Response<R>> responseObservable = isAsync
++        ? new CallEnqueueObservable<>(call)
++        : new CallExecuteObservable<>(call);
+ 
+     Observable<?> observable;
+     if (isResult) {
+diff --git a/retrofit-adapters/rxjava2/src/main/java/retrofit2/adapter/rxjava2/RxJava2CallAdapterFactory.java b/retrofit-adapters/rxjava2/src/main/java/retrofit2/adapter/rxjava2/RxJava2CallAdapterFactory.java
+index 1f1b056dd..dfe4b317b 100644
+--- a/retrofit-adapters/rxjava2/src/main/java/retrofit2/adapter/rxjava2/RxJava2CallAdapterFactory.java
++++ b/retrofit-adapters/rxjava2/src/main/java/retrofit2/adapter/rxjava2/RxJava2CallAdapterFactory.java
+@@ -59,7 +59,15 @@
+    * by default.
+    */
+   public static RxJava2CallAdapterFactory create() {
+-    return new RxJava2CallAdapterFactory(null);
++    return new RxJava2CallAdapterFactory(null, false);
++  }
++
++  /**
++   * Returns an instance which creates asynchronous observables. Applying
++   * {@link Observable#subscribeOn} has no effect on stream types created by this factory.
++   */
++  public static RxJava2CallAdapterFactory createAsync() {
++    return new RxJava2CallAdapterFactory(null, true);
+   }
+ 
+   /**
+@@ -68,13 +76,15 @@ public static RxJava2CallAdapterFactory create() {
+    */
+   public static RxJava2CallAdapterFactory createWithScheduler(Scheduler scheduler) {
+     if (scheduler == null) throw new NullPointerException("scheduler == null");
+-    return new RxJava2CallAdapterFactory(scheduler);
++    return new RxJava2CallAdapterFactory(scheduler, false);
+   }
+ 
+   private final Scheduler scheduler;
++  private final boolean isAsync;
+ 
+-  private RxJava2CallAdapterFactory(Scheduler scheduler) {
++  private RxJava2CallAdapterFactory(Scheduler scheduler, boolean isAsync) {
+     this.scheduler = scheduler;
++    this.isAsync = isAsync;
+   }
+ 
+   @Override
+@@ -84,7 +94,8 @@ private RxJava2CallAdapterFactory(Scheduler scheduler) {
+     if (rawType == Completable.class) {
+       // Completable is not parameterized (which is what the rest of this method deals with) so it
+       // can only be created with a single configuration.
+-      return new RxJava2CallAdapter(Void.class, scheduler, false, true, false, false, false, true);
++      return new RxJava2CallAdapter(Void.class, scheduler, isAsync, false, true, false, false,
++          false, true);
+     }
+ 
+     boolean isFlowable = rawType == Flowable.class;
+@@ -98,7 +109,9 @@ private RxJava2CallAdapterFactory(Scheduler scheduler) {
+     boolean isBody = false;
+     Type responseType;
+     if (!(returnType instanceof ParameterizedType)) {
+-      String name = isFlowable ? "Flowable" : isSingle ? "Single" : "Observable";
++      String name = isFlowable ? "Flowable"
++          : isSingle ? "Single"
++          : isMaybe ? "Maybe" : "Observable";
+       throw new IllegalStateException(name + " return type must be parameterized"
+           + " as " + name + "<Foo> or " + name + "<? extends Foo>");
+     }
+@@ -123,7 +136,7 @@ private RxJava2CallAdapterFactory(Scheduler scheduler) {
+       isBody = true;
+     }
+ 
+-    return new RxJava2CallAdapter(responseType, scheduler, isResult, isBody, isFlowable,
++    return new RxJava2CallAdapter(responseType, scheduler, isAsync, isResult, isBody, isFlowable,
+         isSingle, isMaybe, false);
+   }
+ }
+diff --git a/retrofit-adapters/rxjava2/src/test/java/retrofit2/adapter/rxjava2/AsyncTest.java b/retrofit-adapters/rxjava2/src/test/java/retrofit2/adapter/rxjava2/AsyncTest.java
+new file mode 100644
+index 000000000..d008a5e70
+--- /dev/null
++++ b/retrofit-adapters/rxjava2/src/test/java/retrofit2/adapter/rxjava2/AsyncTest.java
+@@ -0,0 +1,133 @@
++/*
++ * Copyright (C) 2017 Square, Inc.
++ *
++ * Licensed under the Apache License, Version 2.0 (the "License");
++ * you may not use this file except in compliance with the License.
++ * You may obtain a copy of the License at
++ *
++ *      http://www.apache.org/licenses/LICENSE-2.0
++ *
++ * Unless required by applicable law or agreed to in writing, software
++ * distributed under the License is distributed on an "AS IS" BASIS,
++ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++ * See the License for the specific language governing permissions and
++ * limitations under the License.
++ */
++package retrofit2.adapter.rxjava2;
++
++import io.reactivex.Completable;
++import io.reactivex.exceptions.CompositeException;
++import io.reactivex.exceptions.Exceptions;
++import io.reactivex.functions.Consumer;
++import io.reactivex.observers.TestObserver;
++import io.reactivex.plugins.RxJavaPlugins;
++import java.io.IOException;
++import java.util.concurrent.CountDownLatch;
++import java.util.concurrent.atomic.AtomicReference;
++import okhttp3.mockwebserver.MockResponse;
++import okhttp3.mockwebserver.MockWebServer;
++import org.junit.Before;
++import org.junit.Rule;
++import org.junit.Test;
++import retrofit2.Retrofit;
++import retrofit2.adapter.rxjava2.CompletableThrowingTest.ForwardingCompletableObserver;
++import retrofit2.http.GET;
++
++import static java.util.concurrent.TimeUnit.SECONDS;
++import static okhttp3.mockwebserver.SocketPolicy.DISCONNECT_AFTER_REQUEST;
++import static org.assertj.core.api.Assertions.assertThat;
++import static org.junit.Assert.assertFalse;
++
++public final class AsyncTest {
++  @Rule public final MockWebServer server = new MockWebServer();
++
++  interface Service {
++    @GET("/") Completable completable();
++  }
++
++  private Service service;
++  @Before public void setUp() {
++    Retrofit retrofit = new Retrofit.Builder()
++        .baseUrl(server.url("/"))
++        .addCallAdapterFactory(RxJava2CallAdapterFactory.createAsync())
++        .build();
++    service = retrofit.create(Service.class);
++  }
++
++  @Test public void success() throws InterruptedException {
++    TestObserver<Void> observer = new TestObserver<>();
++    service.completable().subscribe(observer);
++    assertFalse(observer.await(1, SECONDS));
++
++    server.enqueue(new MockResponse());
++    observer.awaitTerminalEvent(1, SECONDS);
++    observer.assertComplete();
++  }
++
++
++  @Test public void failure() throws InterruptedException {
++    TestObserver<Void> observer = new TestObserver<>();
++    service.completable().subscribe(observer);
++    assertFalse(observer.await(1, SECONDS));
++
++    server.enqueue(new MockResponse().setSocketPolicy(DISCONNECT_AFTER_REQUEST));
++    observer.awaitTerminalEvent(1, SECONDS);
++    observer.assertError(IOException.class);
++  }
++
++  @Test public void throwingInOnCompleteDeliveredToPlugin() throws InterruptedException {
++    server.enqueue(new MockResponse());
++
++    final CountDownLatch latch = new CountDownLatch(1);
++    final AtomicReference<Throwable> errorRef = new AtomicReference<>();
++    RxJavaPlugins.setErrorHandler(new Consumer<Throwable>() {
++      @Override public void accept(Throwable throwable) throws Exception {
++        if (!errorRef.compareAndSet(null, throwable)) {
++          throw Exceptions.propagate(throwable); // Don't swallow secondary errors!
++        }
++        latch.countDown();
++      }
++    });
++
++    TestObserver<Void> observer = new TestObserver<>();
++    final RuntimeException e = new RuntimeException();
++    service.completable().subscribe(new ForwardingCompletableObserver(observer) {
++      @Override public void onComplete() {
++        throw e;
++      }
++    });
++
++    latch.await(1, SECONDS);
++    assertThat(errorRef.get()).isSameAs(e);
++  }
++
++  @Test public void bodyThrowingInOnErrorDeliveredToPlugin() throws InterruptedException {
++    server.enqueue(new MockResponse().setResponseCode(404));
++
++    final CountDownLatch latch = new CountDownLatch(1);
++    final AtomicReference<Throwable> pluginRef = new AtomicReference<>();
++    RxJavaPlugins.setErrorHandler(new Consumer<Throwable>() {
++      @Override public void accept(Throwable throwable) throws Exception {
++        if (!pluginRef.compareAndSet(null, throwable)) {
++          throw Exceptions.propagate(throwable); // Don't swallow secondary errors!
++        }
++        latch.countDown();
++      }
++    });
++
++    TestObserver<Void> observer = new TestObserver<>();
++    final RuntimeException e = new RuntimeException();
++    final AtomicReference<Throwable> errorRef = new AtomicReference<>();
++    service.completable().subscribe(new ForwardingCompletableObserver(observer) {
++      @Override public void onError(Throwable throwable) {
++        errorRef.set(throwable);
++        throw e;
++      }
++    });
++
++    latch.await(1, SECONDS);
++    //noinspection ThrowableResultOfMethodCallIgnored
++    CompositeException composite = (CompositeException) pluginRef.get();
++    assertThat(composite.getExceptions()).containsExactly(errorRef.get(), e);
++  }
++}
+diff --git a/retrofit-adapters/rxjava2/src/test/java/retrofit2/adapter/rxjava2/CompletableThrowingTest.java b/retrofit-adapters/rxjava2/src/test/java/retrofit2/adapter/rxjava2/CompletableThrowingTest.java
+index 535fdeeed..6c558b029 100644
+--- a/retrofit-adapters/rxjava2/src/test/java/retrofit2/adapter/rxjava2/CompletableThrowingTest.java
++++ b/retrofit-adapters/rxjava2/src/test/java/retrofit2/adapter/rxjava2/CompletableThrowingTest.java
+@@ -104,7 +104,7 @@
+     assertThat(composite.getExceptions()).containsExactly(errorRef.get(), e);
+   }
+ 
+-  private static abstract class ForwardingCompletableObserver implements CompletableObserver {
++  static abstract class ForwardingCompletableObserver implements CompletableObserver {
+     private final CompletableObserver delegate;
+ 
+     ForwardingCompletableObserver(CompletableObserver delegate) {
+diff --git a/retrofit-adapters/rxjava2/src/test/java/retrofit2/adapter/rxjava2/RxJava2CallAdapterFactoryTest.java b/retrofit-adapters/rxjava2/src/test/java/retrofit2/adapter/rxjava2/RxJava2CallAdapterFactoryTest.java
+new file mode 100644
+index 000000000..589716125
+--- /dev/null
++++ b/retrofit-adapters/rxjava2/src/test/java/retrofit2/adapter/rxjava2/RxJava2CallAdapterFactoryTest.java
+@@ -0,0 +1,274 @@
++/*
++ * Copyright (C) 2015 Square, Inc.
++ *
++ * Licensed under the Apache License, Version 2.0 (the "License");
++ * you may not use this file except in compliance with the License.
++ * You may obtain a copy of the License at
++ *
++ *      http://www.apache.org/licenses/LICENSE-2.0
++ *
++ * Unless required by applicable law or agreed to in writing, software
++ * distributed under the License is distributed on an "AS IS" BASIS,
++ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++ * See the License for the specific language governing permissions and
++ * limitations under the License.
++ */
++
++package retrofit2.adapter.rxjava2;
++
++import com.google.common.reflect.TypeToken;
++import io.reactivex.Completable;
++import io.reactivex.Flowable;
++import io.reactivex.Maybe;
++import java.lang.annotation.Annotation;
++import java.lang.reflect.Type;
++import java.util.List;
++import org.junit.Before;
++import org.junit.Test;
++import retrofit2.CallAdapter;
++import retrofit2.Response;
++import retrofit2.Retrofit;
++import io.reactivex.Observable;
++import io.reactivex.Single;
++import io.reactivex.Flowable;
++import io.reactivex.Maybe;
++import io.reactivex.Completable;
++
++import static org.assertj.core.api.Assertions.assertThat;
++import static org.junit.Assert.fail;
++
++public class RxJava2CallAdapterFactoryTest {
++  private static final Annotation[] NO_ANNOTATIONS = new Annotation[0];
++
++  private final CallAdapter.Factory factory = RxJava2CallAdapterFactory.create();
++  private Retrofit retrofit;
++
++  @Before public void setUp() {
++    retrofit = new Retrofit.Builder()
++        .baseUrl("http://localhost:1")
++        .addConverterFactory(new StringConverterFactory())
++        .addCallAdapterFactory(factory)
++        .build();
++  }
++
++  @Test public void nullSchedulerThrows() {
++    try {
++      RxJava2CallAdapterFactory.createWithScheduler(null);
++      fail();
++    } catch (NullPointerException e) {
++      assertThat(e).hasMessage("scheduler == null");
++    }
++  }
++
++  @Test public void nonRxJavaTypeReturnsNull() {
++    CallAdapter<?, ?> adapter = factory.get(String.class, NO_ANNOTATIONS, retrofit);
++    assertThat(adapter).isNull();
++  }
++
++  @Test public void responseTypes() {
++    Type oBodyClass = new TypeToken<Observable<String>>() {}.getType();
++    assertThat(factory.get(oBodyClass, NO_ANNOTATIONS, retrofit).responseType())
++        .isEqualTo(String.class);
++    Type sBodyClass = new TypeToken<Single<String>>() {}.getType();
++    assertThat(factory.get(sBodyClass, NO_ANNOTATIONS, retrofit).responseType())
++        .isEqualTo(String.class);
++    Type mBodyClass = new TypeToken<Maybe<String>>() {}.getType();
++    assertThat(factory.get(sBodyClass, NO_ANNOTATIONS, retrofit).responseType())
++        .isEqualTo(String.class);
++    Type fBodyClass = new TypeToken<Flowable<String>>() {}.getType();
++    assertThat(factory.get(sBodyClass, NO_ANNOTATIONS, retrofit).responseType())
++        .isEqualTo(String.class);
++
++    Type oBodyWildcard = new TypeToken<Observable<? extends String>>() {}.getType();
++    assertThat(factory.get(oBodyWildcard, NO_ANNOTATIONS, retrofit).responseType())
++        .isEqualTo(String.class);
++    Type sBodyWildcard = new TypeToken<Single<? extends String>>() {}.getType();
++    assertThat(factory.get(sBodyWildcard, NO_ANNOTATIONS, retrofit).responseType())
++        .isEqualTo(String.class);
++    Type mBodyWildcard = new TypeToken<Maybe<? extends String>>() {}.getType();
++    assertThat(factory.get(sBodyWildcard, NO_ANNOTATIONS, retrofit).responseType())
++        .isEqualTo(String.class);
++    Type fBodyWildcard = new TypeToken<Flowable<? extends String>>() {}.getType();
++    assertThat(factory.get(sBodyWildcard, NO_ANNOTATIONS, retrofit).responseType())
++        .isEqualTo(String.class);
++
++    Type oBodyGeneric = new TypeToken<Observable<List<String>>>() {}.getType();
++    assertThat(factory.get(oBodyGeneric, NO_ANNOTATIONS, retrofit).responseType())
++        .isEqualTo(new TypeToken<List<String>>() {}.getType());
++    Type sBodyGeneric = new TypeToken<Single<List<String>>>() {}.getType();
++    assertThat(factory.get(sBodyGeneric, NO_ANNOTATIONS, retrofit).responseType())
++        .isEqualTo(new TypeToken<List<String>>() {}.getType());
++    Type mBodyGeneric = new TypeToken<Maybe<List<String>>>() {}.getType();
++    assertThat(factory.get(sBodyGeneric, NO_ANNOTATIONS, retrofit).responseType())
++        .isEqualTo(new TypeToken<List<String>>() {}.getType());
++    Type fBodyGeneric = new TypeToken<Flowable<List<String>>>() {}.getType();
++    assertThat(factory.get(sBodyGeneric, NO_ANNOTATIONS, retrofit).responseType())
++        .isEqualTo(new TypeToken<List<String>>() {}.getType());
++
++    Type oResponseClass = new TypeToken<Observable<Response<String>>>() {}.getType();
++    assertThat(factory.get(oResponseClass, NO_ANNOTATIONS, retrofit).responseType())
++        .isEqualTo(String.class);
++    Type sResponseClass = new TypeToken<Single<Response<String>>>() {}.getType();
++    assertThat(factory.get(sResponseClass, NO_ANNOTATIONS, retrofit).responseType())
++        .isEqualTo(String.class);
++    Type mResponseClass = new TypeToken<Maybe<Response<String>>>() {}.getType();
++    assertThat(factory.get(sResponseClass, NO_ANNOTATIONS, retrofit).responseType())
++        .isEqualTo(String.class);
++    Type fResponseClass = new TypeToken<Flowable<Response<String>>>() {}.getType();
++    assertThat(factory.get(sResponseClass, NO_ANNOTATIONS, retrofit).responseType())
++        .isEqualTo(String.class);
++
++    Type oResponseWildcard = new TypeToken<Observable<Response<? extends String>>>() {}.getType();
++    assertThat(factory.get(oResponseWildcard, NO_ANNOTATIONS, retrofit).responseType())
++        .isEqualTo(String.class);
++    Type sResponseWildcard = new TypeToken<Single<Response<? extends String>>>() {}.getType();
++    assertThat(factory.get(sResponseWildcard, NO_ANNOTATIONS, retrofit).responseType())
++        .isEqualTo(String.class);
++    Type mResponseWildcard = new TypeToken<Maybe<Response<? extends String>>>() {}.getType();
++    assertThat(factory.get(sResponseWildcard, NO_ANNOTATIONS, retrofit).responseType())
++        .isEqualTo(String.class);
++    Type fResponseWildcard = new TypeToken<Flowable<Response<? extends String>>>() {}.getType();
++    assertThat(factory.get(sResponseWildcard, NO_ANNOTATIONS, retrofit).responseType())
++        .isEqualTo(String.class);
++
++    Type oResultClass = new TypeToken<Observable<Result<String>>>() {}.getType();
++    assertThat(factory.get(oResultClass, NO_ANNOTATIONS, retrofit).responseType())
++        .isEqualTo(String.class);
++    Type sResultClass = new TypeToken<Single<Result<String>>>() {}.getType();
++    assertThat(factory.get(sResultClass, NO_ANNOTATIONS, retrofit).responseType())
++        .isEqualTo(String.class);
++    Type mResultClass = new TypeToken<Maybe<Result<String>>>() {}.getType();
++    assertThat(factory.get(sResultClass, NO_ANNOTATIONS, retrofit).responseType())
++        .isEqualTo(String.class);
++    Type fResultClass = new TypeToken<Flowable<Result<String>>>() {}.getType();
++    assertThat(factory.get(sResultClass, NO_ANNOTATIONS, retrofit).responseType())
++        .isEqualTo(String.class);
++
++    Type oResultWildcard = new TypeToken<Observable<Result<? extends String>>>() {}.getType();
++    assertThat(factory.get(oResultWildcard, NO_ANNOTATIONS, retrofit).responseType())
++        .isEqualTo(String.class);
++    Type sResultWildcard = new TypeToken<Single<Result<? extends String>>>() {}.getType();
++    assertThat(factory.get(sResultWildcard, NO_ANNOTATIONS, retrofit).responseType())
++        .isEqualTo(String.class);
++    Type mResultWildcard = new TypeToken<Maybe<Result<? extends String>>>() {}.getType();
++    assertThat(factory.get(sResultWildcard, NO_ANNOTATIONS, retrofit).responseType())
++        .isEqualTo(String.class);
++    Type fResultWildcard = new TypeToken<Flowable<Result<? extends String>>>() {}.getType();
++    assertThat(factory.get(sResultWildcard, NO_ANNOTATIONS, retrofit).responseType())
++        .isEqualTo(String.class);
++  }
++
++  @Test public void rawBodyTypeThrows() {
++    Type observableType = new TypeToken<Observable>() {}.getType();
++    try {
++      factory.get(observableType, NO_ANNOTATIONS, retrofit);
++      fail();
++    } catch (IllegalStateException e) {
++      assertThat(e).hasMessage(
++          "Observable return type must be parameterized as Observable<Foo> or Observable<? extends Foo>");
++    }
++
++    Type singleType = new TypeToken<Single>() {}.getType();
++    try {
++      factory.get(singleType, NO_ANNOTATIONS, retrofit);
++      fail();
++    } catch (IllegalStateException e) {
++      assertThat(e).hasMessage(
++          "Single return type must be parameterized as Single<Foo> or Single<? extends Foo>");
++    }
++
++    Type maybeType = new TypeToken<Maybe>() {}.getType();
++    try {
++      factory.get(maybeType, NO_ANNOTATIONS, retrofit);
++      fail();
++    } catch (IllegalStateException e) {
++      assertThat(e).hasMessage(
++          "Maybe return type must be parameterized as Maybe<Foo> or Maybe<? extends Foo>");
++    }
++
++    Type flowableType = new TypeToken<Flowable>() {}.getType();
++    try {
++      factory.get(flowableType, NO_ANNOTATIONS, retrofit);
++      fail();
++    } catch (IllegalStateException e) {
++      assertThat(e).hasMessage(
++          "Flowable return type must be parameterized as Flowable<Foo> or Flowable<? extends Foo>");
++    }
++  }
++
++  @Test public void rawResponseTypeThrows() {
++    Type observableType = new TypeToken<Observable<Response>>() {}.getType();
++    try {
++      factory.get(observableType, NO_ANNOTATIONS, retrofit);
++      fail();
++    } catch (IllegalStateException e) {
++      assertThat(e).hasMessage(
++          "Response must be parameterized as Response<Foo> or Response<? extends Foo>");
++    }
++
++    Type singleType = new TypeToken<Single<Response>>() {}.getType();
++    try {
++      factory.get(singleType, NO_ANNOTATIONS, retrofit);
++      fail();
++    } catch (IllegalStateException e) {
++      assertThat(e).hasMessage(
++          "Response must be parameterized as Response<Foo> or Response<? extends Foo>");
++    }
++
++    Type maybeType = new TypeToken<Maybe<Response>>() {}.getType();
++    try {
++      factory.get(maybeType, NO_ANNOTATIONS, retrofit);
++      fail();
++    } catch (IllegalStateException e) {
++      assertThat(e).hasMessage(
++          "Response must be parameterized as Response<Foo> or Response<? extends Foo>");
++    }
++
++    Type flowableType = new TypeToken<Flowable<Response>>() {}.getType();
++    try {
++      factory.get(flowableType, NO_ANNOTATIONS, retrofit);
++      fail();
++    } catch (IllegalStateException e) {
++      assertThat(e).hasMessage(
++          "Response must be parameterized as Response<Foo> or Response<? extends Foo>");
++    }
++  }
++
++  @Test public void rawResultTypeThrows() {
++    Type observableType = new TypeToken<Observable<Result>>() {}.getType();
++    try {
++      factory.get(observableType, NO_ANNOTATIONS, retrofit);
++      fail();
++    } catch (IllegalStateException e) {
++      assertThat(e).hasMessage(
++          "Result must be parameterized as Result<Foo> or Result<? extends Foo>");
++    }
++
++    Type singleType = new TypeToken<Single<Result>>() {}.getType();
++    try {
++      factory.get(singleType, NO_ANNOTATIONS, retrofit);
++      fail();
++    } catch (IllegalStateException e) {
++      assertThat(e).hasMessage(
++          "Result must be parameterized as Result<Foo> or Result<? extends Foo>");
++    }
++
++    Type maybeType = new TypeToken<Maybe<Result>>() {}.getType();
++    try {
++      factory.get(maybeType, NO_ANNOTATIONS, retrofit);
++      fail();
++    } catch (IllegalStateException e) {
++      assertThat(e).hasMessage(
++          "Result must be parameterized as Result<Foo> or Result<? extends Foo>");
++    }
++
++    Type flowableType = new TypeToken<Flowable<Result>>() {}.getType();
++    try {
++      factory.get(flowableType, NO_ANNOTATIONS, retrofit);
++      fail();
++    } catch (IllegalStateException e) {
++      assertThat(e).hasMessage(
++          "Result must be parameterized as Result<Foo> or Result<? extends Foo>");
++    }
++  }
++}
+diff --git a/retrofit-converters/moshi/pom.xml b/retrofit-converters/moshi/pom.xml
+index 0505438af..0957c881f 100644
+--- a/retrofit-converters/moshi/pom.xml
++++ b/retrofit-converters/moshi/pom.xml
+@@ -23,12 +23,6 @@
+       <groupId>com.squareup.moshi</groupId>
+       <artifactId>moshi</artifactId>
+     </dependency>
+-    <!-- TODO remove this dependency once Moshi ships with 1.9.0 or newer. -->
+-    <dependency>
+-      <groupId>com.squareup.okio</groupId>
+-      <artifactId>okio</artifactId>
+-      <version>1.9.0</version>
+-    </dependency>
+ 
+     <dependency>
+       <groupId>junit</groupId>
+diff --git a/retrofit-converters/moshi/src/main/java/retrofit2/converter/moshi/MoshiConverterFactory.java b/retrofit-converters/moshi/src/main/java/retrofit2/converter/moshi/MoshiConverterFactory.java
+index 60e5f1bfd..0b95d1951 100644
+--- a/retrofit-converters/moshi/src/main/java/retrofit2/converter/moshi/MoshiConverterFactory.java
++++ b/retrofit-converters/moshi/src/main/java/retrofit2/converter/moshi/MoshiConverterFactory.java
+@@ -51,27 +51,37 @@ public static MoshiConverterFactory create() {
+   /** Create an instance using {@code moshi} for conversion. */
+   public static MoshiConverterFactory create(Moshi moshi) {
+     if (moshi == null) throw new NullPointerException("moshi == null");
+-    return new MoshiConverterFactory(moshi, false, false);
++    return new MoshiConverterFactory(moshi, false, false, false);
+   }
+ 
+   private final Moshi moshi;
+   private final boolean lenient;
++  private final boolean failOnUnknown;
+   private final boolean serializeNulls;
+ 
+-  private MoshiConverterFactory(Moshi moshi, boolean lenient, boolean serializeNulls) {
++  private MoshiConverterFactory(Moshi moshi, boolean lenient, boolean failOnUnknown,
++      boolean serializeNulls) {
+     this.moshi = moshi;
+     this.lenient = lenient;
++    this.failOnUnknown = failOnUnknown;
+     this.serializeNulls = serializeNulls;
+   }
+ 
+   /** Return a new factory which uses {@linkplain JsonAdapter#lenient() lenient} adapters. */
+   public MoshiConverterFactory asLenient() {
+-    return new MoshiConverterFactory(moshi, true, serializeNulls);
++    return new MoshiConverterFactory(moshi, true, failOnUnknown, serializeNulls);
++  }
++
++  /**
++   * Return a new factory which uses {@link JsonAdapter#failOnUnknown()} adapters.
++   */
++  public MoshiConverterFactory failOnUnknown() {
++    return new MoshiConverterFactory(moshi, lenient, true, serializeNulls);
+   }
+ 
+   /** Return a new factory which includes null values into the serialized JSON. */
+   public MoshiConverterFactory withNullSerialization() {
+-    return new MoshiConverterFactory(moshi, lenient, true);
++    return new MoshiConverterFactory(moshi, lenient, failOnUnknown, true);
+   }
+ 
+   @Override
+@@ -81,16 +91,21 @@ public MoshiConverterFactory withNullSerialization() {
+     if (lenient) {
+       adapter = adapter.lenient();
+     }
++    if (failOnUnknown) {
++      adapter = adapter.failOnUnknown();
++    }
+     return new MoshiResponseBodyConverter<>(adapter);
+   }
+ 
+-  @Override
+-  public Converter<?, RequestBody> requestBodyConverter(Type type,
++  @Override public Converter<?, RequestBody> requestBodyConverter(Type type,
+       Annotation[] parameterAnnotations, Annotation[] methodAnnotations, Retrofit retrofit) {
+     JsonAdapter<?> adapter = moshi.adapter(type, jsonAnnotations(parameterAnnotations));
+     if (lenient) {
+       adapter = adapter.lenient();
+     }
++    if (failOnUnknown) {
++      adapter = adapter.failOnUnknown();
++    }
+     return new MoshiRequestBodyConverter<>(adapter, serializeNulls);
+   }
+ 
+diff --git a/retrofit-converters/moshi/src/test/java/retrofit2/converter/moshi/MoshiConverterFactoryTest.java b/retrofit-converters/moshi/src/test/java/retrofit2/converter/moshi/MoshiConverterFactoryTest.java
+index d22c37267..14b00dafd 100644
+--- a/retrofit-converters/moshi/src/test/java/retrofit2/converter/moshi/MoshiConverterFactoryTest.java
++++ b/retrofit-converters/moshi/src/test/java/retrofit2/converter/moshi/MoshiConverterFactoryTest.java
+@@ -17,6 +17,7 @@
+ 
+ import com.squareup.moshi.FromJson;
+ import com.squareup.moshi.JsonAdapter;
++import com.squareup.moshi.JsonDataException;
+ import com.squareup.moshi.JsonQualifier;
+ import com.squareup.moshi.JsonReader;
+ import com.squareup.moshi.JsonWriter;
+@@ -120,6 +121,7 @@
+   private Service service;
+   private Service serviceLenient;
+   private Service serviceNulls;
++  private Service serviceFailOnUnknown;
+ 
+   @Before public void setUp() {
+     Moshi moshi = new Moshi.Builder()
+@@ -139,6 +141,7 @@
+     MoshiConverterFactory factory = MoshiConverterFactory.create(moshi);
+     MoshiConverterFactory factoryLenient = factory.asLenient();
+     MoshiConverterFactory factoryNulls = factory.withNullSerialization();
++    MoshiConverterFactory factoryFailOnUnknown = factory.failOnUnknown();
+     Retrofit retrofit = new Retrofit.Builder()
+         .baseUrl(server.url("/"))
+         .addConverterFactory(factory)
+@@ -151,9 +154,14 @@
+         .baseUrl(server.url("/"))
+         .addConverterFactory(factoryNulls)
+         .build();
++    Retrofit retrofitFailOnUnknown = new Retrofit.Builder()
++        .baseUrl(server.url("/"))
++        .addConverterFactory(factoryFailOnUnknown)
++        .build();
+     service = retrofit.create(Service.class);
+     serviceLenient = retrofitLenient.create(Service.class);
+     serviceNulls = retrofitNulls.create(Service.class);
++    serviceFailOnUnknown = retrofitFailOnUnknown.create(Service.class);
+   }
+ 
+   @Test public void anInterface() throws IOException, InterruptedException {
+@@ -222,6 +230,18 @@
+     assertEquals("{\"theName\":null}", server.takeRequest().getBody().readUtf8());
+   }
+ 
++  @Test public void failOnUnknown() throws IOException, InterruptedException {
++    server.enqueue(new MockResponse().setBody("{\"taco\":\"delicious\"}"));
++
++    Call<AnImplementation> call = serviceFailOnUnknown.anImplementation(new AnImplementation(null));
++    try {
++      call.execute();
++      fail();
++    } catch (JsonDataException e) {
++      assertThat(e).hasMessage("Cannot skip unexpected STRING at $.taco");
++    }
++  }
++
+   @Test public void utf8BomSkipped() throws IOException {
+     Buffer responseBody = new Buffer()
+         .write(ByteString.decodeHex("EFBBBF"))
+diff --git a/retrofit-mock/src/main/java/retrofit2/mock/BehaviorCall.java b/retrofit-mock/src/main/java/retrofit2/mock/BehaviorCall.java
+index cfc92c5f7..8ec2b7073 100644
+--- a/retrofit-mock/src/main/java/retrofit2/mock/BehaviorCall.java
++++ b/retrofit-mock/src/main/java/retrofit2/mock/BehaviorCall.java
+@@ -79,6 +79,11 @@ boolean delaySleep() {
+           if (delaySleep()) {
+             callback.onFailure(BehaviorCall.this, behavior.failureException());
+           }
++        } else if (behavior.calculateIsError()) {
++          if (delaySleep()) {
++            //noinspection unchecked An error response has no body.
++            callback.onResponse(BehaviorCall.this, (Response<T>) behavior.createErrorResponse());
++          }
+         } else {
+           delegate.enqueue(new Callback<T>() {
+             @Override public void onResponse(Call<T> call, Response<T> response) {
+diff --git a/retrofit-mock/src/main/java/retrofit2/mock/Calls.java b/retrofit-mock/src/main/java/retrofit2/mock/Calls.java
+index 49b490aee..4a4721e6a 100644
+--- a/retrofit-mock/src/main/java/retrofit2/mock/Calls.java
++++ b/retrofit-mock/src/main/java/retrofit2/mock/Calls.java
+@@ -16,6 +16,8 @@
+ package retrofit2.mock;
+ 
+ import java.io.IOException;
++import java.util.concurrent.Callable;
++import java.util.concurrent.atomic.AtomicBoolean;
+ import okhttp3.Request;
+ import retrofit2.Call;
+ import retrofit2.Callback;
+@@ -23,75 +25,146 @@
+ 
+ /** Factory methods for creating {@link Call} instances which immediately respond or fail. */
+ public final class Calls {
++  /**
++   * Invokes {@code callable} once for the returned {@link Call} and once for each instance that is
++   * obtained from {@linkplain Call#clone() cloning} the returned {@link Call}.
++   */
++  public static <T> Call<T> defer(Callable<Call<T>> callable) {
++    return new DeferredCall<>(callable);
++  }
++
+   public static <T> Call<T> response(T successValue) {
+-    return response(Response.success(successValue));
++    return new FakeCall<>(Response.success(successValue), null);
++  }
++
++  public static <T> Call<T> response(Response<T> response) {
++    return new FakeCall<>(response, null);
+   }
+ 
+-  public static <T> Call<T> response(final Response<T> response) {
+-    return new Call<T>() {
+-      @Override public Response<T> execute() throws IOException {
++  public static <T> Call<T> failure(IOException failure) {
++    return new FakeCall<>(null, failure);
++  }
++
++  private Calls() {
++    throw new AssertionError("No instances.");
++  }
++
++  static final class FakeCall<T> implements Call<T> {
++    private final Response<T> response;
++    private final IOException error;
++    private final AtomicBoolean canceled = new AtomicBoolean();
++    private final AtomicBoolean executed = new AtomicBoolean();
++
++    FakeCall(Response<T> response, IOException error) {
++      if ((response == null) == (error == null)) {
++        throw new AssertionError("Only one of response or error can be set.");
++      }
++      this.response = response;
++      this.error = error;
++    }
++
++    @Override public Response<T> execute() throws IOException {
++      if (!executed.compareAndSet(false, true)) {
++        throw new IllegalStateException("Already executed");
++      }
++      if (canceled.get()) {
++        throw new IOException("canceled");
++      }
++      if (response != null) {
+         return response;
+       }
++      throw error;
++    }
+ 
+-      @Override public void enqueue(Callback<T> callback) {
++    @Override public void enqueue(Callback<T> callback) {
++      if (callback == null) {
++        throw new NullPointerException("callback == null");
++      }
++      if (!executed.compareAndSet(false, true)) {
++        throw new IllegalStateException("Already executed");
++      }
++      if (canceled.get()) {
++        callback.onFailure(this, new IOException("canceled"));
++      } else if (response != null) {
+         callback.onResponse(this, response);
++      } else {
++        callback.onFailure(this, error);
+       }
++    }
+ 
+-      @Override public boolean isExecuted() {
+-        return false;
+-      }
++    @Override public boolean isExecuted() {
++      return executed.get();
++    }
+ 
+-      @Override public void cancel() {
+-      }
++    @Override public void cancel() {
++      canceled.set(true);
++    }
+ 
+-      @Override public boolean isCanceled() {
+-        return false;
+-      }
++    @Override public boolean isCanceled() {
++      return canceled.get();
++    }
+ 
+-      @SuppressWarnings("CloneDoesntCallSuperClone") // Immutable object.
+-      @Override public Call<T> clone() {
+-        return this;
+-      }
++    @Override public Call<T> clone() {
++      return new FakeCall<>(response, error);
++    }
+ 
+-      @Override public Request request() {
++    @Override public Request request() {
++      if (response != null) {
+         return response.raw().request();
+       }
+-    };
++      return new Request.Builder().url("http://localhost").build();
++    }
+   }
+ 
+-  public static <T> Call<T> failure(final IOException failure) {
+-    return new Call<T>() {
+-      @Override public Response<T> execute() throws IOException {
+-        throw failure;
++  static final class DeferredCall<T> implements Call<T> {
++    private final Callable<Call<T>> callable;
++    private Call<T> delegate;
++
++    DeferredCall(Callable<Call<T>> callable) {
++      this.callable = callable;
++    }
++
++    private synchronized Call<T> getDelegate() {
++      Call<T> delegate = this.delegate;
++      if (delegate == null) {
++        try {
++          delegate = callable.call();
++        } catch (IOException e) {
++          delegate = failure(e);
++        } catch (Exception e) {
++          throw new IllegalStateException("Callable threw unrecoverable exception", e);
++        }
++        this.delegate = delegate;
+       }
++      return delegate;
++    }
+ 
+-      @Override public void enqueue(Callback<T> callback) {
+-        callback.onFailure(this, failure);
+-      }
++    @Override public Response<T> execute() throws IOException {
++      return getDelegate().execute();
++    }
+ 
+-      @Override public boolean isExecuted() {
+-        return false;
+-      }
++    @Override public void enqueue(Callback<T> callback) {
++      getDelegate().enqueue(callback);
++    }
+ 
+-      @Override public void cancel() {
+-      }
++    @Override public boolean isExecuted() {
++      return getDelegate().isExecuted();
++    }
+ 
+-      @Override public boolean isCanceled() {
+-        return false;
+-      }
++    @Override public void cancel() {
++      getDelegate().cancel();
++    }
+ 
+-      @SuppressWarnings("CloneDoesntCallSuperClone") // Immutable object.
+-      @Override public Call<T> clone() {
+-        return this;
+-      }
++    @Override public boolean isCanceled() {
++      return getDelegate().isCanceled();
++    }
+ 
+-      @Override public Request request() {
+-        return new Request.Builder().url("http://localhost").build();
+-      }
+-    };
+-  }
++    @Override public Call<T> clone() {
++      return new DeferredCall<>(callable);
++    }
+ 
+-  private Calls() {
+-    throw new AssertionError("No instances.");
++    @Override public Request request() {
++      return getDelegate().request();
++    }
+   }
+ }
+diff --git a/retrofit-mock/src/main/java/retrofit2/mock/NetworkBehavior.java b/retrofit-mock/src/main/java/retrofit2/mock/NetworkBehavior.java
+index 8108c1d63..7cf521d4e 100644
+--- a/retrofit-mock/src/main/java/retrofit2/mock/NetworkBehavior.java
++++ b/retrofit-mock/src/main/java/retrofit2/mock/NetworkBehavior.java
+@@ -17,7 +17,10 @@
+ 
+ import java.io.IOException;
+ import java.util.Random;
++import java.util.concurrent.Callable;
+ import java.util.concurrent.TimeUnit;
++import okhttp3.ResponseBody;
++import retrofit2.Response;
+ 
+ import static java.util.concurrent.TimeUnit.MILLISECONDS;
+ 
+@@ -40,15 +43,7 @@
+   private static final int DEFAULT_DELAY_MS = 2000; // Network calls will take 2 seconds.
+   private static final int DEFAULT_VARIANCE_PERCENT = 40; // Network delay varies by ±40%.
+   private static final int DEFAULT_FAILURE_PERCENT = 3; // 3% of network calls will fail.
+-
+-  /** Applies {@link NetworkBehavior} to instances of {@code T}. */
+-  public interface Adapter<T> {
+-    /**
+-     * Apply {@code behavior} to {@code value} so that it exhibits the configured network behavior
+-     * traits when interacted with.
+-     */
+-    T applyBehavior(NetworkBehavior behavior, T value);
+-  }
++  private static final int DEFAULT_ERROR_PERCENT = 0; // 0% of network calls will return errors.
+ 
+   /** Create an instance with default behavior. */
+   public static NetworkBehavior create() {
+@@ -70,6 +65,12 @@ public static NetworkBehavior create(Random random) {
+   private volatile int variancePercent = DEFAULT_VARIANCE_PERCENT;
+   private volatile int failurePercent = DEFAULT_FAILURE_PERCENT;
+   private volatile Throwable failureException;
++  private volatile int errorPercent = DEFAULT_ERROR_PERCENT;
++  private volatile Callable<Response<?>> errorFactory = new Callable<Response<?>>() {
++    @Override public Response<?> call() {
++      return Response.error(500, ResponseBody.create(null, new byte[0]));
++    }
++  };
+ 
+   private NetworkBehavior(Random random) {
+     this.random = random;
+@@ -120,14 +121,14 @@ public int failurePercent() {
+   /**
+    * Set the exception to be used when a failure is triggered.
+    * <p>
+-   * It is a best practice to remove the stack trace from {@code t} since it can misleadingly
+-   * point to code unrelated to this class.
++   * It is a best practice to remove the stack trace from {@code exception} since it can
++   * misleadingly point to code unrelated to this class.
+    */
+-  public void setFailureException(Throwable t) {
+-    if (t == null) {
+-      throw new NullPointerException("t == null");
++  public void setFailureException(Throwable exception) {
++    if (exception == null) {
++      throw new NullPointerException("exception == null");
+     }
+-    this.failureException = t;
++    this.failureException = exception;
+   }
+ 
+   /** The exception to be used when a failure is triggered. */
+@@ -135,13 +136,61 @@ public Throwable failureException() {
+     return failureException;
+   }
+ 
++  /** The percentage of calls to {@link #calculateIsError()} that return {@code true}. */
++  public int errorPercent() {
++    return errorPercent;
++  }
++
++  /** Set the percentage of calls to {@link #calculateIsError()} that return {@code true}. */
++  public void setErrorPercent(int errorPercent) {
++    if (errorPercent < 0 || errorPercent > 100) {
++      throw new IllegalArgumentException("Error percentage must be between 0 and 100.");
++    }
++    this.errorPercent = errorPercent;
++  }
++
++  /**
++   * Set the error response factory to be used when an error is triggered. This factory may only
++   * return responses for which {@link Response#isSuccessful()} returns false.
++   */
++  public void setErrorFactory(Callable<Response<?>> errorFactory) {
++    if (errorFactory == null) {
++      throw new NullPointerException("errorFactory == null");
++    }
++    this.errorFactory = errorFactory;
++  }
++
++  /** The HTTP error to be used when an error is triggered. */
++  public Response<?> createErrorResponse() {
++    Response<?> call;
++    try {
++      call = errorFactory.call();
++    } catch (Exception e) {
++      throw new IllegalStateException("Error factory threw an exception.", e);
++    }
++    if (call == null) {
++      throw new IllegalStateException("Error factory returned null.");
++    }
++    if (call.isSuccessful()) {
++      throw new IllegalStateException("Error factory returned successful response.");
++    }
++    return call;
++  }
++
+   /**
+    * Randomly determine whether this call should result in a network failure in accordance with
+    * configured behavior. When true, {@link #failureException()} should be thrown.
+    */
+   public boolean calculateIsFailure() {
+-    int randomValue = random.nextInt(100);
+-    return randomValue < failurePercent;
++    return random.nextInt(100) < failurePercent;
++  }
++
++  /**
++   * Randomly determine whether this call should result in an HTTP error in accordance with
++   * configured behavior. When true, {@link #createErrorResponse()} should be returned.
++   */
++  public boolean calculateIsError() {
++    return random.nextInt(100) < errorPercent;
+   }
+ 
+   /**
+diff --git a/retrofit-mock/src/test/java/retrofit2/mock/CallsTest.java b/retrofit-mock/src/test/java/retrofit2/mock/CallsTest.java
+new file mode 100644
+index 000000000..f32f4c4ee
+--- /dev/null
++++ b/retrofit-mock/src/test/java/retrofit2/mock/CallsTest.java
+@@ -0,0 +1,263 @@
++/*
++ * Copyright (C) 2017 Square, Inc.
++ *
++ * Licensed under the Apache License, Version 2.0 (the "License");
++ * you may not use this file except in compliance with the License.
++ * You may obtain a copy of the License at
++ *
++ *      http://www.apache.org/licenses/LICENSE-2.0
++ *
++ * Unless required by applicable law or agreed to in writing, software
++ * distributed under the License is distributed on an "AS IS" BASIS,
++ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++ * See the License for the specific language governing permissions and
++ * limitations under the License.
++ */
++package retrofit2.mock;
++
++import java.io.IOException;
++import java.util.concurrent.Callable;
++import java.util.concurrent.atomic.AtomicReference;
++import org.junit.Test;
++import retrofit2.Call;
++import retrofit2.Callback;
++import retrofit2.Response;
++
++import static org.assertj.core.api.Assertions.assertThat;
++import static org.junit.Assert.assertEquals;
++import static org.junit.Assert.assertFalse;
++import static org.junit.Assert.assertSame;
++import static org.junit.Assert.assertTrue;
++import static org.junit.Assert.fail;
++
++public final class CallsTest {
++  @Test public void bodyExecute() throws IOException {
++    Call<String> taco = Calls.response("Taco");
++    assertEquals("Taco", taco.execute().body());
++  }
++
++  @Test public void bodyEnqueue() throws IOException {
++    Call<String> taco = Calls.response("Taco");
++    final AtomicReference<Response<String>> responseRef = new AtomicReference<>();
++    taco.enqueue(new Callback<String>() {
++      @Override public void onResponse(Call<String> call, Response<String> response) {
++        responseRef.set(response);
++      }
++
++      @Override public void onFailure(Call<String> call, Throwable t) {
++        fail();
++      }
++    });
++    assertThat(responseRef.get().body()).isEqualTo("Taco");
++  }
++
++  @Test public void responseExecute() throws IOException {
++    Response<String> response = Response.success("Taco");
++    Call<String> taco = Calls.response(response);
++    assertFalse(taco.isExecuted());
++    assertSame(response, taco.execute());
++    assertTrue(taco.isExecuted());
++    try {
++      taco.execute();
++      fail();
++    } catch (IllegalStateException e) {
++      assertThat(e).hasMessage("Already executed");
++    }
++  }
++
++  @Test public void responseEnqueue() {
++    Response<String> response = Response.success("Taco");
++    Call<String> taco = Calls.response(response);
++    assertFalse(taco.isExecuted());
++
++    final AtomicReference<Response<String>> responseRef = new AtomicReference<>();
++    taco.enqueue(new Callback<String>() {
++      @Override public void onResponse(Call<String> call, Response<String> response) {
++        responseRef.set(response);
++      }
++
++      @Override public void onFailure(Call<String> call, Throwable t) {
++        fail();
++      }
++    });
++    assertSame(response, responseRef.get());
++    assertTrue(taco.isExecuted());
++
++    try {
++      taco.enqueue(new Callback<String>() {
++        @Override public void onResponse(Call<String> call, Response<String> response) {
++          fail();
++        }
++
++        @Override public void onFailure(Call<String> call, Throwable t) {
++          fail();
++        }
++      });
++      fail();
++    } catch (IllegalStateException e) {
++      assertThat(e).hasMessage("Already executed");
++    }
++  }
++
++  @Test public void enqueueNullThrows() {
++    Call<String> taco = Calls.response("Taco");
++    try {
++      taco.enqueue(null);
++      fail();
++    } catch (NullPointerException e) {
++      assertThat(e).hasMessage("callback == null");
++    }
++  }
++
++  @Test public void responseCancelExecute() {
++    Call<String> taco = Calls.response(Response.success("Taco"));
++    assertFalse(taco.isCanceled());
++    taco.cancel();
++    assertTrue(taco.isCanceled());
++
++    try {
++      taco.execute();
++      fail();
++    } catch (IOException e) {
++      assertThat(e).hasMessage("canceled");
++    }
++  }
++
++  @Test public void responseCancelEnqueue() throws IOException {
++    Call<String> taco = Calls.response(Response.success("Taco"));
++    assertFalse(taco.isCanceled());
++    taco.cancel();
++    assertTrue(taco.isCanceled());
++
++    final AtomicReference<Throwable> failureRef = new AtomicReference<>();
++    taco.enqueue(new Callback<String>() {
++      @Override public void onResponse(Call<String> call, Response<String> response) {
++        fail();
++      }
++
++      @Override public void onFailure(Call<String> call, Throwable t) {
++        failureRef.set(t);
++      }
++    });
++    assertThat(failureRef.get()).isInstanceOf(IOException.class).hasMessage("canceled");
++  }
++
++  @Test public void failureExecute() {
++    IOException failure = new IOException("Hey");
++    Call<Object> taco = Calls.failure(failure);
++    assertFalse(taco.isExecuted());
++    try {
++      taco.execute();
++      fail();
++    } catch (IOException e) {
++      assertSame(failure, e);
++    }
++    assertTrue(taco.isExecuted());
++  }
++
++  @Test public void failureEnqueue() {
++    IOException failure = new IOException("Hey");
++    Call<Object> taco = Calls.failure(failure);
++    assertFalse(taco.isExecuted());
++
++    final AtomicReference<Throwable> failureRef = new AtomicReference<>();
++    taco.enqueue(new Callback<Object>() {
++      @Override public void onResponse(Call<Object> call, Response<Object> response) {
++        fail();
++      }
++
++      @Override public void onFailure(Call<Object> call, Throwable t) {
++        failureRef.set(t);
++      }
++    });
++    assertSame(failure, failureRef.get());
++    assertTrue(taco.isExecuted());
++  }
++
++  @Test public void cloneHasOwnState() throws IOException {
++    Call<String> taco = Calls.response("Taco");
++    assertEquals("Taco", taco.execute().body());
++    Call<String> anotherTaco = taco.clone();
++    assertFalse(anotherTaco.isExecuted());
++    assertEquals("Taco", anotherTaco.execute().body());
++    assertTrue(anotherTaco.isExecuted());
++  }
++
++  @Test public void deferredReturnExecute() throws IOException {
++    Call<Integer> counts = Calls.defer(new Callable<Call<Integer>>() {
++      private int count = 0;
++
++      @Override public Call<Integer> call() throws Exception {
++        return Calls.response(++count);
++      }
++    });
++    Call<Integer> a = counts.clone();
++    Call<Integer> b = counts.clone();
++
++    assertEquals(1, b.execute().body().intValue());
++    assertEquals(2, a.execute().body().intValue());
++  }
++
++  @Test public void deferredReturnEnqueue() {
++    Call<Integer> counts = Calls.defer(new Callable<Call<Integer>>() {
++      private int count = 0;
++
++      @Override public Call<Integer> call() throws Exception {
++        return Calls.response(++count);
++      }
++    });
++    Call<Integer> a = counts.clone();
++    Call<Integer> b = counts.clone();
++
++    final AtomicReference<Response<Integer>> responseRef = new AtomicReference<>();
++    Callback<Integer> callback = new Callback<Integer>() {
++      @Override public void onResponse(Call<Integer> call, Response<Integer> response) {
++        responseRef.set(response);
++      }
++
++      @Override public void onFailure(Call<Integer> call, Throwable t) {
++        fail();
++      }
++    };
++    b.enqueue(callback);
++    assertEquals(1, responseRef.get().body().intValue());
++
++    a.enqueue(callback);
++    assertEquals(2, responseRef.get().body().intValue());
++  }
++
++  @Test public void deferredThrowExecute() throws IOException {
++    final IOException failure = new IOException("Hey");
++    Call<Object> failing = Calls.defer(new Callable<Call<Object>>() {
++      @Override public Call<Object> call() throws Exception {
++        throw failure;
++      }
++    });
++    try {
++      failing.execute();
++      fail();
++    } catch (IOException e) {
++      assertSame(failure, e);
++    }
++  }
++
++  @Test public void deferredThrowEnqueue() {
++    final IOException failure = new IOException("Hey");
++    Call<Object> failing = Calls.defer(new Callable<Call<Object>>() {
++      @Override public Call<Object> call() throws Exception {
++        throw failure;
++      }
++    });
++    final AtomicReference<Throwable> failureRef = new AtomicReference<>();
++    failing.enqueue(new Callback<Object>() {
++      @Override public void onResponse(Call<Object> call, Response<Object> response) {
++        fail();
++      }
++
++      @Override public void onFailure(Call<Object> call, Throwable t) {
++        failureRef.set(t);
++      }
++    });
++    assertSame(failure, failureRef.get());
++  }
++}
+diff --git a/retrofit-mock/src/test/java/retrofit2/mock/NetworkBehaviorTest.java b/retrofit-mock/src/test/java/retrofit2/mock/NetworkBehaviorTest.java
+index 180737826..300d57135 100644
+--- a/retrofit-mock/src/test/java/retrofit2/mock/NetworkBehaviorTest.java
++++ b/retrofit-mock/src/test/java/retrofit2/mock/NetworkBehaviorTest.java
+@@ -17,11 +17,15 @@
+ 
+ import java.io.IOException;
+ import java.util.Random;
++import java.util.concurrent.Callable;
++import okhttp3.ResponseBody;
+ import org.junit.Test;
++import retrofit2.Response;
+ 
+ import static java.util.concurrent.TimeUnit.MILLISECONDS;
+ import static java.util.concurrent.TimeUnit.SECONDS;
+ import static org.assertj.core.api.Assertions.assertThat;
++import static org.junit.Assert.assertEquals;
+ import static org.junit.Assert.fail;
+ 
+ public final class NetworkBehaviorTest {
+@@ -72,6 +76,97 @@
+     }
+   }
+ 
++  @Test public void failureExceptionIsNotNull() {
++    try {
++      behavior.setFailureException(null);
++      fail();
++    } catch (NullPointerException e) {
++      assertThat(e).hasMessage("exception == null");
++    }
++  }
++
++  @Test public void errorRestrictsRange() {
++    try {
++      behavior.setErrorPercent(-13);
++      fail();
++    } catch (IllegalArgumentException e) {
++      assertThat(e).hasMessage("Error percentage must be between 0 and 100.");
++    }
++    try {
++      behavior.setErrorPercent(174);
++      fail();
++    } catch (IllegalArgumentException e) {
++      assertThat(e).hasMessage("Error percentage must be between 0 and 100.");
++    }
++  }
++
++  @Test public void errorFactoryIsNotNull() {
++    try {
++      behavior.setErrorFactory(null);
++      fail();
++    } catch (NullPointerException e) {
++      assertThat(e).hasMessage("errorFactory == null");
++    }
++  }
++
++  @Test public void errorFactoryCannotReturnNull() {
++    behavior.setErrorFactory(new Callable<Response<?>>() {
++      @Override public Response<?> call() throws Exception {
++        return null;
++      }
++    });
++    try {
++      behavior.createErrorResponse();
++      fail();
++    } catch (IllegalStateException e) {
++      assertThat(e).hasMessage("Error factory returned null.");
++    }
++  }
++
++  @Test public void errorFactoryCannotThrow() {
++    final RuntimeException broken = new RuntimeException("Broken");
++    behavior.setErrorFactory(new Callable<Response<?>>() {
++      @Override public Response<?> call() throws Exception {
++        throw broken;
++      }
++    });
++    try {
++      behavior.createErrorResponse();
++      fail();
++    } catch (IllegalStateException e) {
++      assertThat(e).hasMessage("Error factory threw an exception.");
++      assertThat(e.getCause()).isSameAs(broken);
++    }
++  }
++
++  @Test public void errorFactoryCannotReturnSuccess() {
++    behavior.setErrorFactory(new Callable<Response<?>>() {
++      @Override public Response<?> call() throws Exception {
++        return Response.success("Taco");
++      }
++    });
++    try {
++      behavior.createErrorResponse();
++      fail();
++    } catch (IllegalStateException e) {
++      assertThat(e).hasMessage("Error factory returned successful response.");
++    }
++  }
++
++  @Test public void errorFactoryCalledEachTime() {
++    behavior.setErrorFactory(new Callable<Response<?>>() {
++      private int code = 500;
++
++      @Override public Response<?> call() throws Exception {
++        return Response.error(code++, ResponseBody.create(null, new byte[0]));
++      }
++    });
++
++    assertEquals(500, behavior.createErrorResponse().code());
++    assertEquals(501, behavior.createErrorResponse().code());
++    assertEquals(502, behavior.createErrorResponse().code());
++  }
++
+   @Test public void failurePercentageIsAccurate() {
+     behavior.setFailurePercent(0);
+     for (int i = 0; i < 10000; i++) {
+@@ -88,6 +183,22 @@
+     assertThat(failures).isEqualTo(2964); // ~3% of 100k
+   }
+ 
++  @Test public void errorPercentageIsAccurate() {
++    behavior.setErrorPercent(0);
++    for (int i = 0; i < 10000; i++) {
++      assertThat(behavior.calculateIsError()).isFalse();
++    }
++
++    behavior.setErrorPercent(3);
++    int errors = 0;
++    for (int i = 0; i < 100000; i++) {
++      if (behavior.calculateIsError()) {
++        errors += 1;
++      }
++    }
++    assertThat(errors).isEqualTo(2964); // ~3% of 100k
++  }
++
+   @Test public void delayVarianceIsAccurate() {
+     behavior.setDelay(2, SECONDS);
+ 
+diff --git a/retrofit/src/main/java/retrofit2/ParameterHandler.java b/retrofit/src/main/java/retrofit2/ParameterHandler.java
+index c332fad50..f0aa001d1 100644
+--- a/retrofit/src/main/java/retrofit2/ParameterHandler.java
++++ b/retrofit/src/main/java/retrofit2/ParameterHandler.java
+@@ -110,6 +110,21 @@
+     }
+   }
+ 
++  static final class QueryName<T> extends ParameterHandler<T> {
++    private final Converter<T, String> nameConverter;
++    private final boolean encoded;
++
++    QueryName(Converter<T, String> nameConverter, boolean encoded) {
++      this.nameConverter = nameConverter;
++      this.encoded = encoded;
++    }
++
++    @Override void apply(RequestBuilder builder, T value) throws IOException {
++      if (value == null) return; // Skip null values.
++      builder.addQueryParam(nameConverter.convert(value), null, encoded);
++    }
++  }
++
+   static final class QueryMap<T> extends ParameterHandler<Map<String, T>> {
+     private final Converter<T, String> valueConverter;
+     private final boolean encoded;
+diff --git a/retrofit/src/main/java/retrofit2/ServiceMethod.java b/retrofit/src/main/java/retrofit2/ServiceMethod.java
+index 7765aba03..a32f8101a 100644
+--- a/retrofit/src/main/java/retrofit2/ServiceMethod.java
++++ b/retrofit/src/main/java/retrofit2/ServiceMethod.java
+@@ -53,6 +53,7 @@
+ import retrofit2.http.Path;
+ import retrofit2.http.Query;
+ import retrofit2.http.QueryMap;
++import retrofit2.http.QueryName;
+ import retrofit2.http.Url;
+ 
+ /** Adapts an invocation of an interface method into an HTTP call. */
+@@ -429,6 +430,35 @@ private Headers parseHeaders(String[] headers) {
+           return new ParameterHandler.Query<>(name, converter, encoded);
+         }
+ 
++      } else if (annotation instanceof QueryName) {
++        QueryName query = (QueryName) annotation;
++        boolean encoded = query.encoded();
++
++        Class<?> rawParameterType = Utils.getRawType(type);
++        gotQuery = true;
++        if (Iterable.class.isAssignableFrom(rawParameterType)) {
++          if (!(type instanceof ParameterizedType)) {
++            throw parameterError(p, rawParameterType.getSimpleName()
++                + " must include generic type (e.g., "
++                + rawParameterType.getSimpleName()
++                + "<String>)");
++          }
++          ParameterizedType parameterizedType = (ParameterizedType) type;
++          Type iterableType = Utils.getParameterUpperBound(0, parameterizedType);
++          Converter<?, String> converter =
++              retrofit.stringConverter(iterableType, annotations);
++          return new ParameterHandler.QueryName<>(converter, encoded).iterable();
++        } else if (rawParameterType.isArray()) {
++          Class<?> arrayComponentType = boxIfPrimitive(rawParameterType.getComponentType());
++          Converter<?, String> converter =
++              retrofit.stringConverter(arrayComponentType, annotations);
++          return new ParameterHandler.QueryName<>(converter, encoded).array();
++        } else {
++          Converter<?, String> converter =
++              retrofit.stringConverter(type, annotations);
++          return new ParameterHandler.QueryName<>(converter, encoded);
++        }
++
+       } else if (annotation instanceof QueryMap) {
+         Class<?> rawParameterType = Utils.getRawType(type);
+         if (!Map.class.isAssignableFrom(rawParameterType)) {
+diff --git a/retrofit/src/main/java/retrofit2/http/Query.java b/retrofit/src/main/java/retrofit2/http/Query.java
+index 01d294f3a..614795009 100644
+--- a/retrofit/src/main/java/retrofit2/http/Query.java
++++ b/retrofit/src/main/java/retrofit2/http/Query.java
+@@ -31,35 +31,36 @@
+  * <p>
+  * Simple Example:
+  * <pre><code>
+- * &#64;GET("/list")
+- * Call&lt;ResponseBody&gt; list(@Query("page") int page);
++ * &#64;GET("/friends")
++ * Call&lt;ResponseBody&gt; friends(@Query("page") int page);
+  * </code></pre>
+- * Calling with {@code foo.list(1)} yields {@code /list?page=1}.
++ * Calling with {@code foo.friends(1)} yields {@code /friends?page=1}.
+  * <p>
+  * Example with {@code null}:
+  * <pre><code>
+- * &#64;GET("/list")
+- * Call&lt;ResponseBody&gt; list(@Query("category") String category);
++ * &#64;GET("/friends")
++ * Call&lt;ResponseBody&gt; friends(@Query("group") String group);
+  * </code></pre>
+- * Calling with {@code foo.list(null)} yields {@code /list}.
++ * Calling with {@code foo.friends(null)} yields {@code /friends}.
+  * <p>
+  * Array/Varargs Example:
+  * <pre><code>
+- * &#64;GET("/list")
+- * Call&lt;ResponseBody&gt; list(@Query("category") String... categories);
++ * &#64;GET("/friends")
++ * Call&lt;ResponseBody&gt; friends(@Query("group") String... groups);
+  * </code></pre>
+- * Calling with {@code foo.list("bar", "baz")} yields
+- * {@code /list?category=bar&category=baz}.
++ * Calling with {@code foo.friends("coworker", "bowling")} yields
++ * {@code /friends?group=coworker&group=bowling}.
+  * <p>
+  * Parameter names and values are URL encoded by default. Specify {@link #encoded() encoded=true}
+  * to change this behavior.
+  * <pre><code>
+- * &#64;GET("/search")
+- * Call&lt;ResponseBody&gt; list(@Query(value="foo", encoded=true) String foo);
++ * &#64;GET("/friends")
++ * Call&lt;ResponseBody&gt; friends(@Query(value="group", encoded=true) String group);
+  * </code></pre>
+- * Calling with {@code foo.list("foo+bar"))} yields {@code /search?foo=foo+bar}.
++ * Calling with {@code foo.friends("foo+bar"))} yields {@code /friends?group=foo+bar}.
+  *
+  * @see QueryMap
++ * @see QueryName
+  */
+ @Documented
+ @Target(PARAMETER)
+diff --git a/retrofit/src/main/java/retrofit2/http/QueryMap.java b/retrofit/src/main/java/retrofit2/http/QueryMap.java
+index 27e6ae836..119a59381 100644
+--- a/retrofit/src/main/java/retrofit2/http/QueryMap.java
++++ b/retrofit/src/main/java/retrofit2/http/QueryMap.java
+@@ -29,24 +29,25 @@
+  * <p>
+  * Simple Example:
+  * <pre><code>
+- * &#64;GET("/search")
+- * Call&lt;ResponseBody&gt; list(@QueryMap Map&lt;String, String&gt; filters);
++ * &#64;GET("/friends")
++ * Call&lt;ResponseBody&gt; friends(@QueryMap Map&lt;String, String&gt; filters);
+  * </code></pre>
+- * Calling with {@code foo.list(ImmutableMap.of("foo", "bar", "kit", "kat"))} yields
+- * {@code /search?foo=bar&kit=kat}.
++ * Calling with {@code foo.friends(ImmutableMap.of("group", "coworker", "age", "42"))} yields
++ * {@code /friends?group=coworker&age=42}.
+  * <p>
+  * Map keys and values representing parameter values are URL encoded by default. Specify
+  * {@link #encoded() encoded=true} to change this behavior.
+  * <pre><code>
+- * &#64;GET("/search")
+- * Call&lt;ResponseBody&gt; list(@QueryMap(encoded=true) Map&lt;String, String&gt; filters);
++ * &#64;GET("/friends")
++ * Call&lt;ResponseBody&gt; friends(@QueryMap(encoded=true) Map&lt;String, String&gt; filters);
+  * </code></pre>
+- * Calling with {@code foo.list(ImmutableMap.of("foo", "foo+bar"))} yields
+- * {@code /search?foo=foo+bar}.
++ * Calling with {@code foo.list(ImmutableMap.of("group", "coworker+bowling"))} yields
++ * {@code /search?group=coworker+bowling}.
+  * <p>
+  * A {@code null} value for the map, as a key, or as a value is not allowed.
+  *
+  * @see Query
++ * @see QueryName
+  */
+ @Documented
+ @Target(PARAMETER)
+diff --git a/retrofit/src/main/java/retrofit2/http/QueryName.java b/retrofit/src/main/java/retrofit2/http/QueryName.java
+new file mode 100644
+index 000000000..5d6f0e948
+--- /dev/null
++++ b/retrofit/src/main/java/retrofit2/http/QueryName.java
+@@ -0,0 +1,65 @@
++/*
++ * Copyright (C) 2013 Square, Inc.
++ *
++ * Licensed under the Apache License, Version 2.0 (the "License");
++ * you may not use this file except in compliance with the License.
++ * You may obtain a copy of the License at
++ *
++ *      http://www.apache.org/licenses/LICENSE-2.0
++ *
++ * Unless required by applicable law or agreed to in writing, software
++ * distributed under the License is distributed on an "AS IS" BASIS,
++ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++ * See the License for the specific language governing permissions and
++ * limitations under the License.
++ */
++package retrofit2.http;
++
++import java.lang.annotation.Documented;
++import java.lang.annotation.Retention;
++import java.lang.annotation.Target;
++
++import static java.lang.annotation.ElementType.PARAMETER;
++import static java.lang.annotation.RetentionPolicy.RUNTIME;
++
++/**
++ * Query parameter appended to the URL that has no value.
++ * <p>
++ * Passing a {@link java.util.List List} or array will result in a query parameter for each
++ * non-{@code null} item.
++ * <p>
++ * Simple Example:
++ * <pre><code>
++ * &#64;GET("/friends")
++ * Call&lt;ResponseBody&gt; friends(@QueryName String filter);
++ * </code></pre>
++ * Calling with {@code foo.friends("contains(Bob)")} yields {@code /friends?contains(Bob)}.
++ * <p>
++ * Array/Varargs Example:
++ * <pre><code>
++ * &#64;GET("/friends")
++ * Call&lt;ResponseBody&gt; friends(@QueryName String... filters);
++ * </code></pre>
++ * Calling with {@code foo.friends("contains(Bob)", "age(42)")} yields
++ * {@code /friends?contains(Bob)&age(42)}.
++ * <p>
++ * Parameter names are URL encoded by default. Specify {@link #encoded() encoded=true} to change
++ * this behavior.
++ * <pre><code>
++ * &#64;GET("/friends")
++ * Call&lt;ResponseBody&gt; friends(@QueryName(encoded=true) String filter);
++ * </code></pre>
++ * Calling with {@code foo.friends("name+age"))} yields {@code /friends?name+age}.
++ *
++ * @see Query
++ * @see QueryMap
++ */
++@Documented
++@Target(PARAMETER)
++@Retention(RUNTIME)
++public @interface QueryName {
++  /**
++   * Specifies whether the parameter is already URL encoded.
++   */
++  boolean encoded() default false;
++}
+diff --git a/retrofit/src/test/java/retrofit2/RequestBuilderTest.java b/retrofit/src/test/java/retrofit2/RequestBuilderTest.java
+index 0f3b5ebe6..a2ef1376b 100644
+--- a/retrofit/src/test/java/retrofit2/RequestBuilderTest.java
++++ b/retrofit/src/test/java/retrofit2/RequestBuilderTest.java
+@@ -57,6 +57,7 @@
+ import retrofit2.http.Path;
+ import retrofit2.http.Query;
+ import retrofit2.http.QueryMap;
++import retrofit2.http.QueryName;
+ import retrofit2.http.Url;
+ 
+ import static org.assertj.core.api.Assertions.assertThat;
+@@ -1059,11 +1060,11 @@
+       }
+     }
+ 
+-    List<Object> values = Arrays.<Object>asList(1, 2, null, "three");
++    List<Object> values = Arrays.<Object>asList(1, 2, null, "three", "1");
+     Request request = buildRequest(Example.class, values);
+     assertThat(request.method()).isEqualTo("GET");
+     assertThat(request.headers().size()).isZero();
+-    assertThat(request.url().toString()).isEqualTo("http://example.com/foo/bar/?key=1&key=2&key=three");
++    assertThat(request.url().toString()).isEqualTo("http://example.com/foo/bar/?key=1&key=2&key=three&key=1");
+     assertThat(request.body()).isNull();
+   }
+ 
+@@ -1075,11 +1076,11 @@
+       }
+     }
+ 
+-    Object[] values = { 1, 2, null, "three" };
++    Object[] values = { 1, 2, null, "three", "1" };
+     Request request = buildRequest(Example.class, new Object[] { values });
+     assertThat(request.method()).isEqualTo("GET");
+     assertThat(request.headers().size()).isZero();
+-    assertThat(request.url().toString()).isEqualTo("http://example.com/foo/bar/?key=1&key=2&key=three");
++    assertThat(request.url().toString()).isEqualTo("http://example.com/foo/bar/?key=1&key=2&key=three&key=1");
+     assertThat(request.body()).isNull();
+   }
+ 
+@@ -1091,11 +1092,98 @@
+       }
+     }
+ 
+-    int[] values = { 1, 2, 3 };
++    int[] values = { 1, 2, 3, 1 };
++    Request request = buildRequest(Example.class, new Object[] { values });
++    assertThat(request.method()).isEqualTo("GET");
++    assertThat(request.headers().size()).isZero();
++    assertThat(request.url().toString()).isEqualTo("http://example.com/foo/bar/?key=1&key=2&key=3&key=1");
++    assertThat(request.body()).isNull();
++  }
++
++  @Test public void getWithQueryNameParam() {
++    class Example {
++      @GET("/foo/bar/") //
++      Call<ResponseBody> method(@QueryName String ping) {
++        return null;
++      }
++    }
++    Request request = buildRequest(Example.class, "pong");
++    assertThat(request.method()).isEqualTo("GET");
++    assertThat(request.headers().size()).isZero();
++    assertThat(request.url().toString()).isEqualTo("http://example.com/foo/bar/?pong");
++    assertThat(request.body()).isNull();
++  }
++
++  @Test public void getWithEncodedQueryNameParam() {
++    class Example {
++      @GET("/foo/bar/") //
++      Call<ResponseBody> method(@QueryName(encoded = true) String ping) {
++        return null;
++      }
++    }
++    Request request = buildRequest(Example.class, "p%20o%20n%20g");
++    assertThat(request.method()).isEqualTo("GET");
++    assertThat(request.headers().size()).isZero();
++    assertThat(request.url().toString()).isEqualTo("http://example.com/foo/bar/?p%20o%20n%20g");
++    assertThat(request.body()).isNull();
++  }
++
++  @Test public void queryNameParamOptionalOmitsQuery() {
++    class Example {
++      @GET("/foo/bar/") //
++      Call<ResponseBody> method(@QueryName String ping) {
++        return null;
++      }
++    }
++    Request request = buildRequest(Example.class, new Object[] { null });
++    assertThat(request.url().toString()).isEqualTo("http://example.com/foo/bar/");
++  }
++
++  @Test public void getWithQueryNameParamList() {
++    class Example {
++      @GET("/foo/bar/") //
++      Call<ResponseBody> method(@QueryName List<Object> keys) {
++        return null;
++      }
++    }
++
++    List<Object> values = Arrays.<Object>asList(1, 2, null, "three", "1");
++    Request request = buildRequest(Example.class, values);
++    assertThat(request.method()).isEqualTo("GET");
++    assertThat(request.headers().size()).isZero();
++    assertThat(request.url().toString()).isEqualTo("http://example.com/foo/bar/?1&2&three&1");
++    assertThat(request.body()).isNull();
++  }
++
++  @Test public void getWithQueryNameParamArray() {
++    class Example {
++      @GET("/foo/bar/") //
++      Call<ResponseBody> method(@QueryName Object[] keys) {
++        return null;
++      }
++    }
++
++    Object[] values = { 1, 2, null, "three", "1" };
++    Request request = buildRequest(Example.class, new Object[] { values });
++    assertThat(request.method()).isEqualTo("GET");
++    assertThat(request.headers().size()).isZero();
++    assertThat(request.url().toString()).isEqualTo("http://example.com/foo/bar/?1&2&three&1");
++    assertThat(request.body()).isNull();
++  }
++
++  @Test public void getWithQueryNameParamPrimitiveArray() {
++    class Example {
++      @GET("/foo/bar/") //
++      Call<ResponseBody> method(@QueryName int[] keys) {
++        return null;
++      }
++    }
++
++    int[] values = { 1, 2, 3, 1 };
+     Request request = buildRequest(Example.class, new Object[] { values });
+     assertThat(request.method()).isEqualTo("GET");
+     assertThat(request.headers().size()).isZero();
+-    assertThat(request.url().toString()).isEqualTo("http://example.com/foo/bar/?key=1&key=2&key=3");
++    assertThat(request.url().toString()).isEqualTo("http://example.com/foo/bar/?1&2&3&1");
+     assertThat(request.body()).isNull();
+   }
+ 
+diff --git a/samples/pom.xml b/samples/pom.xml
+index 5931b34d8..e266a2b33 100644
+--- a/samples/pom.xml
++++ b/samples/pom.xml
+@@ -24,6 +24,11 @@
+       <artifactId>retrofit-mock</artifactId>
+       <version>${project.version}</version>
+     </dependency>
++    <dependency>
++      <groupId>${project.groupId}</groupId>
++      <artifactId>converter-moshi</artifactId>
++      <version>${project.version}</version>
++    </dependency>
+     <dependency>
+       <groupId>${project.groupId}</groupId>
+       <artifactId>converter-gson</artifactId>
+diff --git a/samples/src/main/java/com/example/retrofit/AnnotatedConverters.java b/samples/src/main/java/com/example/retrofit/AnnotatedConverters.java
+new file mode 100644
+index 000000000..0664d3482
+--- /dev/null
++++ b/samples/src/main/java/com/example/retrofit/AnnotatedConverters.java
+@@ -0,0 +1,155 @@
++/*
++ * Copyright (C) 2017 Square, Inc.
++ *
++ * Licensed under the Apache License, Version 2.0 (the "License");
++ * you may not use this file except in compliance with the License.
++ * You may obtain a copy of the License at
++ *
++ *      http://www.apache.org/licenses/LICENSE-2.0
++ *
++ * Unless required by applicable law or agreed to in writing, software
++ * distributed under the License is distributed on an "AS IS" BASIS,
++ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++ * See the License for the specific language governing permissions and
++ * limitations under the License.
++ */
++package com.example.retrofit;
++
++import com.google.gson.GsonBuilder;
++import java.io.IOException;
++import java.lang.annotation.Annotation;
++import java.lang.annotation.Retention;
++import java.lang.reflect.Type;
++import java.util.LinkedHashMap;
++import java.util.Map;
++import okhttp3.RequestBody;
++import okhttp3.ResponseBody;
++import okhttp3.mockwebserver.MockResponse;
++import okhttp3.mockwebserver.MockWebServer;
++import org.simpleframework.xml.Attribute;
++import org.simpleframework.xml.Default;
++import org.simpleframework.xml.DefaultType;
++import retrofit2.Call;
++import retrofit2.Converter;
++import retrofit2.Retrofit;
++import retrofit2.converter.gson.GsonConverterFactory;
++import retrofit2.converter.moshi.MoshiConverterFactory;
++import retrofit2.converter.simplexml.SimpleXmlConverterFactory;
++import retrofit2.http.GET;
++
++import static java.lang.annotation.RetentionPolicy.RUNTIME;
++
++final class AnnotatedConverters {
++  public static final class AnnotatedConverterFactory extends Converter.Factory {
++    private final Map<Class<? extends Annotation>, Converter.Factory> factories;
++
++    public static final class Builder {
++      private final Map<Class<? extends Annotation>, Converter.Factory> factories =
++          new LinkedHashMap<>();
++
++      public Builder add(Class<? extends Annotation> cls, Converter.Factory factory) {
++        if (cls == null) {
++          throw new NullPointerException("cls == null");
++        }
++        if (factory == null) {
++          throw new NullPointerException("factory == null");
++        }
++        factories.put(cls, factory);
++        return this;
++      }
++
++      public AnnotatedConverterFactory build() {
++        return new AnnotatedConverterFactory(factories);
++      }
++    }
++
++    AnnotatedConverterFactory(Map<Class<? extends Annotation>, Converter.Factory> factories) {
++      this.factories = new LinkedHashMap<>(factories);
++    }
++
++    @Override
++    public Converter<ResponseBody, ?> responseBodyConverter(Type type, Annotation[] annotations,
++        Retrofit retrofit) {
++      for (Annotation annotation : annotations) {
++        Converter.Factory factory = factories.get(annotation.annotationType());
++        if (factory != null) {
++          return factory.responseBodyConverter(type, annotations, retrofit);
++        }
++      }
++      return null;
++    }
++
++    @Override public Converter<?, RequestBody> requestBodyConverter(Type type,
++        Annotation[] parameterAnnotations, Annotation[] methodAnnotations, Retrofit retrofit) {
++      for (Annotation annotation : parameterAnnotations) {
++        Converter.Factory factory = factories.get(annotation.annotationType());
++        if (factory != null) {
++          return factory.requestBodyConverter(type, parameterAnnotations, methodAnnotations,
++              retrofit);
++        }
++      }
++      return null;
++    }
++  }
++
++  @Retention(RUNTIME) public @interface Moshi {
++  }
++
++  @Retention(RUNTIME) public @interface Gson {
++  }
++
++  @Retention(RUNTIME) public @interface SimpleXml {
++  }
++
++  @Default(value = DefaultType.FIELD) static final class Library {
++    @Attribute String name;
++  }
++
++  interface Service {
++    @GET("/") @Moshi Call<Library> exampleMoshi();
++
++    @GET("/") @Gson Call<Library> exampleGson();
++
++    @GET("/") @SimpleXml Call<Library> exampleSimpleXml();
++
++    @GET("/") Call<Library> exampleDefault();
++  }
++
++  public static void main(String... args) throws IOException {
++    MockWebServer server = new MockWebServer();
++    server.start();
++    server.enqueue(new MockResponse().setBody("{\"name\": \"Moshi\"}"));
++    server.enqueue(new MockResponse().setBody("{\"name\": \"Gson\"}"));
++    server.enqueue(new MockResponse().setBody("<user name=\"SimpleXML\"/>"));
++    server.enqueue(new MockResponse().setBody("{\"name\": \"Gson\"}"));
++
++    com.squareup.moshi.Moshi moshi = new com.squareup.moshi.Moshi.Builder().build();
++    com.google.gson.Gson gson = new GsonBuilder().create();
++    MoshiConverterFactory moshiConverterFactory = MoshiConverterFactory.create(moshi);
++    GsonConverterFactory gsonConverterFactory = GsonConverterFactory.create(gson);
++    SimpleXmlConverterFactory simpleXmlConverterFactory = SimpleXmlConverterFactory.create();
++    Retrofit retrofit = new Retrofit.Builder().baseUrl(server.url("/"))
++        .addConverterFactory(
++            new AnnotatedConverterFactory.Builder().add(Moshi.class, moshiConverterFactory)
++                .add(Gson.class, gsonConverterFactory)
++                .add(SimpleXml.class, simpleXmlConverterFactory)
++                .build())
++        .addConverterFactory(gsonConverterFactory)
++        .build();
++    Service service = retrofit.create(Service.class);
++
++    Library library1 = service.exampleMoshi().execute().body();
++    System.out.println("Library 1: " + library1.name);
++
++    Library library2 = service.exampleGson().execute().body();
++    System.out.println("Library 2: " + library2.name);
++
++    Library library3 = service.exampleSimpleXml().execute().body();
++    System.out.println("Library 3: " + library3.name);
++
++    Library library4 = service.exampleDefault().execute().body();
++    System.out.println("Library 4: " + library4.name);
++
++    server.shutdown();
++  }
++}

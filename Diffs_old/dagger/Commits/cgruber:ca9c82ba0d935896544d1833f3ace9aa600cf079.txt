@@ -1,0 +1,1739 @@
+diff --git a/compiler/src/main/java/dagger/internal/codegen/Binding.java b/compiler/src/main/java/dagger/internal/codegen/Binding.java
+index 22cae1c9f..bcfa2bd26 100644
+--- a/compiler/src/main/java/dagger/internal/codegen/Binding.java
++++ b/compiler/src/main/java/dagger/internal/codegen/Binding.java
+@@ -58,6 +58,14 @@
+     }
+   }
+ 
++  /**
++   * True if this represents a binding that refers to a type with parameters, and the
++   * parameters have been resolved based on a requesting key. For example, a ProvisionBinding for
++   * {@code List<T>} might be resolved to {@code List<Foo>} or {@code List<Bar>} depending on how
++   * it's requested.
++   */
++  abstract boolean isResolved();
++
+   /** The {@link Key} that is provided by this binding. */
+   protected abstract Key key();
+ 
+diff --git a/compiler/src/main/java/dagger/internal/codegen/BindingGraph.java b/compiler/src/main/java/dagger/internal/codegen/BindingGraph.java
+index bebdd2a6b..9d7022897 100644
+--- a/compiler/src/main/java/dagger/internal/codegen/BindingGraph.java
++++ b/compiler/src/main/java/dagger/internal/codegen/BindingGraph.java
+@@ -24,6 +24,7 @@
+ import com.google.common.collect.Maps;
+ import com.google.common.collect.Queues;
+ import dagger.Provides;
++import dagger.producers.Produces;
+ import java.util.Deque;
+ import java.util.List;
+ import java.util.Map;
+@@ -39,7 +40,9 @@
+ 
+ import static com.google.auto.common.MoreElements.isAnnotationPresent;
+ import static com.google.common.base.Preconditions.checkState;
+-import static dagger.internal.codegen.ComponentDescriptor.isComponentProvisionMethod;
++import static dagger.internal.codegen.ComponentDescriptor.Kind.PRODUCTION_COMPONENT;
++import static dagger.internal.codegen.ComponentDescriptor.isComponentContributionMethod;
++import static dagger.internal.codegen.ComponentDescriptor.isComponentProductionMethod;
+ import static dagger.internal.codegen.ConfigurationAnnotations.getComponentDependencies;
+ import static dagger.internal.codegen.ConfigurationAnnotations.getComponentModules;
+ import static dagger.internal.codegen.ConfigurationAnnotations.getTransitiveModules;
+@@ -88,41 +91,55 @@ static ResolvedBindings create(
+     private final Key.Factory keyFactory;
+     private final DependencyRequest.Factory dependencyRequestFactory;
+     private final ProvisionBinding.Factory provisionBindingFactory;
++    private final ProductionBinding.Factory productionBindingFactory;
+ 
+     Factory(Elements elements,
+         Types types,
+         InjectBindingRegistry injectBindingRegistry,
+         Key.Factory keyFactory,
+         DependencyRequest.Factory dependencyRequestFactory,
+-        ProvisionBinding.Factory provisionBindingFactory) {
++        ProvisionBinding.Factory provisionBindingFactory,
++        ProductionBinding.Factory productionBindingFactory) {
+       this.elements = elements;
+       this.types = types;
+       this.injectBindingRegistry = injectBindingRegistry;
+       this.keyFactory = keyFactory;
+       this.dependencyRequestFactory = dependencyRequestFactory;
+       this.provisionBindingFactory = provisionBindingFactory;
++      this.productionBindingFactory = productionBindingFactory;
+     }
+ 
+     BindingGraph create(ComponentDescriptor componentDescriptor) {
+-      ImmutableSet.Builder<ProvisionBinding> explicitBindingsBuilder = ImmutableSet.builder();
++      ImmutableSet.Builder<ProvisionBinding> explicitProvisionBindingsBuilder =
++          ImmutableSet.builder();
++      ImmutableSet.Builder<ProductionBinding> explicitProductionBindingsBuilder =
++          ImmutableSet.builder();
+       AnnotationMirror componentAnnotation = componentDescriptor.componentAnnotation();
+ 
+       // binding for the component itself
+       ProvisionBinding componentBinding =
+           provisionBindingFactory.forComponent(componentDescriptor.componentDefinitionType());
+-      explicitBindingsBuilder.add(componentBinding);
++      explicitProvisionBindingsBuilder.add(componentBinding);
+ 
+       // Collect Component dependencies.
+       ImmutableSet<TypeElement> componentDependencyTypes =
+           MoreTypes.asTypeElements(types, getComponentDependencies(componentAnnotation));
+       for (TypeElement componentDependency : componentDependencyTypes) {
+-        explicitBindingsBuilder.add(provisionBindingFactory.forComponent(componentDependency));
++        explicitProvisionBindingsBuilder.add(
++            provisionBindingFactory.forComponent(componentDependency));
+         List<ExecutableElement> dependencyMethods =
+             ElementFilter.methodsIn(elements.getAllMembers(componentDependency));
+         for (ExecutableElement method : dependencyMethods) {
+-          if (isComponentProvisionMethod(elements, method)) {
+-            // MembersInjection methods aren't "provided" explicitly, so ignore them.
+-            explicitBindingsBuilder.add(provisionBindingFactory.forComponentMethod(method));
++          // MembersInjection methods aren't "provided" explicitly, so ignore them.
++          if (isComponentContributionMethod(elements, method)) {
++            if (componentDescriptor.kind().equals(PRODUCTION_COMPONENT)
++                && isComponentProductionMethod(elements, method)) {
++              explicitProductionBindingsBuilder.add(
++                  productionBindingFactory.forComponentMethod(method));
++            } else {
++              explicitProvisionBindingsBuilder.add(
++                  provisionBindingFactory.forComponentMethod(method));
++            }
+           }
+         }
+       }
+@@ -138,16 +155,21 @@ BindingGraph create(ComponentDescriptor componentDescriptor) {
+         List<ExecutableElement> moduleMethods = methodsIn(elements.getAllMembers(module));
+         for (ExecutableElement moduleMethod : moduleMethods) {
+           if (isAnnotationPresent(moduleMethod, Provides.class)) {
+-            explicitBindingsBuilder.add(
++            explicitProvisionBindingsBuilder.add(
+                 provisionBindingFactory.forProvidesMethod(moduleMethod, module.asType()));
+           }
++          if (isAnnotationPresent(moduleMethod, Produces.class)) {
++            explicitProductionBindingsBuilder.add(
++                productionBindingFactory.forProducesMethod(moduleMethod, module.asType()));
++           }
+         }
+       }
+ 
+-      RequestResolver requestResolver =
+-          new RequestResolver(explicitBindingsByKey(explicitBindingsBuilder.build()));
+-      ImmutableSet<DependencyRequest> componentMethodRequests =
+-          componentMethodRequests(componentDescriptor.componentDefinitionType());
++      RequestResolver requestResolver = new RequestResolver(
++          explicitBindingsByKey(explicitProvisionBindingsBuilder.build()),
++          explicitBindingsByKey(explicitProductionBindingsBuilder.build()));
++      ImmutableSet<DependencyRequest> componentMethodRequests = componentMethodRequests(
++          componentDescriptor.componentDefinitionType(), componentDescriptor.kind());
+       for (DependencyRequest componentMethodRequest :
+           componentMethodRequests) {
+         requestResolver.resolve(componentMethodRequest);
+@@ -160,23 +182,30 @@ BindingGraph create(ComponentDescriptor componentDescriptor) {
+           ImmutableMap.copyOf(requestResolver.resolvedBindings));
+     }
+ 
+-    private ImmutableSetMultimap<Key, ProvisionBinding> explicitBindingsByKey(
+-        Iterable<ProvisionBinding> bindings) {
++    private <B extends ContributionBinding> ImmutableSetMultimap<Key, B> explicitBindingsByKey(
++        Iterable<? extends B> bindings) {
+       // Multimaps.index() doesn't do ImmutableSetMultimaps.
+-      ImmutableSetMultimap.Builder<Key, ProvisionBinding> builder = ImmutableSetMultimap.builder();
+-      for (ProvisionBinding binding : bindings) {
++      ImmutableSetMultimap.Builder<Key, B> builder = ImmutableSetMultimap.builder();
++      for (B binding : bindings) {
+         builder.put(binding.key(), binding);
+       }
+       return builder.build();
+     }
+ 
+-    private ImmutableSet<DependencyRequest> componentMethodRequests(TypeElement componentType) {
++    private ImmutableSet<DependencyRequest> componentMethodRequests(TypeElement componentType,
++        ComponentDescriptor.Kind componentKind) {
+       ImmutableSet.Builder<DependencyRequest> interfaceRequestsBuilder = ImmutableSet.builder();
+       for (ExecutableElement componentMethod : methodsIn(elements.getAllMembers(componentType))) {
+         if (componentMethod.getModifiers().contains(Modifier.ABSTRACT)) { // Elide Object.*;
+-          if (ComponentDescriptor.isComponentProvisionMethod(elements, componentMethod)) {
+-            interfaceRequestsBuilder.add(
+-                dependencyRequestFactory.forComponentProvisionMethod(componentMethod));
++          if (isComponentContributionMethod(elements, componentMethod)) {
++            if (componentKind.equals(PRODUCTION_COMPONENT)
++                && isComponentProductionMethod(elements, componentMethod)) {
++              interfaceRequestsBuilder.add(
++                  dependencyRequestFactory.forComponentProductionMethod(componentMethod));
++            } else {
++              interfaceRequestsBuilder.add(
++                  dependencyRequestFactory.forComponentProvisionMethod(componentMethod));
++            }
+           } else if (isComponentMembersInjectionMethod(componentMethod)) {
+             interfaceRequestsBuilder.add(
+                 dependencyRequestFactory.forComponentMembersInjectionMethod(componentMethod));
+@@ -197,13 +226,17 @@ private boolean isComponentMembersInjectionMethod(ExecutableElement method) {
+     }
+ 
+     private final class RequestResolver {
+-      final ImmutableSetMultimap<Key, ProvisionBinding> explicitBindings;
++      final ImmutableSetMultimap<Key, ProvisionBinding> explicitProvisionBindings;
++      final ImmutableSetMultimap<Key, ProductionBinding> explicitProductionBindings;
+       final Map<BindingKey, ResolvedBindings> resolvedBindings;
+       final Deque<BindingKey> cycleStack = Queues.newArrayDeque();
+ 
+-      RequestResolver(ImmutableSetMultimap<Key, ProvisionBinding> explicitBindings) {
+-        assert explicitBindings != null;
+-        this.explicitBindings = explicitBindings;
++      RequestResolver(ImmutableSetMultimap<Key, ProvisionBinding> explicitProvisionBindings,
++          ImmutableSetMultimap<Key, ProductionBinding> explicitProductionBindings) {
++        assert explicitProvisionBindings != null;
++        this.explicitProvisionBindings = explicitProvisionBindings;
++        assert explicitProductionBindings != null;
++        this.explicitProductionBindings = explicitProductionBindings;
+         this.resolvedBindings = Maps.newLinkedHashMap();
+       }
+ 
+@@ -212,14 +245,46 @@ private boolean isComponentMembersInjectionMethod(ExecutableElement method) {
+         switch (bindingKey.kind()) {
+           case CONTRIBUTION:
+             // First, check for explicit keys (those from modules and components)
+-            ImmutableSet<ProvisionBinding> explicitBindingsForKey =
+-                explicitBindings.get(bindingKey.key());
+-            if (explicitBindingsForKey.isEmpty()) {
+-              // If the key is Map<K, V>, get its implicit binding key which is
+-              // Map<K, Provider<V>>
+-              Optional<Key> mapProviderKey =
+-                  keyFactory.implicitMapProviderKeyFrom(bindingKey.key());
+-              if (mapProviderKey.isPresent()) {
++            ImmutableSet<ProvisionBinding> explicitProvisionBindingsForKey =
++                explicitProvisionBindings.get(bindingKey.key());
++            ImmutableSet<ProductionBinding> explicitProductionBindingsForKey =
++                explicitProductionBindings.get(bindingKey.key());
++
++            // If the key is Map<K, V>, get its implicit binding keys, which are either
++            // Map<K, Provider<V>> or Map<K, Producer<V>>, and grab their explicit bindings.
++            Optional<Key> mapProviderKey = keyFactory.implicitMapProviderKeyFrom(bindingKey.key());
++            ImmutableSet<ProvisionBinding> explicitMapProvisionBindings = ImmutableSet.of();
++            if (mapProviderKey.isPresent()) {
++              explicitMapProvisionBindings = explicitProvisionBindings.get(mapProviderKey.get());
++            }
++
++            Optional<Key> mapProducerKey = keyFactory.implicitMapProducerKeyFrom(bindingKey.key());
++            ImmutableSet<ProductionBinding> explicitMapProductionBindings = ImmutableSet.of();
++            if (mapProducerKey.isPresent()) {
++              explicitMapProductionBindings = explicitProductionBindings.get(mapProducerKey.get());
++            }
++
++            if (!explicitProvisionBindingsForKey.isEmpty()
++                || !explicitProductionBindingsForKey.isEmpty()) {
++              // we have some explicit binding for this key, so we collect all explicit implicit map
++              // bindings that might conflict with this and let the validator sort it out
++              return ImmutableSet.<ContributionBinding>builder()
++                  .addAll(explicitProvisionBindingsForKey)
++                  .addAll(explicitMapProvisionBindings)
++                  .addAll(explicitProductionBindingsForKey)
++                  .addAll(explicitMapProductionBindings)
++                  .build();
++            } else {
++              if (!explicitMapProductionBindings.isEmpty()) {
++                // if we have any explicit Map<K, Producer<V>> bindings, then this Map<K, V> binding
++                // must be considered an implicit ProductionBinding
++                DependencyRequest implicitRequest =
++                    dependencyRequestFactory.forImplicitMapBinding(request, mapProducerKey.get());
++                return ImmutableSet.of(productionBindingFactory.forImplicitMapBinding(
++                    request, implicitRequest));
++              } else if (!explicitMapProvisionBindings.isEmpty()) {
++                // if there are Map<K, Provider<V>> bindings, then it'll be an implicit
++                // ProvisionBinding
+                 DependencyRequest implicitRequest =
+                     dependencyRequestFactory.forImplicitMapBinding(request, mapProviderKey.get());
+                 return ImmutableSet.of(provisionBindingFactory.forImplicitMapBinding(
+@@ -230,18 +295,6 @@ private boolean isComponentMembersInjectionMethod(ExecutableElement method) {
+                     injectBindingRegistry.getOrFindProvisionBinding(bindingKey.key());
+                 return ImmutableSet.copyOf(provisionBinding.asSet());
+               }
+-            } else {
+-              // If this is an explicit Map<K, V> request then add in any map binding provision
+-              // methods which are implied by and must collide with explicit Map<K, V> bindings.
+-              Optional<Key> underlyingMapKey =
+-                  keyFactory.implicitMapProviderKeyFrom(bindingKey.key());
+-              if (underlyingMapKey.isPresent()) {
+-                explicitBindingsForKey = ImmutableSet.<ProvisionBinding>builder()
+-                    .addAll(explicitBindingsForKey)
+-                    .addAll(explicitBindings.get(underlyingMapKey.get()))
+-                    .build();
+-              }
+-              return explicitBindingsForKey;
+             }
+           case MEMBERS_INJECTION:
+             // no explicit deps for members injection, so just look it up
+diff --git a/compiler/src/main/java/dagger/internal/codegen/BindingGraphValidator.java b/compiler/src/main/java/dagger/internal/codegen/BindingGraphValidator.java
+index 362d3f7c5..8baeb0ed2 100644
+--- a/compiler/src/main/java/dagger/internal/codegen/BindingGraphValidator.java
++++ b/compiler/src/main/java/dagger/internal/codegen/BindingGraphValidator.java
+@@ -18,6 +18,7 @@
+ import com.google.auto.common.AnnotationMirrors;
+ import com.google.auto.common.MoreElements;
+ import com.google.auto.common.MoreTypes;
++import com.google.auto.value.AutoValue;
+ import com.google.common.base.Equivalence;
+ import com.google.common.base.Function;
+ import com.google.common.base.Joiner;
+@@ -30,7 +31,6 @@
+ import com.google.common.collect.ImmutableMap;
+ import com.google.common.collect.ImmutableSet;
+ import com.google.common.collect.Iterables;
+-import com.google.common.collect.Lists;
+ import com.google.common.collect.Ordering;
+ import dagger.Component;
+ import dagger.internal.codegen.BindingGraph.ResolvedBindings;
+@@ -41,7 +41,7 @@
+ import java.util.Deque;
+ import java.util.Formatter;
+ import java.util.HashSet;
+-import java.util.LinkedList;
++import java.util.Iterator;
+ import java.util.Set;
+ import javax.inject.Singleton;
+ import javax.lang.model.element.AnnotationMirror;
+@@ -57,7 +57,9 @@
+ import static dagger.internal.codegen.ConfigurationAnnotations.getComponentDependencies;
+ import static dagger.internal.codegen.ErrorMessages.INDENT;
+ import static dagger.internal.codegen.ErrorMessages.REQUIRES_AT_INJECT_CONSTRUCTOR_OR_PROVIDER_FORMAT;
++import static dagger.internal.codegen.ErrorMessages.REQUIRES_AT_INJECT_CONSTRUCTOR_OR_PROVIDER_OR_PRODUCER_FORMAT;
+ import static dagger.internal.codegen.ErrorMessages.REQUIRES_PROVIDER_FORMAT;
++import static dagger.internal.codegen.ErrorMessages.REQUIRES_PROVIDER_OR_PRODUCER_FORMAT;
+ import static dagger.internal.codegen.ErrorMessages.stripCommonTypePrefixes;
+ import static dagger.internal.codegen.InjectionAnnotations.getScopeAnnotation;
+ 
+@@ -67,6 +69,7 @@
+   private final InjectBindingRegistry injectBindingRegistry;
+   private final ScopeCycleValidation disableInterComponentScopeCycles;
+   private final ProvisionBindingFormatter provisionBindingFormatter;
++  private final ProductionBindingFormatter productionBindingFormatter;
+   private final MethodSignatureFormatter methodSignatureFormatter;
+   private final DependencyRequestFormatter dependencyRequestFormatter;
+   private final KeyFormatter keyFormatter;
+@@ -76,6 +79,7 @@
+       InjectBindingRegistry injectBindingRegistry,
+       ScopeCycleValidation disableInterComponentScopeCycles,
+       ProvisionBindingFormatter provisionBindingFormatter,
++      ProductionBindingFormatter productionBindingFormatter,
+       MethodSignatureFormatter methodSignatureFormatter,
+       DependencyRequestFormatter dependencyRequestFormatter,
+       KeyFormatter keyFormatter) {
+@@ -83,6 +87,7 @@
+     this.injectBindingRegistry = injectBindingRegistry;
+     this.disableInterComponentScopeCycles = disableInterComponentScopeCycles;
+     this.provisionBindingFormatter = provisionBindingFormatter;
++    this.productionBindingFormatter = productionBindingFormatter;
+     this.methodSignatureFormatter = methodSignatureFormatter;
+     this.dependencyRequestFormatter = dependencyRequestFormatter;
+     this.keyFormatter = keyFormatter;
+@@ -98,17 +103,18 @@
+     validateDependencyScopes(subject, reportBuilder);
+ 
+     for (DependencyRequest entryPoint : subject.entryPoints()) {
+-      LinkedList<DependencyRequest> requestPath = Lists.newLinkedList();
+-      requestPath.push(entryPoint);
+-      traversalHelper(subject, requestPath, new Traverser() {
++      Deque<ResolvedRequest> path = new ArrayDeque<>();
++      path.push(ResolvedRequest.create(entryPoint, subject));
++      traversalHelper(subject, path, new Traverser() {
+         final Set<BindingKey> visitedBindings = new HashSet<>();
+ 
+         @Override
+-        boolean visitResolvedBinding(
+-            Deque<DependencyRequest> requestPath, ResolvedBindings binding) {
+-          for (DependencyRequest request : Iterables.skip(requestPath, 1)) {
+-            if (BindingKey.forDependencyRequest(request).equals(binding.bindingKey())) {
+-              reportCycle(requestPath, subject, reportBuilder);
++        boolean visitResolvedRequest(Deque<ResolvedRequest> path) {
++          ResolvedBindings binding = path.peek().binding();
++          for (ResolvedRequest resolvedRequest : Iterables.skip(path, 1)) {
++            if (BindingKey.forDependencyRequest(resolvedRequest.request())
++                .equals(binding.bindingKey())) {
++              reportCycle(path, reportBuilder);
+               return false;
+             }
+           }
+@@ -117,7 +123,7 @@ boolean visitResolvedBinding(
+             return false;
+           }
+ 
+-          return validateResolvedBinding(requestPath, binding, reportBuilder);
++          return validateResolvedBinding(path, binding, reportBuilder);
+         }
+       });
+     }
+@@ -130,28 +136,33 @@ boolean visitResolvedBinding(
+    * returns true if the bindings are valid.
+    */
+   private boolean validateResolvedBinding(
+-      Deque<DependencyRequest> requestPath,
++      Deque<ResolvedRequest> path,
+       ResolvedBindings resolvedBinding,
+       Builder<BindingGraph> reportBuilder) {
+     if (resolvedBinding.bindings().isEmpty()) {
+-      reportMissingBinding(requestPath, reportBuilder);
++      reportMissingBinding(path, reportBuilder);
+       return false;
+     }
+ 
+-    ImmutableSet.Builder<ContributionBinding> contributionBindingsBuilder =
++    ImmutableSet.Builder<ProvisionBinding> provisionBindingsBuilder =
++        ImmutableSet.builder();
++    ImmutableSet.Builder<ProductionBinding> productionBindingsBuilder =
+         ImmutableSet.builder();
+     ImmutableSet.Builder<MembersInjectionBinding> membersInjectionBindingsBuilder =
+         ImmutableSet.builder();
+     for (Binding binding : resolvedBinding.bindings()) {
+-      if (binding instanceof ContributionBinding) {
+-        contributionBindingsBuilder.add((ContributionBinding) binding);
++      if (binding instanceof ProvisionBinding) {
++        provisionBindingsBuilder.add((ProvisionBinding) binding);
++      }
++      if (binding instanceof ProductionBinding) {
++        productionBindingsBuilder.add((ProductionBinding) binding);
+       }
+       if (binding instanceof MembersInjectionBinding) {
+         membersInjectionBindingsBuilder.add((MembersInjectionBinding) binding);
+       }
+     }
+-    ImmutableSet<ContributionBinding> contributionBindings =
+-        contributionBindingsBuilder.build();
++    ImmutableSet<ProvisionBinding> provisionBindings = provisionBindingsBuilder.build();
++    ImmutableSet<ProductionBinding> productionBindings = productionBindingsBuilder.build();
+     ImmutableSet<MembersInjectionBinding> membersInjectionBindings =
+         membersInjectionBindingsBuilder.build();
+ 
+@@ -161,26 +172,31 @@ private boolean validateResolvedBinding(
+           throw new IllegalArgumentException(
+               "contribution binding keys should never have members injection bindings");
+         }
+-        if (contributionBindings.size() <= 1) {
++        if (!productionBindings.isEmpty() && doesPathRequireProvisionOnly(path)) {
++          reportProviderMayNotDependOnProducer(path, reportBuilder);
++          return false;
++        }
++        if ((provisionBindings.size() + productionBindings.size()) <= 1) {
+           return true;
+         }
+         ImmutableListMultimap<BindingType, ContributionBinding> bindingsByType =
+-            ContributionBinding.bindingTypesFor(contributionBindings);
++            ContributionBinding.bindingTypesFor(
++                Iterables.<ContributionBinding>concat(provisionBindings, productionBindings));
+         if (bindingsByType.keySet().size() > 1) {
+-          reportMultipleBindingTypes(requestPath, resolvedBinding, reportBuilder);
++          reportMultipleBindingTypes(path, reportBuilder);
+           return false;
+         } else if (getOnlyElement(bindingsByType.keySet()).equals(BindingType.UNIQUE)) {
+-          reportDuplicateBindings(requestPath, resolvedBinding, reportBuilder);
++          reportDuplicateBindings(path, reportBuilder);
+           return false;
+         }
+         break;
+       case MEMBERS_INJECTION:
+-        if (!contributionBindings.isEmpty()) {
++        if (!provisionBindings.isEmpty() || !productionBindings.isEmpty()) {
+           throw new IllegalArgumentException(
+               "members injection binding keys should never have contribution bindings");
+         }
+         if (membersInjectionBindings.size() > 1) {
+-          reportDuplicateBindings(requestPath, resolvedBinding, reportBuilder);
++          reportDuplicateBindings(path, reportBuilder);
+           return false;
+         }
+         break;
+@@ -386,26 +402,51 @@ void validateComponentScope(final BindingGraph subject,
+     }
+   }
+ 
++  @SuppressWarnings("resource") // Appendable is a StringBuilder.
++  private void reportProviderMayNotDependOnProducer(
++      Deque<ResolvedRequest> path, ValidationReport.Builder<BindingGraph> reportBuilder) {
++    StringBuilder errorMessage = new StringBuilder();
++    if (path.size() == 1) {
++      new Formatter(errorMessage).format(
++          ErrorMessages.PROVIDER_ENTRY_POINT_MAY_NOT_DEPEND_ON_PRODUCER_FORMAT,
++          keyFormatter.format(path.peek().request().key()));
++    } else {
++      ImmutableSet<ProvisionBinding> dependentProvisions = provisionsDependingOnLatestRequest(path);
++      // TODO(user): Consider displaying all dependent provisions in the error message. If we do
++      // that, should we display all productions that depend on them also?
++      new Formatter(errorMessage).format(ErrorMessages.PROVIDER_MAY_NOT_DEPEND_ON_PRODUCER_FORMAT,
++          keyFormatter.format(dependentProvisions.iterator().next().key()));
++    }
++    reportBuilder.addItem(errorMessage.toString(), path.getLast().request().requestElement());
++  }
++
+   private void reportMissingBinding(
+-      Deque<DependencyRequest> requestPath, ValidationReport.Builder<BindingGraph> reportBuilder) {
+-    Key key = requestPath.peek().key();
++      Deque<ResolvedRequest> path, ValidationReport.Builder<BindingGraph> reportBuilder) {
++    Key key = path.peek().request().key();
+     TypeMirror type = key.type();
+     String typeName = TypeNames.forTypeMirror(type).toString();
+-    boolean requiresProvidesMethod = !key.isValidImplicitProvisionKey(types);
++    boolean requiresContributionMethod = !key.isValidImplicitProvisionKey(types);
++    boolean requiresProvision = doesPathRequireProvisionOnly(path);
+     StringBuilder errorMessage = new StringBuilder();
+-    if (requiresProvidesMethod) {
+-      errorMessage.append(String.format(REQUIRES_PROVIDER_FORMAT, typeName));
++    final String requiresErrorMessageFormat;
++    if (requiresContributionMethod) {
++      requiresErrorMessageFormat = requiresProvision
++          ? REQUIRES_PROVIDER_FORMAT
++          : REQUIRES_PROVIDER_OR_PRODUCER_FORMAT;
+     } else {
+-      errorMessage.append(
+-          String.format(REQUIRES_AT_INJECT_CONSTRUCTOR_OR_PROVIDER_FORMAT, typeName));
++      requiresErrorMessageFormat = requiresProvision
++          ? REQUIRES_AT_INJECT_CONSTRUCTOR_OR_PROVIDER_FORMAT
++          : REQUIRES_AT_INJECT_CONSTRUCTOR_OR_PROVIDER_OR_PRODUCER_FORMAT;
+     }
++    errorMessage.append(String.format(requiresErrorMessageFormat, typeName));
+     if (key.isValidMembersInjectionKey()
+         && !injectBindingRegistry.getOrFindMembersInjectionBinding(key).injectionSites()
+             .isEmpty()) {
+       errorMessage.append(" ").append(ErrorMessages.MEMBERS_INJECTION_DOES_NOT_IMPLY_PROVISION);
+     }
+     ImmutableList<String> printableDependencyPath =
+-        FluentIterable.from(requestPath)
++        FluentIterable.from(path)
++            .transform(REQUEST_FROM_RESOLVED_REQUEST)
+             .transform(dependencyRequestFormatter)
+             .filter(Predicates.not(Predicates.equalTo("")))
+             .toList()
+@@ -414,20 +455,74 @@ private void reportMissingBinding(
+         printableDependencyPath.subList(1, printableDependencyPath.size())) {
+       errorMessage.append("\n").append(dependency);
+     }
+-    reportBuilder.addItem(errorMessage.toString(), requestPath.getLast().requestElement());
++    reportBuilder.addItem(errorMessage.toString(), path.getLast().request().requestElement());
++  }
++
++  /**
++   * Returns whether the given dependency path would require the most recent request to be resolved
++   * by only provision bindings.
++   */
++  private boolean doesPathRequireProvisionOnly(Deque<ResolvedRequest> path) {
++    if (path.size() == 1) {
++      // if this is an entry-point, then we check the request
++      switch (path.peek().request().kind()) {
++        case INSTANCE:
++        case PROVIDER:
++        case LAZY:
++        case MEMBERS_INJECTOR:
++          return true;
++        case PRODUCER:
++        case PRODUCED:
++        case FUTURE:
++          return false;
++        default:
++          throw new AssertionError();
++      }
++    }
++    // otherwise, the second-most-recent bindings determine whether the most recent one must be a
++    // provision
++    ImmutableSet<ProvisionBinding> dependentProvisions = provisionsDependingOnLatestRequest(path);
++    return !dependentProvisions.isEmpty();
++  }
++
++  /**
++   * Returns any provision bindings resolved for the second-most-recent request in the given path;
++   * that is, returns those provision bindings that depend on the latest request in the path.
++   */
++  private ImmutableSet<ProvisionBinding> provisionsDependingOnLatestRequest(
++      Deque<ResolvedRequest> path) {
++    Iterator<ResolvedRequest> iterator = path.iterator();
++    final DependencyRequest request = iterator.next().request();
++    ResolvedRequest previousResolvedRequest = iterator.next();
++    @SuppressWarnings("unchecked")  // validated by instanceof below
++    ImmutableSet<ProvisionBinding> bindings = (ImmutableSet<ProvisionBinding>) FluentIterable
++        .from(previousResolvedRequest.binding().bindings())
++        .filter(new Predicate<Binding>() {
++            @Override public boolean apply(Binding binding) {
++              return binding instanceof ProvisionBinding
++                  && binding.implicitDependencies().contains(request);
++            }
++        }).toSet();
++    return bindings;
+   }
+ 
+   private static final int DUPLICATE_SIZE_LIMIT = 10;
+ 
+   @SuppressWarnings("resource") // Appendable is a StringBuilder.
+-  private void reportDuplicateBindings(Deque<DependencyRequest> requestPath,
+-      ResolvedBindings resolvedBinding, ValidationReport.Builder<BindingGraph> reportBuilder) {
++  private void reportDuplicateBindings(
++      Deque<ResolvedRequest> path, ValidationReport.Builder<BindingGraph> reportBuilder) {
++    ResolvedBindings resolvedBinding = path.peek().binding();
+     StringBuilder builder = new StringBuilder();
+     new Formatter(builder).format(ErrorMessages.DUPLICATE_BINDINGS_FOR_KEY_FORMAT,
+-        keyFormatter.format(requestPath.peek().key()));
++        keyFormatter.format(path.peek().request().key()));
+     for (Binding binding : Iterables.limit(resolvedBinding.bindings(), DUPLICATE_SIZE_LIMIT)) {
+       builder.append('\n').append(INDENT);
+-      builder.append(provisionBindingFormatter.format((ProvisionBinding) binding));
++      // TODO(user): Refactor the formatters so we don't need these instanceof checks.
++      if (binding instanceof ProvisionBinding) {
++        builder.append(provisionBindingFormatter.format((ProvisionBinding) binding));
++      } else if (binding instanceof ProductionBinding) {
++        builder.append(productionBindingFormatter.format((ProductionBinding) binding));
++      }
+     }
+     int numberOfOtherBindings = resolvedBinding.bindings().size() - DUPLICATE_SIZE_LIMIT;
+     if (numberOfOtherBindings > 0) {
+@@ -437,30 +532,34 @@ private void reportDuplicateBindings(Deque<DependencyRequest> requestPath,
+     if (numberOfOtherBindings > 1) {
+       builder.append('s');
+     }
+-    reportBuilder.addItem(builder.toString(), requestPath.getLast().requestElement());
++    reportBuilder.addItem(builder.toString(), path.getLast().request().requestElement());
+   }
+ 
+   @SuppressWarnings("resource") // Appendable is a StringBuilder.
+-  private void reportMultipleBindingTypes(Deque<DependencyRequest> requestPath,
+-      ResolvedBindings resolvedBinding, ValidationReport.Builder<BindingGraph> reportBuilder) {
++  private void reportMultipleBindingTypes(
++      Deque<ResolvedRequest> path, ValidationReport.Builder<BindingGraph> reportBuilder) {
++    ResolvedBindings resolvedBinding = path.peek().binding();
+     StringBuilder builder = new StringBuilder();
+     new Formatter(builder).format(ErrorMessages.MULTIPLE_BINDING_TYPES_FOR_KEY_FORMAT,
+-        keyFormatter.format(requestPath.peek().key()));
+-    @SuppressWarnings("unchecked")
+-    ImmutableListMultimap<BindingType, ProvisionBinding> bindingsByType =
+-        ProvisionBinding.bindingTypesFor((Iterable<ProvisionBinding>) resolvedBinding.bindings());
++        keyFormatter.format(path.peek().request().key()));
++    ImmutableListMultimap<BindingType, ContributionBinding> bindingsByType =
++        ContributionBinding.bindingTypesFor(resolvedBinding.contributionBindings());
+     for (BindingType type :
+         Ordering.natural().immutableSortedCopy(bindingsByType.keySet())) {
+       builder.append(INDENT);
+       builder.append(formatBindingType(type));
+       builder.append(" bindings:\n");
+-      for (ProvisionBinding binding : bindingsByType.get(type)) {
++      for (ContributionBinding binding : bindingsByType.get(type)) {
+         builder.append(INDENT).append(INDENT);
+-        builder.append(provisionBindingFormatter.format(binding));
++        if (binding instanceof ProvisionBinding) {
++          builder.append(provisionBindingFormatter.format((ProvisionBinding) binding));
++        } else if (binding instanceof ProductionBinding) {
++          builder.append(productionBindingFormatter.format((ProductionBinding) binding));
++        }
+         builder.append('\n');
+       }
+     }
+-    reportBuilder.addItem(builder.toString(), requestPath.getLast().requestElement());
++    reportBuilder.addItem(builder.toString(), path.getLast().request().requestElement());
+   }
+ 
+   private String formatBindingType(BindingType type) {
+@@ -476,14 +575,15 @@ private String formatBindingType(BindingType type) {
+     }
+   }
+ 
+-  private void reportCycle(Deque<DependencyRequest> requestPath,
+-      BindingGraph graph, final ValidationReport.Builder<BindingGraph> reportBuilder) {
+-    ImmutableList<String> printableDependencyPath = FluentIterable.from(requestPath)
++  private void reportCycle(Deque<ResolvedRequest> path,
++      final ValidationReport.Builder<BindingGraph> reportBuilder) {
++    ImmutableList<String> printableDependencyPath = FluentIterable.from(path)
++        .transform(REQUEST_FROM_RESOLVED_REQUEST)
+         .transform(dependencyRequestFormatter)
+         .filter(Predicates.not(Predicates.equalTo("")))
+         .toList()
+         .reverse();
+-    DependencyRequest rootRequest = requestPath.getLast();
++    DependencyRequest rootRequest = path.getLast().request();
+     TypeElement componentType =
+         MoreElements.asType(rootRequest.requestElement().getEnclosingElement());
+     // TODO(user): Restructure to provide a hint for the start and end of the cycle.
+@@ -496,12 +596,28 @@ private void reportCycle(Deque<DependencyRequest> requestPath,
+         rootRequest.requestElement());
+   }
+ 
+-  private void traversalHelper(BindingGraph graph, Deque<DependencyRequest> requestPath,
++  @AutoValue
++  abstract static class ResolvedRequest {
++    abstract DependencyRequest request();
++    abstract ResolvedBindings binding();
++
++    static ResolvedRequest create(DependencyRequest request, BindingGraph graph) {
++      return new AutoValue_BindingGraphValidator_ResolvedRequest(
++          request, graph.resolvedBindings().get(BindingKey.forDependencyRequest(request)));
++    }
++  }
++
++  private static final Function<ResolvedRequest, DependencyRequest> REQUEST_FROM_RESOLVED_REQUEST =
++      new Function<ResolvedRequest, DependencyRequest>() {
++        @Override public DependencyRequest apply(ResolvedRequest resolvedRequest) {
++          return resolvedRequest.request();
++        }
++      };
++
++  private void traversalHelper(BindingGraph graph, Deque<ResolvedRequest> path,
+       Traverser traverser) {
+-    ResolvedBindings resolvedBinding = graph.resolvedBindings().get(
+-        BindingKey.forDependencyRequest(requestPath.peek()));
+     ImmutableSet<DependencyRequest> allDeps =
+-        FluentIterable.from(resolvedBinding.bindings())
++        FluentIterable.from(path.peek().binding().bindings())
+             .transformAndConcat(
+                 new Function<Binding, Set<DependencyRequest>>() {
+                   @Override
+@@ -510,19 +626,18 @@ private void traversalHelper(BindingGraph graph, Deque<DependencyRequest> reques
+                   }
+                 })
+             .toSet();
+-    boolean descend = traverser.visitResolvedBinding(requestPath, resolvedBinding);
++    boolean descend = traverser.visitResolvedRequest(path);
+     if (descend) {
+       for (DependencyRequest dependency : allDeps) {
+-        requestPath.push(dependency);
+-        traversalHelper(graph, requestPath, traverser);
+-        requestPath.pop();
++        path.push(ResolvedRequest.create(dependency, graph));
++        traversalHelper(graph, path, traverser);
++        path.pop();
+       }
+     }
+   }
+ 
+   abstract static class Traverser {
+-    abstract boolean visitResolvedBinding(
+-        Deque<DependencyRequest> requestPath, ResolvedBindings binding);
++    abstract boolean visitResolvedRequest(Deque<ResolvedRequest> path);
+   }
+ 
+   /**
+diff --git a/compiler/src/main/java/dagger/internal/codegen/BindingKey.java b/compiler/src/main/java/dagger/internal/codegen/BindingKey.java
+index ed599e267..473deba64 100644
+--- a/compiler/src/main/java/dagger/internal/codegen/BindingKey.java
++++ b/compiler/src/main/java/dagger/internal/codegen/BindingKey.java
+@@ -38,6 +38,7 @@ static BindingKey forDependencyRequest(DependencyRequest request) {
+       case PROVIDER:
+       case PRODUCER:
+       case PRODUCED:
++      case FUTURE:
+         return BindingKey.create(Kind.CONTRIBUTION, request.key());
+       case MEMBERS_INJECTOR:
+         return BindingKey.create(Kind.MEMBERS_INJECTION, request.key());
+diff --git a/compiler/src/main/java/dagger/internal/codegen/ComponentDescriptor.java b/compiler/src/main/java/dagger/internal/codegen/ComponentDescriptor.java
+index adb25639e..1279496f3 100644
+--- a/compiler/src/main/java/dagger/internal/codegen/ComponentDescriptor.java
++++ b/compiler/src/main/java/dagger/internal/codegen/ComponentDescriptor.java
+@@ -22,6 +22,7 @@
+ import com.google.common.base.Optional;
+ import com.google.common.collect.ImmutableMap;
+ import com.google.common.collect.ImmutableSet;
++import com.google.common.util.concurrent.ListenableFuture;
+ import dagger.Component;
+ import dagger.producers.ProductionComponent;
+ import java.lang.annotation.Annotation;
+@@ -131,7 +132,7 @@ private ComponentDescriptor create(TypeElement componentDefinitionType, Kind kin
+         List<ExecutableElement> dependencyMethods =
+             ElementFilter.methodsIn(elements.getAllMembers(componentDependency));
+         for (ExecutableElement dependencyMethod : dependencyMethods) {
+-          if (isComponentProvisionMethod(elements, dependencyMethod)) {
++          if (isComponentContributionMethod(elements, dependencyMethod)) {
+             dependencyMethodIndex.put(dependencyMethod, componentDependency);
+           }
+         }
+@@ -148,10 +149,15 @@ private ComponentDescriptor create(TypeElement componentDefinitionType, Kind kin
+     }
+   }
+ 
+-  static boolean isComponentProvisionMethod(Elements elements, ExecutableElement method) {
++  static boolean isComponentContributionMethod(Elements elements, ExecutableElement method) {
+     return method.getParameters().isEmpty()
+         && !method.getReturnType().getKind().equals(VOID)
+         && !elements.getTypeElement(Object.class.getCanonicalName())
+             .equals(method.getEnclosingElement());
+   }
++
++  static boolean isComponentProductionMethod(Elements elements, ExecutableElement method) {
++    return isComponentContributionMethod(elements, method)
++        && MoreTypes.isTypeOf(ListenableFuture.class, method.getReturnType());
++  }
+ }
+diff --git a/compiler/src/main/java/dagger/internal/codegen/ComponentProcessor.java b/compiler/src/main/java/dagger/internal/codegen/ComponentProcessor.java
+index fdf931e71..a17f21d0e 100644
+--- a/compiler/src/main/java/dagger/internal/codegen/ComponentProcessor.java
++++ b/compiler/src/main/java/dagger/internal/codegen/ComponentProcessor.java
+@@ -69,6 +69,8 @@ public SourceVersion getSupportedSourceVersion() {
+     MethodSignatureFormatter methodSignatureFormatter = new MethodSignatureFormatter(types);
+     ProvisionBindingFormatter provisionBindingFormatter =
+         new ProvisionBindingFormatter(methodSignatureFormatter);
++    ProductionBindingFormatter productionBindingFormatter =
++        new ProductionBindingFormatter(methodSignatureFormatter);
+     DependencyRequestFormatter dependencyRequestFormatter = new DependencyRequestFormatter(types);
+     KeyFormatter keyFormatter = new KeyFormatter();
+ 
+@@ -99,7 +101,7 @@ public SourceVersion getSupportedSourceVersion() {
+     ProvisionBinding.Factory provisionBindingFactory =
+         new ProvisionBinding.Factory(elements, types, keyFactory, dependencyRequestFactory);
+     ProductionBinding.Factory productionBindingFactory =
+-        new ProductionBinding.Factory(keyFactory, dependencyRequestFactory);
++        new ProductionBinding.Factory(types, keyFactory, dependencyRequestFactory);
+ 
+     MembersInjectionBinding.Factory membersInjectionBindingFactory =
+         new MembersInjectionBinding.Factory(elements, types, keyFactory, dependencyRequestFactory);
+@@ -113,7 +115,7 @@ public SourceVersion getSupportedSourceVersion() {
+ 
+     BindingGraph.Factory bindingGraphFactory = new BindingGraph.Factory(
+         elements, types, injectBindingRegistry, keyFactory,
+-        dependencyRequestFactory, provisionBindingFactory);
++        dependencyRequestFactory, provisionBindingFactory, productionBindingFactory);
+ 
+     MapKeyGenerator mapKeyGenerator = new MapKeyGenerator(filer);
+     BindingGraphValidator bindingGraphValidator = new BindingGraphValidator(
+@@ -121,6 +123,7 @@ public SourceVersion getSupportedSourceVersion() {
+         injectBindingRegistry,
+         disableInterComponentScopeValidation(processingEnv),
+         provisionBindingFormatter,
++        productionBindingFormatter,
+         methodSignatureFormatter,
+         dependencyRequestFormatter,
+         keyFormatter);
+@@ -160,7 +163,9 @@ public SourceVersion getSupportedSourceVersion() {
+         new ProductionComponentProcessingStep(
+             messager,
+             productionComponentValidator,
+-            componentDescriptorFactory));
++            bindingGraphValidator,
++            componentDescriptorFactory,
++            bindingGraphFactory));
+   }
+ 
+   @Override
+diff --git a/compiler/src/main/java/dagger/internal/codegen/ConfigurationAnnotations.java b/compiler/src/main/java/dagger/internal/codegen/ConfigurationAnnotations.java
+index 1174af617..a8f1baab5 100644
+--- a/compiler/src/main/java/dagger/internal/codegen/ConfigurationAnnotations.java
++++ b/compiler/src/main/java/dagger/internal/codegen/ConfigurationAnnotations.java
+@@ -29,6 +29,7 @@
+ import dagger.Component;
+ import dagger.MapKey;
+ import dagger.Module;
++import dagger.producers.ProducerModule;
+ import java.util.List;
+ import java.util.Map;
+ import java.util.Queue;
+@@ -44,6 +45,7 @@
+ import static com.google.auto.common.AnnotationMirrors.getAnnotationValue;
+ import static com.google.auto.common.MoreElements.getAnnotationMirror;
+ import static com.google.common.base.Preconditions.checkNotNull;
++
+ /**
+  * Utility methods related to dagger configuration annotations (e.g.: {@link Component}
+  * and {@link Module}).
+@@ -108,7 +110,8 @@
+     for (TypeElement moduleElement = moduleQueue.poll();
+         moduleElement != null;
+         moduleElement = moduleQueue.poll()) {
+-      Optional<AnnotationMirror> moduleMirror = getAnnotationMirror(moduleElement, Module.class);
++      Optional<AnnotationMirror> moduleMirror = getAnnotationMirror(moduleElement, Module.class)
++          .or(getAnnotationMirror(moduleElement, ProducerModule.class));
+       if (moduleMirror.isPresent()) {
+         ImmutableSet.Builder<TypeElement> moduleDependenciesBuilder = ImmutableSet.builder();
+         moduleDependenciesBuilder.addAll(
+@@ -137,7 +140,8 @@ private static void addIncludesFromSuperclasses(Types types, TypeElement element
+     while(!types.isSameType(objectType, superclass)
+         && superclass.getKind().equals(TypeKind.DECLARED)) {
+       element = MoreElements.asType(types.asElement(superclass));
+-      Optional<AnnotationMirror> moduleMirror = getAnnotationMirror(element, Module.class);
++      Optional<AnnotationMirror> moduleMirror = getAnnotationMirror(element, Module.class)
++          .or(getAnnotationMirror(element, ProducerModule.class));
+       if (moduleMirror.isPresent()) {
+         builder.addAll(MoreTypes.asTypeElements(types, getModuleIncludes(moduleMirror.get())));
+       }
+diff --git a/compiler/src/main/java/dagger/internal/codegen/ContributionBinding.java b/compiler/src/main/java/dagger/internal/codegen/ContributionBinding.java
+index 688018fac..5fe1b1a06 100644
+--- a/compiler/src/main/java/dagger/internal/codegen/ContributionBinding.java
++++ b/compiler/src/main/java/dagger/internal/codegen/ContributionBinding.java
+@@ -15,11 +15,13 @@
+  */
+ package dagger.internal.codegen;
+ 
++import com.google.common.base.Optional;
+ import com.google.common.collect.ImmutableListMultimap;
+ import com.google.common.collect.Iterables;
+ import com.google.common.collect.Ordering;
+ import java.util.EnumSet;
+ import java.util.Set;
++import javax.lang.model.element.TypeElement;
+ 
+ import static com.google.common.base.Preconditions.checkArgument;
+ import static com.google.common.base.Preconditions.checkNotNull;
+@@ -47,12 +49,20 @@ boolean isMultibinding() {
+ 
+   abstract BindingType bindingType();
+ 
++  /**
++   * If this is a provision request from an {@code @Provides} or {@code @Produces} method, this will
++   * be the element that contributed it. In the case of subclassed modules, this may differ than the
++   * binding's enclosed element, as this will return the subclass whereas the enclosed element will
++   * be the superclass.
++   */
++  abstract Optional<TypeElement> contributedBy();
++
+   /**
+    * Returns the set of {@link BindingType} enum values implied by a given
+    * {@link ContributionBinding} collection.
+    */
+   static <B extends ContributionBinding> ImmutableListMultimap<BindingType, B> bindingTypesFor(
+-      Iterable<B> bindings) {
++      Iterable<? extends B> bindings) {
+     ImmutableListMultimap.Builder<BindingType, B> builder =
+         ImmutableListMultimap.builder();
+     builder.orderKeysBy(Ordering.<BindingType>natural());
+diff --git a/compiler/src/main/java/dagger/internal/codegen/DependencyRequest.java b/compiler/src/main/java/dagger/internal/codegen/DependencyRequest.java
+index 9e0952d8e..f75d51f91 100644
+--- a/compiler/src/main/java/dagger/internal/codegen/DependencyRequest.java
++++ b/compiler/src/main/java/dagger/internal/codegen/DependencyRequest.java
+@@ -23,6 +23,7 @@
+ import com.google.common.collect.FluentIterable;
+ import com.google.common.collect.ImmutableSet;
+ import com.google.common.collect.Iterables;
++import com.google.common.util.concurrent.ListenableFuture;
+ import dagger.Lazy;
+ import dagger.MembersInjector;
+ import dagger.Provides;
+@@ -66,6 +67,11 @@
+     PRODUCER,
+     /** A request for a {@link Produced}.  E.g.: {@code Produced<Blah>} */
+     PRODUCED,
++    /**
++     * A request for a {@link ListenableFuture}.  E.g.: {@code ListenableFuture<Blah>}.
++     * These can only be requested by component interfaces.
++     */
++    FUTURE,
+   }
+ 
+   abstract Kind kind();
+@@ -145,6 +151,28 @@ DependencyRequest forComponentProvisionMethod(ExecutableElement provisionMethod)
+           MoreTypes.asDeclared(provisionMethod.getEnclosingElement().asType()));
+     }
+ 
++    DependencyRequest forComponentProductionMethod(ExecutableElement productionMethod) {
++      checkNotNull(productionMethod);
++      checkArgument(productionMethod.getParameters().isEmpty(),
++          "Component production methods must be empty: %s", productionMethod);
++      TypeMirror type = productionMethod.getReturnType();
++      Optional<AnnotationMirror> qualifier = InjectionAnnotations.getQualifier(productionMethod);
++      DeclaredType container =
++          MoreTypes.asDeclared(productionMethod.getEnclosingElement().asType());
++      // Only a component production method can be a request for a ListenableFuture, so we
++      // special-case it here.
++      if (isTypeOf(ListenableFuture.class, type)) {
++        return new AutoValue_DependencyRequest(
++            Kind.FUTURE,
++            keyFactory.forQualifiedType(qualifier,
++                Iterables.getOnlyElement(((DeclaredType) type).getTypeArguments())),
++            productionMethod,
++            container);
++      } else {
++        return newDependencyRequest(productionMethod, type, qualifier, container);
++      }
++    }
++
+     DependencyRequest forComponentMembersInjectionMethod(ExecutableElement membersInjectionMethod) {
+       checkNotNull(membersInjectionMethod);
+       Optional<AnnotationMirror> qualifier =
+@@ -171,17 +199,17 @@ private DependencyRequest newDependencyRequest(Element requestElement,
+         checkArgument(!qualifier.isPresent());
+       }
+       return new AutoValue_DependencyRequest(kindAndType.kind(),
+-            keyFactory.forQualifiedType(qualifier, kindAndType.type()),
+-            requestElement,
+-            container);
++          keyFactory.forQualifiedType(qualifier, kindAndType.type()),
++          requestElement,
++          container);
+     }
+-    
++
+     @AutoValue
+     static abstract class KindAndType {
+       abstract Kind kind();
+       abstract TypeMirror type();
+     }
+-    
++
+     /**
+      * Extracts the correct requesting type & kind out a request type. For example, if a user
+      * requests Provider<Foo>, this will return Kind.PROVIDER with "Foo".
+@@ -194,19 +222,19 @@ static KindAndType extractKindAndType(TypeMirror type) {
+         return new AutoValue_DependencyRequest_Factory_KindAndType(Kind.INSTANCE, type);
+       } else if (isTypeOf(Provider.class, type)) {
+         return new AutoValue_DependencyRequest_Factory_KindAndType(Kind.PROVIDER,
+-            Iterables.getOnlyElement(((DeclaredType)type).getTypeArguments()));
++            Iterables.getOnlyElement(((DeclaredType) type).getTypeArguments()));
+       } else if (isTypeOf(Lazy.class, type)) {
+         return new AutoValue_DependencyRequest_Factory_KindAndType(Kind.LAZY,
+-            Iterables.getOnlyElement(((DeclaredType)type).getTypeArguments()));
++            Iterables.getOnlyElement(((DeclaredType) type).getTypeArguments()));
+       } else if (isTypeOf(MembersInjector.class, type)) {
+         return new AutoValue_DependencyRequest_Factory_KindAndType(Kind.MEMBERS_INJECTOR,
+-            Iterables.getOnlyElement(((DeclaredType)type).getTypeArguments()));
++            Iterables.getOnlyElement(((DeclaredType) type).getTypeArguments()));
+       } else if (isTypeOf(Producer.class, type)) {
+         return new AutoValue_DependencyRequest_Factory_KindAndType(Kind.PRODUCER,
+-            Iterables.getOnlyElement(((DeclaredType)type).getTypeArguments()));
++            Iterables.getOnlyElement(((DeclaredType) type).getTypeArguments()));
+       } else if (isTypeOf(Produced.class, type)) {
+         return new AutoValue_DependencyRequest_Factory_KindAndType(Kind.PRODUCED,
+-            Iterables.getOnlyElement(((DeclaredType)type).getTypeArguments()));
++            Iterables.getOnlyElement(((DeclaredType) type).getTypeArguments()));
+       } else {
+         return new AutoValue_DependencyRequest_Factory_KindAndType(Kind.INSTANCE, type);
+       }
+diff --git a/compiler/src/main/java/dagger/internal/codegen/ErrorMessages.java b/compiler/src/main/java/dagger/internal/codegen/ErrorMessages.java
+index 046fcbd7f..a14cf39d6 100644
+--- a/compiler/src/main/java/dagger/internal/codegen/ErrorMessages.java
++++ b/compiler/src/main/java/dagger/internal/codegen/ErrorMessages.java
+@@ -169,12 +169,25 @@
+   static final String MULTIPLE_BINDING_TYPES_FOR_KEY_FORMAT =
+       "%s has incompatible bindings:\n";
+ 
++  static final String PROVIDER_ENTRY_POINT_MAY_NOT_DEPEND_ON_PRODUCER_FORMAT =
++      "%s is a provision entry-point, which cannot depend on a production.";
++
++  static final String PROVIDER_MAY_NOT_DEPEND_ON_PRODUCER_FORMAT =
++      "%s is a provision, which cannot depend on a production.";
++
+   static final String REQUIRES_AT_INJECT_CONSTRUCTOR_OR_PROVIDER_FORMAT =
+       "%s cannot be provided without an @Inject constructor or from an @Provides-annotated method.";
+ 
+   static final String REQUIRES_PROVIDER_FORMAT =
+       "%s cannot be provided without an @Provides-annotated method.";
+ 
++  static final String REQUIRES_AT_INJECT_CONSTRUCTOR_OR_PROVIDER_OR_PRODUCER_FORMAT =
++      "%s cannot be provided without an @Inject constructor or from an @Provides- or "
++      + "@Produces-annotated method.";
++
++  static final String REQUIRES_PROVIDER_OR_PRODUCER_FORMAT =
++      "%s cannot be provided without an @Provides- or @Produces-annotated method.";
++
+   static final String MEMBERS_INJECTION_DOES_NOT_IMPLY_PROVISION =
+       "This type supports members injection but cannot be implicitly provided.";
+ 
+diff --git a/compiler/src/main/java/dagger/internal/codegen/InjectBindingRegistry.java b/compiler/src/main/java/dagger/internal/codegen/InjectBindingRegistry.java
+index 515eef6f9..145ad678f 100644
+--- a/compiler/src/main/java/dagger/internal/codegen/InjectBindingRegistry.java
++++ b/compiler/src/main/java/dagger/internal/codegen/InjectBindingRegistry.java
+@@ -63,7 +63,7 @@
+   private final MembersInjectionBinding.Factory membersInjectionBindingFactory;
+   private final MembersInjectorGenerator membersInjectorGenerator;
+ 
+-  final class BindingsCollection<B extends Binding & ResolvableBinding> {
++  final class BindingsCollection<B extends Binding> {
+     private final Map<Key, B> bindingsByKey = Maps.newLinkedHashMap();
+     private final Deque<B> bindingsRequiringGeneration = Queues.newArrayDeque();
+     private final Set<B> materializedBindings = Sets.newLinkedHashSet();
+diff --git a/compiler/src/main/java/dagger/internal/codegen/Key.java b/compiler/src/main/java/dagger/internal/codegen/Key.java
+index e2f1cea98..a7bd50761 100644
+--- a/compiler/src/main/java/dagger/internal/codegen/Key.java
++++ b/compiler/src/main/java/dagger/internal/codegen/Key.java
+@@ -26,6 +26,7 @@
+ import com.google.common.util.concurrent.ListenableFuture;
+ import dagger.MapKey;
+ import dagger.Provides;
++import dagger.producers.Producer;
+ import dagger.producers.Produces;
+ import java.util.Map;
+ import java.util.Set;
+@@ -173,6 +174,14 @@ private TypeElement getProviderElement() {
+       return elements.getTypeElement(Provider.class.getCanonicalName());
+     }
+ 
++    private TypeElement getProducerElement() {
++      return elements.getTypeElement(Producer.class.getCanonicalName());
++    }
++
++    private TypeElement getClassElement(Class<?> cls) {
++      return elements.getTypeElement(cls.getCanonicalName());
++    }
++
+     Key forComponentMethod(ExecutableElement componentMethod) {
+       checkNotNull(componentMethod);
+       checkArgument(componentMethod.getKind().equals(METHOD));
+@@ -182,6 +191,19 @@ Key forComponentMethod(ExecutableElement componentMethod) {
+           MoreTypes.equivalence().wrap(returnType));
+     }
+ 
++    Key forProductionComponentMethod(ExecutableElement componentMethod) {
++      checkNotNull(componentMethod);
++      checkArgument(componentMethod.getKind().equals(METHOD));
++      TypeMirror returnType = normalize(componentMethod.getReturnType());
++      TypeMirror keyType = returnType;
++      if (MoreTypes.isTypeOf(ListenableFuture.class, returnType)) {
++        keyType = Iterables.getOnlyElement(MoreTypes.asDeclared(returnType).getTypeArguments());
++      }
++      return new AutoValue_Key(
++          wrapOptionalInEquivalence(AnnotationMirrors.equivalence(), getQualifier(componentMethod)),
++          MoreTypes.equivalence().wrap(keyType));
++    }
++
+     Key forProvidesMethod(ExecutableType executableType, ExecutableElement e) {
+       checkNotNull(e);
+       checkArgument(e.getKind().equals(METHOD));
+@@ -225,12 +247,12 @@ Key forProvidesMethod(ExecutableType executableType, ExecutableElement e) {
+ 
+     // TODO(user): Reconcile this method with forProvidesMethod when Provides.Type and
+     // Produces.Type are no longer different.
+-    Key forProducesMethod(ExecutableElement e) {
++    Key forProducesMethod(ExecutableType executableType, ExecutableElement e) {
+       checkNotNull(e);
+       checkArgument(e.getKind().equals(METHOD));
+       Produces producesAnnotation = e.getAnnotation(Produces.class);
+       checkArgument(producesAnnotation != null);
+-      TypeMirror returnType = normalize(e.getReturnType());
++      TypeMirror returnType = normalize(executableType.getReturnType());
+       TypeMirror keyType = returnType;
+       if (MoreTypes.isTypeOf(ListenableFuture.class, returnType)) {
+         keyType = Iterables.getOnlyElement(MoreTypes.asDeclared(returnType).getTypeArguments());
+@@ -252,7 +274,7 @@ Key forProducesMethod(ExecutableElement e) {
+           TypeElement keyTypeElement =
+               mapKey.unwrapValue() ? Util.getKeyTypeElement(mapKeyAnnotation, elements)
+                   : (TypeElement) mapKeyAnnotation.getAnnotationType().asElement();
+-          TypeMirror valueType = types.getDeclaredType(getProviderElement(), keyType);
++          TypeMirror valueType = types.getDeclaredType(getProducerElement(), keyType);
+           TypeMirror mapType =
+               types.getDeclaredType(getMapElement(), keyTypeElement.asType(), valueType);
+           return new AutoValue_Key(
+@@ -300,13 +322,31 @@ Key forQualifiedType(Optional<AnnotationMirror> qualifier, TypeMirror type) {
+      * {@link Map}{@code <K, V>}, a key of {@code Map<K, Provider<V>>} will be returned.
+      */
+     Optional<Key> implicitMapProviderKeyFrom(Key possibleMapKey) {
++      return maybeWrapMapValue(possibleMapKey, Provider.class);
++    }
++
++    /**
++     * Optionally extract a {@link Key} for the underlying production binding(s) if such a
++     * valid key can be inferred from the given key.  Specifically, if the key represents a
++     * {@link Map}{@code <K, V>}, a key of {@code Map<K, Producer<V>>} will be returned.
++     */
++    Optional<Key> implicitMapProducerKeyFrom(Key possibleMapKey) {
++      return maybeWrapMapValue(possibleMapKey, Producer.class);
++    }
++
++    /**
++     * Returns a key of {@link Map}{@code <K, WrappingClass<V>>} if the input key represents a
++     * {@code Map<K, V>}.
++     */
++    private Optional<Key> maybeWrapMapValue(Key possibleMapKey, Class<?> wrappingClass) {
+       if (MoreTypes.isTypeOf(Map.class, possibleMapKey.type())) {
+         DeclaredType declaredMapType = MoreTypes.asDeclared(possibleMapKey.type());
+         TypeMirror mapValueType = Util.getValueTypeOfMap(declaredMapType);
+-        if (!MoreTypes.isTypeOf(Provider.class, mapValueType)) {
++        if (!MoreTypes.isTypeOf(wrappingClass, mapValueType)) {
+           DeclaredType keyType = Util.getKeyTypeOfMap(declaredMapType);
+-          DeclaredType providerType = types.getDeclaredType(getProviderElement(), mapValueType);
+-          TypeMirror mapType = types.getDeclaredType(getMapElement(), keyType, providerType);
++          DeclaredType wrappedType = types.getDeclaredType(
++              getClassElement(wrappingClass), mapValueType);
++          TypeMirror mapType = types.getDeclaredType(getMapElement(), keyType, wrappedType);
+           return Optional.<Key>of(new AutoValue_Key(
+               possibleMapKey.wrappedQualifier(),
+               MoreTypes.equivalence().wrap(mapType)));
+diff --git a/compiler/src/main/java/dagger/internal/codegen/MembersInjectionBinding.java b/compiler/src/main/java/dagger/internal/codegen/MembersInjectionBinding.java
+index 14b2fb2a9..dea62cb39 100644
+--- a/compiler/src/main/java/dagger/internal/codegen/MembersInjectionBinding.java
++++ b/compiler/src/main/java/dagger/internal/codegen/MembersInjectionBinding.java
+@@ -52,7 +52,7 @@
+  * @since 2.0
+  */
+ @AutoValue
+-abstract class MembersInjectionBinding extends Binding implements ResolvableBinding {
++abstract class MembersInjectionBinding extends Binding {
+   @Override abstract TypeElement bindingElement();
+ 
+   /** The set of individual sites where {@link Inject} is applied. */
+diff --git a/compiler/src/main/java/dagger/internal/codegen/ProducerModuleProcessingStep.java b/compiler/src/main/java/dagger/internal/codegen/ProducerModuleProcessingStep.java
+index 9fd3161a3..3e7d81dc6 100644
+--- a/compiler/src/main/java/dagger/internal/codegen/ProducerModuleProcessingStep.java
++++ b/compiler/src/main/java/dagger/internal/codegen/ProducerModuleProcessingStep.java
+@@ -116,7 +116,8 @@ public void process(SetMultimap<Class<? extends Annotation>, Element> elementsBy
+                 .transform(new Function<ExecutableElement, ProductionBinding>() {
+                   @Override
+                   public ProductionBinding apply(ExecutableElement producesMethod) {
+-                    return productionBindingFactory.forProducesMethod(producesMethod);
++                    return productionBindingFactory.forProducesMethod(producesMethod,
++                        producesMethod.getEnclosingElement().asType());
+                   }
+                 })
+                 .toSet();
+diff --git a/compiler/src/main/java/dagger/internal/codegen/ProductionBinding.java b/compiler/src/main/java/dagger/internal/codegen/ProductionBinding.java
+index 0a8e946ec..749712a3c 100644
+--- a/compiler/src/main/java/dagger/internal/codegen/ProductionBinding.java
++++ b/compiler/src/main/java/dagger/internal/codegen/ProductionBinding.java
+@@ -17,12 +17,18 @@
+ 
+ import com.google.auto.common.MoreTypes;
+ import com.google.auto.value.AutoValue;
++import com.google.common.base.Optional;
+ import com.google.common.collect.ImmutableList;
+ import com.google.common.collect.ImmutableSet;
+ import com.google.common.util.concurrent.ListenableFuture;
+ import dagger.producers.Produces;
+ import javax.lang.model.element.ExecutableElement;
++import javax.lang.model.element.TypeElement;
++import javax.lang.model.type.DeclaredType;
++import javax.lang.model.type.ExecutableType;
++import javax.lang.model.type.TypeKind;
+ import javax.lang.model.type.TypeMirror;
++import javax.lang.model.util.Types;
+ 
+ import static com.google.common.base.Preconditions.checkArgument;
+ import static com.google.common.base.Preconditions.checkNotNull;
+@@ -47,6 +53,11 @@
+     IMMEDIATE,
+     /** Represents a binding configured by {@link Produces} that returns a future. */
+     FUTURE_PRODUCTION,
++    /**
++     * Represents a binding from a production method on a component dependency that returns a
++     * future. Methods that return immediate values are considered provision bindings.
++     */
++    COMPONENT_PRODUCTION,
+   }
+ 
+   /**
+@@ -77,33 +88,82 @@ BindingType bindingType() {
+   }
+ 
+   static final class Factory {
++    private final Types types;
+     private final Key.Factory keyFactory;
+     private final DependencyRequest.Factory dependencyRequestFactory;
+ 
+-    Factory(Key.Factory keyFactory, DependencyRequest.Factory dependencyRequestFactory) {
++    Factory(Types types,
++        Key.Factory keyFactory,
++        DependencyRequest.Factory
++        dependencyRequestFactory) {
++      this.types = types;
+       this.keyFactory = keyFactory;
+       this.dependencyRequestFactory = dependencyRequestFactory;
+     }
+ 
+-    ProductionBinding forProducesMethod(ExecutableElement producesMethod) {
++    ProductionBinding forProducesMethod(
++        ExecutableElement producesMethod, TypeMirror contributedBy) {
+       checkNotNull(producesMethod);
+       checkArgument(producesMethod.getKind().equals(METHOD));
++      checkArgument(contributedBy.getKind().equals(TypeKind.DECLARED));
+       Produces producesAnnotation = producesMethod.getAnnotation(Produces.class);
+       checkArgument(producesAnnotation != null);
+-      Key key = keyFactory.forProducesMethod(producesMethod);
++      DeclaredType declaredContainer = MoreTypes.asDeclared(contributedBy);
++      ExecutableType resolvedMethod =
++          MoreTypes.asExecutable(types.asMemberOf(declaredContainer, producesMethod));
++      Key key = keyFactory.forProducesMethod(resolvedMethod, producesMethod);
+       ImmutableSet<DependencyRequest> dependencies =
+-          dependencyRequestFactory.forRequiredVariables(producesMethod.getParameters());
++          dependencyRequestFactory.forRequiredResolvedVariables(
++              declaredContainer,
++              producesMethod.getParameters(),
++              resolvedMethod.getParameterTypes());
+       Kind kind = MoreTypes.isTypeOf(ListenableFuture.class, producesMethod.getReturnType())
+           ? Kind.FUTURE_PRODUCTION
+           : Kind.IMMEDIATE;
+       return new AutoValue_ProductionBinding(
++          false /* not resolved */,
+           key,
+           producesMethod,
+           dependencies,
+           findBindingPackage(key),
++          Optional.of(MoreTypes.asTypeElement(types, declaredContainer)),
+           kind,
+           producesAnnotation.type(),
+           ImmutableList.copyOf(producesMethod.getThrownTypes()));
+     }
++
++    ProductionBinding forImplicitMapBinding(DependencyRequest explicitRequest,
++        DependencyRequest implicitRequest) {
++      checkNotNull(explicitRequest);
++      checkNotNull(implicitRequest);
++      ImmutableSet<DependencyRequest> dependencies = ImmutableSet.of(implicitRequest);
++      return new AutoValue_ProductionBinding(
++          false /* not resolved */,
++          explicitRequest.key(),
++          implicitRequest.requestElement(),
++          dependencies,
++          findBindingPackage(explicitRequest.key()),
++          Optional.<TypeElement>absent(),
++          Kind.FUTURE_PRODUCTION,
++          Produces.Type.MAP,
++          ImmutableList.of());
++    }
++
++    ProductionBinding forComponentMethod(ExecutableElement componentMethod) {
++      checkNotNull(componentMethod);
++      checkArgument(componentMethod.getKind().equals(METHOD));
++      checkArgument(componentMethod.getParameters().isEmpty());
++      checkArgument(MoreTypes.isTypeOf(ListenableFuture.class, componentMethod.getReturnType()));
++      return new AutoValue_ProductionBinding(
++          false /* not resolved */,
++          keyFactory.forProductionComponentMethod(componentMethod),
++          componentMethod,
++          ImmutableSet.<DependencyRequest>of(),
++          Optional.<String>absent(),
++          Optional.<TypeElement>absent(),
++          Kind.COMPONENT_PRODUCTION,
++          Produces.Type.UNIQUE,
++          ImmutableList.copyOf(componentMethod.getThrownTypes()));
++    }
+   }
+ }
+diff --git a/compiler/src/main/java/dagger/internal/codegen/ProductionBindingFormatter.java b/compiler/src/main/java/dagger/internal/codegen/ProductionBindingFormatter.java
+new file mode 100644
+index 000000000..e7e7e778a
+--- /dev/null
++++ b/compiler/src/main/java/dagger/internal/codegen/ProductionBindingFormatter.java
+@@ -0,0 +1,49 @@
++/*
++ * Copyright (C) 2014 Google, Inc.
++ *
++ * Licensed under the Apache License, Version 2.0 (the "License");
++ * you may not use this file except in compliance with the License.
++ * You may obtain a copy of the License at
++ *
++ * http://www.apache.org/licenses/LICENSE-2.0
++ *
++ * Unless required by applicable law or agreed to in writing, software
++ * distributed under the License is distributed on an "AS IS" BASIS,
++ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++ * See the License for the specific language governing permissions and
++ * limitations under the License.
++ */
++package dagger.internal.codegen;
++
++import com.google.common.base.Optional;
++
++import static com.google.auto.common.MoreElements.asExecutable;
++import static com.google.auto.common.MoreTypes.asDeclared;
++
++/**
++ * Formats a {@link ProductionBinding} into a {@link String} suitable for use in error messages.
++ *
++ * @author Jesse Beder
++ * @since 2.0
++ */
++final class ProductionBindingFormatter extends Formatter<ProductionBinding> {
++  private final MethodSignatureFormatter methodSignatureFormatter;
++
++  ProductionBindingFormatter(MethodSignatureFormatter methodSignatureFormatter) {
++    this.methodSignatureFormatter = methodSignatureFormatter;
++  }
++
++  @Override public String format(ProductionBinding binding) {
++    switch (binding.bindingKind()) {
++      case IMMEDIATE:
++      case FUTURE_PRODUCTION:
++        return methodSignatureFormatter.format(asExecutable(binding.bindingElement()),
++            Optional.of(asDeclared(binding.contributedBy().get().asType())));
++      case COMPONENT_PRODUCTION:
++        return methodSignatureFormatter.format(asExecutable(binding.bindingElement()));
++      default:
++        throw new UnsupportedOperationException(
++            "Not yet supporting " + binding.bindingKind() + " binding types.");
++    }
++  }
++}
+diff --git a/compiler/src/main/java/dagger/internal/codegen/ProductionComponentProcessingStep.java b/compiler/src/main/java/dagger/internal/codegen/ProductionComponentProcessingStep.java
+index 7e2c667d3..94f1e330b 100644
+--- a/compiler/src/main/java/dagger/internal/codegen/ProductionComponentProcessingStep.java
++++ b/compiler/src/main/java/dagger/internal/codegen/ProductionComponentProcessingStep.java
+@@ -35,15 +35,21 @@
+ final class ProductionComponentProcessingStep implements ProcessingStep {
+   private final Messager messager;
+   private final ProductionComponentValidator componentValidator;
++  private final BindingGraphValidator bindingGraphValidator;
+   private final ComponentDescriptor.Factory componentDescriptorFactory;
++  private final BindingGraph.Factory bindingGraphFactory;
+ 
+   ProductionComponentProcessingStep(
+       Messager messager,
+       ProductionComponentValidator componentValidator,
+-      ComponentDescriptor.Factory componentDescriptorFactory) {
++      BindingGraphValidator bindingGraphValidator,
++      ComponentDescriptor.Factory componentDescriptorFactory,
++      BindingGraph.Factory bindingGraphFactory) {
+     this.messager = messager;
+     this.componentValidator = componentValidator;
++    this.bindingGraphValidator = bindingGraphValidator;
+     this.componentDescriptorFactory = componentDescriptorFactory;
++    this.bindingGraphFactory = bindingGraphFactory;
+   }
+ 
+   @Override
+@@ -61,7 +67,12 @@ public void process(SetMultimap<Class<? extends Annotation>, Element> elementsBy
+           componentValidator.validate(componentTypeElement);
+       componentReport.printMessagesTo(messager);
+       if (componentReport.isClean()) {
+-        componentDescriptorFactory.forProductionComponent(componentTypeElement);
++        ComponentDescriptor componentDescriptor =
++            componentDescriptorFactory.forProductionComponent(componentTypeElement);
++        BindingGraph bindingGraph = bindingGraphFactory.create(componentDescriptor);
++        ValidationReport<BindingGraph> graphReport =
++            bindingGraphValidator.validate(bindingGraph);
++        graphReport.printMessagesTo(messager);
+       }
+     }
+   }
+diff --git a/compiler/src/main/java/dagger/internal/codegen/ProvisionBinding.java b/compiler/src/main/java/dagger/internal/codegen/ProvisionBinding.java
+index fcd2e7ec7..258694ded 100644
+--- a/compiler/src/main/java/dagger/internal/codegen/ProvisionBinding.java
++++ b/compiler/src/main/java/dagger/internal/codegen/ProvisionBinding.java
+@@ -25,6 +25,7 @@
+ import com.google.common.collect.Sets;
+ import dagger.Component;
+ import dagger.Provides;
++import dagger.producers.ProductionComponent;
+ import javax.inject.Inject;
+ import javax.lang.model.element.AnnotationMirror;
+ import javax.lang.model.element.Element;
+@@ -59,7 +60,7 @@
+  * @since 2.0
+  */
+ @AutoValue
+-abstract class ProvisionBinding extends ContributionBinding implements ResolvableBinding {
++abstract class ProvisionBinding extends ContributionBinding {
+   @Override
+   ImmutableSet<DependencyRequest> implicitDependencies() {
+     return new ImmutableSet.Builder<DependencyRequest>()
+@@ -107,13 +108,6 @@
+ 
+   /** If this provision requires members injection, this will be the corresponding request. */
+   abstract Optional<DependencyRequest> memberInjectionRequest();
+-  
+-  /**
+-   * If this is a provision request from an {@code @Provides} method, this will be the element that
+-   * contributed it. In the case of subclassed modules, this may differ than the binding's enclosed
+-   * element, as this will return the subclass whereas the enclosed element will be the superclass.
+-   */
+-  abstract Optional<TypeElement> contributedBy();
+ 
+   @Override
+   BindingType bindingType() {
+@@ -209,11 +203,11 @@ ProvisionBinding forInjectConstructor(ExecutableElement constructorElement,
+           constructorElement,
+           dependencies,
+           findBindingPackage(key),
++          Optional.<TypeElement>absent(),
+           Kind.INJECTION,
+           Provides.Type.UNIQUE,
+           wrapOptionalInEquivalence(AnnotationMirrors.equivalence(), scope),
+-          membersInjectionRequest,
+-          Optional.<TypeElement>absent());
++          membersInjectionRequest);
+     }
+ 
+     private static final ImmutableSet<ElementKind> MEMBER_KINDS =
+@@ -256,11 +250,11 @@ ProvisionBinding forProvidesMethod(ExecutableElement providesMethod, TypeMirror
+           providesMethod,
+           dependencies,
+           findBindingPackage(key),
++          Optional.of(MoreTypes.asTypeElement(types, declaredContainer)),
+           Kind.PROVISION,
+           providesAnnotation.type(),
+           wrapOptionalInEquivalence(AnnotationMirrors.equivalence(), scope),
+-          Optional.<DependencyRequest>absent(),
+-          Optional.of(MoreTypes.asTypeElement(types, declaredContainer)));
++          Optional.<DependencyRequest>absent());
+     }
+ 
+     ProvisionBinding forImplicitMapBinding(DependencyRequest explicitRequest,
+@@ -275,28 +269,28 @@ ProvisionBinding forImplicitMapBinding(DependencyRequest explicitRequest,
+           implicitRequest.requestElement(),
+           dependencies,
+           findBindingPackage(explicitRequest.key()),
++          Optional.<TypeElement>absent(),
+           Kind.SYNTHETIC_PROVISON,
+           Provides.Type.MAP,
+           wrapOptionalInEquivalence(AnnotationMirrors.equivalence(), scope),
+-          Optional.<DependencyRequest>absent(),
+-          Optional.<TypeElement>absent());
++          Optional.<DependencyRequest>absent());
+     }
+ 
+     ProvisionBinding forComponent(TypeElement componentDefinitionType) {
+       checkNotNull(componentDefinitionType);
+-      Component componentAnnotation = componentDefinitionType.getAnnotation(Component.class);
+-      checkArgument(componentAnnotation != null);
++      checkArgument(isAnnotationPresent(componentDefinitionType, Component.class)
++          || isAnnotationPresent(componentDefinitionType, ProductionComponent.class));
+       return new AutoValue_ProvisionBinding(
+           false /* not resolved */,
+           keyFactory.forComponent(componentDefinitionType.asType()),
+           componentDefinitionType,
+           ImmutableSet.<DependencyRequest>of(),
+           Optional.<String>absent(),
++          Optional.<TypeElement>absent(),
+           Kind.COMPONENT,
+           Provides.Type.UNIQUE,
+           Optional.<Equivalence.Wrapper<AnnotationMirror>>absent(),
+-          Optional.<DependencyRequest>absent(),
+-          Optional.<TypeElement>absent());
++          Optional.<DependencyRequest>absent());
+     }
+ 
+     ProvisionBinding forComponentMethod(ExecutableElement componentMethod) {
+@@ -310,11 +304,11 @@ ProvisionBinding forComponentMethod(ExecutableElement componentMethod) {
+           componentMethod,
+           ImmutableSet.<DependencyRequest>of(),
+           Optional.<String>absent(),
++          Optional.<TypeElement>absent(),
+           Kind.COMPONENT_PROVISION,
+           Provides.Type.UNIQUE,
+           wrapOptionalInEquivalence(AnnotationMirrors.equivalence(), scope),
+-          Optional.<DependencyRequest>absent(),
+-          Optional.<TypeElement>absent());
++          Optional.<DependencyRequest>absent());
+     }
+   }
+ }
+diff --git a/compiler/src/main/java/dagger/internal/codegen/ResolvableBinding.java b/compiler/src/main/java/dagger/internal/codegen/ResolvableBinding.java
+deleted file mode 100644
+index 7dc52f78b..000000000
+--- a/compiler/src/main/java/dagger/internal/codegen/ResolvableBinding.java
++++ /dev/null
+@@ -1,29 +0,0 @@
+-/*
+- * Copyright (C) 2015 Google, Inc.
+- *
+- * Licensed under the Apache License, Version 2.0 (the "License");
+- * you may not use this file except in compliance with the License.
+- * You may obtain a copy of the License at
+- *
+- * http://www.apache.org/licenses/LICENSE-2.0
+- *
+- * Unless required by applicable law or agreed to in writing, software
+- * distributed under the License is distributed on an "AS IS" BASIS,
+- * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+- * See the License for the specific language governing permissions and
+- * limitations under the License.
+- */
+-package dagger.internal.codegen;
+-
+-/**
+- * A Binding that can be resolved at request time. For example, a ProvisionBinding for
+- * {@code List<T>} might be resolved to {@code List<Foo>} or {@code List<Bar>}
+- * depending on how it's requested.
+- */
+-interface ResolvableBinding {  
+-  /**
+-   * True if this represents a binding that refers to a type with parameters, and the
+-   * parameters have been resolved based on a requesting key.
+-   */
+-  boolean isResolved();
+-}
+diff --git a/compiler/src/test/java/dagger/internal/codegen/KeyTest.java b/compiler/src/test/java/dagger/internal/codegen/KeyTest.java
+index c6d283670..461c6c3c8 100644
+--- a/compiler/src/test/java/dagger/internal/codegen/KeyTest.java
++++ b/compiler/src/test/java/dagger/internal/codegen/KeyTest.java
+@@ -165,9 +165,9 @@ String provideQualifiedString() {
+         : ElementFilter.methodsIn(moduleElement.getEnclosedElements())) {
+       assertThat(
+           keyFactory.forProvidesMethod((ExecutableType) providesMethod.asType(), providesMethod))
+-          .isEqualTo(new AutoValue_Key(
+-              Optional.<Equivalence.Wrapper<AnnotationMirror>>absent(),
+-              MoreTypes.equivalence().wrap(setOfStringsType)));
++              .isEqualTo(new AutoValue_Key(
++                  Optional.<Equivalence.Wrapper<AnnotationMirror>>absent(),
++                  MoreTypes.equivalence().wrap(setOfStringsType)));
+     }
+   }
+ 
+@@ -224,8 +224,9 @@ String provideQualifiedString() {
+         elements.getTypeElement(ProducesMethodsModule.class.getCanonicalName());
+     for (ExecutableElement producesMethod
+         : ElementFilter.methodsIn(moduleElement.getEnclosedElements())) {
+-      assertThat(keyFactory.forProducesMethod(producesMethod))
+-          .isEqualTo(new AutoValue_Key(
++      assertThat(keyFactory.forProducesMethod(
++          (ExecutableType) producesMethod.asType(), producesMethod))
++              .isEqualTo(new AutoValue_Key(
+                   Optional.<Equivalence.Wrapper<AnnotationMirror>>absent(),
+                   MoreTypes.equivalence().wrap(stringType)));
+     }
+@@ -250,7 +251,8 @@ String provideQualifiedString() {
+         elements.getTypeElement(SetProducesMethodsModule.class.getCanonicalName());
+     for (ExecutableElement producesMethod
+         : ElementFilter.methodsIn(moduleElement.getEnclosedElements())) {
+-      assertThat(keyFactory.forProducesMethod(producesMethod))
++      assertThat(keyFactory.forProducesMethod(
++          (ExecutableType) producesMethod.asType(), producesMethod))
+           .isEqualTo(new AutoValue_Key(
+                   Optional.<Equivalence.Wrapper<AnnotationMirror>>absent(),
+                   MoreTypes.equivalence().wrap(setOfStringsType)));
+diff --git a/compiler/src/test/java/dagger/internal/codegen/ProductionGraphValidationTest.java b/compiler/src/test/java/dagger/internal/codegen/ProductionGraphValidationTest.java
+new file mode 100644
+index 000000000..9f577b722
+--- /dev/null
++++ b/compiler/src/test/java/dagger/internal/codegen/ProductionGraphValidationTest.java
+@@ -0,0 +1,164 @@
++/*
++ * Copyright (C) 2014 Google, Inc.
++ *
++ * Licensed under the Apache License, Version 2.0 (the "License");
++ * you may not use this file except in compliance with the License.
++ * You may obtain a copy of the License at
++ *
++ * http://www.apache.org/licenses/LICENSE-2.0
++ *
++ * Unless required by applicable law or agreed to in writing, software
++ * distributed under the License is distributed on an "AS IS" BASIS,
++ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++ * See the License for the specific language governing permissions and
++ * limitations under the License.
++ */
++package dagger.internal.codegen;
++
++import com.google.testing.compile.JavaFileObjects;
++import java.util.Arrays;
++import javax.tools.JavaFileObject;
++import org.junit.Test;
++import org.junit.runner.RunWith;
++import org.junit.runners.JUnit4;
++
++import static com.google.common.truth.Truth.assertAbout;
++import static com.google.testing.compile.JavaSourceSubjectFactory.javaSource;
++import static com.google.testing.compile.JavaSourcesSubjectFactory.javaSources;
++
++/**
++ * Unit tests for {@link BindingGraphValidator} that exercise producer-specific logic.
++ */
++@RunWith(JUnit4.class)
++public class ProductionGraphValidationTest {
++  @Test public void componentWithUnprovidedInput() {
++    JavaFileObject component = JavaFileObjects.forSourceLines("test.MyComponent",
++        "package test;",
++        "",
++        "import com.google.common.util.concurrent.ListenableFuture;",
++        "import dagger.producers.ProductionComponent;",
++        "",
++        "@ProductionComponent(modules = FooModule.class)",
++        "interface MyComponent {",
++        "  ListenableFuture<Foo> getFoo();",
++        "}");
++    JavaFileObject module = JavaFileObjects.forSourceLines("test.FooModule",
++        "package test;",
++        "",
++        "import dagger.producers.ProducerModule;",
++        "import dagger.producers.Produces;",
++        "",
++        "class Foo {}",
++        "class Bar {}",
++        "",
++        "@ProducerModule",
++        "class FooModule {",
++        "  @Produces Foo foo(Bar bar) {",
++        "    return null;",
++        "  }",
++        "}");
++    assertAbout(javaSources()).that(Arrays.asList(module, component))
++        .processedWith(new ComponentProcessor())
++        .failsToCompile()
++        .withErrorContaining("test.Bar cannot be provided without an @Inject constructor or from "
++            + "an @Provides- or @Produces-annotated method.")
++            .in(component).onLine(8);
++  }
++
++  @Test public void componentProductionWithNoDependencyChain() {
++    JavaFileObject component = JavaFileObjects.forSourceLines("test.TestClass",
++        "package test;",
++        "",
++        "import com.google.common.util.concurrent.ListenableFuture;",
++        "import dagger.producers.ProductionComponent;",
++        "",
++        "final class TestClass {",
++        "  interface A {}",
++        "",
++        "  @ProductionComponent()",
++        "  interface AComponent {",
++        "    ListenableFuture<A> getA();",
++        "  }",
++        "}");
++    String expectedError =
++        "test.TestClass.A cannot be provided without an @Provides- or @Produces-annotated method.";
++    assertAbout(javaSource()).that(component)
++        .processedWith(new ComponentProcessor())
++        .failsToCompile()
++        .withErrorContaining(expectedError).in(component).onLine(11);
++  }
++
++  @Test public void provisionDependsOnProduction() {
++    JavaFileObject component = JavaFileObjects.forSourceLines("test.TestClass",
++        "package test;",
++        "",
++        "import com.google.common.util.concurrent.ListenableFuture;",
++        "import dagger.Module;",
++        "import dagger.Provides;",
++        "import dagger.producers.ProducerModule;",
++        "import dagger.producers.Produces;",
++        "import dagger.producers.ProductionComponent;",
++        "",
++        "final class TestClass {",
++        "  interface A {}",
++        "  interface B {}",
++        "",
++        "  @Module",
++        "  final class AModule {",
++        "    @Provides A a(B b) {",
++        "      return null;",
++        "    }",
++        "  }",
++        "",
++        "  @ProducerModule",
++        "  final class BModule {",
++        "    @Produces ListenableFuture<B> b() {",
++        "      return null;",
++        "    }",
++        "  }",
++        "",
++        "  @ProductionComponent(modules = {AModule.class, BModule.class})",
++        "  interface AComponent {",
++        "    ListenableFuture<A> getA();",
++        "  }",
++        "}");
++    String expectedError =
++        "test.TestClass.A is a provision, which cannot depend on a production.";
++    assertAbout(javaSource()).that(component)
++        .processedWith(new ComponentProcessor())
++        .failsToCompile()
++        .withErrorContaining(expectedError).in(component).onLine(30);
++  }
++
++  @Test public void provisionEntryPointDependsOnProduction() {
++    JavaFileObject component = JavaFileObjects.forSourceLines("test.TestClass",
++        "package test;",
++        "",
++        "import com.google.common.util.concurrent.ListenableFuture;",
++        "import dagger.producers.ProducerModule;",
++        "import dagger.producers.Produces;",
++        "import dagger.producers.ProductionComponent;",
++        "",
++        "final class TestClass {",
++        "  interface A {}",
++        "",
++        "  @ProducerModule",
++        "  final class AModule {",
++        "    @Produces ListenableFuture<A> a() {",
++        "      return null;",
++        "    }",
++        "  }",
++        "",
++        "  @ProductionComponent(modules = AModule.class)",
++        "  interface AComponent {",
++        "    A getA();",
++        "  }",
++        "}");
++    String expectedError =
++        "test.TestClass.A is a provision entry-point, which cannot depend on a production.";
++    assertAbout(javaSource()).that(component)
++        .processedWith(new ComponentProcessor())
++        .failsToCompile()
++        .withErrorContaining(expectedError).in(component).onLine(20);
++  }
++}

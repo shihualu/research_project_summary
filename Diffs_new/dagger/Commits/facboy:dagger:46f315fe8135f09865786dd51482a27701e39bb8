@@ -1,0 +1,1823 @@
+diff --git a/java/dagger/internal/codegen/DaggerTypes.java b/java/dagger/internal/codegen/DaggerTypes.java
+index 40f3b4188..a0f352ff2 100644
+--- a/java/dagger/internal/codegen/DaggerTypes.java
++++ b/java/dagger/internal/codegen/DaggerTypes.java
+@@ -23,6 +23,7 @@
+ import com.google.auto.common.MoreElements;
+ import com.google.auto.common.MoreTypes;
+ import com.google.common.collect.ImmutableSet;
++import com.google.common.graph.Traverser;
+ import com.google.common.util.concurrent.FluentFuture;
+ import com.google.common.util.concurrent.ListenableFuture;
+ import com.squareup.javapoet.ClassName;
+@@ -65,6 +66,14 @@
+     return Optional.ofNullable(MoreTypes.nonObjectSuperclass(types, elements, type).orNull());
+   }
+ 
++  /**
++   * Returns the {@linkplain #directSupertypes(TypeMirror) supertype}s of a type in breadth-first
++   * order.
++   */
++  Iterable<TypeMirror> supertypes(TypeMirror type) {
++    return Traverser.<TypeMirror>forGraph(this::directSupertypes).breadthFirst(type);
++  }
++
+   /**
+    * Returns {@code type}'s single type argument.
+    *
+diff --git a/java/dagger/internal/codegen/DiagnosticReporterFactory.java b/java/dagger/internal/codegen/DiagnosticReporterFactory.java
+index 0695d81c2..9a469f1ef 100644
+--- a/java/dagger/internal/codegen/DiagnosticReporterFactory.java
++++ b/java/dagger/internal/codegen/DiagnosticReporterFactory.java
+@@ -16,17 +16,32 @@
+ 
+ package dagger.internal.codegen;
+ 
++import static com.google.auto.common.MoreTypes.asTypeElement;
+ import static com.google.common.base.Preconditions.checkArgument;
++import static com.google.common.base.Predicates.equalTo;
+ import static com.google.common.base.Verify.verify;
++import static com.google.common.collect.Iterables.filter;
++import static com.google.common.collect.Iterables.indexOf;
++import static com.google.common.collect.Iterables.transform;
+ import static com.google.common.collect.Lists.asList;
++import static dagger.internal.codegen.DaggerElements.DECLARATION_ORDER;
+ import static dagger.internal.codegen.DaggerElements.elementEncloses;
+ import static dagger.internal.codegen.DaggerElements.elementToString;
+ import static dagger.internal.codegen.DaggerGraphs.shortestPath;
++import static java.util.Collections.min;
++import static java.util.Comparator.comparing;
++import static java.util.Comparator.comparingInt;
+ 
++import com.google.auto.common.MoreElements;
++import com.google.common.base.Function;
++import com.google.common.cache.CacheBuilder;
++import com.google.common.cache.CacheLoader;
++import com.google.common.collect.HashBasedTable;
+ import com.google.common.collect.ImmutableList;
+ import com.google.common.collect.ImmutableSet;
+ import com.google.common.collect.Iterables;
+ import com.google.common.collect.Sets;
++import com.google.common.collect.Table;
+ import com.google.errorprone.annotations.CanIgnoreReturnValue;
+ import com.google.errorprone.annotations.FormatMethod;
+ import dagger.model.BindingGraph;
+@@ -36,9 +51,12 @@
+ import dagger.model.BindingGraph.DependencyEdge;
+ import dagger.model.BindingGraph.Edge;
+ import dagger.model.BindingGraph.Node;
++import dagger.model.ComponentPath;
+ import dagger.model.DependencyRequest;
+ import dagger.spi.BindingGraphPlugin;
+ import dagger.spi.DiagnosticReporter;
++import java.util.Comparator;
++import java.util.Map;
+ import java.util.Set;
+ import javax.annotation.processing.Messager;
+ import javax.inject.Inject;
+@@ -50,12 +68,14 @@
+ // TODO(ronshapiro): If multiple plugins print errors on the same node/edge, should we condense the
+ // messages and only print the dependency trace once?
+ final class DiagnosticReporterFactory {
++  private final DaggerTypes types;
+   private final Messager messager;
+   private final DependencyRequestFormatter dependencyRequestFormatter;
+ 
+   @Inject
+   DiagnosticReporterFactory(
+-      Messager messager, DependencyRequestFormatter dependencyRequestFormatter) {
++      DaggerTypes types, Messager messager, DependencyRequestFormatter dependencyRequestFormatter) {
++    this.types = types;
+     this.messager = messager;
+     this.dependencyRequestFormatter = dependencyRequestFormatter;
+ 
+@@ -66,11 +86,26 @@ DiagnosticReporterImpl reporter(BindingGraph graph, BindingGraphPlugin plugin) {
+     return new DiagnosticReporterImpl(graph, plugin.pluginName());
+   }
+ 
++  private static <K, V> Function<K, V> memoize(Function<K, V> uncached) {
++    return CacheBuilder.newBuilder().build(CacheLoader.from(uncached));
++  }
++
+   /**
+    * A {@link DiagnosticReporter} that keeps track of which {@linkplain Diagnostic.Kind kinds} of
+    * diagnostics were reported.
+    */
+   final class DiagnosticReporterImpl implements DiagnosticReporter {
++
++    /** A cached function from type to all of its supertypes in breadth-first order. */
++    private final Function<TypeElement, Iterable<TypeElement>> supertypes =
++        memoize(
++            component ->
++                transform(types.supertypes(component.asType()), type -> asTypeElement(type)));
++
++    /** The shortest path (value) from an entry point (column) to a binding (row). */
++    private final Table<BindingNode, DependencyEdge, ImmutableList<Node>> shortestPaths =
++        HashBasedTable.create();
++
+     private final BindingGraph graph;
+     private final String plugin;
+     private final TypeElement rootComponent;
+@@ -92,9 +127,7 @@ DiagnosticReporterImpl reporter(BindingGraph graph, BindingGraphPlugin plugin) {
+     public void reportComponent(
+         Diagnostic.Kind diagnosticKind, ComponentNode componentNode, String messageFormat) {
+       StringBuilder messageBuilder = new StringBuilder(messageFormat);
+-      if (!componentNode.componentPath().currentComponent().equals(rootComponent)) {
+-        appendComponentPath(messageBuilder, componentNode);
+-      }
++      appendComponentPathUnlessAtRoot(messageBuilder, componentNode);
+       printMessage(diagnosticKind, messageBuilder, rootComponent);
+     }
+ 
+@@ -110,12 +143,13 @@ public void reportComponent(
+           diagnosticKind, componentNode, formatMessage(messageFormat, firstArg, moreArgs));
+     }
+ 
++    // TODO(ronshapiro): should this also include the binding element?
+     @Override
+     public void reportBinding(
+         Diagnostic.Kind diagnosticKind, BindingNode bindingNode, String message) {
+-      // TODO(ronshapiro): should this also include the binding element?
+-      reportAtEntryPointsWithDependencyTrace(
+-          diagnosticKind, new StringBuilder(message), bindingNode);
++      StringBuilder messageBuilder = new StringBuilder(message);
++      appendEntryPointsAndOneTrace(messageBuilder, bindingNode);
++      printMessage(diagnosticKind, messageBuilder, rootComponent);
+     }
+ 
+     @Override
+@@ -132,15 +166,8 @@ public void reportBinding(
+     public void reportDependency(
+         Diagnostic.Kind diagnosticKind, DependencyEdge dependencyEdge, String message) {
+       StringBuilder messageBuilder = new StringBuilder(message);
+-      dependencyRequestFormatter.appendFormatLine(
+-          messageBuilder, dependencyEdge.dependencyRequest());
+-
+-      if (dependencyEdge.isEntryPoint()) {
+-        printAtEntryPoint(diagnosticKind, messageBuilder, dependencyEdge);
+-      } else {
+-        BindingNode sourceNode = (BindingNode) graph.incidentNodes(dependencyEdge).source();
+-        reportAtEntryPointsWithDependencyTrace(diagnosticKind, messageBuilder, sourceNode);
+-      }
++      appendEntryPointsAndOneTrace(messageBuilder, dependencyEdge);
++      printMessage(diagnosticKind, messageBuilder, rootComponent);
+     }
+ 
+     @Override
+@@ -179,23 +206,76 @@ private String formatMessage(String messageFormat, Object firstArg, Object[] mor
+     }
+ 
+     /**
+-     * For each entry point that depends on {@code targetNode}, appends the {@link
+-     * #dependencyTrace(DependencyEdge, BindingNode)} to the binding onto {@code message} and prints
+-     * to the messager.
++     * Appends the dependency trace to {@code dependencyEdge} from one of the entry points from
++     * which it is reachable, and any remaining entry points, to {@code message}.
++     */
++    private void appendEntryPointsAndOneTrace(
++        StringBuilder message, DependencyEdge dependencyEdge) {
++      if (dependencyEdge.isEntryPoint()) {
++        appendEntryPoint(message, dependencyEdge);
++      } else { // it's part of a binding
++        dependencyRequestFormatter.appendFormatLine(message, dependencyEdge.dependencyRequest());
++        appendEntryPointsAndOneTrace(message, (BindingNode) source(dependencyEdge));
++      }
++    }
++
++    /**
++     * Appends the dependency trace to {@code bindingNode} from one of the entry points from which
++     * it is reachable, and any remaining entry points, to {@code message}.
+      */
+-    private void reportAtEntryPointsWithDependencyTrace(
+-        Diagnostic.Kind diagnosticKind, CharSequence message, BindingNode bindingNode) {
+-      for (DependencyEdge entryPoint : graph.entryPointEdgesDependingOnBindingNode(bindingNode)) {
+-        printAtEntryPoint(
+-            diagnosticKind,
+-            new StringBuilder(message).append(dependencyTrace(entryPoint, bindingNode)),
+-            entryPoint);
++    private void appendEntryPointsAndOneTrace(StringBuilder message, BindingNode bindingNode) {
++      ImmutableSet<DependencyEdge> entryPoints =
++          graph.entryPointEdgesDependingOnBindingNode(bindingNode);
++      // Show the full dependency trace for one entry point.
++      DependencyEdge entryPointForTrace =
++          min(
++              entryPoints,
++              // prefer entry points in components closest to the root
++              rootComponentFirst()
++                  // then prefer entry points with a short dependency path to the error
++                  .thenComparing(shortestDependencyPathFirst(bindingNode))
++                  // then prefer entry points declared in the component to those declared in a
++                  // supertype
++                  .thenComparing(nearestComponentSupertypeFirst())
++                  // finally prefer entry points declared first in their enclosing type
++                  .thenComparing(requestElementDeclarationOrder()));
++      appendDependencyTrace(message, entryPointForTrace, bindingNode);
++
++      // List the remaining entry points, showing which component they're in.
++      if (entryPoints.size() > 1) {
++        message.append("\nThe following other entry points also depend on it:");
++        entryPoints
++            .stream()
++            .filter(entryPoint -> !entryPoint.equals(entryPointForTrace))
++            .sorted(
++                // start with entry points in components closest to the root
++                rootComponentFirst()
++                    // then list entry points declared in the component before those declared in a
++                    // supertype
++                    .thenComparing(nearestComponentSupertypeFirst())
++                    // finally list entry points in declaration order in their declaring type
++                    .thenComparing(requestElementDeclarationOrder()))
++            .forEachOrdered(
++                entryPoint -> {
++                  message.append("\n    ");
++                  Element requestElement = entryPoint.dependencyRequest().requestElement().get();
++                  message.append(elementToString(requestElement));
++
++                  // For entry points declared in subcomponents or supertypes of the root component,
++                  // append the component path to make clear to the user which component it's in.
++                  ComponentPath componentPath = source(entryPoint).componentPath();
++                  if (!componentPath.atRoot()
++                      || !requestElement.getEnclosingElement().equals(rootComponent)) {
++                    message.append(String.format(" [%s]", componentPath));
++                  }
++                });
+       }
+     }
+ 
+     // TODO(ronshapiro): Adding a DependencyPath type to dagger.model could be useful, i.e.
+     // bindingGraph.shortestPathFromEntryPoint(DependencyEdge, BindingNode)
+-    private CharSequence dependencyTrace(DependencyEdge entryPoint, BindingNode bindingNode) {
++    private void appendDependencyTrace(
++        StringBuilder message, DependencyEdge entryPoint, BindingNode bindingNode) {
+       checkArgument(entryPoint.isEntryPoint());
+       Node entryPointBinding = graph.incidentNodes(entryPoint).target();
+       ImmutableList<Node> shortestBindingPath =
+@@ -210,8 +290,8 @@ private CharSequence dependencyTrace(DependencyEdge entryPoint, BindingNode bind
+           bindingNode,
+           graph);
+ 
+-      StringBuilder trace =
+-          new StringBuilder(shortestBindingPath.size() * 100 /* a guess heuristic */);
++      message.ensureCapacity(
++          message.capacity() + shortestBindingPath.size() * 100 /* a guess heuristic */);
+       for (int i = shortestBindingPath.size() - 1; i > 0; i--) {
+         Set<Edge> dependenciesBetween =
+             graph.edgesConnecting(shortestBindingPath.get(i - 1), shortestBindingPath.get(i));
+@@ -219,27 +299,19 @@ private CharSequence dependencyTrace(DependencyEdge entryPoint, BindingNode bind
+             // If a binding requests a key more than once, any of them should be fine to get to
+             // the shortest path
+             ((DependencyEdge) Iterables.get(dependenciesBetween, 0)).dependencyRequest();
+-        dependencyRequestFormatter.appendFormatLine(trace, dependencyRequest);
++        dependencyRequestFormatter.appendFormatLine(message, dependencyRequest);
+       }
+-      dependencyRequestFormatter.appendFormatLine(trace, entryPoint.dependencyRequest());
+-      return trace;
++      appendEntryPoint(message, entryPoint);
+     }
+ 
+-    /**
+-     * Prints {@code message} at {@code entryPoint}'s element if it is defined in the {@code
+-     * rootComponent}, otherwise at the root component.
+-     */
+-    private void printAtEntryPoint(
+-        Diagnostic.Kind diagnosticKind, CharSequence message, DependencyEdge entryPoint) {
++    private void appendEntryPoint(StringBuilder message, DependencyEdge entryPoint) {
+       checkArgument(entryPoint.isEntryPoint());
+-      Element entryPointElement = entryPoint.dependencyRequest().requestElement().get();
++      dependencyRequestFormatter.appendFormatLine(message, entryPoint.dependencyRequest());
++      appendComponentPathUnlessAtRoot(message, source(entryPoint));
++    }
+ 
+-      StringBuilder messageBuilder = new StringBuilder(message);
+-      Node component = graph.incidentNodes(entryPoint).source();
+-      if (!component.equals(graph.rootComponentNode())) {
+-        appendComponentPath(messageBuilder, component);
+-      }
+-      printMessage(diagnosticKind, messageBuilder, entryPointElement);
++    private Node source(Edge edge) {
++      return graph.incidentNodes(edge).source();
+     }
+ 
+     private void printMessage(
+@@ -254,14 +326,83 @@ private void printMessage(
+       messager.printMessage(diagnosticKind, insertBracketPrefix(message, plugin), elementToReport);
+     }
+ 
+-    @CanIgnoreReturnValue
+-    private StringBuilder appendComponentPath(StringBuilder message, Node node) {
+-      return message.append("\ncomponent path: ").append(node.componentPath());
++    private void appendComponentPathUnlessAtRoot(StringBuilder message, Node node) {
++      if (!node.componentPath().equals(graph.rootComponentNode().componentPath())) {
++        message.append(String.format(" [%s]", node.componentPath()));
++      }
+     }
+ 
+     @CanIgnoreReturnValue
+     private StringBuilder insertBracketPrefix(StringBuilder messageBuilder, String prefix) {
+       return messageBuilder.insert(0, String.format("[%s] ", prefix));
+     }
++
++    /**
++     * Returns a comparator that sorts entry points in components whose paths from the root are
++     * shorter first.
++     */
++    private Comparator<DependencyEdge> rootComponentFirst() {
++      return comparingInt(entryPoint -> source(entryPoint).componentPath().components().size());
++    }
++
++    /**
++     * Returns a comparator that puts entry points whose shortest dependency path to {@code
++     * bindingNode} is shortest first.
++     */
++    private Comparator<DependencyEdge> shortestDependencyPathFirst(BindingNode bindingNode) {
++      Map<DependencyEdge, ImmutableList<Node>> shortestPathsToBinding =
++          shortestPaths.row(bindingNode);
++      return comparing(
++          entryPoint ->
++              shortestPathsToBinding
++                  .computeIfAbsent(
++                      entryPoint, computeShortestPathToBindingFromEntryNode(bindingNode))
++                  .size());
++    }
++
++    private Function<DependencyEdge, ImmutableList<Node>> computeShortestPathToBindingFromEntryNode(
++        BindingNode bindingNode) {
++      return entryPoint ->
++          shortestPath(
++              node -> filter(graph.successors(node), successor -> successor instanceof BindingNode),
++              graph.incidentNodes(entryPoint).target(),
++              bindingNode);
++    }
++
++    /**
++     * Returns a comparator that sorts entry points in by the distance of the type that declares
++     * them from the type of the component that contains them.
++     *
++     * <p>For instance, an entry point declared directly in the component type would sort before one
++     * declared in a direct supertype, which would sort before one declared in a supertype of a
++     * supertype.
++     */
++    private Comparator<DependencyEdge> nearestComponentSupertypeFirst() {
++      return comparingInt(
++          entryPoint ->
++              indexOf(
++                  supertypes.apply(componentContainingEntryPoint(entryPoint)),
++                  equalTo(typeDeclaringEntryPoint(entryPoint))));
++    }
++
++    private TypeElement componentContainingEntryPoint(DependencyEdge entryPoint) {
++      return source(entryPoint).componentPath().currentComponent();
++    }
++
++    private TypeElement typeDeclaringEntryPoint(DependencyEdge entryPoint) {
++      return MoreElements.asType(
++          entryPoint.dependencyRequest().requestElement().get().getEnclosingElement());
++    }
++
++    /**
++     * Returns a comparator that sorts entry points in the order in which they were declared in
++     * their declaring type.
++     *
++     * <p>Only useful to compare entry points declared in the same type.
++     */
++    private Comparator<DependencyEdge> requestElementDeclarationOrder() {
++      return comparing(
++          entryPoint -> entryPoint.dependencyRequest().requestElement().get(), DECLARATION_ORDER);
++    }
+   }
+ }
+diff --git a/java/dagger/internal/codegen/DuplicateBindingsValidation.java b/java/dagger/internal/codegen/DuplicateBindingsValidation.java
+index 7c8686145..39460d295 100644
+--- a/java/dagger/internal/codegen/DuplicateBindingsValidation.java
++++ b/java/dagger/internal/codegen/DuplicateBindingsValidation.java
+@@ -144,7 +144,7 @@ private String incompatibleBindingsMessage(
+ 
+     Set<BindingNode> uniqueBindings =
+         Sets.filter(duplicateBindings, binding -> !binding.equals(multibinding));
+-    message.append(INDENT).append("Unique bindings and declarations:");
++    message.append('\n').append(INDENT).append("Unique bindings and declarations:");
+     formatDeclarations(
+         message,
+         2,
+@@ -160,7 +160,6 @@ private void formatDeclarations(
+       Iterable<? extends BindingDeclaration> bindingDeclarations) {
+     bindingDeclarationFormatter.formatIndentedList(
+         builder, ImmutableList.copyOf(bindingDeclarations), indentLevel);
+-    builder.append('\n');
+   }
+ 
+   private ImmutableSet<BindingDeclaration> declarations(
+diff --git a/javatests/dagger/android/processor/DuplicateAndroidInjectorsCheckerTest.java b/javatests/dagger/android/processor/DuplicateAndroidInjectorsCheckerTest.java
+index 76167511e..8cd1979ee 100644
+--- a/javatests/dagger/android/processor/DuplicateAndroidInjectorsCheckerTest.java
++++ b/javatests/dagger/android/processor/DuplicateAndroidInjectorsCheckerTest.java
+@@ -98,7 +98,7 @@ public void conflictingMapKeys() {
+     assertThat(compilation)
+         .hadErrorContaining("Multiple injector factories bound for the same type")
+         .inFile(component)
+-        .onLineContaining("dispatchingInjector()");
++        .onLineContaining("interface TestComponent");
+     assertThat(compilation).hadErrorContaining("classKey(test.TestInjectorFactory)");
+     assertThat(compilation).hadErrorContaining("stringKey(test.TestInjectorFactory)");
+     assertThat(compilation).hadErrorCount(1);
+diff --git a/javatests/dagger/internal/codegen/ComponentProcessorTest.java b/javatests/dagger/internal/codegen/ComponentProcessorTest.java
+index f140cbf5c..43603c3e8 100644
+--- a/javatests/dagger/internal/codegen/ComponentProcessorTest.java
++++ b/javatests/dagger/internal/codegen/ComponentProcessorTest.java
+@@ -2184,7 +2184,7 @@ public void bindsToDuplicateBinding_bindsKeyIsNotDuplicated() {
+     assertThat(compilation)
+         .hadErrorContaining("java.lang.String is bound multiple times")
+         .inFile(component)
+-        .onLineContaining("Object notDuplicated();");
++        .onLineContaining("interface TestComponent");
+   }
+ 
+   @Test
+diff --git a/javatests/dagger/internal/codegen/GraphValidationTest.java b/javatests/dagger/internal/codegen/GraphValidationTest.java
+index f9821b3c6..c9b91ff79 100644
+--- a/javatests/dagger/internal/codegen/GraphValidationTest.java
++++ b/javatests/dagger/internal/codegen/GraphValidationTest.java
+@@ -68,41 +68,63 @@
+     assertThat(compilation)
+         .hadErrorContaining("test.Bar cannot be provided without an @Provides-annotated method.")
+         .inFile(component)
+-        .onLine(7);
++        .onLineContaining("interface MyComponent");
+   }
+ 
+-  @Test public void componentProvisionWithNoDependencyChain() {
++  @Test
++  public void componentProvisionWithNoDependencyChain_unqualified() {
+     JavaFileObject component =
+         JavaFileObjects.forSourceLines(
+             "test.TestClass",
+             "package test;",
+             "",
+             "import dagger.Component;",
+-            "import javax.inject.Qualifier;",
+             "",
+             "final class TestClass {",
+-            "  @Qualifier @interface Q {}",
+             "  interface A {}",
+             "",
+             "  @Component()",
+             "  interface AComponent {",
+             "    A getA();",
+-            "    @Q A qualifiedA();",
+             "  }",
+             "}");
+     Compilation compilation = daggerCompiler().compile(component);
+     assertThat(compilation).failed();
+     assertThat(compilation)
+         .hadErrorContaining(
+-            "test.TestClass.A cannot be provided without an @Provides-annotated method.")
++            "[Dagger/MissingBinding] test.TestClass.A cannot be provided "
++                + "without an @Provides-annotated method.")
+         .inFile(component)
+-        .onLine(12);
++        .onLineContaining("interface AComponent");
++  }
++
++  @Test
++  public void componentProvisionWithNoDependencyChain_qualified() {
++    JavaFileObject component =
++        JavaFileObjects.forSourceLines(
++            "test.TestClass",
++            "package test;",
++            "",
++            "import dagger.Component;",
++            "import javax.inject.Qualifier;",
++            "",
++            "final class TestClass {",
++            "  @Qualifier @interface Q {}",
++            "  interface A {}",
++            "",
++            "  @Component()",
++            "  interface AComponent {",
++            "    @Q A qualifiedA();",
++            "  }",
++            "}");
++    Compilation compilation = daggerCompiler().compile(component);
++    assertThat(compilation).failed();
+     assertThat(compilation)
+         .hadErrorContaining(
+-            "@test.TestClass.Q test.TestClass.A "
+-                + "cannot be provided without an @Provides-annotated method.")
++            "[Dagger/MissingBinding] @test.TestClass.Q test.TestClass.A cannot be provided "
++                + "without an @Provides-annotated method.")
+         .inFile(component)
+-        .onLine(13);
++        .onLineContaining("interface AComponent");
+   }
+ 
+   @Test public void constructorInjectionWithoutAnnotation() {
+@@ -132,7 +154,7 @@
+             "test.TestClass.A cannot be provided without an @Inject constructor or an "
+                 + "@Provides-annotated method.")
+         .inFile(component)
+-        .onLine(15);
++        .onLineContaining("interface AComponent");
+   }
+ 
+   @Test public void membersInjectWithoutProvision() {
+@@ -167,7 +189,7 @@
+                 + "@Provides-annotated method. This type supports members injection but cannot be "
+                 + "implicitly provided.")
+         .inFile(component)
+-        .onLine(19);
++        .onLineContaining("interface AComponent");
+   }
+ 
+   @Test
+@@ -208,7 +230,7 @@ public void membersInjectDependsOnUnboundedType() {
+                 "    test.InjectsUnboundedType is injected at",
+                 "        test.TestComponent.injectsUnboundedType(test.InjectsUnboundedType)"))
+         .inFile(component)
+-        .onLine(7);
++        .onLineContaining("interface TestComponent");
+   }
+ 
+   @Ignore // TODO(b/77220343)
+@@ -368,7 +390,7 @@ public void staticFieldInjection() {
+                 "    test.Outer.C is provided at",
+                 "        test.Outer.CComponent.getC()"))
+         .inFile(component)
+-        .onLine(23);
++        .onLineContaining("interface CComponent");
+   }
+ 
+   @Test public void cyclicDependencyNotIncludingEntryPoint() {
+@@ -422,7 +444,7 @@ public void staticFieldInjection() {
+                 "    test.Outer.D is provided at",
+                 "        test.Outer.DComponent.getD()"))
+         .inFile(component)
+-        .onLine(27);
++        .onLineContaining("interface DComponent");
+   }
+ 
+   @Test
+@@ -490,7 +512,7 @@ public void cyclicDependencyNotBrokenByMapBinding() {
+                 "    test.Outer.C is provided at",
+                 "        test.Outer.CComponent.getC()"))
+         .inFile(component)
+-        .onLineContaining("C getC();");
++        .onLineContaining("interface CComponent");
+   }
+ 
+   @Test
+@@ -551,7 +573,7 @@ public void cyclicDependencyWithSetBinding() {
+                 "    test.Outer.C is provided at",
+                 "        test.Outer.CComponent.getC()"))
+         .inFile(component)
+-        .onLine(25);
++        .onLineContaining("interface CComponent");
+   }
+ 
+   @Test
+@@ -607,7 +629,7 @@ public void falsePositiveCyclicDependencyIndirectionDetected() {
+                 "    test.Outer.D is provided at",
+                 "        test.Outer.DComponent.getD()"))
+         .inFile(component)
+-        .onLine(28);
++        .onLineContaining("interface DComponent");
+   }
+ 
+   @Test
+@@ -761,13 +783,13 @@ public void cyclicDependencyInSubcomponentsWithChildren() {
+     assertThat(compilation)
+         .hadErrorContaining(
+             message(
+-                "[test.Child.entry()] Found a dependency cycle:",
++                "Found a dependency cycle:",
+                 "    java.lang.String is injected at",
+                 "        test.CycleModule.object(string)",
+                 "    java.lang.Object is injected at",
+                 "        test.CycleModule.string(object)",
+                 "    java.lang.String is provided at",
+-                "        test.Child.entry()"))
++                "        test.Child.entry() [test.Parent → test.Child]"))
+         .inFile(parent)
+         .onLineContaining("interface Parent");
+   }
+@@ -820,7 +842,7 @@ public void circularBindsMethods() {
+                 "    java.lang.Object is provided at",
+                 "        test.TestComponent.unqualified()"))
+         .inFile(component)
+-        .onLineContaining("unqualified();");
++        .onLineContaining("interface TestComponent");
+   }
+ 
+   @Test
+@@ -860,7 +882,7 @@ public void selfReferentialBinds() {
+                 "    java.lang.Object is provided at",
+                 "        test.TestComponent.selfReferential()"))
+         .inFile(component)
+-        .onLine(7);
++        .onLineContaining("interface TestComponent");
+   }
+ 
+   @Test
+@@ -914,7 +936,7 @@ public void cycleFromMembersInjectionMethod_WithSameKeyAsMembersInjectionMethod(
+                 "    test.A is injected at",
+                 "        test.CycleComponent.inject(test.A)"))
+         .inFile(component)
+-        .onLineContaining("void inject(A a);");
++        .onLineContaining("interface CycleComponent");
+   }
+ 
+   @Test
+@@ -947,7 +969,7 @@ public void longCycleMaskedByShortBrokenCycles() {
+     assertThat(compilation)
+         .hadErrorContaining("Found a dependency cycle:")
+         .inFile(cycles)
+-        .onLineContaining("A a();");
++        .onLineContaining("interface C");
+   }
+ 
+   @Test
+@@ -980,7 +1002,7 @@ public void missingBindingWithSameKeyAsMembersInjectionMethod() {
+     assertThat(compilation)
+         .hadErrorContaining("test.Self cannot be provided without an @Inject constructor")
+         .inFile(component)
+-        .onLineContaining("void inject(Self target);");
++        .onLineContaining("interface SelfComponent");
+   }
+ 
+   @Test
+@@ -1058,7 +1080,7 @@ public void genericInjectClassWithWildcardDependencies() {
+                 "    @Provides test.Outer.A test.Outer.AModule.provideA(String)",
+                 "    test.Outer.A test.Outer.Parent.getA()"))
+         .inFile(component)
+-        .onLine(30);
++        .onLineContaining("interface Child");
+   }
+ 
+   @Test public void duplicateExplicitBindings_TwoProvidesMethods() {
+@@ -1099,7 +1121,7 @@ public void genericInjectClassWithWildcardDependencies() {
+                 "    @Provides test.Outer.A test.Outer.Module1.provideA1()",
+                 "    @Provides test.Outer.A test.Outer.Module2.provideA2(String)"))
+         .inFile(component)
+-        .onLine(24);
++        .onLineContaining("interface TestComponent");
+   }
+ 
+   @Test
+@@ -1147,66 +1169,49 @@ public void duplicateExplicitBindings_ProvidesVsBinds() {
+                 "    @Provides test.Outer.A test.Outer.Module1.provideA1()",
+                 "    @Binds test.Outer.A test.Outer.Module2.bindA2(test.Outer.B)"))
+         .inFile(component)
+-        .onLine(28);
++        .onLineContaining("interface TestComponent");
+   }
+ 
+-  @Test public void duplicateExplicitBindings_MultipleProvisionTypes() {
+-    JavaFileObject component = JavaFileObjects.forSourceLines("test.Outer",
+-        "package test;",
+-        "",
+-        "import dagger.Binds;",
+-        "import dagger.Component;",
+-        "import dagger.MapKey;",
+-        "import dagger.Module;",
+-        "import dagger.Provides;",
+-        "import dagger.MapKey;",
+-        "import dagger.multibindings.IntoMap;",
+-        "import dagger.multibindings.IntoSet;",
+-        "import java.util.HashMap;",
+-        "import java.util.HashSet;",
+-        "import java.util.Map;",
+-        "import java.util.Set;",
+-        "import javax.inject.Qualifier;",
+-        "",
+-        "import static java.lang.annotation.RetentionPolicy.RUNTIME;",
+-        "final class Outer {",
+-        "  @MapKey(unwrapValue = true)",
+-        "  @interface StringKey {",
+-        "    String value();",
+-        "  }",
+-        "",
+-        "  @Qualifier @interface SomeQualifier {}",
+-        "",
+-        "  @Module",
+-        "  abstract static class TestModule1 {",
+-        "    @Provides @IntoMap",
+-        "    @StringKey(\"foo\")",
+-        "    static String stringMapEntry() { return \"\"; }",
+-        "",
+-        "    @Binds @IntoMap @StringKey(\"bar\")",
+-        "    abstract String bindStringMapEntry(@SomeQualifier String value);",
+-        "",
+-        "    @Provides @IntoSet static String stringSetElement() { return \"\"; }",
+-        "    @Binds @IntoSet abstract String bindStringSetElement(@SomeQualifier String value);",
+-        "",
+-        "    @Provides @SomeQualifier static String provideSomeQualifiedString() { return \"\"; }",
+-        "  }",
+-        "",
+-        "  @Module",
+-        "  static class TestModule2 {",
+-        "    @Provides Set<String> stringSet() { return new HashSet<String>(); }",
+-        "",
+-        "    @Provides Map<String, String> stringMap() {",
+-        "      return new HashMap<String, String>();",
+-        "    }",
+-        "  }",
+-        "",
+-        "  @Component(modules = { TestModule1.class, TestModule2.class })",
+-        "  interface TestComponent {",
+-        "    Set<String> getStringSet();",
+-        "    Map<String, String> getStringMap();",
+-        "  }",
+-        "}");
++  @Test
++  public void duplicateExplicitBindings_multibindingsAndExplicitSets() {
++    JavaFileObject component =
++        JavaFileObjects.forSourceLines(
++            "test.Outer",
++            "package test;",
++            "",
++            "import dagger.Binds;",
++            "import dagger.Component;",
++            "import dagger.Module;",
++            "import dagger.Provides;",
++            "import dagger.multibindings.IntoSet;",
++            "import java.util.HashSet;",
++            "import java.util.Set;",
++            "import javax.inject.Qualifier;",
++            "",
++            "final class Outer {",
++            "  @Qualifier @interface SomeQualifier {}",
++            "",
++            "  @Module",
++            "  abstract static class TestModule1 {",
++            "    @Provides @IntoSet static String stringSetElement() { return \"\"; }",
++            "",
++            "    @Binds",
++            "    @IntoSet abstract String bindStringSetElement(@SomeQualifier String value);",
++            "",
++            "    @Provides @SomeQualifier",
++            "    static String provideSomeQualifiedString() { return \"\"; }",
++            "  }",
++            "",
++            "  @Module",
++            "  static class TestModule2 {",
++            "    @Provides Set<String> stringSet() { return new HashSet<String>(); }",
++            "  }",
++            "",
++            "  @Component(modules = { TestModule1.class, TestModule2.class })",
++            "  interface TestComponent {",
++            "    Set<String> getStringSet();",
++            "  }",
++            "}");
+ 
+     Compilation compilation = daggerCompiler().compile(component);
+     assertThat(compilation).failed();
+@@ -1223,7 +1228,57 @@ public void duplicateExplicitBindings_ProvidesVsBinds() {
+                 "    Unique bindings and declarations:",
+                 "        @Provides Set<String> test.Outer.TestModule2.stringSet()"))
+         .inFile(component)
+-        .onLine(52);
++        .onLineContaining("interface TestComponent");
++  }
++
++  @Test
++  public void duplicateExplicitBindings_multibindingsAndExplicitMaps() {
++    JavaFileObject component =
++        JavaFileObjects.forSourceLines(
++            "test.Outer",
++            "package test;",
++            "",
++            "import dagger.Binds;",
++            "import dagger.Component;",
++            "import dagger.Module;",
++            "import dagger.Provides;",
++            "import dagger.multibindings.IntoMap;",
++            "import dagger.multibindings.StringKey;",
++            "import java.util.HashMap;",
++            "import java.util.Map;",
++            "import javax.inject.Qualifier;",
++            "",
++            "final class Outer {",
++            "  @Qualifier @interface SomeQualifier {}",
++            "",
++            "  @Module",
++            "  abstract static class TestModule1 {",
++            "    @Provides @IntoMap",
++            "    @StringKey(\"foo\")",
++            "    static String stringMapEntry() { return \"\"; }",
++            "",
++            "    @Binds @IntoMap @StringKey(\"bar\")",
++            "    abstract String bindStringMapEntry(@SomeQualifier String value);",
++            "",
++            "    @Provides @SomeQualifier",
++            "    static String provideSomeQualifiedString() { return \"\"; }",
++            "  }",
++            "",
++            "  @Module",
++            "  static class TestModule2 {",
++            "    @Provides Map<String, String> stringMap() {",
++            "      return new HashMap<String, String>();",
++            "    }",
++            "  }",
++            "",
++            "  @Component(modules = { TestModule1.class, TestModule2.class })",
++            "  interface TestComponent {",
++            "    Map<String, String> getStringMap();",
++            "  }",
++            "}");
++
++    Compilation compilation = daggerCompiler().compile(component);
++    assertThat(compilation).failed();
+     assertThat(compilation)
+         .hadErrorContaining(
+             message(
+@@ -1231,56 +1286,46 @@ public void duplicateExplicitBindings_ProvidesVsBinds() {
+                     + "or declarations:",
+                 "    Map bindings and declarations:",
+                 "        @Binds @dagger.multibindings.IntoMap "
+-                    + "@test.Outer.StringKey(\"bar\") String"
++                    + "@dagger.multibindings.StringKey(\"bar\") String"
+                     + " test.Outer.TestModule1.bindStringMapEntry(@test.Outer.SomeQualifier "
+                     + "String)",
+                 "        @Provides @dagger.multibindings.IntoMap "
+-                    + "@test.Outer.StringKey(\"foo\") String"
++                    + "@dagger.multibindings.StringKey(\"foo\") String"
+                     + " test.Outer.TestModule1.stringMapEntry()",
+                 "    Unique bindings and declarations:",
+                 "        @Provides Map<String,String> test.Outer.TestModule2.stringMap()"))
+         .inFile(component)
+-        .onLine(53);
++        .onLineContaining("interface TestComponent");
+   }
+ 
+   @Test
+-  public void duplicateExplicitBindings_UniqueBindingAndMultibindingDeclaration() {
++  public void duplicateExplicitBindings_UniqueBindingAndMultibindingDeclaration_Set() {
+     JavaFileObject component =
+         JavaFileObjects.forSourceLines(
+             "test.Outer",
+             "package test;",
+             "",
+-            "import static java.lang.annotation.RetentionPolicy.RUNTIME;",
+-            "",
+             "import dagger.Component;",
+             "import dagger.Module;",
+             "import dagger.Provides;",
+             "import dagger.multibindings.Multibinds;",
+-            "import java.util.HashMap;",
+             "import java.util.HashSet;",
+-            "import java.util.Map;",
+             "import java.util.Set;",
+             "",
+             "final class Outer {",
+             "  @Module",
+             "  abstract static class TestModule1 {",
+-            "    @Multibinds abstract Map<String, String> stringMap();",
+             "    @Multibinds abstract Set<String> stringSet();",
+             "  }",
+             "",
+             "  @Module",
+             "  static class TestModule2 {",
+             "    @Provides Set<String> stringSet() { return new HashSet<String>(); }",
+-            "",
+-            "    @Provides Map<String, String> stringMap() {",
+-            "      return new HashMap<String, String>();",
+-            "    }",
+             "  }",
+             "",
+             "  @Component(modules = { TestModule1.class, TestModule2.class })",
+             "  interface TestComponent {",
+             "    Set<String> getStringSet();",
+-            "    Map<String, String> getStringMap();",
+             "  }",
+             "}");
+ 
+@@ -1296,7 +1341,44 @@ public void duplicateExplicitBindings_UniqueBindingAndMultibindingDeclaration()
+                 "    Unique bindings and declarations:",
+                 "        @Provides Set<String> test.Outer.TestModule2.stringSet()"))
+         .inFile(component)
+-        .onLine(32);
++        .onLineContaining("interface TestComponent");
++  }
++
++  @Test
++  public void duplicateExplicitBindings_UniqueBindingAndMultibindingDeclaration_Map() {
++    JavaFileObject component =
++        JavaFileObjects.forSourceLines(
++            "test.Outer",
++            "package test;",
++            "",
++            "import dagger.Component;",
++            "import dagger.Module;",
++            "import dagger.Provides;",
++            "import dagger.multibindings.Multibinds;",
++            "import java.util.HashMap;",
++            "import java.util.Map;",
++            "",
++            "final class Outer {",
++            "  @Module",
++            "  abstract static class TestModule1 {",
++            "    @Multibinds abstract Map<String, String> stringMap();",
++            "  }",
++            "",
++            "  @Module",
++            "  static class TestModule2 {",
++            "    @Provides Map<String, String> stringMap() {",
++            "      return new HashMap<String, String>();",
++            "    }",
++            "  }",
++            "",
++            "  @Component(modules = { TestModule1.class, TestModule2.class })",
++            "  interface TestComponent {",
++            "    Map<String, String> getStringMap();",
++            "  }",
++            "}");
++
++    Compilation compilation = daggerCompiler().compile(component);
++    assertThat(compilation).failed();
+     assertThat(compilation)
+         .hadErrorContaining(
+             message(
+@@ -1308,7 +1390,7 @@ public void duplicateExplicitBindings_UniqueBindingAndMultibindingDeclaration()
+                 "    Unique bindings and declarations:",
+                 "        @Provides Map<String,String> test.Outer.TestModule2.stringMap()"))
+         .inFile(component)
+-        .onLine(33);
++        .onLineContaining("interface TestComponent");
+   }
+ 
+   @Test public void duplicateBindings_TruncateAfterLimit() {
+@@ -1422,7 +1504,7 @@ public void duplicateExplicitBindings_UniqueBindingAndMultibindingDeclaration()
+                 "    @Provides test.Outer.A test.Outer.Module10.provideA()",
+                 "    and 2 others"))
+         .inFile(component)
+-        .onLineContaining("getA();");
++        .onLineContaining("interface TestComponent");
+   }
+ 
+   @Test public void longChainOfDependencies() {
+@@ -1475,50 +1557,26 @@ public void duplicateExplicitBindings_UniqueBindingAndMultibindingDeclaration()
+             "    Provider<Lazy<C>> lazyCProvider();",
+             "  }",
+             "}");
+-    String errorText = "test.TestClass.A cannot be provided without an @Provides-annotated method.";
+-    String otherErrorFormat =
+-        message(
+-            errorText,
+-            "    test.TestClass.A is injected at",
+-            "        test.TestClass.B.<init>(a)",
+-            "    test.TestClass.B is injected at",
+-            "        test.TestClass.C.b",
+-            "    test.TestClass.C is %s at",
+-            "        test.TestClass.AComponent.%s");
+ 
+     Compilation compilation = daggerCompiler().compile(component);
+     assertThat(compilation).failed();
+     assertThat(compilation)
+         .hadErrorContaining(
+             message(
+-                errorText,
++                "test.TestClass.A cannot be provided without an @Provides-annotated method.",
+                 "    test.TestClass.A is injected at",
+                 "        test.TestClass.B.<init>(a)",
+                 "    test.TestClass.B is injected at",
+-                "        test.TestClass.DImpl.<init>(…, b)",
+-                "    test.TestClass.DImpl is injected at",
+-                "        test.TestClass.DModule.d(…, impl, …)",
+-                "    @javax.inject.Named(\"slim shady\") test.TestClass.D is provided at",
+-                "        test.TestClass.AComponent.getFoo()"))
+-        .inFile(component)
+-        .onLineContaining("getFoo();");
+-    assertThat(compilation)
+-        .hadErrorContaining(
+-            String.format(otherErrorFormat, "injected", "injectC(test.TestClass.C)"))
+-        .inFile(component)
+-        .onLineContaining("injectC(C c);");
+-    assertThat(compilation)
+-        .hadErrorContaining(String.format(otherErrorFormat, "provided", "cProvider()"))
+-        .inFile(component)
+-        .onLineContaining("cProvider();");
+-    assertThat(compilation)
+-        .hadErrorContaining(String.format(otherErrorFormat, "provided", "lazyC()"))
+-        .inFile(component)
+-        .onLineContaining("lazyC();");
+-    assertThat(compilation)
+-        .hadErrorContaining(String.format(otherErrorFormat, "provided", "lazyCProvider()"))
++                "        test.TestClass.C.b",
++                "    test.TestClass.C is injected at",
++                "        test.TestClass.AComponent.injectC(test.TestClass.C)",
++                "The following other entry points also depend on it:",
++                "    test.TestClass.AComponent.getFoo()",
++                "    test.TestClass.AComponent.cProvider()",
++                "    test.TestClass.AComponent.lazyC()",
++                "    test.TestClass.AComponent.lazyCProvider()"))
+         .inFile(component)
+-        .onLineContaining("lazyCProvider();");
++        .onLineContaining("interface AComponent");
+   }
+ 
+   @Test
+@@ -1568,7 +1626,7 @@ public void bindsMethodAppearsInTrace() {
+                 "    TestInterface is provided at",
+                 "        TestComponent.testInterface()"))
+         .inFile(component)
+-        .onLine(5);
++        .onLineContaining("interface TestComponent");
+   }
+ 
+   @Test
+@@ -1651,28 +1709,10 @@ public void bindsMissingRightHandSide() {
+                         + ".bindWithResolvedKey(test.Duplicates.BoundImpl)",
+                     "    @Binds test.Duplicates.BoundTwice "
+                         + "test.Duplicates.DuplicatesModule"
+-                        + ".bindWithUnresolvedKey(test.Duplicates.NotBound"))
+-        .inFile(component)
+-        .onLineContaining("boundTwice();");
+-    assertThat(compilation)
+-        .hadErrorContaining("test.Duplicates.NotBound cannot be provided")
+-        .inFile(component)
+-        .onLineContaining("object();");
+-    assertThat(compilation)
+-        .hadErrorContaining("test.Duplicates.NotBound cannot be provided")
+-        .inFile(component)
+-        .onLineContaining("set();");
+-    assertThat(compilation)
+-        .hadErrorContaining("test.Duplicates.NotBound cannot be provided")
++                        + ".bindWithUnresolvedKey(test.Duplicates.NotBound)\\E")
++                + "|\\Qsame map key is bound more than once")
+         .inFile(component)
+-        .onLineContaining("intMap();");
+-    // Some javacs report only the first error for each source line.
+-    // Assert that one of the expected errors is reported.
+-    assertThat(compilation)
+-        .hadErrorContainingMatch(
+-            "test\\.Duplicates\\.NotBound cannot be provided|same map key is bound more than once")
+-        .inFile(component)
+-        .onLineContaining("longMap();");
++        .onLineContaining("interface C");
+   }
+ 
+   @Test public void resolvedParametersInDependencyTrace() {
+@@ -2510,9 +2550,10 @@ public void bindingUsedOnlyInSubcomponentDependsOnBindingOnlyInSubcomponent() {
+     Compilation compilation = daggerCompiler().compile(parent, parentModule, child, childModule);
+     assertThat(compilation).failed();
+     assertThat(compilation)
+-        .hadErrorContaining("[Child.needsString()] java.lang.String cannot be provided")
++        .hadErrorContainingMatch(
++            "(?s)\\Qjava.lang.String cannot be provided\\E.*\\QChild.needsString()\\E")
+         .inFile(parent)
+-        .onLine(4);
++        .onLineContaining("interface Parent");
+   }
+ 
+   @Test
+@@ -2584,9 +2625,11 @@ public void multibindingContributionBetweenAncestorComponentAndEntrypointCompone
+         daggerCompiler().compile(parent, parentModule, child, childModule, grandchild);
+     assertThat(compilation).failed();
+     assertThat(compilation)
+-        .hadErrorContaining("[Grandchild.object()] java.lang.Double cannot be provided")
++        .hadErrorContainingMatch(
++            "(?s)\\Qjava.lang.Double cannot be provided\\E.*"
++                + "\\QGrandchild.object() [Parent → Child → Grandchild]\\E$")
+         .inFile(parent)
+-        .onLine(4);
++        .onLineContaining("interface Parent");
+   }
+ 
+   @Test
+@@ -2654,7 +2697,7 @@ public void missingReleasableReferenceManager() {
+             "@interface BadMetadata {}");
+     JavaFileObject component =
+         JavaFileObjects.forSourceLines(
+-            "test.TestComponent",
++            "test.TestComponents",
+             "package test;",
+             "",
+             "import dagger.Component;",
+@@ -2662,18 +2705,30 @@ public void missingReleasableReferenceManager() {
+             "import dagger.releasablereferences.ReleasableReferenceManager;",
+             "import dagger.releasablereferences.TypedReleasableReferenceManager;",
+             "",
+-            "@TestScope",
+-            "@YetAnotherScope",
+-            "@Component",
+-            "interface TestComponent {",
+-            "  @ForReleasableReferences(OtherScope.class)",
+-            "  ReleasableReferenceManager otherManager();",
++            "interface TestComponents {",
++            "  @TestScope",
++            "  @YetAnotherScope",
++            "  @Component",
++            "  interface WrongScopeComponent {",
++            "    @ForReleasableReferences(OtherScope.class)",
++            "    ReleasableReferenceManager otherManager();",
++            "  }",
+             "",
+-            "  @ForReleasableReferences(TestScope.class)",
+-            "  TypedReleasableReferenceManager<TestMetadata> typedManager();",
++            "  @TestScope",
++            "  @YetAnotherScope",
++            "  @Component",
++            "  interface WrongMetadataComponent {",
++            "    @ForReleasableReferences(TestScope.class)",
++            "    TypedReleasableReferenceManager<TestMetadata> wrongMetadata();",
++            "  }",
+             "",
+-            "  @ForReleasableReferences(TestScope.class)",
+-            "  TypedReleasableReferenceManager<BadMetadata> badManager();",
++            "  @TestScope",
++            "  @YetAnotherScope",
++            "  @Component",
++            "  interface BadMetadataComponent {",
++            "    @ForReleasableReferences(TestScope.class)",
++            "    TypedReleasableReferenceManager<BadMetadata> badManager();",
++            "  }",
+             "}");
+     Compilation compilation =
+         daggerCompiler()
+@@ -2684,12 +2739,12 @@ public void missingReleasableReferenceManager() {
+             "There is no binding for "
+                 + "@dagger.releasablereferences.ForReleasableReferences(test.OtherScope.class) "
+                 + "dagger.releasablereferences.ReleasableReferenceManager "
+-                + "because no component in test.TestComponent's component hierarchy is annotated "
+-                + "with @test.OtherScope. "
++                + "because no component in test.TestComponents.WrongScopeComponent's "
++                + "component hierarchy is annotated with @test.OtherScope. "
+                 + "The available reference-releasing scopes are "
+                 + "[@test.TestScope, @test.YetAnotherScope].")
+         .inFile(component)
+-        .onLine(13);
++        .onLineContaining("interface WrongScopeComponent");
+     assertThat(compilation)
+         .hadErrorContaining(
+             "There is no binding for "
+@@ -2697,7 +2752,7 @@ public void missingReleasableReferenceManager() {
+                 + "dagger.releasablereferences.TypedReleasableReferenceManager<test.TestMetadata> "
+                 + "because test.TestScope is not annotated with @test.TestMetadata")
+         .inFile(component)
+-        .onLine(16);
++        .onLineContaining("interface WrongMetadataComponent");
+     assertThat(compilation)
+         .hadErrorContaining(
+             "There is no binding for "
+@@ -2706,11 +2761,11 @@ public void missingReleasableReferenceManager() {
+                 + "because test.BadMetadata is not annotated with "
+                 + "@dagger.releasablereferences.CanReleaseReferences")
+         .inFile(component)
+-        .onLine(19);
++        .onLineContaining("interface BadMetadataComponent");
+   }
+ 
+   @Test
+-  public void releasableReferenceManagerConflict() {
++  public void releasableReferenceManagerConflict_ReleasableReferenceManager() {
+     JavaFileObject testScope =
+         JavaFileObjects.forSourceLines(
+             "test.TestScope",
+@@ -2746,8 +2801,6 @@ public void releasableReferenceManagerConflict() {
+             "import dagger.Provides;",
+             "import dagger.releasablereferences.ForReleasableReferences;",
+             "import dagger.releasablereferences.ReleasableReferenceManager;",
+-            "import dagger.releasablereferences.TypedReleasableReferenceManager;",
+-            "import java.util.Set;",
+             "",
+             "@Module",
+             "abstract class TestModule {",
+@@ -2755,21 +2808,6 @@ public void releasableReferenceManagerConflict() {
+             "  static ReleasableReferenceManager rrm() {",
+             "    return null;",
+             "  }",
+-            "",
+-            "  @Provides @ForReleasableReferences(TestScope.class)",
+-            "  static TypedReleasableReferenceManager<TestMetadata> typedRrm() {",
+-            "    return null;",
+-            "  }",
+-            "",
+-            "  @Provides",
+-            "  static Set<ReleasableReferenceManager> rrmSet() {",
+-            "    return null;",
+-            "  }",
+-            "",
+-            "  @Provides",
+-            "  static Set<TypedReleasableReferenceManager<TestMetadata>> typedRrmSet() {",
+-            "    return null;",
+-            "  }",
+             "}");
+ 
+     JavaFileObject component =
+@@ -2780,20 +2818,12 @@ public void releasableReferenceManagerConflict() {
+             "import dagger.Component;",
+             "import dagger.releasablereferences.ForReleasableReferences;",
+             "import dagger.releasablereferences.ReleasableReferenceManager;",
+-            "import dagger.releasablereferences.TypedReleasableReferenceManager;",
+-            "import java.util.Set;",
+             "",
+             "@TestScope",
+             "@Component(modules = TestModule.class)",
+             "interface TestComponent {",
+             "  @ForReleasableReferences(TestScope.class)",
+             "  ReleasableReferenceManager testManager();",
+-            "",
+-            "  @ForReleasableReferences(TestScope.class)",
+-            "  TypedReleasableReferenceManager<TestMetadata> typedManager();",
+-            "",
+-            "  Set<ReleasableReferenceManager> managers();",
+-            "  Set<TypedReleasableReferenceManager<TestMetadata>> typedManagers();",
+             "}");
+ 
+     Compilation compilation =
+@@ -2812,7 +2842,74 @@ public void releasableReferenceManagerConflict() {
+                         + "%1$s.ReleasableReferenceManager from the scope declaration"),
+                 "dagger.releasablereferences"))
+         .inFile(component)
+-        .onLine(13);
++        .onLineContaining("interface TestComponent");
++  }
++
++  @Test
++  public void releasableReferenceManagerConflict_TypedReleasableReferenceManager() {
++    JavaFileObject testScope =
++        JavaFileObjects.forSourceLines(
++            "test.TestScope",
++            "package test;",
++            "",
++            "import static java.lang.annotation.RetentionPolicy.RUNTIME;",
++            "",
++            "import dagger.releasablereferences.CanReleaseReferences;",
++            "import java.lang.annotation.Retention;",
++            "import javax.inject.Scope;",
++            "",
++            "@TestMetadata",
++            "@CanReleaseReferences",
++            "@Scope",
++            "@Retention(RUNTIME)",
++            "@interface TestScope {}");
++    JavaFileObject testMetadata =
++        JavaFileObjects.forSourceLines(
++            "test.TestMetadata",
++            "package test;",
++            "",
++            "import dagger.releasablereferences.CanReleaseReferences;",
++            "",
++            "@CanReleaseReferences",
++            "@interface TestMetadata {}");
++
++    JavaFileObject testModule =
++        JavaFileObjects.forSourceLines(
++            "test.TestModule",
++            "package test;",
++            "",
++            "import dagger.Module;",
++            "import dagger.Provides;",
++            "import dagger.releasablereferences.ForReleasableReferences;",
++            "import dagger.releasablereferences.TypedReleasableReferenceManager;",
++            "",
++            "@Module",
++            "abstract class TestModule {",
++            "  @Provides @ForReleasableReferences(TestScope.class)",
++            "  static TypedReleasableReferenceManager<TestMetadata> typedRrm() {",
++            "    return null;",
++            "  }",
++            "}");
++
++    JavaFileObject component =
++        JavaFileObjects.forSourceLines(
++            "test.TestComponent",
++            "package test;",
++            "",
++            "import dagger.Component;",
++            "import dagger.releasablereferences.ForReleasableReferences;",
++            "import dagger.releasablereferences.TypedReleasableReferenceManager;",
++            "",
++            "@TestScope",
++            "@Component(modules = TestModule.class)",
++            "interface TestComponent {",
++            "  @ForReleasableReferences(TestScope.class)",
++            "  TypedReleasableReferenceManager<TestMetadata> typedManager();",
++            "}");
++
++    Compilation compilation =
++        daggerCompiler().compile(testScope, testMetadata, testModule, component);
++    assertThat(compilation).failed();
+     assertThat(compilation)
+         .hadErrorContaining(
+             String.format(
+@@ -2829,7 +2926,75 @@ public void releasableReferenceManagerConflict() {
+                         + "from the scope declaration"),
+                 "dagger.releasablereferences"))
+         .inFile(component)
+-        .onLine(16);
++        .onLineContaining("interface TestComponent");
++  }
++
++  @Test
++  public void releasableReferenceManagerConflict_SetOfReleasableReferenceManager() {
++    JavaFileObject testScope =
++        JavaFileObjects.forSourceLines(
++            "test.TestScope",
++            "package test;",
++            "",
++            "import static java.lang.annotation.RetentionPolicy.RUNTIME;",
++            "",
++            "import dagger.releasablereferences.CanReleaseReferences;",
++            "import java.lang.annotation.Retention;",
++            "import javax.inject.Scope;",
++            "",
++            "@TestMetadata",
++            "@CanReleaseReferences",
++            "@Scope",
++            "@Retention(RUNTIME)",
++            "@interface TestScope {}");
++    JavaFileObject testMetadata =
++        JavaFileObjects.forSourceLines(
++            "test.TestMetadata",
++            "package test;",
++            "",
++            "import dagger.releasablereferences.CanReleaseReferences;",
++            "",
++            "@CanReleaseReferences",
++            "@interface TestMetadata {}");
++
++    JavaFileObject testModule =
++        JavaFileObjects.forSourceLines(
++            "test.TestModule",
++            "package test;",
++            "",
++            "import dagger.Module;",
++            "import dagger.Provides;",
++            "import dagger.releasablereferences.ForReleasableReferences;",
++            "import dagger.releasablereferences.ReleasableReferenceManager;",
++            "import java.util.Set;",
++            "",
++            "@Module",
++            "abstract class TestModule {",
++            "  @Provides",
++            "  static Set<ReleasableReferenceManager> rrmSet() {",
++            "    return null;",
++            "  }",
++            "}");
++
++    JavaFileObject component =
++        JavaFileObjects.forSourceLines(
++            "test.TestComponent",
++            "package test;",
++            "",
++            "import dagger.Component;",
++            "import dagger.releasablereferences.ForReleasableReferences;",
++            "import dagger.releasablereferences.ReleasableReferenceManager;",
++            "import java.util.Set;",
++            "",
++            "@TestScope",
++            "@Component(modules = TestModule.class)",
++            "interface TestComponent {",
++            "  Set<ReleasableReferenceManager> managers();",
++            "}");
++
++    Compilation compilation =
++        daggerCompiler().compile(testScope, testMetadata, testModule, component);
++    assertThat(compilation).failed();
+     assertThat(compilation)
+         .hadErrorContaining(
+             message(
+@@ -2841,7 +3006,75 @@ public void releasableReferenceManagerConflict() {
+                 "    Dagger-generated binding for "
+                     + "Set<dagger.releasablereferences.ReleasableReferenceManager>"))
+         .inFile(component)
+-        .onLine(18);
++        .onLineContaining("interface TestComponent");
++  }
++
++  @Test
++  public void releasableReferenceManagerConflict_SetOfTypedReleasableReferenceManagers() {
++    JavaFileObject testScope =
++        JavaFileObjects.forSourceLines(
++            "test.TestScope",
++            "package test;",
++            "",
++            "import static java.lang.annotation.RetentionPolicy.RUNTIME;",
++            "",
++            "import dagger.releasablereferences.CanReleaseReferences;",
++            "import java.lang.annotation.Retention;",
++            "import javax.inject.Scope;",
++            "",
++            "@TestMetadata",
++            "@CanReleaseReferences",
++            "@Scope",
++            "@Retention(RUNTIME)",
++            "@interface TestScope {}");
++    JavaFileObject testMetadata =
++        JavaFileObjects.forSourceLines(
++            "test.TestMetadata",
++            "package test;",
++            "",
++            "import dagger.releasablereferences.CanReleaseReferences;",
++            "",
++            "@CanReleaseReferences",
++            "@interface TestMetadata {}");
++
++    JavaFileObject testModule =
++        JavaFileObjects.forSourceLines(
++            "test.TestModule",
++            "package test;",
++            "",
++            "import dagger.Module;",
++            "import dagger.Provides;",
++            "import dagger.releasablereferences.ForReleasableReferences;",
++            "import dagger.releasablereferences.TypedReleasableReferenceManager;",
++            "import java.util.Set;",
++            "",
++            "@Module",
++            "abstract class TestModule {",
++            "  @Provides",
++            "  static Set<TypedReleasableReferenceManager<TestMetadata>> typedRrmSet() {",
++            "    return null;",
++            "  }",
++            "}");
++
++    JavaFileObject component =
++        JavaFileObjects.forSourceLines(
++            "test.TestComponent",
++            "package test;",
++            "",
++            "import dagger.Component;",
++            "import dagger.releasablereferences.ForReleasableReferences;",
++            "import dagger.releasablereferences.TypedReleasableReferenceManager;",
++            "import java.util.Set;",
++            "",
++            "@TestScope",
++            "@Component(modules = TestModule.class)",
++            "interface TestComponent {",
++            "  Set<TypedReleasableReferenceManager<TestMetadata>> typedManagers();",
++            "}");
++
++    Compilation compilation =
++        daggerCompiler().compile(testScope, testMetadata, testModule, component);
++    assertThat(compilation).failed();
+     assertThat(compilation)
+         .hadErrorContaining(
+             String.format(
+@@ -2855,7 +3088,7 @@ public void releasableReferenceManagerConflict() {
+                         + "Set<%1$s.TypedReleasableReferenceManager<test.TestMetadata>>"),
+                 "dagger.releasablereferences"))
+         .inFile(component)
+-        .onLine(19);
++        .onLineContaining("interface TestComponent");
+   }
+ 
+   @Test
+diff --git a/javatests/dagger/internal/codegen/MembersInjectionTest.java b/javatests/dagger/internal/codegen/MembersInjectionTest.java
+index cc78863a9..bb6029fab 100644
+--- a/javatests/dagger/internal/codegen/MembersInjectionTest.java
++++ b/javatests/dagger/internal/codegen/MembersInjectionTest.java
+@@ -1017,7 +1017,8 @@ public void fieldInjectionForShadowedMember() {
+     assertThat(compilation).succeeded();
+   }
+ 
+-  @Test public void rawFrameworkTypes() {
++  @Test
++  public void rawFrameworkTypeField() {
+     JavaFileObject file =
+         JavaFileObjects.forSourceLines(
+             "test.RawFrameworkTypes",
+@@ -1031,25 +1032,45 @@ public void fieldInjectionForShadowedMember() {
+             "  @Inject Provider fieldWithRawProvider;",
+             "}",
+             "",
++            "@Component",
++            "interface C {",
++            "  void inject(RawProviderField rawProviderField);",
++            "}");
++
++    Compilation compilation = daggerCompiler().withOptions(compilerMode.javacopts()).compile(file);
++    assertThat(compilation).failed();
++    assertThat(compilation)
++        .hadErrorContaining("javax.inject.Provider cannot be provided")
++        .inFile(file)
++        .onLineContaining("interface C");
++  }
++
++  @Test
++  public void rawFrameworkTypeParameter() {
++    JavaFileObject file =
++        JavaFileObjects.forSourceLines(
++            "test.RawFrameworkTypes",
++            "package test;",
++            "",
++            "import dagger.Component;",
++            "import javax.inject.Inject;",
++            "import javax.inject.Provider;",
++            "",
+             "class RawProviderParameter {",
+             "  @Inject void methodInjection(Provider rawProviderParameter) {}",
+             "}",
+             "",
+             "@Component",
+             "interface C {",
+-            "  void inject(RawProviderField rawProviderField);",
+             "  void inject(RawProviderParameter rawProviderParameter);",
+             "}");
++
+     Compilation compilation = daggerCompiler().withOptions(compilerMode.javacopts()).compile(file);
+     assertThat(compilation).failed();
+     assertThat(compilation)
+         .hadErrorContaining("javax.inject.Provider cannot be provided")
+         .inFile(file)
+-        .onLine(17);
+-    assertThat(compilation)
+-        .hadErrorContaining("javax.inject.Provider cannot be provided")
+-        .inFile(file)
+-        .onLine(18);
++        .onLineContaining("interface C");
+   }
+ 
+   @Test
+diff --git a/javatests/dagger/internal/codegen/MultibindingTest.java b/javatests/dagger/internal/codegen/MultibindingTest.java
+index 23ce61438..fb156cd57 100644
+--- a/javatests/dagger/internal/codegen/MultibindingTest.java
++++ b/javatests/dagger/internal/codegen/MultibindingTest.java
+@@ -134,7 +134,7 @@ public void concreteBindingForMultibindingAlias() {
+             "java.util.Map<java.lang.String,java.lang.String> "
+                 + "cannot be provided without an @Provides-annotated method")
+         .inFile(component)
+-        .onLineContaining("mapOfStringToString()");
++        .onLineContaining("interface TestComponent");
+   }
+ 
+   @Test
+@@ -186,8 +186,7 @@ public void produceConcreteSet_andRequestSetOfProduced() {
+             "java.util.Set<dagger.producers.Produced<java.lang.String>> "
+                 + "cannot be provided without an @Provides- or @Produces-annotated method")
+         .inFile(component)
+-        .onLineContaining("setOfProduced()");
+-
++        .onLineContaining("interface TestComponent");
+   }
+ 
+   @Test
+diff --git a/javatests/dagger/internal/codegen/ProductionGraphValidationTest.java b/javatests/dagger/internal/codegen/ProductionGraphValidationTest.java
+index 905f94453..1029c1cd5 100644
+--- a/javatests/dagger/internal/codegen/ProductionGraphValidationTest.java
++++ b/javatests/dagger/internal/codegen/ProductionGraphValidationTest.java
+@@ -80,7 +80,7 @@
+             "test.Bar cannot be provided without an @Inject constructor or an @Provides- or "
+                 + "@Produces-annotated method.")
+         .inFile(component)
+-        .onLine(8);
++        .onLineContaining("interface MyComponent");
+   }
+ 
+   @Test public void componentProductionWithNoDependencyChain() {
+@@ -106,7 +106,7 @@
+             "test.TestClass.A cannot be provided without an @Provides- or @Produces-annotated "
+                 + "method.")
+         .inFile(component)
+-        .onLine(11);
++        .onLineContaining("interface AComponent");
+   }
+ 
+   @Test public void provisionDependsOnProduction() {
+@@ -149,7 +149,7 @@
+     assertThat(compilation)
+         .hadErrorContaining("test.TestClass.A is a provision, which cannot depend on a production.")
+         .inFile(component)
+-        .onLine(30);
++        .onLineContaining("interface AComponent");
+   }
+ 
+   @Test public void provisionEntryPointDependsOnProduction() {
+@@ -185,7 +185,7 @@
+         .hadErrorContaining(
+             "test.TestClass.A is a provision entry-point, which cannot depend on a production.")
+         .inFile(component)
+-        .onLine(20);
++        .onLineContaining("interface AComponent");
+   }
+ 
+   @Test
+@@ -243,7 +243,7 @@ public void providingMultibindingWithProductions() {
+     assertThat(compilation)
+         .hadErrorContaining("test.TestClass.A is a provision, which cannot depend on a production")
+         .inFile(component)
+-        .onLine(43);
++        .onLineContaining("interface AComponent");
+   }
+ 
+   @Test
+@@ -294,7 +294,7 @@ public void monitoringDependsOnUnboundType() {
+         .hadErrorContaining(
+             "test.TestClass.A cannot be provided without an @Provides-annotated method.")
+         .inFile(component)
+-        .onLine(34);
++        .onLineContaining("interface StringComponent");
+   }
+ 
+   @Test
+@@ -350,7 +350,7 @@ public void monitoringDependsOnProduction() {
+                 + " test.TestClass.MonitoringModule#monitorFactory is a provision,"
+                 + " which cannot depend on a production.")
+         .inFile(component)
+-        .onLine(37);
++        .onLineContaining("interface StringComponent");
+   }
+ 
+   @Test
+@@ -391,7 +391,10 @@ public void cycleNotBrokenByMap() {
+             "}");
+     Compilation compilation = daggerCompiler().compile(EXECUTOR_MODULE, component, module);
+     assertThat(compilation).failed();
+-    assertThat(compilation).hadErrorContaining("cycle").inFile(component).onLine(8);
++    assertThat(compilation)
++        .hadErrorContaining("cycle")
++        .inFile(component)
++        .onLineContaining("interface TestComponent");
+   }
+ 
+   @Test
+@@ -433,7 +436,10 @@ public void cycleNotBrokenByProducerMap() {
+             "}");
+     Compilation compilation = daggerCompiler().compile(EXECUTOR_MODULE, component, module);
+     assertThat(compilation).failed();
+-    assertThat(compilation).hadErrorContaining("cycle").inFile(component).onLine(8);
++    assertThat(compilation)
++        .hadErrorContaining("cycle")
++        .inFile(component)
++        .onLineContaining("interface TestComponent");
+   }
+   
+   @Test
+diff --git a/javatests/dagger/internal/codegen/SubcomponentBuilderValidationTest.java b/javatests/dagger/internal/codegen/SubcomponentBuilderValidationTest.java
+index ce0c7d43c..3cfed6971 100644
+--- a/javatests/dagger/internal/codegen/SubcomponentBuilderValidationTest.java
++++ b/javatests/dagger/internal/codegen/SubcomponentBuilderValidationTest.java
+@@ -725,9 +725,11 @@ public void testMultipleSettersPerBoundInstanceTypeFails() {
+     assertThat(compilation)
+         .hadErrorContaining(
+             message(
+-                "[test.ChildComponent.s()] java.lang.String is bound multiple times:",
++                "java.lang.String is bound multiple times:",
+                 "    @BindsInstance void test.ChildComponent.Builder.set1(String)",
+-                "    @BindsInstance void test.ChildComponent.Builder.set2(String)"))
++                "    @BindsInstance void test.ChildComponent.Builder.set2(String)",
++                "    java.lang.String is provided at",
++                "        test.ChildComponent.s() [test.ParentComponent → test.ChildComponent]"))
+         .inFile(componentFile)
+         .onLineContaining("interface ParentComponent {");
+   }
+diff --git a/javatests/dagger/internal/codegen/SubcomponentValidationTest.java b/javatests/dagger/internal/codegen/SubcomponentValidationTest.java
+index 1842fb2fb..212e62aae 100644
+--- a/javatests/dagger/internal/codegen/SubcomponentValidationTest.java
++++ b/javatests/dagger/internal/codegen/SubcomponentValidationTest.java
+@@ -309,11 +309,10 @@ public void factoryMethod_grandchild() {
+     assertThat(compilation).failed();
+     assertThat(compilation)
+         .hadErrorContaining(
+-            "[test.ChildComponent.getString()] "
+-                + "java.lang.Integer cannot be provided without an @Inject constructor or an "
++            "java.lang.Integer cannot be provided without an @Inject constructor or an "
+                 + "@Provides-annotated method")
+         .inFile(componentFile)
+-        .onLine(6);
++        .onLineContaining("interface TestComponent");
+   }
+ 
+   @Test public void subcomponentOnConcreteType() {
+diff --git a/javatests/dagger/spi/SpiPluginTest.java b/javatests/dagger/spi/SpiPluginTest.java
+index 51ddf283e..fd4d9d9fe 100644
+--- a/javatests/dagger/spi/SpiPluginTest.java
++++ b/javatests/dagger/spi/SpiPluginTest.java
+@@ -68,7 +68,7 @@ public void dependencyTraceAtBinding() {
+                 "    test.Foo is provided at",
+                 "        test.TestComponent.foo()"))
+         .inFile(component)
+-        .onLineContaining("Foo foo();");
++        .onLineContaining("interface TestComponent");
+   }
+ 
+   @Test
+@@ -156,7 +156,7 @@ public void dependencyTraceAtDependencyRequest() {
+                 "    test.EntryPoint is provided at",
+                 "        test.TestComponent.entryPoint()"))
+         .inFile(component)
+-        .onLineContaining("EntryPoint entryPoint();");
++        .onLineContaining("interface TestComponent");
+     assertThat(compilationFactory.compilationWithErrorOnDependency("dup1"))
+         .hadErrorContaining(
+             message(
+@@ -166,7 +166,7 @@ public void dependencyTraceAtDependencyRequest() {
+                 "    test.EntryPoint is provided at",
+                 "        test.TestComponent.entryPoint()"))
+         .inFile(component)
+-        .onLineContaining("EntryPoint entryPoint();");
++        .onLineContaining("interface TestComponent");
+     assertThat(compilationFactory.compilationWithErrorOnDependency("dup2"))
+         .hadErrorContaining(
+             message(
+@@ -176,9 +176,8 @@ public void dependencyTraceAtDependencyRequest() {
+                 "    test.EntryPoint is provided at",
+                 "        test.TestComponent.entryPoint()"))
+         .inFile(component)
+-        .onLineContaining("EntryPoint entryPoint();");
+-    // Note that this compilation results in one error being reported twice since there are
+-    // two entry points that depend on test.Foo
++        .onLineContaining("interface TestComponent");
++
+     Compilation inFooDepCompilation =
+         compilationFactory.compilationWithErrorOnDependency("inFooDep");
+     assertThat(inFooDepCompilation)
+@@ -190,25 +189,11 @@ public void dependencyTraceAtDependencyRequest() {
+                 "    test.Foo is injected at",
+                 "        test.EntryPoint.<init>(foo, …)",
+                 "    test.EntryPoint is provided at",
+-                "        test.TestComponent.entryPoint()"))
++                "        test.TestComponent.entryPoint()",
++                "The following other entry points also depend on it:",
++                "    test.TestComponent.chain()"))
+         .inFile(component)
+-        .onLineContaining("EntryPoint entryPoint();");
+-    assertThat(inFooDepCompilation)
+-        .hadErrorContaining(
+-            message(
+-                "[FailingPlugin] Bad Dependency!",
+-                "    test.Duplicated is injected at",
+-                "        test.Foo.<init>(inFooDep)",
+-                "    test.Foo is injected at",
+-                "        test.Chain3.<init>(foo)",
+-                "    test.Chain3 is injected at",
+-                "        test.Chain2.<init>(chain)",
+-                "    test.Chain2 is injected at",
+-                "        test.Chain1.<init>(chain)",
+-                "    test.Chain1 is provided at",
+-                "        test.TestComponent.chain()"))
+-        .inFile(component)
+-        .onLineContaining("Chain1 chain();");
++        .onLineContaining("interface TestComponent");
+   }
+ 
+   @Test
+@@ -261,24 +246,25 @@ public void dependencyTraceAtDependencyRequest_subcomponents() {
+     assertThat(compilationFactory.compilationWithErrorOnDependency("childEntryPoint"))
+         .hadErrorContaining(
+             message(
+-                "[FailingPlugin] [test.TestSubcomponent.childEntryPoint()] Bad Dependency!",
++                "[FailingPlugin] Bad Dependency!",
+                 "    test.EntryPoint is provided at",
+-                "        test.TestSubcomponent.childEntryPoint()",
+-                "component path: test.TestComponent → test.TestSubcomponent"))
++                "        test.TestSubcomponent.childEntryPoint()"
++                    + " [test.TestComponent → test.TestSubcomponent]"))
+         .inFile(component)
+         .onLineContaining("interface TestComponent");
+     assertThat(compilationFactory.compilationWithErrorOnDependency("foo"))
+         .hadErrorContaining(
++            // TODO(ronshapiro): Maybe make the component path resemble a stack trace:
++            //     test.TestSubcomponent is a child of
++            //         test.TestComponent
++            // TODO(dpb): Or invert the order: Child → Parent
+             message(
+-                "[FailingPlugin] [test.TestSubcomponent.childEntryPoint()] Bad Dependency!",
++                "[FailingPlugin] Bad Dependency!",
+                 "    test.Foo is injected at",
+                 "        test.EntryPoint.<init>(foo)",
+                 "    test.EntryPoint is provided at",
+-                "        test.TestSubcomponent.childEntryPoint()",
+-                // TODO(ronshapiro): Maybe make the component path resemble a stack trace:
+-                //     test.TestSubcomponent is a child of
+-                //         test.TestComponent
+-                "component path: test.TestComponent → test.TestSubcomponent"))
++                "        test.TestSubcomponent.childEntryPoint() "
++                    + "[test.TestComponent → test.TestSubcomponent]"))
+         .inFile(component)
+         .onLineContaining("interface TestComponent");
+   }
+@@ -338,9 +324,7 @@ public void errorOnSubcomponent() {
+     assertThat(compilation).failed();
+     assertThat(compilation)
+         .hadErrorContaining(
+-            message(
+-                "[FailingPlugin] Bad Subcomponent!",
+-                "component path: test.TestComponent → test.TestSubcomponent"))
++            "[FailingPlugin] Bad Subcomponent! [test.TestComponent → test.TestSubcomponent]")
+         .inFile(component)
+         .onLineContaining("interface TestComponent");
+   }
+@@ -455,18 +439,10 @@ public void shortestPathToBindingExistsThroughSubcomponentBuilder() {
+                 "    test.Chain2 is injected at",
+                 "        test.Chain1.<init>(chain)",
+                 "    test.Chain1 is provided at",
+-                "        test.TestComponent.chain()"))
+-        .inFile(component)
+-        .onLineContaining("Chain1 chain();");
+-    assertThat(compilation)
+-        .hadErrorContaining(
+-            message(
+-                // TODO(ronshapiro): should this error be reported if it's already been reported at
+-                // an ancestor component?
+-                "[FailingPlugin] [test.TestSubcomponent.exposedOnSubcomponent()] Bad Binding!",
+-                "    test.ExposedOnSubcomponent is provided at",
+-                "        test.TestSubcomponent.exposedOnSubcomponent()",
+-                "component path: test.TestComponent → test.TestSubcomponent"))
++                "        test.TestComponent.chain()",
++                "The following other entry points also depend on it:",
++                "    test.TestSubcomponent.exposedOnSubcomponent() "
++                    + "[test.TestComponent → test.TestSubcomponent]"))
+         .inFile(component)
+         .onLineContaining("interface TestComponent");
+   }

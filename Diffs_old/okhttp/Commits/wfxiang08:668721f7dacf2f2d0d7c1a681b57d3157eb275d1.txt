@@ -1,0 +1,459 @@
+diff --git a/okhttp-tests/src/test/java/okhttp3/InterceptorTest.java b/okhttp-tests/src/test/java/okhttp3/InterceptorTest.java
+index 287f12a317..dd72d07f74 100644
+--- a/okhttp-tests/src/test/java/okhttp3/InterceptorTest.java
++++ b/okhttp-tests/src/test/java/okhttp3/InterceptorTest.java
+@@ -597,8 +597,7 @@ private void interceptorThrowsRuntimeExceptionAsynchronous(boolean network) thro
+       client.newCall(request).execute();
+       fail();
+     } catch (NullPointerException expected) {
+-      assertEquals("application interceptor " + interceptor
+-          + " returned null", expected.getMessage());
++      assertEquals("interceptor " + interceptor + " returned null", expected.getMessage());
+     }
+   }
+ 
+@@ -627,7 +626,7 @@ private void interceptorThrowsRuntimeExceptionAsynchronous(boolean network) thro
+       client.newCall(request).execute();
+       fail();
+     } catch (NullPointerException expected) {
+-      assertEquals("network interceptor " + interceptor + " returned null", expected.getMessage());
++      assertEquals("interceptor " + interceptor + " returned null", expected.getMessage());
+     }
+   }
+ 
+diff --git a/okhttp/src/main/java/okhttp3/RealCall.java b/okhttp/src/main/java/okhttp3/RealCall.java
+index 6cf3000613..c2a6a7653b 100644
+--- a/okhttp/src/main/java/okhttp3/RealCall.java
++++ b/okhttp/src/main/java/okhttp3/RealCall.java
+@@ -18,9 +18,12 @@
+ import java.io.IOException;
+ import java.net.HttpRetryException;
+ import java.net.ProtocolException;
++import java.util.ArrayList;
++import java.util.List;
+ import okhttp3.internal.NamedRunnable;
+ import okhttp3.internal.Platform;
+ import okhttp3.internal.http.HttpEngine;
++import okhttp3.internal.http.RealInterceptorChain;
+ import okhttp3.internal.http.RouteException;
+ import okhttp3.internal.http.StreamAllocation;
+ import okhttp3.internal.http.UnrepeatableRequestBody;
+@@ -152,46 +155,18 @@ HttpUrl redactedUrl() {
+   }
+ 
+   private Response getResponseWithInterceptorChain() throws IOException {
+-    Interceptor.Chain chain = new ApplicationInterceptorChain(0, originalRequest);
+-    return chain.proceed(originalRequest);
+-  }
+-
+-  class ApplicationInterceptorChain implements Interceptor.Chain {
+-    private final int index;
+-    private final Request request;
+-
+-    ApplicationInterceptorChain(int index, Request request) {
+-      this.index = index;
+-      this.request = request;
+-    }
+-
+-    @Override public Connection connection() {
+-      return null;
+-    }
+-
+-    @Override public Request request() {
+-      return request;
++    // Build a full stack of interceptors.
++    List<Interceptor> interceptors = new ArrayList<>();
++    interceptors.addAll(client.interceptors());
++    interceptors.add(new RetryAndFollowUpInterceptor());
++    if (!forWebSocket) {
++      interceptors.addAll(client.networkInterceptors());
+     }
++    interceptors.add(new HttpEngine.CallServerInterceptor(forWebSocket));
+ 
+-    @Override public Response proceed(Request request) throws IOException {
+-      Interceptor.Chain chain = new ApplicationInterceptorChain(index + 1, request);
+-
+-      // If there's another interceptor in the chain, call that.
+-      if (index < client.interceptors().size()) {
+-        Interceptor interceptor = client.interceptors().get(index);
+-        Response interceptedResponse = interceptor.intercept(chain);
+-
+-        if (interceptedResponse == null) {
+-          throw new NullPointerException("application interceptor " + interceptor
+-              + " returned null");
+-        }
+-
+-        return interceptedResponse;
+-      }
+-
+-      // No more interceptors. Do HTTP.
+-      return new RetryAndFollowUpInterceptor().intercept(chain);
+-    }
++    Interceptor.Chain chain = new RealInterceptorChain(
++        interceptors, null, null, null, 0, originalRequest);
++    return chain.proceed(originalRequest);
+   }
+ 
+   /**
+@@ -237,7 +212,7 @@ private Response getResponseWithInterceptorChain() throws IOException {
+         Response response = null;
+         boolean releaseConnection = true;
+         try {
+-          response = engine.proceed(request);
++          response = engine.proceed(request, (RealInterceptorChain) chain);
+           releaseConnection = false;
+         } catch (RouteException e) {
+           // The attempt to connect via a route failed. The request will not have been sent.
+diff --git a/okhttp/src/main/java/okhttp3/internal/http/Http1xStream.java b/okhttp/src/main/java/okhttp3/internal/http/Http1xStream.java
+index d0160c9089..e351a4d6dc 100644
+--- a/okhttp/src/main/java/okhttp3/internal/http/Http1xStream.java
++++ b/okhttp/src/main/java/okhttp3/internal/http/Http1xStream.java
+@@ -115,7 +115,6 @@ public Http1xStream(StreamAllocation streamAllocation, BufferedSource source, Bu
+    * header field receives the proper value.
+    */
+   @Override public void writeRequestHeaders(Request request) throws IOException {
+-    httpEngine.writingRequestHeaders();
+     String requestLine = RequestLine.get(
+         request, httpEngine.getConnection().route().proxy().type());
+     writeRequest(request.headers(), requestLine);
+diff --git a/okhttp/src/main/java/okhttp3/internal/http/Http2xStream.java b/okhttp/src/main/java/okhttp3/internal/http/Http2xStream.java
+index 3f878f633c..3766527ca5 100644
+--- a/okhttp/src/main/java/okhttp3/internal/http/Http2xStream.java
++++ b/okhttp/src/main/java/okhttp3/internal/http/Http2xStream.java
+@@ -126,8 +126,7 @@ public Http2xStream(StreamAllocation streamAllocation, FramedConnection framedCo
+   @Override public void writeRequestHeaders(Request request) throws IOException {
+     if (stream != null) return;
+ 
+-    httpEngine.writingRequestHeaders();
+-    boolean permitsRequestBody = httpEngine.permitsRequestBody(request);
++    boolean permitsRequestBody = HttpMethod.permitsRequestBody(request.method());
+     List<Header> requestHeaders = framedConnection.getProtocol() == Protocol.HTTP_2
+         ? http2HeadersList(request)
+         : spdy3HeadersList(request);
+diff --git a/okhttp/src/main/java/okhttp3/internal/http/HttpEngine.java b/okhttp/src/main/java/okhttp3/internal/http/HttpEngine.java
+index a0c0b3f372..273eda726f 100644
+--- a/okhttp/src/main/java/okhttp3/internal/http/HttpEngine.java
++++ b/okhttp/src/main/java/okhttp3/internal/http/HttpEngine.java
+@@ -103,9 +103,6 @@
+   private final Response priorResponse;
+   private HttpStream httpStream;
+ 
+-  /** The time when the request headers were written, or -1 if they haven't been written yet. */
+-  long sentRequestMillis = -1;
+-
+   /**
+    * True if this client added an "Accept-Encoding: gzip" header field and is therefore responsible
+    * for also decompressing the transfer stream.
+@@ -137,7 +134,7 @@ public HttpEngine(OkHttpClient client, HttpUrl userRequestUrl,
+    * @throws IOException if there was a problem while making a request. Sometimes recoverable. See
+    * {@link #recover}.
+    */
+-  public Response proceed(Request userRequest) throws IOException {
++  public Response proceed(Request userRequest, RealInterceptorChain chain) throws IOException {
+     if (httpStream != null) throw new IllegalStateException();
+ 
+     Request request = networkRequest(userRequest);
+@@ -170,7 +167,7 @@ public Response proceed(Request userRequest) throws IOException {
+           .code(504)
+           .message("Unsatisfiable Request (only-if-cached)")
+           .body(EMPTY_BODY)
+-          .sentRequestAtMillis(sentRequestMillis)
++          .sentRequestAtMillis(-1L)
+           .receivedResponseAtMillis(System.currentTimeMillis())
+           .build();
+     }
+@@ -198,14 +195,8 @@ public Response proceed(Request userRequest) throws IOException {
+       }
+     }
+ 
+-    Response networkResponse;
+-    if (forWebSocket) {
+-      httpStream.writeRequestHeaders(networkRequest);
+-      networkResponse = readNetworkResponse(networkRequest);
+-    } else {
+-      networkResponse = new NetworkInterceptorChain(0, networkRequest,
+-          streamAllocation.connection()).proceed(networkRequest);
+-    }
++    Response networkResponse = chain.proceed(networkRequest, streamAllocation.connection(),
++        streamAllocation, httpStream);
+ 
+     receiveHeaders(networkResponse.headers());
+ 
+@@ -261,19 +252,6 @@ private static Response stripBody(Response response) {
+         : response;
+   }
+ 
+-  /**
+-   * Called immediately before the transport transmits HTTP request headers. This is used to observe
+-   * the sent time should the request be cached.
+-   */
+-  public void writingRequestHeaders() {
+-    if (sentRequestMillis != -1) throw new IllegalStateException();
+-    sentRequestMillis = System.currentTimeMillis();
+-  }
+-
+-  boolean permitsRequestBody(Request request) {
+-    return HttpMethod.permitsRequestBody(request.method());
+-  }
+-
+   public Connection getConnection() {
+     return streamAllocation.connection();
+   }
+@@ -503,76 +481,32 @@ private String cookieHeader(List<Cookie> cookies) {
+     return cookieHeader.toString();
+   }
+ 
+-  class NetworkInterceptorChain implements Interceptor.Chain {
+-    private final int index;
+-    private final Request request;
+-    private final Connection connection;
+-    private int calls;
++  public static class CallServerInterceptor implements Interceptor {
++    private final boolean forWebSocket;
+ 
+-    NetworkInterceptorChain(int index, Request request, Connection connection) {
+-      this.index = index;
+-      this.request = request;
+-      this.connection = connection;
+-    }
+-
+-    @Override public Connection connection() {
+-      return connection;
+-    }
++    /** The time when the request headers were written, or -1 if they haven't been written yet. */
++    long sentRequestMillis = -1;
+ 
+-    @Override public Request request() {
+-      return request;
++    public CallServerInterceptor(boolean forWebSocket) {
++      this.forWebSocket = forWebSocket;
+     }
+ 
+-    @Override public Response proceed(Request request) throws IOException {
+-      calls++;
+-
+-      if (index > 0) {
+-        Interceptor caller = client.networkInterceptors().get(index - 1);
+-        Address address = connection().route().address();
+-
+-        // Confirm that the interceptor uses the connection we've already prepared.
+-        if (!request.url().host().equals(address.url().host())
+-            || request.url().port() != address.url().port()) {
+-          throw new IllegalStateException("network interceptor " + caller
+-              + " must retain the same host and port");
+-        }
+-
+-        // Confirm that this is the interceptor's first call to chain.proceed().
+-        if (calls > 1) {
+-          throw new IllegalStateException("network interceptor " + caller
+-              + " must call proceed() exactly once");
+-        }
+-      }
+-
+-      if (index < client.networkInterceptors().size()) {
+-        // There's another interceptor in the chain. Call that.
+-        NetworkInterceptorChain chain = new NetworkInterceptorChain(index + 1, request, connection);
+-        Interceptor interceptor = client.networkInterceptors().get(index);
+-        Response interceptedResponse = interceptor.intercept(chain);
+-
+-        // Confirm that the interceptor made the required call to chain.proceed().
+-        if (chain.calls != 1) {
+-          throw new IllegalStateException("network interceptor " + interceptor
+-              + " must call proceed() exactly once");
+-        }
+-        if (interceptedResponse == null) {
+-          throw new NullPointerException("network interceptor " + interceptor
+-              + " returned null");
+-        }
+-
+-        return interceptedResponse;
+-      }
++    @Override public Response intercept(Chain chain) throws IOException {
++      HttpStream httpStream = ((RealInterceptorChain) chain).httpStream();
++      StreamAllocation streamAllocation = ((RealInterceptorChain) chain).streamAllocation();
+ 
++      Request request = chain.request();
++      sentRequestMillis = System.currentTimeMillis();
+       httpStream.writeRequestHeaders(request);
+ 
+-      if (permitsRequestBody(request) && request.body() != null) {
++      if (HttpMethod.permitsRequestBody(request.method()) && request.body() != null) {
+         Sink requestBodyOut = httpStream.createRequestBody(request, request.body().contentLength());
+         BufferedSink bufferedRequestBody = Okio.buffer(requestBodyOut);
+         request.body().writeTo(bufferedRequestBody);
+         bufferedRequestBody.close();
+       }
+ 
+-      Response response = readNetworkResponse(request);
++      Response response = readNetworkResponse(httpStream, streamAllocation, request);
+ 
+       int code = response.code();
+       if ((code == 204 || code == 205) && response.body().contentLength() > 0) {
+@@ -582,30 +516,31 @@ private String cookieHeader(List<Cookie> cookies) {
+ 
+       return response;
+     }
+-  }
+ 
+-  private Response readNetworkResponse(Request networkRequest) throws IOException {
+-    httpStream.finishRequest();
+-
+-    Response networkResponse = httpStream.readResponseHeaders()
+-        .request(networkRequest)
+-        .handshake(streamAllocation.connection().handshake())
+-        .sentRequestAtMillis(sentRequestMillis)
+-        .receivedResponseAtMillis(System.currentTimeMillis())
+-        .build();
++    private Response readNetworkResponse(HttpStream httpStream, StreamAllocation streamAllocation,
++        Request networkRequest) throws IOException {
++      httpStream.finishRequest();
+ 
+-    if (!forWebSocket || networkResponse.code() != 101) {
+-      networkResponse = networkResponse.newBuilder()
+-          .body(httpStream.openResponseBody(networkResponse))
++      Response networkResponse = httpStream.readResponseHeaders()
++          .request(networkRequest)
++          .handshake(streamAllocation.connection().handshake())
++          .sentRequestAtMillis(sentRequestMillis)
++          .receivedResponseAtMillis(System.currentTimeMillis())
+           .build();
+-    }
+ 
+-    if ("close".equalsIgnoreCase(networkResponse.request().header("Connection"))
+-        || "close".equalsIgnoreCase(networkResponse.header("Connection"))) {
+-      streamAllocation.noNewStreams();
+-    }
++      if (!forWebSocket || networkResponse.code() != 101) {
++        networkResponse = networkResponse.newBuilder()
++            .body(httpStream.openResponseBody(networkResponse))
++            .build();
++      }
++
++      if ("close".equalsIgnoreCase(networkResponse.request().header("Connection"))
++          || "close".equalsIgnoreCase(networkResponse.header("Connection"))) {
++        streamAllocation.noNewStreams();
++      }
+ 
+-    return networkResponse;
++      return networkResponse;
++    }
+   }
+ 
+   /**
+diff --git a/okhttp/src/main/java/okhttp3/internal/http/RealInterceptorChain.java b/okhttp/src/main/java/okhttp3/internal/http/RealInterceptorChain.java
+new file mode 100644
+index 0000000000..8e67b1b84a
+--- /dev/null
++++ b/okhttp/src/main/java/okhttp3/internal/http/RealInterceptorChain.java
+@@ -0,0 +1,111 @@
++/*
++ * Copyright (C) 2016 Square, Inc.
++ *
++ * Licensed under the Apache License, Version 2.0 (the "License");
++ * you may not use this file except in compliance with the License.
++ * You may obtain a copy of the License at
++ *
++ *      http://www.apache.org/licenses/LICENSE-2.0
++ *
++ * Unless required by applicable law or agreed to in writing, software
++ * distributed under the License is distributed on an "AS IS" BASIS,
++ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++ * See the License for the specific language governing permissions and
++ * limitations under the License.
++ */
++package okhttp3.internal.http;
++
++import java.io.IOException;
++import java.util.List;
++import okhttp3.Connection;
++import okhttp3.HttpUrl;
++import okhttp3.Interceptor;
++import okhttp3.Request;
++import okhttp3.Response;
++
++/**
++ * A concrete interceptor chain that carries the entire interceptor chain: all application
++ * interceptors, the OkHttp core, all network interceptors, and finally the network caller.
++ */
++public final class RealInterceptorChain implements Interceptor.Chain {
++  private final List<Interceptor> interceptors;
++  private final Connection connection;
++  private final StreamAllocation streamAllocation;
++  private final HttpStream httpStream;
++  private final int index;
++  private final Request request;
++  private int calls;
++
++  public RealInterceptorChain(List<Interceptor> interceptors, Connection connection,
++      StreamAllocation streamAllocation, HttpStream httpStream, int index, Request request) {
++    this.interceptors = interceptors;
++    this.connection = connection;
++    this.streamAllocation = streamAllocation;
++    this.httpStream = httpStream;
++    this.index = index;
++    this.request = request;
++  }
++
++  @Override public Connection connection() {
++    return connection;
++  }
++
++  public StreamAllocation streamAllocation() {
++    return streamAllocation;
++  }
++
++  public HttpStream httpStream() {
++    return httpStream;
++  }
++
++  @Override public Request request() {
++    return request;
++  }
++
++  @Override public Response proceed(Request request) throws IOException {
++    return proceed(request, connection, streamAllocation, httpStream);
++  }
++
++  public Response proceed(Request request, Connection connection, StreamAllocation streamAllocation,
++      HttpStream httpStream) throws IOException {
++    if (index >= interceptors.size()) throw new AssertionError();
++
++    calls++;
++
++    // If we already have a connection, confirm that the incoming request will use it.
++    if (this.connection != null && !sameConnection(request.url())) {
++      throw new IllegalStateException("network interceptor " + interceptors.get(index - 1)
++          + " must retain the same host and port");
++    }
++
++    // If we already have a connection, confirm that this is the only call to chain.proceed().
++    if (this.connection != null && calls > 1) {
++      throw new IllegalStateException("network interceptor " + interceptors.get(index - 1)
++          + " must call proceed() exactly once");
++    }
++
++    // Call the next interceptor in the chain.
++    RealInterceptorChain chain = new RealInterceptorChain(
++        interceptors, connection, streamAllocation, httpStream, index + 1, request);
++    Interceptor interceptor = interceptors.get(index);
++    Response interceptedResponse = interceptor.intercept(chain);
++
++    // Confirm that the next interceptor made its required call to chain.proceed().
++    if (connection != null && index + 1 < interceptors.size() && chain.calls != 1) {
++      throw new IllegalStateException("network interceptor " + interceptor
++          + " must call proceed() exactly once");
++    }
++
++    // Confirm that the intercepted response isn't null.
++    if (interceptedResponse == null) {
++      throw new NullPointerException("interceptor " + interceptor + " returned null");
++    }
++
++    return interceptedResponse;
++  }
++
++  private boolean sameConnection(HttpUrl url) {
++    return url.host().equals(connection().route().address().url().host())
++        && url.port() == connection().route().address().url().port();
++  }
++}

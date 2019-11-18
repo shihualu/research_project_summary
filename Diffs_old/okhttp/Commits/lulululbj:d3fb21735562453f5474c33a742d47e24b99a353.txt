@@ -1,0 +1,137 @@
+diff --git a/okhttp/src/main/java/okhttp3/Dispatcher.java b/okhttp/src/main/java/okhttp3/Dispatcher.java
+index d21e9df1b9..14c80f2f4e 100644
+--- a/okhttp/src/main/java/okhttp3/Dispatcher.java
++++ b/okhttp/src/main/java/okhttp3/Dispatcher.java
+@@ -37,9 +37,9 @@
+  * of calls concurrently.
+  */
+ public final class Dispatcher {
+-  private int maxRequests = 64;
+-  private int maxRequestsPerHost = 5;
+-  private @Nullable Runnable idleCallback;
++  private int maxRequests = 64; // runningAsyncCalls 队列最大请求数
++  private int maxRequestsPerHost = 5; // 异步请求同一 host 下最大请求数
++  private @Nullable Runnable idleCallback; // idle 回调
+ 
+   /** Executes calls. Created lazily. */
+   private @Nullable ExecutorService executorService;
+@@ -177,6 +177,9 @@ public synchronized void cancelAll() {
+    * them on the executor service. Must not be called with synchronization because executing calls
+    * can call into user code.
+    *
++   * 将 readyAsyncCalls 中的请求移动到 runningAsyncCalls 中，并通过线程池执行
++   * 不能同步调用，会调用用户代码
++   *
+    * @return true if the dispatcher is currently running calls.
+    */
+   private boolean promoteAndExecute() {
+@@ -188,7 +191,9 @@ private boolean promoteAndExecute() {
+       for (Iterator<AsyncCall> i = readyAsyncCalls.iterator(); i.hasNext(); ) {
+         AsyncCall asyncCall = i.next();
+ 
++        // runningAsyncCalls 队列中最大值不超过 64
+         if (runningAsyncCalls.size() >= maxRequests) break; // Max capacity.
++        // 单个 host 下请求不能超过 5 个
+         if (asyncCall.callsPerHost().get() >= maxRequestsPerHost) continue; // Host max capacity.
+ 
+         i.remove();
+@@ -201,7 +206,7 @@ private boolean promoteAndExecute() {
+ 
+     for (int i = 0, size = executableCalls.size(); i < size; i++) {
+       AsyncCall asyncCall = executableCalls.get(i);
+-      asyncCall.executeOn(executorService());
++      asyncCall.executeOn(executorService()); // 调用线程池执行
+     }
+ 
+     return isRunning;
+@@ -226,10 +231,12 @@ void finished(RealCall call) {
+   private <T> void finished(Deque<T> calls, T call) {
+     Runnable idleCallback;
+     synchronized (this) {
++      // 执行结束后，从相应队列中移除该 call
+       if (!calls.remove(call)) throw new AssertionError("Call wasn't in-flight!");
+       idleCallback = this.idleCallback;
+     }
+ 
++    // 并将 readyAsyncCalls 队列中的请求按策略移动到 runningAsyncCalls 中
+     boolean isRunning = promoteAndExecute();
+ 
+     if (!isRunning && idleCallback != null) {
+diff --git a/okhttp/src/main/java/okhttp3/RealCall.java b/okhttp/src/main/java/okhttp3/RealCall.java
+index bb108764da..2774eb6687 100644
+--- a/okhttp/src/main/java/okhttp3/RealCall.java
++++ b/okhttp/src/main/java/okhttp3/RealCall.java
+@@ -69,7 +69,11 @@ static RealCall newRealCall(OkHttpClient client, Request originalRequest, boolea
+     return originalRequest;
+   }
+ 
++  /**
++   * 同步执行
++   */
+   @Override public Response execute() throws IOException {
++    // 每个 call 只能执行一次，否则抛出异常
+     synchronized (this) {
+       if (executed) throw new IllegalStateException("Already Executed");
+       executed = true;
+@@ -77,19 +81,26 @@ static RealCall newRealCall(OkHttpClient client, Request originalRequest, boolea
+     transmitter.timeoutEnter();
+     transmitter.callStart();
+     try {
++      // 将请求加入 runningSyncCalls 队列，这是一个同步队列
+       client.dispatcher().executed(this);
+       return getResponseWithInterceptorChain();
+     } finally {
++      // 将该 Call 从同步队列 runningSyncCalls 中移除
+       client.dispatcher().finished(this);
+     }
+   }
+ 
++  /**
++   * 异步执行
++   */
+   @Override public void enqueue(Callback responseCallback) {
++    // 每个 call 只能执行一次，否则抛出异常
+     synchronized (this) {
+       if (executed) throw new IllegalStateException("Already Executed");
+       executed = true;
+     }
+     transmitter.callStart();
++    // 构建一个 AsyncCall，将其加入 readyAsyncCalls 队列，这是一个异步队列
+     client.dispatcher().enqueue(new AsyncCall(responseCallback));
+   }
+ 
+@@ -169,6 +180,7 @@ void executeOn(ExecutorService executorService) {
+       boolean signalledCallback = false;
+       transmitter.timeoutEnter();
+       try {
++        // 和同步请求一样，最后还是调用 getResponseWithInterceptorChain() 方法执行请求
+         Response response = getResponseWithInterceptorChain();
+         signalledCallback = true;
+         responseCallback.onResponse(RealCall.this, response);
+@@ -202,16 +214,25 @@ String redactedUrl() {
+   Response getResponseWithInterceptorChain() throws IOException {
+     // Build a full stack of interceptors.
+     List<Interceptor> interceptors = new ArrayList<>();
++    // 用户设置的拦截器
+     interceptors.addAll(client.interceptors());
++    // 失败重试和重定向拦截器
+     interceptors.add(new RetryAndFollowUpInterceptor(client));
++    // 1. 将用户构建的请求转换为发送给服务器的网络请求
++    // 2. 将服务器返回的响应转换为对用户友好的响应
+     interceptors.add(new BridgeInterceptor(client.cookieJar()));
++    // 缓存拦截器，提供缓存和写缓存
+     interceptors.add(new CacheInterceptor(client.internalCache()));
+-    interceptors.add(new ConnectInterceptor(client));
++    // 连接拦截器，与目标服务器建立连接
++    interceptors.add(new ConnectInterceptor(client)); //
+     if (!forWebSocket) {
++      // 用户设置的网络拦截器
+       interceptors.addAll(client.networkInterceptors());
+     }
++    // 最后一个拦截器，真正与服务器进行通讯
+     interceptors.add(new CallServerInterceptor(forWebSocket));
+ 
++    // 通过 RealInterceptorChain 层层处理
+     Interceptor.Chain chain = new RealInterceptorChain(interceptors, transmitter, null, 0,
+         originalRequest, this, client.connectTimeoutMillis(),
+         client.readTimeoutMillis(), client.writeTimeoutMillis());

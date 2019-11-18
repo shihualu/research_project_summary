@@ -1,0 +1,1020 @@
+diff --git a/okhttp-tls/src/main/java/okhttp3/tls/HeldCertificate.kt b/okhttp-tls/src/main/java/okhttp3/tls/HeldCertificate.kt
+index 6fae9ee615..e82a9fde19 100644
+--- a/okhttp-tls/src/main/java/okhttp3/tls/HeldCertificate.kt
++++ b/okhttp-tls/src/main/java/okhttp3/tls/HeldCertificate.kt
+@@ -16,7 +16,9 @@
+ package okhttp3.tls
+ 
+ import okhttp3.internal.canParseAsIpAddress
++import okio.Buffer
+ import okio.ByteString
++import okio.ByteString.Companion.decodeBase64
+ import okio.ByteString.Companion.toByteString
+ import org.bouncycastle.asn1.ASN1Encodable
+ import org.bouncycastle.asn1.DERSequence
+@@ -27,14 +29,20 @@ import org.bouncycastle.asn1.x509.X509Extensions
+ import org.bouncycastle.jce.provider.BouncyCastleProvider
+ import org.bouncycastle.x509.X509V3CertificateGenerator
+ import java.math.BigInteger
++import java.security.GeneralSecurityException
++import java.security.KeyFactory
+ import java.security.KeyPair
+ import java.security.KeyPairGenerator
+ import java.security.PrivateKey
+ import java.security.PublicKey
+ import java.security.SecureRandom
+ import java.security.Security
++import java.security.cert.CertificateFactory
+ import java.security.cert.X509Certificate
++import java.security.interfaces.ECPublicKey
+ import java.security.interfaces.RSAPrivateKey
++import java.security.interfaces.RSAPublicKey
++import java.security.spec.PKCS8EncodedKeySpec
+ import java.util.Date
+ import java.util.UUID
+ import java.util.concurrent.TimeUnit
+@@ -353,7 +361,7 @@ class HeldCertificate(
+         BigInteger.ONE
+       }
+       val signatureAlgorithm = if (signedByKeyPair.private is RSAPrivateKey) {
+-        "SHA256WithRSAEncryption"
++        "SHA256WithRSA"
+       } else {
+         "SHA256withECDSA"
+       }
+@@ -419,4 +427,103 @@ class HeldCertificate(
+       }
+     }
+   }
++
++  companion object {
++    private val PEM_REGEX = Regex("""-----BEGIN ([!-,.-~ ]*)-----([^-]*)-----END \1-----""")
++
++    /**
++     * Decodes a multiline string that contains both a [certificate][certificatePem] and a
++     * [private key][privateKeyPkcs8Pem], both [PEM-encoded][rfc_7468]. A typical input string looks
++     * like this:
++     *
++     * ```
++     * -----BEGIN CERTIFICATE-----
++     * MIIBYTCCAQegAwIBAgIBKjAKBggqhkjOPQQDAjApMRQwEgYDVQQLEwtlbmdpbmVl
++     * cmluZzERMA8GA1UEAxMIY2FzaC5hcHAwHhcNNzAwMTAxMDAwMDA1WhcNNzAwMTAx
++     * MDAwMDEwWjApMRQwEgYDVQQLEwtlbmdpbmVlcmluZzERMA8GA1UEAxMIY2FzaC5h
++     * cHAwWTATBgcqhkjOPQIBBggqhkjOPQMBBwNCAASda8ChkQXxGELnrV/oBnIAx3dD
++     * ocUOJfdz4pOJTP6dVQB9U3UBiW5uSX/MoOD0LL5zG3bVyL3Y6pDwKuYvfLNhoyAw
++     * HjAcBgNVHREBAf8EEjAQhwQBAQEBgghjYXNoLmFwcDAKBggqhkjOPQQDAgNIADBF
++     * AiAyHHg1N6YDDQiY920+cnI5XSZwEGhAtb9PYWO8bLmkcQIhAI2CfEZf3V/obmdT
++     * yyaoEufLKVXhrTQhRfodTeigi4RX
++     * -----END CERTIFICATE-----
++     * -----BEGIN PRIVATE KEY-----
++     * MEECAQAwEwYHKoZIzj0CAQYIKoZIzj0DAQcEJzAlAgEBBCA7ODT0xhGSNn4ESj6J
++     * lu/GJQZoU9lDrCPeUcQ28tzOWw==
++     * -----END PRIVATE KEY-----
++     * ```
++     *
++     * The string should contain exactly one certificate and one private key in [PKCS #8][rfc_5208]
++     * format. It should not contain any other PEM-encoded blocks, but it may contain other text
++     * which will be ignored.
++     *
++     * Encode a held certificate into this format by concatenating the results of
++     * [certificatePem()][certificatePem] and [privateKeyPkcs8Pem()][privateKeyPkcs8Pem].
++     *
++     * [rfc_7468]: https://tools.ietf.org/html/rfc7468
++     * [rfc_5208]: https://tools.ietf.org/html/rfc5208
++     */
++    @JvmStatic
++    fun decode(certificateAndPrivateKeyPem: String): HeldCertificate {
++      var certificatePem: String? = null
++      var pkcs8Base64: String? = null
++      for (match in PEM_REGEX.findAll(certificateAndPrivateKeyPem)) {
++        when (val label = match.groups[1]!!.value) {
++          "CERTIFICATE" -> {
++            require(certificatePem == null) { "string includes multiple certificates" }
++            certificatePem = match.groups[0]!!.value // Keep --BEGIN-- and --END-- for certificates.
++          }
++          "PRIVATE KEY" -> {
++            require(pkcs8Base64 == null) { "string includes multiple private keys" }
++            pkcs8Base64 = match.groups[2]!!.value // Include the contents only for PKCS8.
++          }
++          else -> {
++            throw IllegalArgumentException("unexpected type: $label")
++          }
++        }
++      }
++      require(certificatePem != null) { "string does not include a certificate" }
++      require(pkcs8Base64 != null) { "string does not include a private key" }
++
++      return decode(certificatePem, pkcs8Base64)
++    }
++
++    private fun decode(certificatePem: String, pkcs8Base64Text: String): HeldCertificate {
++      val certificate = try {
++        decodePem(certificatePem)
++      } catch (e: GeneralSecurityException) {
++        throw IllegalArgumentException("failed to decode certificate", e)
++      }
++
++      val privateKey = try {
++        val pkcs8Bytes = pkcs8Base64Text.decodeBase64()
++            ?: throw IllegalArgumentException("failed to decode private key")
++
++        // The private key doesn't tell us its type but it's okay because the certificate knows!
++        val keyType = when (certificate.publicKey) {
++          is ECPublicKey -> "EC"
++          is RSAPublicKey -> "RSA"
++          else -> throw IllegalArgumentException("unexpected key type: ${certificate.publicKey}")
++        }
++
++        decodePkcs8(pkcs8Bytes, keyType)
++      } catch (e: GeneralSecurityException) {
++        throw IllegalArgumentException("failed to decode private key", e)
++      }
++
++      val keyPair = KeyPair(certificate.publicKey, privateKey)
++      return HeldCertificate(keyPair, certificate)
++    }
++
++    private fun decodePem(pem: String): X509Certificate {
++      val certificates = CertificateFactory.getInstance("X.509")
++          .generateCertificates(Buffer().writeUtf8(pem).inputStream())
++      return certificates.iterator().next() as X509Certificate
++    }
++
++    private fun decodePkcs8(data: ByteString, keyAlgorithm: String): PrivateKey {
++      val keyFactory = KeyFactory.getInstance(keyAlgorithm)
++      return keyFactory.generatePrivate(PKCS8EncodedKeySpec(data.toByteArray()))
++    }
++  }
+ }
+diff --git a/okhttp-tls/src/test/java/okhttp3/tls/HeldCertificateTest.java b/okhttp-tls/src/test/java/okhttp3/tls/HeldCertificateTest.java
+index 76dbeb81f1..378e154069 100644
+--- a/okhttp-tls/src/test/java/okhttp3/tls/HeldCertificateTest.java
++++ b/okhttp-tls/src/test/java/okhttp3/tls/HeldCertificateTest.java
+@@ -31,6 +31,7 @@
+ import static java.util.Arrays.asList;
+ import static org.assertj.core.api.Assertions.assertThat;
+ import static org.assertj.core.data.Offset.offset;
++import static org.junit.Assert.fail;
+ 
+ public final class HeldCertificateTest {
+   @Test public void defaultCertificate() throws CertificateParsingException {
+@@ -219,4 +220,268 @@
+     assertThat(root.certificate().getSigAlgName()).isEqualTo("SHA256WITHECDSA");
+     assertThat(leaf.certificate().getSigAlgName()).isEqualTo("SHA256WITHECDSA");
+   }
++
++  @Test public void decodeEcdsa256() throws Exception {
++    // The certificate + private key below was generated programmatically:
++    //
++    // HeldCertificate heldCertificate = new HeldCertificate.Builder()
++    //     .validityInterval(5_000L, 10_000L)
++    //     .addSubjectAlternativeName("1.1.1.1")
++    //     .addSubjectAlternativeName("cash.app")
++    //     .serialNumber(42L)
++    //     .commonName("cash.app")
++    //     .organizationalUnit("engineering")
++    //     .ecdsa256()
++    //     .build();
++
++    String certificatePem = ""
++        + "-----BEGIN CERTIFICATE-----\n"
++        + "MIIBYTCCAQegAwIBAgIBKjAKBggqhkjOPQQDAjApMRQwEgYDVQQLEwtlbmdpbmVl\n"
++        + "cmluZzERMA8GA1UEAxMIY2FzaC5hcHAwHhcNNzAwMTAxMDAwMDA1WhcNNzAwMTAx\n"
++        + "MDAwMDEwWjApMRQwEgYDVQQLEwtlbmdpbmVlcmluZzERMA8GA1UEAxMIY2FzaC5h\n"
++        + "cHAwWTATBgcqhkjOPQIBBggqhkjOPQMBBwNCAASda8ChkQXxGELnrV/oBnIAx3dD\n"
++        + "ocUOJfdz4pOJTP6dVQB9U3UBiW5uSX/MoOD0LL5zG3bVyL3Y6pDwKuYvfLNhoyAw\n"
++        + "HjAcBgNVHREBAf8EEjAQhwQBAQEBgghjYXNoLmFwcDAKBggqhkjOPQQDAgNIADBF\n"
++        + "AiAyHHg1N6YDDQiY920+cnI5XSZwEGhAtb9PYWO8bLmkcQIhAI2CfEZf3V/obmdT\n"
++        + "yyaoEufLKVXhrTQhRfodTeigi4RX\n"
++        + "-----END CERTIFICATE-----\n";
++    String pkcs8Pem = ""
++        + "-----BEGIN PRIVATE KEY-----\n"
++        + "MEECAQAwEwYHKoZIzj0CAQYIKoZIzj0DAQcEJzAlAgEBBCA7ODT0xhGSNn4ESj6J\n"
++        + "lu/GJQZoU9lDrCPeUcQ28tzOWw==\n"
++        + "-----END PRIVATE KEY-----\n";
++
++    HeldCertificate heldCertificate = HeldCertificate.decode(certificatePem + pkcs8Pem);
++    assertThat(heldCertificate.certificatePem()).isEqualTo(certificatePem);
++    assertThat(heldCertificate.privateKeyPkcs8Pem()).isEqualTo(pkcs8Pem);
++
++    X509Certificate certificate = heldCertificate.certificate();
++    assertThat(certificate.getNotBefore().getTime()).isEqualTo(5_000L);
++    assertThat(certificate.getNotAfter().getTime()).isEqualTo(10_000L);
++
++    assertThat(certificate.getSubjectAlternativeNames()).containsExactly(
++        asList(GeneralName.iPAddress, "1.1.1.1"),
++        asList(GeneralName.dNSName, "cash.app"));
++
++    assertThat(certificate.getSubjectX500Principal().getName())
++        .isEqualTo("CN=cash.app,OU=engineering");
++  }
++
++  @Test public void decodeRsa512() throws Exception {
++    // The certificate + private key below was generated with OpenSSL. Never generate certificates
++    // with MD5 or 512-bit RSA; that's insecure!
++    //
++    // openssl req \
++    //   -x509 \
++    //   -md5 \
++    //   -nodes \
++    //   -days 1 \
++    //   -newkey rsa:512 \
++    //   -keyout privateKey.key \
++    //   -out certificate.crt
++
++    String certificatePem = ""
++        + "-----BEGIN CERTIFICATE-----\n"
++        + "MIIBFzCBwgIJAIVAqagcVN7/MA0GCSqGSIb3DQEBBAUAMBMxETAPBgNVBAMMCGNh\n"
++        + "c2guYXBwMB4XDTE5MDkwNzAyMjg0NFoXDTE5MDkwODAyMjg0NFowEzERMA8GA1UE\n"
++        + "AwwIY2FzaC5hcHAwXDANBgkqhkiG9w0BAQEFAANLADBIAkEA8qAeoubm4mBTD9/J\n"
++        + "ujLQkfk/fuJt/T5pVQ1vUEqxfcMw0zYgszQ5C2MiIl7M6JkTRKU01q9hVFCR83wX\n"
++        + "zIdrLQIDAQABMA0GCSqGSIb3DQEBBAUAA0EAO1UpwhrkW3Ho1nZK/taoUQOoqz/n\n"
++        + "HFVMtyEkm5gBDgz8nJXwb3zbegclQyH+kVou02S8zC5WWzEtd0R8S0LsTA==\n"
++        + "-----END CERTIFICATE-----\n";
++    String pkcs8Pem = ""
++        + "-----BEGIN PRIVATE KEY-----\n"
++        + "MIIBVQIBADANBgkqhkiG9w0BAQEFAASCAT8wggE7AgEAAkEA8qAeoubm4mBTD9/J\n"
++        + "ujLQkfk/fuJt/T5pVQ1vUEqxfcMw0zYgszQ5C2MiIl7M6JkTRKU01q9hVFCR83wX\n"
++        + "zIdrLQIDAQABAkEA7dEA9o/5k77y68ZhRv9z7QEwucBcKzQ3rsSCbWMpYqg924F9\n"
++        + "L8Z76kzSedSO2PN8mg6y/OLL+qBuTeUK/yiowQIhAP0cknFMbqeNX6uvj/S+V7in\n"
++        + "bIhQkhcSdJjRw8fxMnJpAiEA9WTp9wzJpn+9etZo0jJ8wkM0+LTMNELo47Ctz7l1\n"
++        + "kiUCIQCi34vslD5wWyzBEcwUtZdFH5dbcF1Rs3KMFA9jzfWkYQIgHtiWiFV1K5a3\n"
++        + "DK/S8UkjYY/tIq4nVRJsD+LvlkLrwnkCIECcz4yF4HQgv+Tbzj/gGSBl1VIliTcB\n"
++        + "Rc5RUQ0mZJQF\n"
++        + "-----END PRIVATE KEY-----\n";
++
++    HeldCertificate heldCertificate = HeldCertificate.decode(pkcs8Pem + certificatePem);
++    assertThat(heldCertificate.certificatePem()).isEqualTo(certificatePem);
++    assertThat(heldCertificate.privateKeyPkcs8Pem()).isEqualTo(pkcs8Pem);
++
++    X509Certificate certificate = heldCertificate.certificate();
++    assertThat(certificate.getSubjectX500Principal().getName())
++        .isEqualTo("CN=cash.app");
++  }
++
++  @Test public void decodeRsa2048() throws Exception {
++    // The certificate + private key below was generated programmatically:
++    //
++    // HeldCertificate heldCertificate = new HeldCertificate.Builder()
++    //     .validityInterval(5_000L, 10_000L)
++    //     .addSubjectAlternativeName("1.1.1.1")
++    //     .addSubjectAlternativeName("cash.app")
++    //     .serialNumber(42L)
++    //     .commonName("cash.app")
++    //     .organizationalUnit("engineering")
++    //     .rsa2048()
++    //     .build();
++
++    String certificatePem = ""
++        + "-----BEGIN CERTIFICATE-----\n"
++        + "MIIC7TCCAdWgAwIBAgIBKjANBgkqhkiG9w0BAQsFADApMRQwEgYDVQQLEwtlbmdp\n"
++        + "bmVlcmluZzERMA8GA1UEAxMIY2FzaC5hcHAwHhcNNzAwMTAxMDAwMDA1WhcNNzAw\n"
++        + "MTAxMDAwMDEwWjApMRQwEgYDVQQLEwtlbmdpbmVlcmluZzERMA8GA1UEAxMIY2Fz\n"
++        + "aC5hcHAwggEiMA0GCSqGSIb3DQEBAQUAA4IBDwAwggEKAoIBAQCaU+vrUPL0APGI\n"
++        + "SXIuRX4xRrigXmGKx+GRPnWDWvGJwOm23Vpq/eZxQx6PbSUB1+QZzAwge20RpNAp\n"
++        + "2lt5/qFtgUpEon2j06rd/0+ODqqVJX+6d3SpmF1fPfKUB6AOZbxEkaJpBSTavoTg\n"
++        + "G2M/NMdjZjrcB3quNQcLg54mmI3HJm1zOd/8i2fZjvoiyVY30Inn2SmQsAotXw1u\n"
++        + "aE/319bnR2sQlnkp6MJU0eLEtKyRif/IODvY+mtRYYdkFtoeT6qQPMIh+gF/H3to\n"
++        + "5tjs3g59QC8k2TJDop4EFYUOwdrtnb8wUiBnLyURD1szASE2IO2Ftk1zaNOPKtrv\n"
++        + "VeJuB/mpAgMBAAGjIDAeMBwGA1UdEQEB/wQSMBCHBAEBAQGCCGNhc2guYXBwMA0G\n"
++        + "CSqGSIb3DQEBCwUAA4IBAQAPm7vfk+rxSucxxbFiimmFKBw+ymieLY/kznNh0lHJ\n"
++        + "q15fsMYK7TTTt2FFqyfVXhhRZegLrkrGb3+4Dz1uNtcRrjT4qo+T/JOuZGxtBLbm\n"
++        + "4/hkFSYavtd2FW+/CK7EnQKUyabgLOblb21IHOlcPwpSe6KkJjpwq0TV/ozzfk/q\n"
++        + "kGRA7/Ubn5TMRYyHWnod2SS14+BkItcWN03Z7kvyMYrpNZpu6vQRYsqJJFMcmpGZ\n"
++        + "sZQW31gO2arPmfNotkQdFdNL12c9YZKkJGhyK6NcpffD2l6O9NS5SRD5RnkvBxQw\n"
++        + "fX5DamL8je/YKSLQ4wgUA/5iVKlCiJGQi6fYIJ0kxayO\n"
++        + "-----END CERTIFICATE-----\n";
++    String pkcs8Pem = ""
++        + "-----BEGIN PRIVATE KEY-----\n"
++        + "MIIEvwIBADANBgkqhkiG9w0BAQEFAASCBKkwggSlAgEAAoIBAQCaU+vrUPL0APGI\n"
++        + "SXIuRX4xRrigXmGKx+GRPnWDWvGJwOm23Vpq/eZxQx6PbSUB1+QZzAwge20RpNAp\n"
++        + "2lt5/qFtgUpEon2j06rd/0+ODqqVJX+6d3SpmF1fPfKUB6AOZbxEkaJpBSTavoTg\n"
++        + "G2M/NMdjZjrcB3quNQcLg54mmI3HJm1zOd/8i2fZjvoiyVY30Inn2SmQsAotXw1u\n"
++        + "aE/319bnR2sQlnkp6MJU0eLEtKyRif/IODvY+mtRYYdkFtoeT6qQPMIh+gF/H3to\n"
++        + "5tjs3g59QC8k2TJDop4EFYUOwdrtnb8wUiBnLyURD1szASE2IO2Ftk1zaNOPKtrv\n"
++        + "VeJuB/mpAgMBAAECggEAOlOXaYNZn1Cv+INRrR1EmVkSNEIXeX0bymohvbhka1zG\n"
++        + "t/8myiMVsh7c8PYeM3kl034j4y7ixPVWW0sUoaHT3vArYo9LDtzTyj1REu6GGAJp\n"
++        + "KM82/1X/jBx8jufm3SokIoIsMKbqC+ZPj+ep9dx7sxyTCE+nVSnjdL2Uyx+DDg3o\n"
++        + "na237HTScWIi+tMv5QGEwqLHS2q+NZYfjgnSxNY8BRw4XZCcIZRko9niuB5gUjj/\n"
++        + "y01HwvOCWuOMaSKZak1OdOaz3427/TkhYIqf6ft0ELF+ASRk3BLQA06pRt88H3u2\n"
++        + "3vsHJsWr2rkCN0h9uDp2o50ZQ5fvlxqG0QIZmvkIkQKBgQDOHeZKvXO5IxQ+S8ed\n"
++        + "09bC5SKiclCdW+Ry7N2x1MBfrxc4TTTTNaUN9Qdc6RXANG9bX2CJv0Dkh/0yH3z9\n"
++        + "Bdq6YcoP6DFCX46jwhCKvxMX9h9PFLvY7l2VSe7NfboGzvYLCy8ErsGuio8u9MHZ\n"
++        + "osX2ch6Gdhn1xUwLCw+T7rNwjQKBgQC/rWb0sWfgbKhEqV+u5oov+fFjooWmTQlQ\n"
++        + "jcj+lMWUOkitnPmX9TsH5JDa8I89Y0gJGu7Lfg8XSH+4FCCfX3mSLYwVH5vAIvmr\n"
++        + "TjMqRwSahQuTr/g+lx7alpcUHYv3z6b3WYIXFPPr3t7grWNJ14wMv9DnItWOg84H\n"
++        + "LlxAvXXsjQKBgQCRPPhdignVVyaYjwVl7TPTuWoiVbMAbxQW91lwSZ4UzmfqQF0M\n"
++        + "xyw7HYHGsmelPE2LcTWxWpb7cee0PgPwtwNdejLL6q1rO7JjKghF/EYUCFYff1iu\n"
++        + "j6hZ3fLr0cAXtBYjygmjnxDTUMd8KvO9y7j644cm8GlyiUgAMBcWAolmsQKBgQCT\n"
++        + "AJQTWfPGxM6QSi3d32VfwhsFROGnVzGrm/HofYTCV6jhraAmkKcDOKJ3p0LT286l\n"
++        + "XQiC/FzqiGmbbaRPVlPQbiofESzMQIamgMTwyaKYNy1XyP9kUVYSYqfff4GXPqRY\n"
++        + "00bYGPOxlC3utkuNmEgKhxnaCncqY5+hFkceR6+nCQKBgQC1Gonjhw0lYe43aHpp\n"
++        + "nDJKv3FnyN3wxjsR2c9sWpDzHA6CMVhSeLoXCB9ishmrSE/CygNlTU1TEy63xN22\n"
++        + "+dMHl5I/urMesjKKWiKZHdbWVIjJDv25r3jrN9VLr4q6AD9r1Su5G0o2j0N5ujVg\n"
++        + "SzpFHp+ZzhL/SANa8EqlcF6ItQ==\n"
++        + "-----END PRIVATE KEY-----\n";
++
++    HeldCertificate heldCertificate = HeldCertificate.decode(pkcs8Pem + certificatePem);
++    assertThat(heldCertificate.certificatePem()).isEqualTo(certificatePem);
++    assertThat(heldCertificate.privateKeyPkcs8Pem()).isEqualTo(pkcs8Pem);
++
++    X509Certificate certificate = heldCertificate.certificate();
++    assertThat(certificate.getNotBefore().getTime()).isEqualTo(5_000L);
++    assertThat(certificate.getNotAfter().getTime()).isEqualTo(10_000L);
++
++    assertThat(certificate.getSubjectAlternativeNames()).containsExactly(
++        asList(GeneralName.iPAddress, "1.1.1.1"),
++        asList(GeneralName.dNSName, "cash.app"));
++
++    assertThat(certificate.getSubjectX500Principal().getName())
++        .isEqualTo("CN=cash.app,OU=engineering");
++  }
++
++  @Test public void decodeWrongNumber() {
++    String certificatePem = ""
++        + "-----BEGIN CERTIFICATE-----\n"
++        + "MIIBYTCCAQegAwIBAgIBKjAKBggqhkjOPQQDAjApMRQwEgYDVQQLEwtlbmdpbmVl\n"
++        + "cmluZzERMA8GA1UEAxMIY2FzaC5hcHAwHhcNNzAwMTAxMDAwMDA1WhcNNzAwMTAx\n"
++        + "MDAwMDEwWjApMRQwEgYDVQQLEwtlbmdpbmVlcmluZzERMA8GA1UEAxMIY2FzaC5h\n"
++        + "cHAwWTATBgcqhkjOPQIBBggqhkjOPQMBBwNCAASda8ChkQXxGELnrV/oBnIAx3dD\n"
++        + "ocUOJfdz4pOJTP6dVQB9U3UBiW5uSX/MoOD0LL5zG3bVyL3Y6pDwKuYvfLNhoyAw\n"
++        + "HjAcBgNVHREBAf8EEjAQhwQBAQEBgghjYXNoLmFwcDAKBggqhkjOPQQDAgNIADBF\n"
++        + "AiAyHHg1N6YDDQiY920+cnI5XSZwEGhAtb9PYWO8bLmkcQIhAI2CfEZf3V/obmdT\n"
++        + "yyaoEufLKVXhrTQhRfodTeigi4RX\n"
++        + "-----END CERTIFICATE-----\n";
++    String pkcs8Pem = ""
++        + "-----BEGIN PRIVATE KEY-----\n"
++        + "MEECAQAwEwYHKoZIzj0CAQYIKoZIzj0DAQcEJzAlAgEBBCA7ODT0xhGSNn4ESj6J\n"
++        + "lu/GJQZoU9lDrCPeUcQ28tzOWw==\n"
++        + "-----END PRIVATE KEY-----\n";
++
++    try {
++      HeldCertificate.decode(certificatePem);
++      fail();
++    } catch (IllegalArgumentException expected) {
++      assertThat(expected).hasMessage("string does not include a private key");
++    }
++
++    try {
++      HeldCertificate.decode(pkcs8Pem);
++      fail();
++    } catch (IllegalArgumentException expected) {
++      assertThat(expected).hasMessage("string does not include a certificate");
++    }
++
++    try {
++      HeldCertificate.decode(certificatePem + pkcs8Pem + certificatePem);
++      fail();
++    } catch (IllegalArgumentException expected) {
++      assertThat(expected).hasMessage("string includes multiple certificates");
++    }
++
++    try {
++      HeldCertificate.decode(pkcs8Pem + certificatePem + pkcs8Pem);
++      fail();
++    } catch (IllegalArgumentException expected) {
++      assertThat(expected).hasMessage("string includes multiple private keys");
++    }
++  }
++
++  @Test public void decodeWrongType() {
++    try {
++      HeldCertificate.decode(""
++          + "-----BEGIN CERTIFICATE-----\n"
++          + "MIIBmjCCAQOgAwIBAgIBATANBgkqhkiG9w0BAQsFADATMREwDwYDVQQDEwhjYXNo\n"
++          + "-----END CERTIFICATE-----\n"
++          + "-----BEGIN RSA PRIVATE KEY-----\n"
++          + "sXPVYAsGD1wizrXX+wFaL3chtF1oG1Fx/jcsSsG6BA==\n"
++          + "-----END RSA PRIVATE KEY-----\n");
++      fail();
++    } catch (IllegalArgumentException expected) {
++      assertThat(expected).hasMessage("unexpected type: RSA PRIVATE KEY");
++    }
++  }
++
++  @Test public void decodeMalformed() {
++    try {
++      HeldCertificate.decode(""
++          + "-----BEGIN CERTIFICATE-----\n"
++          + "MIIBYTCCAQegAwIBAgIBKjAKBggqhkjOPQQDAjApMRQwEgYDVQQLEwtlbmdpbmVl\n"
++          + "-----END CERTIFICATE-----\n"
++          + "-----BEGIN PRIVATE KEY-----\n"
++          + "MEECAQAwEwYHKoZIzj0CAQYIKoZIzj0DAQcEJzAlAgEBBCA7ODT0xhGSNn4ESj6J\n"
++          + "lu/GJQZoU9lDrCPeUcQ28tzOWw==\n"
++          + "-----END PRIVATE KEY-----\n");
++      fail();
++    } catch (IllegalArgumentException expected) {
++      assertThat(expected).hasMessage("failed to decode certificate");
++    }
++    try {
++      HeldCertificate.decode(""
++          + "-----BEGIN CERTIFICATE-----\n"
++          + "MIIBYTCCAQegAwIBAgIBKjAKBggqhkjOPQQDAjApMRQwEgYDVQQLEwtlbmdpbmVl\n"
++          + "cmluZzERMA8GA1UEAxMIY2FzaC5hcHAwHhcNNzAwMTAxMDAwMDA1WhcNNzAwMTAx\n"
++          + "MDAwMDEwWjApMRQwEgYDVQQLEwtlbmdpbmVlcmluZzERMA8GA1UEAxMIY2FzaC5h\n"
++          + "cHAwWTATBgcqhkjOPQIBBggqhkjOPQMBBwNCAASda8ChkQXxGELnrV/oBnIAx3dD\n"
++          + "ocUOJfdz4pOJTP6dVQB9U3UBiW5uSX/MoOD0LL5zG3bVyL3Y6pDwKuYvfLNhoyAw\n"
++          + "HjAcBgNVHREBAf8EEjAQhwQBAQEBgghjYXNoLmFwcDAKBggqhkjOPQQDAgNIADBF\n"
++          + "AiAyHHg1N6YDDQiY920+cnI5XSZwEGhAtb9PYWO8bLmkcQIhAI2CfEZf3V/obmdT\n"
++          + "yyaoEufLKVXhrTQhRfodTeigi4RX\n"
++          + "-----END CERTIFICATE-----\n"
++          + "-----BEGIN PRIVATE KEY-----\n"
++          + "MEECAQAwEwYHKoZIzj0CAQYIKoZIzj0DAQcEJzAlAgEBBCA7ODT0xhGSNn4ESj6J\n"
++          + "-----END PRIVATE KEY-----\n");
++      fail();
++    } catch (IllegalArgumentException expected) {
++      assertThat(expected).hasMessage("failed to decode private key");
++    }
++  }
+ }
+diff --git a/okhttp/src/main/java/okhttp3/CertificatePinner.kt b/okhttp/src/main/java/okhttp3/CertificatePinner.kt
+index 29e3f9ddaf..db95d81ef3 100644
+--- a/okhttp/src/main/java/okhttp3/CertificatePinner.kt
++++ b/okhttp/src/main/java/okhttp3/CertificatePinner.kt
+@@ -126,7 +126,7 @@ import javax.net.ssl.SSLPeerUnverifiedException
+ @Suppress("NAME_SHADOWING")
+ class CertificatePinner internal constructor(
+   private val pins: Set<Pin>,
+-  private val certificateChainCleaner: CertificateChainCleaner?
++  internal val certificateChainCleaner: CertificateChainCleaner?
+ ) {
+   /**
+    * Confirms that at least one of the certificates pinned for `hostname` is in `peerCertificates`.
+@@ -138,17 +138,19 @@ class CertificatePinner internal constructor(
+    */
+   @Throws(SSLPeerUnverifiedException::class)
+   fun check(hostname: String, peerCertificates: List<Certificate>) {
+-    var peerCertificates = peerCertificates
++    return check(hostname) {
++      (certificateChainCleaner?.clean(peerCertificates, hostname) ?: peerCertificates)
++          .map { it as X509Certificate }
++    }
++  }
++
++  internal fun check(hostname: String, cleanedPeerCertificatesFn: () -> List<X509Certificate>) {
+     val pins = findMatchingPins(hostname)
+     if (pins.isEmpty()) return
+ 
+-    if (certificateChainCleaner != null) {
+-      peerCertificates = certificateChainCleaner.clean(peerCertificates, hostname)
+-    }
++    val peerCertificates = cleanedPeerCertificatesFn()
+ 
+     for (peerCertificate in peerCertificates) {
+-      val x509Certificate = peerCertificate as X509Certificate
+-
+       // Lazily compute the hashes for each certificate.
+       var sha1: ByteString? = null
+       var sha256: ByteString? = null
+@@ -156,11 +158,11 @@ class CertificatePinner internal constructor(
+       for (pin in pins) {
+         when (pin.hashAlgorithm) {
+           "sha256/" -> {
+-            if (sha256 == null) sha256 = x509Certificate.toSha256ByteString()
++            if (sha256 == null) sha256 = peerCertificate.toSha256ByteString()
+             if (pin.hash == sha256) return // Success!
+           }
+           "sha1/" -> {
+-            if (sha1 == null) sha1 = x509Certificate.toSha1ByteString()
++            if (sha1 == null) sha1 = peerCertificate.toSha1ByteString()
+             if (pin.hash == sha1) return // Success!
+           }
+           else -> throw AssertionError("unsupported hashAlgorithm: ${pin.hashAlgorithm}")
+@@ -172,8 +174,8 @@ class CertificatePinner internal constructor(
+     val message = buildString {
+       append("Certificate pinning failure!")
+       append("\n  Peer certificate chain:")
+-      for (c in 0 until peerCertificates.size) {
+-        val x509Certificate = peerCertificates[c] as X509Certificate
++      for (element in peerCertificates) {
++        val x509Certificate = element as X509Certificate
+         append("\n    ")
+         append(pin(x509Certificate))
+         append(": ")
+@@ -195,7 +197,7 @@ class CertificatePinner internal constructor(
+       ReplaceWith("check(hostname, peerCertificates.toList())")
+   )
+   @Throws(SSLPeerUnverifiedException::class)
+-  inline fun check(hostname: String, vararg peerCertificates: Certificate) {
++  fun check(hostname: String, vararg peerCertificates: Certificate) {
+     check(hostname, peerCertificates.toList())
+   }
+ 
+diff --git a/okhttp/src/main/java/okhttp3/Handshake.kt b/okhttp/src/main/java/okhttp3/Handshake.kt
+index ffe41afd2e..8fb6a8a475 100644
+--- a/okhttp/src/main/java/okhttp3/Handshake.kt
++++ b/okhttp/src/main/java/okhttp3/Handshake.kt
+@@ -15,8 +15,8 @@
+  */
+ package okhttp3
+ 
+-import okhttp3.internal.toImmutableList
+ import okhttp3.internal.immutableListOf
++import okhttp3.internal.toImmutableList
+ import java.io.IOException
+ import java.security.Principal
+ import java.security.cert.Certificate
+@@ -31,7 +31,7 @@ import javax.net.ssl.SSLSession
+  * This value object describes a completed handshake. Use [ConnectionSpec] to set policy for new
+  * handshakes.
+  */
+-class Handshake private constructor(
++class Handshake internal constructor(
+   /**
+    * Returns the TLS version used for this connection. This value wasn't tracked prior to OkHttp
+    * 3.0. For responses cached by preceding versions this returns [TlsVersion.SSL_3_0].
+@@ -41,12 +41,16 @@ class Handshake private constructor(
+   /** Returns the cipher suite used for the connection. */
+   @get:JvmName("cipherSuite") val cipherSuite: CipherSuite,
+ 
+-  /** Returns a possibly-empty list of certificates that identify the remote peer. */
+-  @get:JvmName("peerCertificates") val peerCertificates: List<Certificate>,
+-
+   /** Returns a possibly-empty list of certificates that identify this peer. */
+-  @get:JvmName("localCertificates") val localCertificates: List<Certificate>
++  @get:JvmName(
++      "localCertificates") val localCertificates: List<Certificate>,
++
++  // Delayed provider of peerCertificates, to allow lazy cleaning.
++  peerCertificatesFn: () -> List<Certificate>
+ ) {
++  /** Returns a possibly-empty list of certificates that identify the remote peer. */
++  @get:JvmName("peerCertificates") val peerCertificates: List<Certificate> by lazy(
++      peerCertificatesFn)
+ 
+   @JvmName("-deprecated_tlsVersion")
+   @Deprecated(
+@@ -146,26 +150,22 @@ class Handshake private constructor(
+       if ("NONE" == tlsVersionString) throw IOException("tlsVersion == NONE")
+       val tlsVersion = TlsVersion.forJavaName(tlsVersionString)
+ 
+-      val peerCertificates: Array<Certificate>? = try {
+-        peerCertificates
++      val peerCertificatesCopy = try {
++        peerCertificates.toImmutableList()
+       } catch (_: SSLPeerUnverifiedException) {
+-        null
++        listOf<Certificate>()
+       }
+ 
+-      val peerCertificatesList = if (peerCertificates != null) {
+-        immutableListOf(*peerCertificates)
+-      } else {
+-        emptyList()
+-      }
++      return Handshake(tlsVersion, cipherSuite,
++          localCertificates.toImmutableList()) { peerCertificatesCopy }
++    }
+ 
+-      val localCertificates = localCertificates
+-      val localCertificatesList = if (localCertificates != null) {
+-        immutableListOf(*localCertificates)
++    private fun Array<out Certificate>?.toImmutableList(): List<Certificate> {
++      return if (this != null) {
++        immutableListOf(*this)
+       } else {
+         emptyList()
+       }
+-
+-      return Handshake(tlsVersion, cipherSuite, peerCertificatesList, localCertificatesList)
+     }
+ 
+     @Throws(IOException::class)
+@@ -183,8 +183,9 @@ class Handshake private constructor(
+       peerCertificates: List<Certificate>,
+       localCertificates: List<Certificate>
+     ): Handshake {
+-      return Handshake(tlsVersion, cipherSuite, peerCertificates.toImmutableList(),
+-          localCertificates.toImmutableList())
++      val peerCertificatesCopy = peerCertificates.toImmutableList()
++      return Handshake(tlsVersion, cipherSuite, localCertificates.toImmutableList()
++      ) { peerCertificatesCopy }
+     }
+   }
+ }
+\ No newline at end of file
+diff --git a/okhttp/src/main/java/okhttp3/internal/connection/RealConnection.kt b/okhttp/src/main/java/okhttp3/internal/connection/RealConnection.kt
+index fce137c6b9..6b299e997a 100644
+--- a/okhttp/src/main/java/okhttp3/internal/connection/RealConnection.kt
++++ b/okhttp/src/main/java/okhttp3/internal/connection/RealConnection.kt
+@@ -33,7 +33,6 @@ import okhttp3.Response
+ import okhttp3.Route
+ import okhttp3.internal.EMPTY_RESPONSE
+ import okhttp3.internal.closeQuietly
+-import okhttp3.internal.toHostHeader
+ import okhttp3.internal.http.ExchangeCodec
+ import okhttp3.internal.http1.Http1ExchangeCodec
+ import okhttp3.internal.http2.ConnectionShutdownException
+@@ -44,6 +43,7 @@ import okhttp3.internal.http2.Http2Stream
+ import okhttp3.internal.http2.StreamResetException
+ import okhttp3.internal.platform.Platform
+ import okhttp3.internal.tls.OkHostnameVerifier
++import okhttp3.internal.toHostHeader
+ import okhttp3.internal.userAgent
+ import okhttp3.internal.ws.RealWebSocket
+ import okio.BufferedSink
+@@ -370,9 +370,18 @@ class RealConnection(
+         }
+       }
+ 
++      val certificatePinner = address.certificatePinner!!
++
++      handshake = Handshake(unverifiedHandshake.tlsVersion, unverifiedHandshake.cipherSuite,
++          unverifiedHandshake.localCertificates) {
++        certificatePinner.certificateChainCleaner!!.clean(unverifiedHandshake.peerCertificates,
++            address.url.host)
++      }
++
+       // Check that the certificate pinner is satisfied by the certificates presented.
+-      address.certificatePinner!!.check(address.url.host,
+-          unverifiedHandshake.peerCertificates)
++      certificatePinner.check(address.url.host) {
++        handshake!!.peerCertificates.map { it as X509Certificate }
++      }
+ 
+       // Success! Save the handshake and the ALPN protocol.
+       val maybeProtocol = if (connectionSpec.supportsTlsExtensions) {
+@@ -383,7 +392,6 @@ class RealConnection(
+       socket = sslSocket
+       source = sslSocket.source().buffer()
+       sink = sslSocket.sink().buffer()
+-      handshake = unverifiedHandshake
+       protocol = if (maybeProtocol != null) Protocol.get(maybeProtocol) else Protocol.HTTP_1_1
+       success = true
+     } finally {
+diff --git a/okhttp/src/main/java/okhttp3/internal/http2/Http2Connection.kt b/okhttp/src/main/java/okhttp3/internal/http2/Http2Connection.kt
+index 663b6f4038..74dc44a93c 100644
+--- a/okhttp/src/main/java/okhttp3/internal/http2/Http2Connection.kt
++++ b/okhttp/src/main/java/okhttp3/internal/http2/Http2Connection.kt
+@@ -122,22 +122,22 @@ class Http2Connection internal constructor(builder: Builder) : Closeable {
+     set(Settings.MAX_FRAME_SIZE, Http2.INITIAL_MAX_FRAME_SIZE)
+   }
+ 
+-  /**
+-   * The total number of bytes consumed by the application, but not yet acknowledged by sending a
+-   * `WINDOW_UPDATE` frame on this connection.
+-   */
+-  // Visible for testing
+-  var unacknowledgedBytesRead = 0L
++  /** The total number of bytes consumed by the application. */
++  var readBytesTotal = 0L
+     private set
+ 
+-  /**
+-   * Count of bytes that can be written on the connection before receiving a window update.
+-   */
+-  // Visible for testing
+-  var bytesLeftInWriteWindow: Long = peerSettings.initialWindowSize.toLong()
+-    internal set
++  /** The total number of bytes acknowledged by outgoing `WINDOW_UPDATE` frames. */
++  var readBytesAcknowledged = 0L
++    private set
++
++  /** The total number of bytes produced by the application. */
++  var writeBytesTotal = 0L
++    private set
++
++  /** The total number of bytes permitted to be produced according to `WINDOW_UPDATE` frames. */
++  var writeBytesMaximum: Long = peerSettings.initialWindowSize.toLong()
++    private set
+ 
+-  internal var receivedInitialPeerSettings = false
+   internal val socket: Socket = builder.socket
+   val writer = Http2Writer(builder.sink, client)
+ 
+@@ -177,10 +177,11 @@ class Http2Connection internal constructor(builder: Builder) : Closeable {
+       peerSettings.getMaxConcurrentStreams(Integer.MAX_VALUE)
+ 
+   @Synchronized internal fun updateConnectionFlowControl(read: Long) {
+-    unacknowledgedBytesRead += read
+-    if (unacknowledgedBytesRead >= okHttpSettings.initialWindowSize / 2) {
+-      writeWindowUpdateLater(0, unacknowledgedBytesRead)
+-      unacknowledgedBytesRead = 0
++    readBytesTotal += read
++    val readBytesToAcknowledge = (readBytesTotal - readBytesAcknowledged)
++    if (readBytesToAcknowledge >= okHttpSettings.initialWindowSize / 2) {
++      writeWindowUpdateLater(0, readBytesToAcknowledge)
++      readBytesAcknowledged += readBytesToAcknowledge
+     }
+   }
+ 
+@@ -238,7 +239,9 @@ class Http2Connection internal constructor(builder: Builder) : Closeable {
+         streamId = nextStreamId
+         nextStreamId += 2
+         stream = Http2Stream(streamId, this, outFinished, inFinished, null)
+-        flushHeaders = (!out || bytesLeftInWriteWindow == 0L || stream.bytesLeftInWriteWindow == 0L)
++        flushHeaders = !out ||
++            writeBytesTotal >= writeBytesMaximum ||
++            stream.writeBytesTotal >= stream.writeBytesMaximum
+         if (stream.isOpen) {
+           streams[streamId] = stream
+         }
+@@ -298,7 +301,7 @@ class Http2Connection internal constructor(builder: Builder) : Closeable {
+       var toWrite: Int
+       synchronized(this@Http2Connection) {
+         try {
+-          while (bytesLeftInWriteWindow <= 0L) {
++          while (writeBytesTotal >= writeBytesMaximum) {
+             // Before blocking, confirm that the stream we're writing is still open. It's possible
+             // that the stream has since been closed (such as if this write timed out.)
+             if (!streams.containsKey(streamId)) {
+@@ -311,9 +314,9 @@ class Http2Connection internal constructor(builder: Builder) : Closeable {
+           throw InterruptedIOException()
+         }
+ 
+-        toWrite = minOf(byteCount, bytesLeftInWriteWindow).toInt()
++        toWrite = minOf(byteCount, writeBytesMaximum - writeBytesTotal).toInt()
+         toWrite = minOf(toWrite, writer.maxDataLength())
+-        bytesLeftInWriteWindow -= toWrite.toLong()
++        writeBytesTotal += toWrite.toLong()
+       }
+ 
+       byteCount -= toWrite.toLong()
+@@ -656,43 +659,53 @@ class Http2Connection internal constructor(builder: Builder) : Closeable {
+     }
+ 
+     override fun settings(clearPrevious: Boolean, settings: Settings) {
++      writerExecutor.tryExecute("OkHttp $connectionName ACK Settings") {
++        applyAndAckSettings(clearPrevious, settings)
++      }
++    }
++
++    /**
++     * Apply inbound settings and send an acknowledgement to the peer that provided them.
++     *
++     * We need to apply the settings and ack them atomically. This is because some HTTP/2
++     * implementations (nghttp2) forbid peers from taking advantage of settings before they have
++     * acknowledged! In particular, we shouldn't send frames that assume a new `initialWindowSize`
++     * until we send the frame that acknowledges this new size.
++     *
++     * Since we can't ACK settings on the current reader thread (the reader thread can't write) we
++     * execute all peer settings logic on the writer thread. This relies on the fact that the
++     * writer executor won't reorder tasks; otherwise settings could be applied in the opposite
++     * order than received.
++     */
++    fun applyAndAckSettings(clearPrevious: Boolean, settings: Settings) {
+       var delta = 0L
+       var streamsToNotify: Array<Http2Stream>? = null
+-      synchronized(this@Http2Connection) {
+-        val priorWriteWindowSize = peerSettings.initialWindowSize
+-        if (clearPrevious) peerSettings.clear()
+-        peerSettings.merge(settings)
+-        applyAndAckSettings(settings)
+-        val peerInitialWindowSize = peerSettings.initialWindowSize
+-        if (peerInitialWindowSize != -1 && peerInitialWindowSize != priorWriteWindowSize) {
+-          delta = (peerInitialWindowSize - priorWriteWindowSize).toLong()
+-          if (!receivedInitialPeerSettings) {
+-            receivedInitialPeerSettings = true
+-          }
+-          if (streams.isNotEmpty()) {
+-            streamsToNotify = streams.values.toTypedArray()
++      synchronized(writer) {
++        synchronized(this@Http2Connection) {
++          val priorWriteWindowSize = peerSettings.initialWindowSize
++          if (clearPrevious) peerSettings.clear()
++          peerSettings.merge(settings)
++          val peerInitialWindowSize = peerSettings.initialWindowSize
++          if (peerInitialWindowSize != -1 && peerInitialWindowSize != priorWriteWindowSize) {
++            delta = (peerInitialWindowSize - priorWriteWindowSize).toLong()
++            streamsToNotify = if (streams.isNotEmpty()) streams.values.toTypedArray() else null
+           }
+         }
+-        listenerExecutor.execute("OkHttp $connectionName settings") {
+-          listener.onSettings(this@Http2Connection)
++        try {
++          writer.applyAndAckSettings(peerSettings)
++        } catch (e: IOException) {
++          failConnection(e)
+         }
+       }
+-      if (streamsToNotify != null && delta != 0L) {
++      if (streamsToNotify != null) {
+         for (stream in streamsToNotify!!) {
+           synchronized(stream) {
+             stream.addBytesToWriteWindow(delta)
+           }
+         }
+       }
+-    }
+-
+-    private fun applyAndAckSettings(peerSettings: Settings) {
+-      writerExecutor.tryExecute("OkHttp $connectionName ACK Settings") {
+-        try {
+-          writer.applyAndAckSettings(peerSettings)
+-        } catch (e: IOException) {
+-          failConnection(e)
+-        }
++      listenerExecutor.execute("OkHttp $connectionName settings") {
++        listener.onSettings(this@Http2Connection)
+       }
+     }
+ 
+@@ -746,7 +759,7 @@ class Http2Connection internal constructor(builder: Builder) : Closeable {
+     override fun windowUpdate(streamId: Int, windowSizeIncrement: Long) {
+       if (streamId == 0) {
+         synchronized(this@Http2Connection) {
+-          bytesLeftInWriteWindow += windowSizeIncrement
++          writeBytesMaximum += windowSizeIncrement
+           this@Http2Connection.notifyAll()
+         }
+       } else {
+diff --git a/okhttp/src/main/java/okhttp3/internal/http2/Http2Stream.kt b/okhttp/src/main/java/okhttp3/internal/http2/Http2Stream.kt
+index 045150fed3..1f1b0142a2 100644
+--- a/okhttp/src/main/java/okhttp3/internal/http2/Http2Stream.kt
++++ b/okhttp/src/main/java/okhttp3/internal/http2/Http2Stream.kt
+@@ -44,20 +44,20 @@ class Http2Stream internal constructor(
+   // Internal state is guarded by this. No long-running or potentially blocking operations are
+   // performed while the lock is held.
+ 
+-  /**
+-   * The total number of bytes consumed by the application (with [FramingSource.read]), but
+-   * not yet acknowledged by sending a `WINDOW_UPDATE` frame on this stream.
+-   */
+-  var unacknowledgedBytesRead = 0L
++  /** The total number of bytes consumed by the application. */
++  var readBytesTotal = 0L
+     internal set
+ 
+-  /**
+-   * Count of bytes that can be written on the stream before receiving a window update. Even if this
+-   * is positive, writes will block until there available bytes in
+-   * [Http2Connection.bytesLeftInWriteWindow].
+-   */
+-  // guarded by this
+-  var bytesLeftInWriteWindow: Long = connection.peerSettings.initialWindowSize.toLong()
++  /** The total number of bytes acknowledged by outgoing `WINDOW_UPDATE` frames. */
++  var readBytesAcknowledged = 0L
++    internal set
++
++  /** The total number of bytes produced by the application. */
++  var writeBytesTotal = 0L
++    internal set
++
++  /** The total number of bytes permitted to be produced by incoming `WINDOW_UPDATE` frame. */
++  var writeBytesMaximum: Long = connection.peerSettings.initialWindowSize.toLong()
+     internal set
+ 
+   /** Received headers yet to be [taken][takeHeaders], or [read][FramingSource.read]. */
+@@ -185,7 +185,7 @@ class Http2Stream internal constructor(
+     // flow-control window is fully depleted.
+     if (!flushHeaders) {
+       synchronized(connection) {
+-        flushHeaders = connection.bytesLeftInWriteWindow == 0L
++        flushHeaders = (connection.writeBytesTotal >= connection.writeBytesMaximum)
+       }
+     }
+ 
+@@ -358,14 +358,15 @@ class Http2Stream internal constructor(
+             } else if (readBuffer.size > 0L) {
+               // Prepare to read bytes. Start by moving them to the caller's buffer.
+               readBytesDelivered = readBuffer.read(sink, minOf(byteCount, readBuffer.size))
+-              unacknowledgedBytesRead += readBytesDelivered
++              readBytesTotal += readBytesDelivered
+ 
++              val unacknowledgedBytesRead = (readBytesTotal - readBytesAcknowledged)
+               if (errorExceptionToDeliver == null &&
+                   unacknowledgedBytesRead >= connection.okHttpSettings.initialWindowSize / 2) {
+                 // Flow control: notify the peer that we're ready for more data! Only send a
+                 // WINDOW_UPDATE if the stream isn't in error.
+                 connection.writeWindowUpdateLater(id, unacknowledgedBytesRead)
+-                unacknowledgedBytesRead = 0
++                readBytesAcknowledged = readBytesTotal
+               }
+             } else if (!finished && errorExceptionToDeliver == null) {
+               // Nothing to do. Wait until that changes then try again.
+@@ -521,7 +522,10 @@ class Http2Stream internal constructor(
+       synchronized(this@Http2Stream) {
+         writeTimeout.enter()
+         try {
+-          while (bytesLeftInWriteWindow <= 0L && !finished && !closed && errorCode == null) {
++          while (writeBytesTotal >= writeBytesMaximum &&
++              !finished &&
++              !closed &&
++              errorCode == null) {
+             waitForIo() // Wait until we receive a WINDOW_UPDATE for this stream.
+           }
+         } finally {
+@@ -529,8 +533,8 @@ class Http2Stream internal constructor(
+         }
+ 
+         checkOutNotClosed() // Kick out if the stream was reset or closed while waiting.
+-        toWrite = minOf(bytesLeftInWriteWindow, sendBuffer.size)
+-        bytesLeftInWriteWindow -= toWrite
++        toWrite = minOf(writeBytesMaximum - writeBytesTotal, sendBuffer.size)
++        writeBytesTotal += toWrite
+       }
+ 
+       writeTimeout.enter()
+@@ -601,7 +605,7 @@ class Http2Stream internal constructor(
+ 
+   /** [delta] will be negative if a settings frame initial window is smaller than the last. */
+   fun addBytesToWriteWindow(delta: Long) {
+-    bytesLeftInWriteWindow += delta
++    writeBytesMaximum += delta
+     if (delta > 0L) {
+       this@Http2Stream.notifyAll()
+     }
+diff --git a/okhttp/src/test/java/okhttp3/internal/http2/Http2ConnectionTest.java b/okhttp/src/test/java/okhttp3/internal/http2/Http2ConnectionTest.java
+index f8d5fb82ca..e39871d1c2 100644
+--- a/okhttp/src/test/java/okhttp3/internal/http2/Http2ConnectionTest.java
++++ b/okhttp/src/test/java/okhttp3/internal/http2/Http2ConnectionTest.java
+@@ -37,7 +37,6 @@
+ import okio.Source;
+ import okio.Utf8;
+ import org.junit.After;
+-import org.junit.Before;
+ import org.junit.Rule;
+ import org.junit.Test;
+ import org.junit.rules.TestRule;
+@@ -114,9 +113,10 @@
+     // This stream was created *after* the connection settings were adjusted.
+     Http2Stream stream = connection.newStream(headerEntries("a", "android"), false);
+ 
+-    assertThat(connection.getPeerSettings().getInitialWindowSize()).isEqualTo(3368);
++    assertThat(connection.getPeerSettings().getInitialWindowSize()).isEqualTo(3368L);
+     // New Stream is has the most recent initial window size.
+-    assertThat(stream.getBytesLeftInWriteWindow()).isEqualTo(3368);
++    assertThat(stream.getWriteBytesTotal()).isEqualTo(0L);
++    assertThat(stream.getWriteBytesMaximum()).isEqualTo(3368L);
+   }
+ 
+   @Test public void peerHttp2ServerZerosCompressionTable() throws Exception {
+@@ -229,7 +229,8 @@
+     InFrame frame3 = peer.takeFrame();
+     assertThat(frame3.type).isEqualTo(Http2.TYPE_RST_STREAM);
+ 
+-    assertThat(connection.getUnacknowledgedBytesRead()).isEqualTo(2048);
++    assertThat(connection.getReadBytesAcknowledged()).isEqualTo(0L);
++    assertThat(connection.getReadBytesTotal()).isEqualTo(2048L);
+   }
+ 
+   @Test public void receiveGoAwayHttp2() throws Exception {
+@@ -307,7 +308,8 @@
+     Http2Connection connection = connect(peer);
+     connection.getOkHttpSettings().set(INITIAL_WINDOW_SIZE, windowSize);
+     Http2Stream stream = connection.newStream(headerEntries("b", "banana"), false);
+-    assertThat(stream.getUnacknowledgedBytesRead()).isEqualTo(0);
++    assertThat(stream.getReadBytesAcknowledged()).isEqualTo(0L);
++    assertThat(stream.getReadBytesTotal()).isEqualTo(0L);
+     assertThat(stream.takeHeaders()).isEqualTo(Headers.of("a", "android"));
+     Source in = stream.getSource();
+     Buffer buffer = new Buffer();
+@@ -942,7 +944,7 @@
+     // fake a settings frame with clear flag set.
+     Settings settings2 = new Settings();
+     settings2.set(MAX_CONCURRENT_STREAMS, 60000);
+-    connection.getReaderRunnable().settings(true, settings2);
++    connection.getReaderRunnable().applyAndAckSettings(true, settings2);
+ 
+     synchronized (connection) {
+       assertThat(connection.getPeerSettings().getHeaderTableSize()).isEqualTo(-1);
+@@ -1637,7 +1639,8 @@
+     Http2Connection connection = connect(peer);
+     connection.getOkHttpSettings().set(INITIAL_WINDOW_SIZE, windowSize);
+     Http2Stream stream = connection.newStream(headerEntries("b", "banana"), false);
+-    assertThat(stream.getUnacknowledgedBytesRead()).isEqualTo(0);
++    assertThat(stream.getReadBytesAcknowledged()).isEqualTo(0L);
++    assertThat(stream.getReadBytesTotal()).isEqualTo(0L);
+     assertThat(stream.takeHeaders()).isEqualTo(Headers.of("a", "android"));
+     Source in = stream.getSource();
+     Buffer buffer = new Buffer();
+@@ -1749,14 +1752,18 @@
+     out1.flush();
+ 
+     // Check that we've filled the window for both the stream and also the connection.
+-    assertThat(connection.getBytesLeftInWriteWindow()).isEqualTo(0);
+-    assertThat(connection.getStream(3).getBytesLeftInWriteWindow()).isEqualTo(0);
++    assertThat(connection.getWriteBytesTotal()).isEqualTo(DEFAULT_INITIAL_WINDOW_SIZE);
++    assertThat(connection.getWriteBytesMaximum()).isEqualTo(DEFAULT_INITIAL_WINDOW_SIZE);
++    assertThat(stream1.getWriteBytesTotal()).isEqualTo(DEFAULT_INITIAL_WINDOW_SIZE);
++    assertThat(stream1.getWriteBytesMaximum()).isEqualTo(DEFAULT_INITIAL_WINDOW_SIZE);
+ 
+     // receiving a window update on the connection will unblock new streams.
+     connection.getReaderRunnable().windowUpdate(0, 3);
+ 
+-    assertThat(connection.getBytesLeftInWriteWindow()).isEqualTo(3);
+-    assertThat(connection.getStream(3).getBytesLeftInWriteWindow()).isEqualTo(0);
++    assertThat(connection.getWriteBytesTotal()).isEqualTo(DEFAULT_INITIAL_WINDOW_SIZE);
++    assertThat(connection.getWriteBytesMaximum()).isEqualTo(DEFAULT_INITIAL_WINDOW_SIZE + 3);
++    assertThat(stream1.getWriteBytesTotal()).isEqualTo(DEFAULT_INITIAL_WINDOW_SIZE);
++    assertThat(stream1.getWriteBytesMaximum()).isEqualTo(DEFAULT_INITIAL_WINDOW_SIZE);
+ 
+     // Another stream should be able to send data even though 1 is blocked.
+     Http2Stream stream2 = connection.newStream(headerEntries("b", "banana"), true);
+@@ -1764,10 +1771,12 @@
+     out2.writeUtf8("foo");
+     out2.flush();
+ 
+-    assertThat(connection.getBytesLeftInWriteWindow()).isEqualTo(0);
+-    assertThat(connection.getStream(3).getBytesLeftInWriteWindow()).isEqualTo(0);
+-    assertThat(connection.getStream(5).getBytesLeftInWriteWindow()).isEqualTo(
+-        (long) (DEFAULT_INITIAL_WINDOW_SIZE - 3));
++    assertThat(connection.getWriteBytesTotal()).isEqualTo(DEFAULT_INITIAL_WINDOW_SIZE + 3);
++    assertThat(connection.getWriteBytesMaximum()).isEqualTo(DEFAULT_INITIAL_WINDOW_SIZE + 3);
++    assertThat(stream1.getWriteBytesTotal()).isEqualTo(DEFAULT_INITIAL_WINDOW_SIZE);
++    assertThat(stream1.getWriteBytesMaximum()).isEqualTo(DEFAULT_INITIAL_WINDOW_SIZE);
++    assertThat(stream2.getWriteBytesTotal()).isEqualTo(3L);
++    assertThat(stream2.getWriteBytesMaximum()).isEqualTo(DEFAULT_INITIAL_WINDOW_SIZE);
+   }
+ 
+   @Test public void remoteOmitsInitialSettings() throws Exception {

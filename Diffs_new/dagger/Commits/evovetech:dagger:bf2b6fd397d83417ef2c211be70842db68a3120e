@@ -1,0 +1,998 @@
+diff --git a/java/dagger/internal/codegen/BUILD b/java/dagger/internal/codegen/BUILD
+index 7d1f41fe8..4538d1e9a 100644
+--- a/java/dagger/internal/codegen/BUILD
++++ b/java/dagger/internal/codegen/BUILD
+@@ -180,7 +180,6 @@ java_library(
+         "InjectValidator.java",
+         "MapKeyValidator.java",
+         "MethodSignatureFormatter.java",
+-        "MissingBindingSuggestions.java",
+         "ModuleValidator.java",
+         "MultibindingAnnotationsProcessingStep.java",
+         "MultibindsMethodValidator.java",
+@@ -203,6 +202,7 @@ java_library(
+         "InjectBindingValidation.java",
+         "MapMultibindingValidation.java",
+         "MembersInjectionBindingValidation.java",
++        "MissingBindingValidation.java",
+         "NonNullableRequestForNullableBindingValidation.java",
+         "ProvisionDependencyOnProducerBindingValidation.java",
+         "Validation.java",
+diff --git a/java/dagger/internal/codegen/BindingGraphConverter.java b/java/dagger/internal/codegen/BindingGraphConverter.java
+index 9f17dc9aa..e827dbad3 100644
+--- a/java/dagger/internal/codegen/BindingGraphConverter.java
++++ b/java/dagger/internal/codegen/BindingGraphConverter.java
+@@ -29,6 +29,7 @@
+ import dagger.model.BindingGraph.BindingNode;
+ import dagger.model.BindingGraph.ComponentNode;
+ import dagger.model.BindingGraph.Edge;
++import dagger.model.BindingGraph.MissingBindingNode;
+ import dagger.model.BindingGraph.Node;
+ import dagger.model.BindingGraphProxies;
+ import dagger.model.DependencyRequest;
+@@ -75,7 +76,9 @@ protected void visitComponent(BindingGraph graph) {
+       parentComponent = currentComponent;
+       currentComponent =
+           componentNode(
+-              componentTreePath().toComponentPath(), graph.componentDescriptor().entryPoints());
++              componentTreePath().toComponentPath(),
++              graph.componentDescriptor().entryPoints(),
++              graph.componentDescriptor().scopes());
+ 
+       network.addNode(currentComponent);
+ 
+@@ -106,13 +109,23 @@ protected void visitSubcomponentFactoryMethod(
+      */
+     private void addDependencyEdges(
+         Node source, DependencyRequest dependencyRequest, BindingGraph graph) {
+-      for (BindingNode dependency :
+-          bindingNodes(graph.resolvedBindings(dependencyRequest.kind(), dependencyRequest.key()))) {
+-        network.addEdge(
+-            source, dependency, dependencyEdge(dependencyRequest, source instanceof ComponentNode));
++      ResolvedBindings dependencies =
++          graph.resolvedBindings(dependencyRequest.kind(), dependencyRequest.key());
++      if (dependencies.isEmpty()) {
++        addDependencyEdge(source, dependencyRequest, missingBindingNode(dependencies));
++      } else {
++        for (Node dependency : bindingNodes(dependencies)) {
++          addDependencyEdge(source, dependencyRequest, dependency);
++        }
+       }
+     }
+ 
++    private void addDependencyEdge(
++        Node source, DependencyRequest dependencyRequest, Node dependency) {
++      network.addEdge(
++          source, dependency, dependencyEdge(dependencyRequest, source instanceof ComponentNode));
++    }
++
+     private ImmutableSet<BindingNode> bindingNodes(ResolvedBindings resolvedBindings) {
+       ImmutableSet.Builder<BindingNode> bindingNodes = ImmutableSet.builder();
+       resolvedBindings
+@@ -154,5 +167,13 @@ private BindingNode bindingNode(
+           .map(declaration -> declaration.bindingElement().get())
+           .collect(toImmutableSet());
+     }
++
++    private MissingBindingNode missingBindingNode(ResolvedBindings dependencies) {
++      return BindingGraphProxies.missingBindingNode(
++          componentTreePath()
++              .pathFromRootToAncestor(dependencies.owningComponent())
++              .toComponentPath(),
++          dependencies.key());
++    }
+   }
+ }
+diff --git a/java/dagger/internal/codegen/BindingGraphValidationModule.java b/java/dagger/internal/codegen/BindingGraphValidationModule.java
+index b3f6afa42..fe8d26b1a 100644
+--- a/java/dagger/internal/codegen/BindingGraphValidationModule.java
++++ b/java/dagger/internal/codegen/BindingGraphValidationModule.java
+@@ -40,6 +40,11 @@
+   @Validation
+   BindingGraphPlugin membersInjection(MembersInjectionBindingValidation validation);
+ 
++  @Binds
++  @IntoSet
++  @Validation
++  BindingGraphPlugin missingBinding(MissingBindingValidation validation);
++
+   @Binds
+   @IntoSet
+   @Validation
+diff --git a/java/dagger/internal/codegen/BindingGraphValidator.java b/java/dagger/internal/codegen/BindingGraphValidator.java
+index 047ee1795..aec303cd4 100644
+--- a/java/dagger/internal/codegen/BindingGraphValidator.java
++++ b/java/dagger/internal/codegen/BindingGraphValidator.java
+@@ -16,21 +16,16 @@
+ 
+ package dagger.internal.codegen;
+ 
+-import static com.google.auto.common.MoreElements.isAnnotationPresent;
+ import static com.google.auto.common.MoreTypes.asDeclared;
+ import static com.google.auto.common.MoreTypes.asExecutable;
+ import static com.google.auto.common.MoreTypes.asTypeElements;
+-import static com.google.auto.common.MoreTypes.isType;
+-import static com.google.auto.common.MoreTypes.isTypeOf;
+ import static com.google.common.base.Verify.verify;
+ import static com.google.common.collect.Iterables.getOnlyElement;
+-import static dagger.internal.codegen.BindingType.PROVISION;
+ import static dagger.internal.codegen.ComponentRequirement.Kind.BOUND_INSTANCE;
+ import static dagger.internal.codegen.ComponentRequirement.Kind.MODULE;
+ import static dagger.internal.codegen.ConfigurationAnnotations.getComponentAnnotation;
+ import static dagger.internal.codegen.ConfigurationAnnotations.getComponentDependencies;
+ import static dagger.internal.codegen.DaggerElements.getAnnotationMirror;
+-import static dagger.internal.codegen.DaggerElements.isAnnotationPresent;
+ import static dagger.internal.codegen.DaggerStreams.toImmutableSet;
+ import static dagger.internal.codegen.DiagnosticFormatting.stripCommonTypePrefixes;
+ import static dagger.internal.codegen.ErrorMessages.CONTAINS_DEPENDENCY_CYCLE_FORMAT;
+@@ -39,14 +34,7 @@
+ import static dagger.internal.codegen.ErrorMessages.DUPLICATE_SIZE_LIMIT;
+ import static dagger.internal.codegen.ErrorMessages.MULTIPLE_CONTRIBUTION_TYPES_FOR_KEY_FORMAT;
+ import static dagger.internal.codegen.ErrorMessages.abstractModuleHasInstanceBindingMethods;
+-import static dagger.internal.codegen.ErrorMessages.referenceReleasingScopeMetadataMissingCanReleaseReferences;
+-import static dagger.internal.codegen.ErrorMessages.referenceReleasingScopeNotAnnotatedWithMetadata;
+-import static dagger.internal.codegen.ErrorMessages.referenceReleasingScopeNotInComponentHierarchy;
+ import static dagger.internal.codegen.Formatter.INDENT;
+-import static dagger.internal.codegen.Keys.isValidImplicitProvisionKey;
+-import static dagger.internal.codegen.Keys.isValidMembersInjectionKey;
+-import static dagger.internal.codegen.MoreAnnotationMirrors.getTypeValue;
+-import static dagger.internal.codegen.RequestKinds.entryPointCanUseProduction;
+ import static dagger.internal.codegen.RequestKinds.extractKeyType;
+ import static dagger.internal.codegen.RequestKinds.getRequestKind;
+ import static dagger.internal.codegen.Scopes.getReadableSource;
+@@ -54,7 +42,6 @@
+ import static dagger.internal.codegen.Scopes.singletonScope;
+ import static dagger.internal.codegen.Util.componentCanMakeNewInstances;
+ import static dagger.internal.codegen.Util.reentrantComputeIfAbsent;
+-import static java.util.function.Predicate.isEqual;
+ import static java.util.stream.Collectors.groupingBy;
+ import static java.util.stream.Collectors.joining;
+ import static java.util.stream.Collectors.mapping;
+@@ -87,10 +74,6 @@
+ import dagger.model.Key;
+ import dagger.model.RequestKind;
+ import dagger.model.Scope;
+-import dagger.releasablereferences.CanReleaseReferences;
+-import dagger.releasablereferences.ForReleasableReferences;
+-import dagger.releasablereferences.ReleasableReferenceManager;
+-import dagger.releasablereferences.TypedReleasableReferenceManager;
+ import java.util.ArrayDeque;
+ import java.util.Deque;
+ import java.util.Formatter;
+@@ -109,7 +92,6 @@
+ import javax.lang.model.element.TypeElement;
+ import javax.lang.model.type.DeclaredType;
+ import javax.lang.model.type.ExecutableType;
+-import javax.lang.model.type.TypeKind;
+ import javax.lang.model.type.TypeMirror;
+ import javax.lang.model.util.Elements;
+ 
+@@ -119,7 +101,6 @@
+   private final Elements elements;
+   private final DaggerTypes types;
+   private final CompilerOptions compilerOptions;
+-  private final InjectBindingRegistry injectBindingRegistry;
+   private final BindingDeclarationFormatter bindingDeclarationFormatter;
+   private final MethodSignatureFormatter methodSignatureFormatter;
+   private final DependencyRequestFormatter dependencyRequestFormatter;
+@@ -130,7 +111,6 @@
+       Elements elements,
+       DaggerTypes types,
+       CompilerOptions compilerOptions,
+-      InjectBindingRegistry injectBindingRegistry,
+       BindingDeclarationFormatter bindingDeclarationFormatter,
+       MethodSignatureFormatter methodSignatureFormatter,
+       DependencyRequestFormatter dependencyRequestFormatter,
+@@ -138,7 +118,6 @@
+     this.elements = elements;
+     this.types = types;
+     this.compilerOptions = compilerOptions;
+-    this.injectBindingRegistry = injectBindingRegistry;
+     this.bindingDeclarationFormatter = bindingDeclarationFormatter;
+     this.methodSignatureFormatter = methodSignatureFormatter;
+     this.dependencyRequestFormatter = dependencyRequestFormatter;
+@@ -589,9 +568,7 @@ protected void visitDependencyRequest(DependencyRequest dependencyRequest) {
+ 
+       @Override
+       protected void visitResolvedBindings(ResolvedBindings resolvedBindings) {
+-        if (resolvedBindings.isEmpty()) {
+-          reportMissingBinding();
+-        } else if (resolvedBindings.bindings().size() > 1) {
++        if (resolvedBindings.bindings().size() > 1) {
+           reportDuplicateBindings();
+         }
+         super.visitResolvedBindings(resolvedBindings);
+@@ -671,119 +648,6 @@ protected void visitContributionBinding(
+         return declarations.build();
+       }
+ 
+-      /**
+-       * Descriptive portion of the error message for when the given request has no binding.
+-       * Currently, the only other portions of the message are the dependency path, line number and
+-       * filename.
+-       */
+-      private StringBuilder requiresErrorMessageBase() {
+-        Key key = dependencyRequest().key();
+-        StringBuilder errorMessage = new StringBuilder();
+-        // TODO(dpb): Check for wildcard injection somewhere else first?
+-        if (key.type().getKind().equals(TypeKind.WILDCARD)) {
+-          errorMessage
+-              .append("Dagger does not support injecting Provider<T>, Lazy<T> or Produced<T> when ")
+-              .append("T is a wildcard type such as ")
+-              .append(formatCurrentDependencyRequestKey());
+-        } else {
+-          // TODO(ronshapiro): replace "provided" with "satisfied"?
+-          errorMessage
+-              .append(formatCurrentDependencyRequestKey())
+-              .append(" cannot be provided without ");
+-          if (isValidImplicitProvisionKey(key, types)) {
+-            errorMessage.append("an @Inject constructor or ");
+-          }
+-          errorMessage.append("an @Provides-");
+-          if (dependencyRequestCanUseProduction()) {
+-            errorMessage.append(" or @Produces-");
+-          }
+-          errorMessage.append("annotated method.");
+-        }
+-        if (isValidMembersInjectionKey(key)
+-            && injectBindingRegistry.getOrFindMembersInjectionBinding(key)
+-                .map(binding -> !binding.injectionSites().isEmpty())
+-                .orElse(false)) {
+-          errorMessage.append(" ").append(ErrorMessages.MEMBERS_INJECTION_DOES_NOT_IMPLY_PROVISION);
+-        }
+-        return errorMessage.append('\n');
+-      }
+-
+-      private void reportMissingBinding() {
+-        if (reportMissingReleasableReferenceManager()) {
+-          return;
+-        }
+-        StringBuilder errorMessage = requiresErrorMessageBase().append(formatDependencyTrace());
+-        for (String suggestion :
+-            MissingBindingSuggestions.forKey(rootGraph, dependencyRequest().key())) {
+-          errorMessage.append('\n').append(suggestion);
+-        }
+-        reportErrorAtEntryPoint(rootGraph, errorMessage.toString());
+-      }
+-
+-      /**
+-       * If the current dependency request is missing a binding because it's an invalid
+-       * {@code @ForReleasableReferences} request, reports that.
+-       *
+-       * <p>An invalid request is one whose type is either {@link ReleasableReferenceManager} or
+-       * {@link TypedReleasableReferenceManager}, and whose scope:
+-       *
+-       * <ul>
+-       *   <li>does not annotate any component in the hierarchy, or
+-       *   <li>is not annotated with the metadata annotation type that is the {@link
+-       *       TypedReleasableReferenceManager}'s type argument
+-       * </ul>
+-       *
+-       * @return {@code true} if the request was invalid and an error was reported
+-       */
+-      private boolean reportMissingReleasableReferenceManager() {
+-        Key key = dependencyRequest().key();
+-        if (!key.qualifier().isPresent()
+-            || !isTypeOf(ForReleasableReferences.class, key.qualifier().get().getAnnotationType())
+-            || !isType(key.type())) {
+-          return false;
+-        }
+-
+-        Optional<DeclaredType> metadataType;
+-        if (isTypeOf(ReleasableReferenceManager.class, key.type())) {
+-          metadataType = Optional.empty();
+-        } else if (isTypeOf(TypedReleasableReferenceManager.class, key.type())) {
+-          List<? extends TypeMirror> typeArguments =
+-              MoreTypes.asDeclared(key.type()).getTypeArguments();
+-          if (typeArguments.size() != 1
+-              || !typeArguments.get(0).getKind().equals(TypeKind.DECLARED)) {
+-            return false;
+-          }
+-          metadataType = Optional.of(MoreTypes.asDeclared(typeArguments.get(0)));
+-        } else {
+-          return false;
+-        }
+-
+-        Scope scope =
+-            Scopes.scope(MoreTypes.asTypeElement(getTypeValue(key.qualifier().get(), "value")));
+-        String missingRequestKey = formatCurrentDependencyRequestKey();
+-        if (!rootGraph.componentDescriptor().releasableReferencesScopes().contains(scope)) {
+-          reportErrorAtEntryPoint(
+-              rootGraph,
+-              referenceReleasingScopeNotInComponentHierarchy(missingRequestKey, scope, rootGraph));
+-          return true;
+-        }
+-        if (metadataType.isPresent()) {
+-          if (!isAnnotationPresent(scope.scopeAnnotationElement(), metadataType.get())) {
+-            reportErrorAtEntryPoint(
+-                rootGraph,
+-                referenceReleasingScopeNotAnnotatedWithMetadata(
+-                    missingRequestKey, scope, metadataType.get()));
+-          }
+-          if (!isAnnotationPresent(metadataType.get().asElement(), CanReleaseReferences.class)) {
+-            reportErrorAtEntryPoint(
+-                rootGraph,
+-                referenceReleasingScopeMetadataMissingCanReleaseReferences(
+-                    missingRequestKey, metadataType.get()));
+-          }
+-        }
+-        return false;
+-      }
+-
+       @SuppressWarnings("resource") // Appendable is a StringBuilder.
+       private void reportDependsOnProductionExecutor() {
+         reportErrorAtEntryPoint(
+@@ -920,24 +784,6 @@ private boolean breaksCycle(TypeMirror requestedType, RequestKind requestKind) {
+         }
+       }
+ 
+-      /**
+-       * Returns true if the current dependency request can be satisfied by a production binding.
+-       */
+-      private boolean dependencyRequestCanUseProduction() {
+-        if (atEntryPoint()) {
+-          return entryPointCanUseProduction(dependencyRequest().kind());
+-        } else {
+-          // The current request can be satisfied by a production binding if it's not from a
+-          // provision binding
+-          return !hasDependentProvisionBindings();
+-        }
+-      }
+-
+-      /** Returns {@code true} if any provision bindings contain the latest request in the path. */
+-      private boolean hasDependentProvisionBindings() {
+-        return dependentBindings().stream().map(Binding::bindingType).anyMatch(isEqual(PROVISION));
+-      }
+-
+       private String formatCurrentDependencyRequestKey() {
+         return dependencyRequest().key().toString();
+       }
+diff --git a/java/dagger/internal/codegen/DiagnosticReporterFactory.java b/java/dagger/internal/codegen/DiagnosticReporterFactory.java
+index e952bca98..ddb98e8fc 100644
+--- a/java/dagger/internal/codegen/DiagnosticReporterFactory.java
++++ b/java/dagger/internal/codegen/DiagnosticReporterFactory.java
+@@ -18,6 +18,7 @@
+ 
+ import static com.google.common.base.Preconditions.checkArgument;
+ import static com.google.common.collect.Lists.asList;
++import static dagger.internal.codegen.DaggerElements.elementToString;
+ import static dagger.internal.codegen.DaggerGraphs.shortestPath;
+ 
+ import com.google.common.collect.ImmutableList;
+@@ -87,7 +88,7 @@ DiagnosticReporterImpl reporter(BindingGraph graph, BindingGraphPlugin plugin) {
+     @Override
+     public void reportComponent(
+         Diagnostic.Kind diagnosticKind, ComponentNode componentNode, String messageFormat) {
+-      StringBuilder messageBuilder = messagePrefix(messageFormat);
++      StringBuilder messageBuilder = new StringBuilder(messageFormat);
+       if (!componentNode.componentPath().currentComponent().equals(rootComponent)) {
+         appendComponentPath(messageBuilder, componentNode);
+       }
+@@ -110,7 +111,8 @@ public void reportComponent(
+     public void reportBinding(
+         Diagnostic.Kind diagnosticKind, BindingNode bindingNode, String message) {
+       // TODO(ronshapiro): should this also include the binding element?
+-      reportAtEntryPointsWithDependencyTrace(diagnosticKind, messagePrefix(message), bindingNode);
++      reportAtEntryPointsWithDependencyTrace(
++          diagnosticKind, new StringBuilder(message), bindingNode);
+     }
+ 
+     @Override
+@@ -127,7 +129,7 @@ public void reportBinding(
+     public void reportDependency(
+         Diagnostic.Kind diagnosticKind, DependencyEdge dependencyEdge, String message) {
+       StringBuilder messageBuilder =
+-          messagePrefix(message)
++          new StringBuilder(message)
+               .append('\n')
+               .append(dependencyRequestFormatter.format(dependencyEdge.dependencyRequest()));
+ 
+@@ -202,24 +204,29 @@ private void printAtEntryPoint(
+         Diagnostic.Kind diagnosticKind, CharSequence message, DependencyEdge entryPoint) {
+       checkArgument(entryPoint.isEntryPoint());
+       Element entryPointElement = entryPoint.dependencyRequest().requestElement().get();
+-      Element elementToReport =
+-          // TODO(ronshapiro): should we create a HashSet out of getEnclosedElements() so we don't
+-          // need to do an O(n) contains() each time?
+-          rootComponent.getEnclosedElements().contains(entryPointElement)
+-              ? entryPointElement
+-              : rootComponent;
+ 
++      StringBuilder messageBuilder = new StringBuilder(message);
+       Node component = graph.incidentNodes(entryPoint).source();
+       if (!component.equals(graph.rootComponentNode())) {
+-        message = appendComponentPath(new StringBuilder(message), component);
++        appendComponentPath(messageBuilder, component);
++      }
++
++      // TODO(ronshapiro): should we create a HashSet out of getEnclosedElements() so we don't
++      // need to do an O(n) contains() each time?
++      if (rootComponent.getEnclosedElements().contains(entryPointElement)) {
++        printMessage(diagnosticKind, messageBuilder, entryPointElement);
++      } else {
++        printMessage(
++            diagnosticKind,
++            insertBracketPrefix(messageBuilder, elementToString(entryPointElement)),
++            rootComponent);
+       }
+-      printMessage(diagnosticKind, message, elementToReport);
+     }
+ 
+     private void printMessage(
+-        Diagnostic.Kind diagnosticKind, CharSequence message, Element elementToReport) {
++        Diagnostic.Kind diagnosticKind, StringBuilder message, Element elementToReport) {
+       reportedDiagnosticKinds.add(diagnosticKind);
+-      messager.printMessage(diagnosticKind, message, elementToReport);
++      messager.printMessage(diagnosticKind, insertBracketPrefix(message, plugin), elementToReport);
+     }
+ 
+     @CanIgnoreReturnValue
+@@ -227,8 +234,9 @@ private StringBuilder appendComponentPath(StringBuilder message, Node node) {
+       return message.append("\ncomponent path: ").append(node.componentPath());
+     }
+ 
+-    private StringBuilder messagePrefix(String message) {
+-      return new StringBuilder(String.format("[%s] ", plugin)).append(message);
++    @CanIgnoreReturnValue
++    private StringBuilder insertBracketPrefix(StringBuilder messageBuilder, String prefix) {
++      return messageBuilder.insert(0, String.format("[%s] ", prefix));
+     }
+   }
+ }
+diff --git a/java/dagger/internal/codegen/ErrorMessages.java b/java/dagger/internal/codegen/ErrorMessages.java
+index 23809da7b..b14beb8a0 100644
+--- a/java/dagger/internal/codegen/ErrorMessages.java
++++ b/java/dagger/internal/codegen/ErrorMessages.java
+@@ -18,14 +18,11 @@
+ 
+ import static dagger.internal.codegen.ConfigurationAnnotations.getSubcomponentAnnotation;
+ import static dagger.internal.codegen.MoreAnnotationMirrors.simpleName;
+-import static dagger.internal.codegen.Scopes.getReadableSource;
+ import static java.util.stream.Collectors.joining;
+-import static java.util.stream.Collectors.toList;
+ 
+ import com.google.auto.common.MoreElements;
+ import com.google.auto.common.MoreTypes;
+ import com.google.common.base.Joiner;
+-import dagger.model.Scope;
+ import dagger.multibindings.Multibinds;
+ import dagger.releasablereferences.CanReleaseReferences;
+ import dagger.releasablereferences.ForReleasableReferences;
+@@ -35,7 +32,6 @@
+ import javax.lang.model.element.AnnotationMirror;
+ import javax.lang.model.element.ExecutableElement;
+ import javax.lang.model.element.TypeElement;
+-import javax.lang.model.type.DeclaredType;
+ import javax.lang.model.type.TypeMirror;
+ 
+ /**
+@@ -248,15 +244,6 @@ static String provisionMayNotDependOnProducerType(TypeMirror type) {
+         MoreTypes.asTypeElement(type).getSimpleName());
+   }
+ 
+-  static final String MEMBERS_INJECTION_DOES_NOT_IMPLY_PROVISION =
+-      "This type supports members injection but cannot be implicitly provided.";
+-
+-  static final String MEMBERS_INJECTION_WITH_RAW_TYPE =
+-      "%s has type parameters, cannot members inject the raw type. via:\n%s";
+-
+-  static final String MEMBERS_INJECTION_WITH_UNBOUNDED_TYPE =
+-      "Type parameters must be bounded for members injection. %s required by %s, via:\n%s";
+-
+   static final String CONTAINS_DEPENDENCY_CYCLE_FORMAT = "Found a dependency cycle:\n%s";
+ 
+   static final String CANNOT_RETURN_NULL_FROM_NON_NULLABLE_COMPONENT_METHOD =
+@@ -326,36 +313,6 @@ private static String forReleasableReferencesValueNeedsAnnotation(
+         ForReleasableReferences.class.getSimpleName(), scopeType.getQualifiedName(), annotations);
+   }
+ 
+-  static String referenceReleasingScopeNotInComponentHierarchy(
+-      String formattedKey, Scope scope, BindingGraph topLevelGraph) {
+-    return String.format(
+-        "There is no binding for %s because no component in %s's component hierarchy is "
+-            + "annotated with %s. The available reference-releasing scopes are %s.",
+-        formattedKey,
+-        topLevelGraph.componentType().getQualifiedName(),
+-        getReadableSource(scope),
+-        topLevelGraph
+-            .componentDescriptor()
+-            .releasableReferencesScopes()
+-            .stream()
+-            .map(Scopes::getReadableSource)
+-            .collect(toList()));
+-  }
+-
+-  static String referenceReleasingScopeMetadataMissingCanReleaseReferences(
+-      String formattedKey, DeclaredType metadataType) {
+-    return String.format(
+-        "There is no binding for %s because %s is not annotated with @%s.",
+-        formattedKey, metadataType, CanReleaseReferences.class.getCanonicalName());
+-  }
+-
+-  static String referenceReleasingScopeNotAnnotatedWithMetadata(
+-      String formattedKey, Scope scope, TypeMirror metadataType) {
+-    return String.format(
+-        "There is no binding for %s because %s is not annotated with @%s.",
+-        formattedKey, scope.scopeAnnotationElement().getQualifiedName(), metadataType);
+-  }
+-
+   /**
+    * Returns an error message for a method that has more than one binding method annotation.
+    *
+diff --git a/java/dagger/internal/codegen/MissingBindingSuggestions.java b/java/dagger/internal/codegen/MissingBindingSuggestions.java
+deleted file mode 100644
+index 9380863de..000000000
+--- a/java/dagger/internal/codegen/MissingBindingSuggestions.java
++++ /dev/null
+@@ -1,56 +0,0 @@
+-/*
+- * Copyright (C) 2015 The Dagger Authors.
+- *
+- * Licensed under the Apache License, Version 2.0 (the "License");
+- * you may not use this file except in compliance with the License.
+- * You may obtain a copy of the License at
+- *
+- * http://www.apache.org/licenses/LICENSE-2.0
+- *
+- * Unless required by applicable law or agreed to in writing, software
+- * distributed under the License is distributed on an "AS IS" BASIS,
+- * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+- * See the License for the specific language governing permissions and
+- * limitations under the License.
+- */
+-
+-package dagger.internal.codegen;
+-
+-import com.google.common.collect.ImmutableList;
+-import dagger.model.Key;
+-import java.util.ArrayDeque;
+-import java.util.Deque;
+-
+-/**
+- * Utility code that looks for bindings matching a key in all subcomponents in a binding graph so
+- * that a user is advised that a binding exists elsewhere when it is not found in the current
+- * subgraph. If a binding matching a key exists in a sub- or sibling component, that is often what
+- * the user actually wants to use.
+- */
+-class MissingBindingSuggestions {
+-  /**
+-   * Searches the entire binding graph from the top-level graph for a binding matching
+-   * {@code key}.
+-   */
+-  static ImmutableList<String> forKey(BindingGraph topLevelGraph, Key key) {
+-    ImmutableList.Builder<String> resolutions = new ImmutableList.Builder<>();
+-    Deque<BindingGraph> graphsToTry = new ArrayDeque<>();
+-
+-    graphsToTry.add(topLevelGraph);
+-    do {
+-      BindingGraph graph = graphsToTry.removeLast();
+-      ResolvedBindings bindings = graph.contributionBindings().get(key);
+-      if ((bindings == null) || bindings.bindings().isEmpty()) {
+-        graphsToTry.addAll(graph.subgraphs());
+-      } else {
+-        resolutions.add(
+-            "A binding with matching key exists in component: "
+-                + graph.componentType().getQualifiedName());
+-      }
+-    } while (!graphsToTry.isEmpty());
+-
+-    return resolutions.build();
+-  }
+-
+-  private MissingBindingSuggestions() {}
+-}
+diff --git a/java/dagger/internal/codegen/MissingBindingValidation.java b/java/dagger/internal/codegen/MissingBindingValidation.java
+new file mode 100644
+index 000000000..5ce5f9bab
+--- /dev/null
++++ b/java/dagger/internal/codegen/MissingBindingValidation.java
+@@ -0,0 +1,228 @@
++/*
++ * Copyright (C) 2018 The Dagger Authors.
++ *
++ * Licensed under the Apache License, Version 2.0 (the "License");
++ * you may not use this file except in compliance with the License.
++ * You may obtain a copy of the License at
++ *
++ * http://www.apache.org/licenses/LICENSE-2.0
++ *
++ * Unless required by applicable law or agreed to in writing, software
++ * distributed under the License is distributed on an "AS IS" BASIS,
++ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++ * See the License for the specific language governing permissions and
++ * limitations under the License.
++ */
++
++package dagger.internal.codegen;
++
++import static com.google.auto.common.MoreElements.isAnnotationPresent;
++import static com.google.auto.common.MoreTypes.asTypeElement;
++import static com.google.auto.common.MoreTypes.isType;
++import static com.google.auto.common.MoreTypes.isTypeOf;
++import static dagger.internal.codegen.DaggerElements.isAnnotationPresent;
++import static dagger.internal.codegen.DaggerStreams.instancesOf;
++import static dagger.internal.codegen.Keys.isValidImplicitProvisionKey;
++import static dagger.internal.codegen.Keys.isValidMembersInjectionKey;
++import static dagger.internal.codegen.MoreAnnotationMirrors.getTypeValue;
++import static dagger.internal.codegen.RequestKinds.entryPointCanUseProduction;
++import static dagger.internal.codegen.Scopes.getReadableSource;
++import static java.util.function.Predicate.isEqual;
++import static java.util.stream.Collectors.toList;
++import static javax.tools.Diagnostic.Kind.ERROR;
++
++import com.google.auto.common.MoreTypes;
++import dagger.model.BindingGraph;
++import dagger.model.BindingGraph.BindingNode;
++import dagger.model.BindingGraph.ComponentNode;
++import dagger.model.BindingGraph.DependencyEdge;
++import dagger.model.BindingGraph.Node;
++import dagger.model.Key;
++import dagger.model.Scope;
++import dagger.releasablereferences.CanReleaseReferences;
++import dagger.releasablereferences.ForReleasableReferences;
++import dagger.releasablereferences.ReleasableReferenceManager;
++import dagger.releasablereferences.TypedReleasableReferenceManager;
++import dagger.spi.BindingGraphPlugin;
++import dagger.spi.DiagnosticReporter;
++import java.util.List;
++import java.util.Optional;
++import java.util.stream.Stream;
++import javax.inject.Inject;
++import javax.lang.model.element.TypeElement;
++import javax.lang.model.type.DeclaredType;
++import javax.lang.model.type.TypeKind;
++import javax.lang.model.type.TypeMirror;
++
++/** Reports errors for missing bindings. */
++final class MissingBindingValidation implements BindingGraphPlugin {
++
++  private final DaggerTypes types;
++  private final DaggerElements elements;
++  private final InjectBindingRegistry injectBindingRegistry;
++
++  @Inject
++  MissingBindingValidation(
++      DaggerTypes types, DaggerElements elements, InjectBindingRegistry injectBindingRegistry) {
++    this.types = types;
++    this.injectBindingRegistry = injectBindingRegistry;
++    this.elements = elements;
++  }
++
++  @Override
++  public String pluginName() {
++    return "Dagger/MissingBinding";
++  }
++
++  @Override
++  public void visitGraph(BindingGraph graph, DiagnosticReporter diagnosticReporter) {
++    // TODO(ronshapiro): Maybe report each missing binding once instead of each dependency.
++    graph
++        .missingBindingNodes()
++        .stream()
++        .flatMap(node -> graph.inEdges(node).stream())
++        .flatMap(instancesOf(DependencyEdge.class))
++        .forEach(edge -> reportMissingBinding(edge, graph, diagnosticReporter));
++  }
++
++  private void reportMissingBinding(
++      DependencyEdge edge, BindingGraph graph, DiagnosticReporter diagnosticReporter) {
++    diagnosticReporter.reportDependency(
++        ERROR,
++        edge,
++        missingReleasableReferenceManagerBindingErrorMessage(edge, graph)
++            .orElseGet(() -> missingBindingErrorMessage(edge, graph)));
++  }
++
++  private String missingBindingErrorMessage(DependencyEdge edge, BindingGraph graph) {
++    Key key = edge.dependencyRequest().key();
++    StringBuilder errorMessage = new StringBuilder();
++    // TODO(dpb): Check for wildcard injection somewhere else first?
++    if (key.type().getKind().equals(TypeKind.WILDCARD)) {
++      // TODO(ronshapiro): Explore creating this message using RequestKinds.
++      errorMessage
++          .append("Dagger does not support injecting Provider<T>, Lazy<T>, Producer<T>, ")
++          .append("or Produced<T> when T is a wildcard type such as ")
++          .append(key);
++    } else {
++      // TODO(ronshapiro): replace "provided" with "satisfied"?
++      errorMessage.append(key).append(" cannot be provided without ");
++      if (isValidImplicitProvisionKey(key, types)) {
++        errorMessage.append("an @Inject constructor or ");
++      }
++      errorMessage.append("an @Provides-"); // TODO(dpb): s/an/a
++      if (dependencyCanBeProduction(edge, graph)) {
++        errorMessage.append(" or @Produces-");
++      }
++      errorMessage.append("annotated method.");
++    }
++    if (isValidMembersInjectionKey(key) && typeHasInjectionSites(key)) {
++      errorMessage.append(
++          " This type supports members injection but cannot be implicitly provided.");
++    }
++    graph
++        .bindingNodes(key)
++        .stream()
++        .map(bindingNode -> bindingNode.componentPath().currentComponent())
++        .distinct()
++        .forEach(
++            component ->
++                errorMessage
++                    .append("\nA binding with matching key exists in component: ")
++                    .append(component.getQualifiedName()));
++    return errorMessage.toString();
++  }
++
++  private boolean dependencyCanBeProduction(DependencyEdge edge, BindingGraph graph) {
++    Node source = graph.incidentNodes(edge).source();
++    if (source instanceof ComponentNode) {
++      return entryPointCanUseProduction(edge.dependencyRequest().kind());
++    }
++    if (source instanceof BindingNode) {
++      return ((BindingNode) source).binding().isProduction();
++    }
++    throw new IllegalArgumentException("expected a BindingNode or ComponentNode: " + source);
++  }
++
++  private boolean typeHasInjectionSites(Key key) {
++    return injectBindingRegistry
++        .getOrFindMembersInjectionBinding(key)
++        .map(binding -> !binding.injectionSites().isEmpty())
++        .orElse(false);
++  }
++
++  /**
++   * If {@code edge} is missing a binding because it's an invalid {@code @ForReleasableReferences}
++   * request, returns a more specific error message.
++   *
++   * <p>An invalid request is one whose type is either {@link ReleasableReferenceManager} or {@link
++   * TypedReleasableReferenceManager}, and whose scope:
++   *
++   * <ul>
++   *   <li>does not annotate any component in the hierarchy, or
++   *   <li>is not annotated with the metadata annotation type that is the {@link
++   *       TypedReleasableReferenceManager}'s type argument
++   * </ul>
++   */
++  private Optional<String> missingReleasableReferenceManagerBindingErrorMessage(
++      DependencyEdge edge, BindingGraph graph) {
++    Key key = edge.dependencyRequest().key();
++    if (!key.qualifier().isPresent()
++        || !isTypeOf(ForReleasableReferences.class, key.qualifier().get().getAnnotationType())
++        || !isType(key.type())) {
++      return Optional.empty();
++    }
++
++    Optional<DeclaredType> metadataType;
++    if (isTypeOf(ReleasableReferenceManager.class, key.type())) {
++      metadataType = Optional.empty();
++    } else if (isTypeOf(TypedReleasableReferenceManager.class, key.type())) {
++      List<? extends TypeMirror> typeArguments =
++          MoreTypes.asDeclared(key.type()).getTypeArguments();
++      if (typeArguments.size() != 1 || !typeArguments.get(0).getKind().equals(TypeKind.DECLARED)) {
++        return Optional.empty();
++      }
++      metadataType = Optional.of(MoreTypes.asDeclared(typeArguments.get(0)));
++    } else {
++      return Optional.empty();
++    }
++
++    Scope scope = Scopes.scope(asTypeElement(getTypeValue(key.qualifier().get(), "value")));
++    if (releasableReferencesScopes(graph).noneMatch(isEqual(scope))) {
++      return Optional.of(
++          String.format(
++              "There is no binding for %s because no component in %s's component hierarchy is "
++                  + "annotated with %s. The available reference-releasing scopes are %s.",
++              key,
++              graph.rootComponentNode().toString(),
++              getReadableSource(scope),
++              releasableReferencesScopes(graph).map(Scopes::getReadableSource).collect(toList())));
++    }
++    if (metadataType.isPresent()) {
++      TypeElement metadataTypeElement = asTypeElement(metadataType.get());
++      if (!isAnnotationPresent(scope.scopeAnnotationElement(), metadataType.get())) {
++        return Optional.of(notAnnotated(key, scope.scopeAnnotationElement(), metadataTypeElement));
++      }
++      if (!isAnnotationPresent(metadataTypeElement, CanReleaseReferences.class)) {
++        return Optional.of(
++            notAnnotated(
++                key, metadataTypeElement, elements.getTypeElement(CanReleaseReferences.class)));
++      }
++    }
++    return Optional.empty();
++  }
++
++  private static String notAnnotated(Key key, TypeElement type, TypeElement annotation) {
++    return String.format(
++        "There is no binding for %s because %s is not annotated with @%s.",
++        key, type.getQualifiedName(), annotation);
++  }
++
++  private Stream<Scope> releasableReferencesScopes(BindingGraph graph) {
++    return graph
++        .componentNodes()
++        .stream()
++        .flatMap(node -> node.scopes().stream())
++        .filter(Scope::canReleaseReferences);
++  }
++}
+diff --git a/java/dagger/model/BindingGraph.java b/java/dagger/model/BindingGraph.java
+index 9b578b816..4736924c3 100644
+--- a/java/dagger/model/BindingGraph.java
++++ b/java/dagger/model/BindingGraph.java
+@@ -71,8 +71,9 @@
+  * binding node for the {@code @Subcomponent.Builder} type. For subcomponents defined by {@linkplain
+  * ChildFactoryMethodEdge subcomponent factory methods}, the source node is the component node for
+  * the parent.
++ *
++ * <p><b>Note that this API is experimental and will change.</b>
+  */
+-// TODO(dpb): Represent graphs with missing or conflicting bindings.
+ public final class BindingGraph extends ForwardingNetwork<Node, Edge> {
+   BindingGraph(Network<Node, Edge> network) {
+     super(ImmutableNetwork.copyOf(network));
+@@ -90,6 +91,14 @@
+         .collect(toImmutableSet());
+   }
+ 
++  /** Returns the nodes that represent missing bindings. */
++  public ImmutableSet<MissingBindingNode> missingBindingNodes() {
++    return nodes()
++        .stream()
++        .flatMap(instancesOf(MissingBindingNode.class))
++        .collect(toImmutableSet());
++  }
++
+   /** Returns the component nodes. */
+   public ImmutableSet<ComponentNode> componentNodes() {
+     return componentNodeStream().collect(toImmutableSet());
+@@ -130,7 +139,7 @@ public ComponentNode rootComponentNode() {
+         .collect(toImmutableMap(DependencyEdge::dependencyRequest, edge -> edge));
+   }
+ 
+-  /** Returns the dependency edges from any binding for a dependency request. */
++  /** Returns the dependency edges for a dependency request. */
+   public ImmutableSet<DependencyEdge> dependencyEdges(DependencyRequest dependencyRequest) {
+     return dependencyEdgeStream()
+         .filter(edge -> edge.dependencyRequest().equals(dependencyRequest))
+@@ -200,6 +209,12 @@ public ComponentNode rootComponentNode() {
+    * <p>Because one {@link DependencyRequest} may represent a dependency from two bindings (e.g., a
+    * dependency of {@code Foo<String>} and {@code Foo<Number>} may have the same key and request
+    * element), this class does not override {@link #equals(Object)} to use value semantics.
++   *
++   * <p>For entry points, the source node is the {@link ComponentNode} that contains the entry
++   * point. Otherwise the source node is a {@link BindingNode}.
++   *
++   * <p>For dependencies on missing bindings, the target node is a {@link MissingBindingNode}.
++   * Otherwise the target node is a {@link BindingNode}.
+    */
+   public static final class DependencyEdge implements Edge {
+ 
+@@ -335,6 +350,27 @@ public String toString() {
+     }
+   }
+ 
++  /** A node in the binding graph that represents a missing binding for a key in a component. */
++  @AutoValue
++  @DoNotMock("Use Dagger-supplied implementations")
++  public abstract static class MissingBindingNode implements Node {
++    static MissingBindingNode create(ComponentPath component, Key key) {
++      return new AutoValue_BindingGraph_MissingBindingNode(component, key);
++    }
++
++    /** The component in which the binding is missing. */
++    @Override
++    public abstract ComponentPath componentPath();
++
++    /** The key for which there is no binding. */
++    public abstract Key key();
++
++    @Override
++    public String toString() {
++      return String.format("missing binding for %s in %s", key(), componentPath());
++    }
++  }
++
+   /**
+    * A <b>component node</b> in the graph. Every entry point {@linkplain DependencyEdge dependency
+    * edge}'s source node is a component node for the component containing the entry point.
+@@ -342,8 +378,10 @@ public String toString() {
+   @AutoValue
+   public abstract static class ComponentNode implements Node {
+     static ComponentNode create(
+-        ComponentPath componentPath, ImmutableSet<DependencyRequest> entryPoints) {
+-      return new AutoValue_BindingGraph_ComponentNode(componentPath, entryPoints);
++        ComponentPath componentPath,
++        ImmutableSet<DependencyRequest> entryPoints,
++        ImmutableSet<Scope> scopes) {
++      return new AutoValue_BindingGraph_ComponentNode(componentPath, entryPoints, scopes);
+     }
+ 
+     /** The component represented by this node. */
+@@ -353,6 +391,9 @@ static ComponentNode create(
+     /** The entry points on this component. */
+     public abstract ImmutableSet<DependencyRequest> entryPoints();
+ 
++    /** The scopes declared on this component. */
++    public abstract ImmutableSet<Scope> scopes();
++
+     @Override
+     public final String toString() {
+       return componentPath().toString();
+diff --git a/java/dagger/model/BindingGraphProxies.java b/java/dagger/model/BindingGraphProxies.java
+index 1bdd17fd9..1c444c67a 100644
+--- a/java/dagger/model/BindingGraphProxies.java
++++ b/java/dagger/model/BindingGraphProxies.java
+@@ -23,6 +23,7 @@
+ import dagger.model.BindingGraph.ComponentNode;
+ import dagger.model.BindingGraph.DependencyEdge;
+ import dagger.model.BindingGraph.Edge;
++import dagger.model.BindingGraph.MissingBindingNode;
+ import dagger.model.BindingGraph.Node;
+ import dagger.model.BindingGraph.SubcomponentBuilderBindingEdge;
+ import java.util.function.Supplier;
+@@ -50,10 +51,17 @@ public static BindingNode bindingNode(
+     return BindingNode.create(component, binding, associatedDeclarations, toStringFunction);
+   }
+ 
++  /** Creates a new {@link MissingBindingNode}. */
++  public static MissingBindingNode missingBindingNode(ComponentPath component, Key key) {
++    return MissingBindingNode.create(component, key);
++  }
++
+   /** Creates a new {@link ComponentNode}. */
+   public static ComponentNode componentNode(
+-      ComponentPath component, ImmutableSet<DependencyRequest> entryPoints) {
+-    return ComponentNode.create(component, entryPoints);
++      ComponentPath component,
++      ImmutableSet<DependencyRequest> entryPoints,
++      ImmutableSet<Scope> scopes) {
++    return ComponentNode.create(component, entryPoints, scopes);
+   }
+ 
+   /** Creates a new {@link DependencyEdge}. */
+diff --git a/javatests/dagger/internal/codegen/GraphValidationTest.java b/javatests/dagger/internal/codegen/GraphValidationTest.java
+index a838c12aa..a332b2381 100644
+--- a/javatests/dagger/internal/codegen/GraphValidationTest.java
++++ b/javatests/dagger/internal/codegen/GraphValidationTest.java
+@@ -1374,9 +1374,7 @@ public void duplicateExplicitBindings_UniqueBindingAndMultibindingDeclaration()
+             "test.TestClass.A is injected at",
+             "    test.TestClass.B.<init>(a)",
+             "test.TestClass.B is injected at",
+-            "    test.TestClass.C.b",
+-            "test.TestClass.C is injected at",
+-            "    test.TestClass.DImpl.<init>(c, …)",
++            "    test.TestClass.DImpl.<init>(…, b)",
+             "test.TestClass.DImpl is injected at",
+             "    test.TestClass.DModule.d(…, impl, …)",
+             "@javax.inject.Named(\"slim shady\") test.TestClass.D is provided at",
+diff --git a/javatests/dagger/spi/SpiPluginTest.java b/javatests/dagger/spi/SpiPluginTest.java
+index be63d8217..d9d479b38 100644
+--- a/javatests/dagger/spi/SpiPluginTest.java
++++ b/javatests/dagger/spi/SpiPluginTest.java
+@@ -261,7 +261,7 @@ public void dependencyTraceAtDependencyRequest_subcomponents() {
+     assertThat(compilationFactory.compilationWithErrorOnDependency("childEntryPoint"))
+         .hadErrorContaining(
+             lines(
+-                "[FailingPlugin] Bad Dependency!",
++                "[FailingPlugin] [test.TestSubcomponent.childEntryPoint()] Bad Dependency!",
+                 "      test.EntryPoint is provided at",
+                 "          test.TestSubcomponent.childEntryPoint()",
+                 "  component path: test.TestComponent → test.TestSubcomponent"))
+@@ -270,7 +270,7 @@ public void dependencyTraceAtDependencyRequest_subcomponents() {
+     assertThat(compilationFactory.compilationWithErrorOnDependency("foo"))
+         .hadErrorContaining(
+             lines(
+-                "[FailingPlugin] Bad Dependency!",
++                "[FailingPlugin] [test.TestSubcomponent.childEntryPoint()] Bad Dependency!",
+                 "      test.Foo is injected at",
+                 "          test.EntryPoint.<init>(foo)",
+                 "      test.EntryPoint is provided at",
+@@ -463,7 +463,7 @@ public void shortestPathToBindingExistsThroughSubcomponentBuilder() {
+             lines(
+                 // TODO(ronshapiro): should this error be reported if it's already been reported at
+                 // an ancestor component?
+-                "[FailingPlugin] Bad Binding!",
++                "[FailingPlugin] [test.TestSubcomponent.exposedOnSubcomponent()] Bad Binding!",
+                 "      test.ExposedOnSubcomponent is provided at",
+                 "          test.TestSubcomponent.exposedOnSubcomponent()",
+                 "  component path: test.TestComponent → test.TestSubcomponent"))

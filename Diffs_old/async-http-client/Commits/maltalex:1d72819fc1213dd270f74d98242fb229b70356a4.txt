@@ -1,0 +1,618 @@
+diff --git a/client/src/main/java/org/asynchttpclient/netty/channel/BlockingConnectionSemaphoreFactory.java b/client/src/main/java/org/asynchttpclient/netty/channel/BlockingConnectionSemaphoreFactory.java
+deleted file mode 100644
+index 384f67b96..000000000
+--- a/client/src/main/java/org/asynchttpclient/netty/channel/BlockingConnectionSemaphoreFactory.java
++++ /dev/null
+@@ -1,30 +0,0 @@
+-/*
+- * Copyright (c) 2018 AsyncHttpClient Project. All rights reserved.
+- *
+- * This program is licensed to you under the Apache License Version 2.0,
+- * and you may not use this file except in compliance with the Apache License Version 2.0.
+- * You may obtain a copy of the Apache License Version 2.0 at
+- *     http://www.apache.org/licenses/LICENSE-2.0.
+- *
+- * Unless required by applicable law or agreed to in writing,
+- * software distributed under the Apache License Version 2.0 is distributed on an
+- * "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+- * See the Apache License Version 2.0 for the specific language governing permissions and limitations there under.
+- */
+-package org.asynchttpclient.netty.channel;
+-
+-import org.asynchttpclient.AsyncHttpClientConfig;
+-
+-public class BlockingConnectionSemaphoreFactory implements ConnectionSemaphoreFactory {
+-
+-  public ConnectionSemaphore newConnectionSemaphore(AsyncHttpClientConfig config) {
+-    ConnectionSemaphore semaphore = new NoopConnectionSemaphore();
+-    if (config.getMaxConnections() > 0) {
+-      semaphore = new MaxConnectionBlockingSemaphore(config.getMaxConnections());
+-    }
+-    if (config.getMaxConnectionsPerHost() > 0) {
+-      semaphore = new PerHostConnectionBlockingSemaphore(config.getMaxConnectionsPerHost(), semaphore);
+-    }
+-    return semaphore;
+-  }
+-}
+diff --git a/client/src/main/java/org/asynchttpclient/netty/channel/CombinedConnectionSemaphore.java b/client/src/main/java/org/asynchttpclient/netty/channel/CombinedConnectionSemaphore.java
+new file mode 100644
+index 000000000..04549fd80
+--- /dev/null
++++ b/client/src/main/java/org/asynchttpclient/netty/channel/CombinedConnectionSemaphore.java
+@@ -0,0 +1,69 @@
++/*
++ * Copyright (c) 2018 AsyncHttpClient Project. All rights reserved.
++ *
++ * This program is licensed to you under the Apache License Version 2.0,
++ * and you may not use this file except in compliance with the Apache License Version 2.0.
++ * You may obtain a copy of the Apache License Version 2.0 at
++ *     http://www.apache.org/licenses/LICENSE-2.0.
++ *
++ * Unless required by applicable law or agreed to in writing,
++ * software distributed under the Apache License Version 2.0 is distributed on an
++ * "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++ * See the Apache License Version 2.0 for the specific language governing permissions and limitations there under.
++ */
++package org.asynchttpclient.netty.channel;
++
++import java.io.IOException;
++import java.util.concurrent.TimeUnit;
++
++/**
++ * A combined {@link ConnectionSemaphore} with two limits - a global limit and a per-host limit
++ */
++public class CombinedConnectionSemaphore extends PerHostConnectionSemaphore {
++  protected final MaxConnectionSemaphore globalMaxConnectionSemaphore;
++
++  CombinedConnectionSemaphore(int maxConnections, int maxConnectionsPerHost, int acquireTimeout) {
++    super(maxConnectionsPerHost, acquireTimeout);
++    this.globalMaxConnectionSemaphore = new MaxConnectionSemaphore(maxConnections, acquireTimeout);
++  }
++
++  @Override
++  public void acquireChannelLock(Object partitionKey) throws IOException {
++    long remainingTime = super.acquireTimeout > 0 ? acquireGlobalTimed(partitionKey) : acquireGlobal(partitionKey);
++
++    try {
++      if (remainingTime < 0 || !getFreeConnectionsForHost(partitionKey).tryAcquire(remainingTime, TimeUnit.MILLISECONDS)) {
++        releaseGlobal(partitionKey);
++        throw tooManyConnectionsPerHost;
++      }
++    } catch (InterruptedException e) {
++      releaseGlobal(partitionKey);
++      throw new RuntimeException(e);
++    }
++  }
++
++  protected void releaseGlobal(Object partitionKey) {
++    this.globalMaxConnectionSemaphore.releaseChannelLock(partitionKey);
++  }
++
++  protected long acquireGlobal(Object partitionKey) throws IOException {
++    this.globalMaxConnectionSemaphore.acquireChannelLock(partitionKey);
++    return 0;
++  }
++
++  /*
++   * Acquires the global lock and returns the remaining time, in millis, to acquire the per-host lock
++   */
++  protected long acquireGlobalTimed(Object partitionKey) throws IOException {
++    long beforeGlobalAcquire = System.currentTimeMillis();
++    acquireGlobal(partitionKey);
++    long lockTime = System.currentTimeMillis() - beforeGlobalAcquire;
++    return this.acquireTimeout - lockTime;
++  }
++
++  @Override
++  public void releaseChannelLock(Object partitionKey) {
++    this.globalMaxConnectionSemaphore.releaseChannelLock(partitionKey);
++    super.releaseChannelLock(partitionKey);
++  }
++}
+diff --git a/client/src/main/java/org/asynchttpclient/netty/channel/DefaultConnectionSemaphoreFactory.java b/client/src/main/java/org/asynchttpclient/netty/channel/DefaultConnectionSemaphoreFactory.java
+index a102f1def..eba42186e 100644
+--- a/client/src/main/java/org/asynchttpclient/netty/channel/DefaultConnectionSemaphoreFactory.java
++++ b/client/src/main/java/org/asynchttpclient/netty/channel/DefaultConnectionSemaphoreFactory.java
+@@ -17,14 +17,21 @@
+ 
+ public class DefaultConnectionSemaphoreFactory implements ConnectionSemaphoreFactory {
+ 
+-    public ConnectionSemaphore newConnectionSemaphore(AsyncHttpClientConfig config) {
+-        ConnectionSemaphore semaphore = new NoopConnectionSemaphore();
+-        if (config.getMaxConnections() > 0) {
+-            semaphore = new MaxConnectionSemaphore(config.getMaxConnections());
+-        }
+-        if (config.getMaxConnectionsPerHost() > 0) {
+-            semaphore = new PerHostConnectionSemaphore(config.getMaxConnectionsPerHost(), semaphore);
+-        }
+-        return semaphore;
++  public ConnectionSemaphore newConnectionSemaphore(AsyncHttpClientConfig config) {
++    int acquireFreeChannelTimeout = Math.max(0, config.getAcquireFreeChannelTimeout());
++    int maxConnections = config.getMaxConnections();
++    int maxConnectionsPerHost = config.getMaxConnectionsPerHost();
++
++    if (maxConnections > 0 && maxConnectionsPerHost > 0) {
++      return new CombinedConnectionSemaphore(maxConnections, maxConnectionsPerHost, acquireFreeChannelTimeout);
++    }
++    if (maxConnections > 0) {
++      return new MaxConnectionSemaphore(maxConnections, acquireFreeChannelTimeout);
+     }
++    if (maxConnectionsPerHost > 0) {
++      return new CombinedConnectionSemaphore(maxConnections, maxConnectionsPerHost, acquireFreeChannelTimeout);
++    }
++
++    return new NoopConnectionSemaphore();
++  }
+ }
+diff --git a/client/src/main/java/org/asynchttpclient/netty/channel/BlockingSemaphoreInfinite.java b/client/src/main/java/org/asynchttpclient/netty/channel/InfiniteSemaphore.java
+similarity index 92%
+rename from client/src/main/java/org/asynchttpclient/netty/channel/BlockingSemaphoreInfinite.java
+rename to client/src/main/java/org/asynchttpclient/netty/channel/InfiniteSemaphore.java
+index 41a069fce..97b822473 100644
+--- a/client/src/main/java/org/asynchttpclient/netty/channel/BlockingSemaphoreInfinite.java
++++ b/client/src/main/java/org/asynchttpclient/netty/channel/InfiniteSemaphore.java
+@@ -23,12 +23,12 @@
+  *
+  * @author Alex Maltinsky
+  */
+-public class BlockingSemaphoreInfinite extends Semaphore {
++public class InfiniteSemaphore extends Semaphore {
+ 
+-  public static final BlockingSemaphoreInfinite INSTANCE = new BlockingSemaphoreInfinite();
++  public static final InfiniteSemaphore INSTANCE = new InfiniteSemaphore();
+   private static final long serialVersionUID = 1L;
+ 
+-  private BlockingSemaphoreInfinite() {
++  private InfiniteSemaphore() {
+     super(Integer.MAX_VALUE);
+   }
+ 
+diff --git a/client/src/main/java/org/asynchttpclient/netty/channel/MaxConnectionBlockingSemaphore.java b/client/src/main/java/org/asynchttpclient/netty/channel/MaxConnectionBlockingSemaphore.java
+deleted file mode 100644
+index a5699df6e..000000000
+--- a/client/src/main/java/org/asynchttpclient/netty/channel/MaxConnectionBlockingSemaphore.java
++++ /dev/null
+@@ -1,44 +0,0 @@
+-/*
+- * Copyright (c) 2018 AsyncHttpClient Project. All rights reserved.
+- *
+- * This program is licensed to you under the Apache License Version 2.0,
+- * and you may not use this file except in compliance with the Apache License Version 2.0.
+- * You may obtain a copy of the Apache License Version 2.0 at
+- *     http://www.apache.org/licenses/LICENSE-2.0.
+- *
+- * Unless required by applicable law or agreed to in writing,
+- * software distributed under the Apache License Version 2.0 is distributed on an
+- * "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+- * See the Apache License Version 2.0 for the specific language governing permissions and limitations there under.
+- */
+-package org.asynchttpclient.netty.channel;
+-
+-import java.util.concurrent.Semaphore;
+-
+-/**
+- * A blocking connection semaphore based on a plain java Semaphore
+- *
+- * @author Alex Maltinsky
+- */
+-public class MaxConnectionBlockingSemaphore implements ConnectionSemaphore {
+-
+-  private final Semaphore freeChannels;
+-
+-  MaxConnectionBlockingSemaphore(int maxConnections) {
+-    this.freeChannels = maxConnections > 0 ? new Semaphore(maxConnections) : BlockingSemaphoreInfinite.INSTANCE;
+-  }
+-
+-  @Override
+-  public void acquireChannelLock(Object partitionKey) {
+-    try {
+-      this.freeChannels.acquire();
+-    } catch (InterruptedException e) {
+-      throw new RuntimeException(e);
+-    }
+-  }
+-
+-  @Override
+-  public void releaseChannelLock(Object partitionKey) {
+-    this.freeChannels.release();
+-  }
+-}
+diff --git a/client/src/main/java/org/asynchttpclient/netty/channel/MaxConnectionSemaphore.java b/client/src/main/java/org/asynchttpclient/netty/channel/MaxConnectionSemaphore.java
+index 99bd6a4be..99c318afa 100644
+--- a/client/src/main/java/org/asynchttpclient/netty/channel/MaxConnectionSemaphore.java
++++ b/client/src/main/java/org/asynchttpclient/netty/channel/MaxConnectionSemaphore.java
+@@ -16,6 +16,8 @@
+ import org.asynchttpclient.exception.TooManyConnectionsException;
+ 
+ import java.io.IOException;
++import java.util.concurrent.Semaphore;
++import java.util.concurrent.TimeUnit;
+ 
+ import static org.asynchttpclient.util.ThrowableUtil.unknownStackTrace;
+ 
+@@ -23,21 +25,29 @@
+  * Max connections limiter.
+  *
+  * @author Stepan Koltsov
++ * @author Alex Maltinsky
+  */
+ public class MaxConnectionSemaphore implements ConnectionSemaphore {
+ 
+-  private final NonBlockingSemaphoreLike freeChannels;
+-  private final IOException tooManyConnections;
++  protected final Semaphore freeChannels;
++  protected final IOException tooManyConnections;
++  protected final int acquireTimeout;
+ 
+-  MaxConnectionSemaphore(int maxConnections) {
++  MaxConnectionSemaphore(int maxConnections, int acquireTimeout) {
+     tooManyConnections = unknownStackTrace(new TooManyConnectionsException(maxConnections), MaxConnectionSemaphore.class, "acquireChannelLock");
+-    freeChannels = maxConnections > 0 ? new NonBlockingSemaphore(maxConnections) : NonBlockingSemaphoreInfinite.INSTANCE;
++    freeChannels = maxConnections > 0 ? new Semaphore(maxConnections) : InfiniteSemaphore.INSTANCE;
++    this.acquireTimeout = Math.max(0, acquireTimeout);
+   }
+ 
+   @Override
+   public void acquireChannelLock(Object partitionKey) throws IOException {
+-    if (!freeChannels.tryAcquire())
+-      throw tooManyConnections;
++    try {
++      if (!freeChannels.tryAcquire(acquireTimeout, TimeUnit.MILLISECONDS)) {
++        throw tooManyConnections;
++      }
++    } catch (InterruptedException e) {
++      throw new RuntimeException(e);
++    }
+   }
+ 
+   @Override
+diff --git a/client/src/main/java/org/asynchttpclient/netty/channel/NonBlockingSemaphore.java b/client/src/main/java/org/asynchttpclient/netty/channel/NonBlockingSemaphore.java
+deleted file mode 100644
+index a7bd2eacf..000000000
+--- a/client/src/main/java/org/asynchttpclient/netty/channel/NonBlockingSemaphore.java
++++ /dev/null
+@@ -1,54 +0,0 @@
+-/*
+- * Copyright (c) 2017 AsyncHttpClient Project. All rights reserved.
+- *
+- * This program is licensed to you under the Apache License Version 2.0,
+- * and you may not use this file except in compliance with the Apache License Version 2.0.
+- * You may obtain a copy of the Apache License Version 2.0 at
+- *     http://www.apache.org/licenses/LICENSE-2.0.
+- *
+- * Unless required by applicable law or agreed to in writing,
+- * software distributed under the Apache License Version 2.0 is distributed on an
+- * "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+- * See the Apache License Version 2.0 for the specific language governing permissions and limitations there under.
+- */
+-package org.asynchttpclient.netty.channel;
+-
+-import java.util.concurrent.atomic.AtomicInteger;
+-
+-/**
+- * Semaphore-like API, but without blocking.
+- *
+- * @author Stepan Koltsov
+- */
+-class NonBlockingSemaphore implements NonBlockingSemaphoreLike {
+-
+-  private final AtomicInteger permits;
+-
+-  NonBlockingSemaphore(int permits) {
+-    this.permits = new AtomicInteger(permits);
+-  }
+-
+-  @Override
+-  public void release() {
+-    permits.incrementAndGet();
+-  }
+-
+-  @Override
+-  public boolean tryAcquire() {
+-    for (; ; ) {
+-      int count = permits.get();
+-      if (count <= 0) {
+-        return false;
+-      }
+-      if (permits.compareAndSet(count, count - 1)) {
+-        return true;
+-      }
+-    }
+-  }
+-
+-  @Override
+-  public String toString() {
+-    // mimic toString of Semaphore class
+-    return super.toString() + "[Permits = " + permits + "]";
+-  }
+-}
+diff --git a/client/src/main/java/org/asynchttpclient/netty/channel/NonBlockingSemaphoreInfinite.java b/client/src/main/java/org/asynchttpclient/netty/channel/NonBlockingSemaphoreInfinite.java
+deleted file mode 100644
+index 3d4fb91db..000000000
+--- a/client/src/main/java/org/asynchttpclient/netty/channel/NonBlockingSemaphoreInfinite.java
++++ /dev/null
+@@ -1,39 +0,0 @@
+-/*
+- * Copyright (c) 2017 AsyncHttpClient Project. All rights reserved.
+- *
+- * This program is licensed to you under the Apache License Version 2.0,
+- * and you may not use this file except in compliance with the Apache License Version 2.0.
+- * You may obtain a copy of the Apache License Version 2.0 at
+- *     http://www.apache.org/licenses/LICENSE-2.0.
+- *
+- * Unless required by applicable law or agreed to in writing,
+- * software distributed under the Apache License Version 2.0 is distributed on an
+- * "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+- * See the Apache License Version 2.0 for the specific language governing permissions and limitations there under.
+- */
+-package org.asynchttpclient.netty.channel;
+-
+-/**
+- * Non-blocking semaphore-like object with infinite permits.
+- * <p>
+- * So try-acquire always succeeds.
+- *
+- * @author Stepan Koltsov
+- */
+-enum NonBlockingSemaphoreInfinite implements NonBlockingSemaphoreLike {
+-  INSTANCE;
+-
+-  @Override
+-  public void release() {
+-  }
+-
+-  @Override
+-  public boolean tryAcquire() {
+-    return true;
+-  }
+-
+-  @Override
+-  public String toString() {
+-    return NonBlockingSemaphore.class.getName();
+-  }
+-}
+diff --git a/client/src/main/java/org/asynchttpclient/netty/channel/NonBlockingSemaphoreLike.java b/client/src/main/java/org/asynchttpclient/netty/channel/NonBlockingSemaphoreLike.java
+deleted file mode 100644
+index 44303c9df..000000000
+--- a/client/src/main/java/org/asynchttpclient/netty/channel/NonBlockingSemaphoreLike.java
++++ /dev/null
+@@ -1,25 +0,0 @@
+-/*
+- * Copyright (c) 2017 AsyncHttpClient Project. All rights reserved.
+- *
+- * This program is licensed to you under the Apache License Version 2.0,
+- * and you may not use this file except in compliance with the Apache License Version 2.0.
+- * You may obtain a copy of the Apache License Version 2.0 at
+- *     http://www.apache.org/licenses/LICENSE-2.0.
+- *
+- * Unless required by applicable law or agreed to in writing,
+- * software distributed under the Apache License Version 2.0 is distributed on an
+- * "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+- * See the Apache License Version 2.0 for the specific language governing permissions and limitations there under.
+- */
+-package org.asynchttpclient.netty.channel;
+-
+-/**
+- * Non-blocking semaphore API.
+- *
+- * @author Stepan Koltsov
+- */
+-interface NonBlockingSemaphoreLike {
+-  void release();
+-
+-  boolean tryAcquire();
+-}
+diff --git a/client/src/main/java/org/asynchttpclient/netty/channel/PerHostConnectionBlockingSemaphore.java b/client/src/main/java/org/asynchttpclient/netty/channel/PerHostConnectionBlockingSemaphore.java
+deleted file mode 100644
+index 8cbf90333..000000000
+--- a/client/src/main/java/org/asynchttpclient/netty/channel/PerHostConnectionBlockingSemaphore.java
++++ /dev/null
+@@ -1,60 +0,0 @@
+-/*
+- * Copyright (c) 2018 AsyncHttpClient Project. All rights reserved.
+- *
+- * This program is licensed to you under the Apache License Version 2.0,
+- * and you may not use this file except in compliance with the Apache License Version 2.0.
+- * You may obtain a copy of the Apache License Version 2.0 at
+- *     http://www.apache.org/licenses/LICENSE-2.0.
+- *
+- * Unless required by applicable law or agreed to in writing,
+- * software distributed under the Apache License Version 2.0 is distributed on an
+- * "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+- * See the Apache License Version 2.0 for the specific language governing permissions and limitations there under.
+- */
+-package org.asynchttpclient.netty.channel;
+-
+-
+-import java.io.IOException;
+-import java.util.concurrent.ConcurrentHashMap;
+-import java.util.concurrent.Semaphore;
+-
+-/**
+- * A blocking per-host connections limiter
+- *
+- * @author Alex Maltinsky
+- */
+-public class PerHostConnectionBlockingSemaphore implements ConnectionSemaphore {
+-
+-  private final ConnectionSemaphore globalSemaphore;
+-
+-  private final ConcurrentHashMap<Object, Semaphore> freeChannelsPerHost = new ConcurrentHashMap<>();
+-  private final int maxConnectionsPerHost;
+-
+-  PerHostConnectionBlockingSemaphore(int maxConnectionsPerHost, ConnectionSemaphore globalSemaphore) {
+-    this.globalSemaphore = globalSemaphore;
+-    this.maxConnectionsPerHost = maxConnectionsPerHost;
+-  }
+-
+-  @Override
+-  public void acquireChannelLock(Object partitionKey) throws IOException {
+-    globalSemaphore.acquireChannelLock(partitionKey);
+-
+-    try {
+-      getFreeConnectionsForHost(partitionKey).acquire();
+-    } catch (InterruptedException e) {
+-      throw new RuntimeException(e);
+-    }
+-  }
+-
+-  @Override
+-  public void releaseChannelLock(Object partitionKey) {
+-    globalSemaphore.releaseChannelLock(partitionKey);
+-    getFreeConnectionsForHost(partitionKey).release();
+-  }
+-
+-  private Semaphore getFreeConnectionsForHost(Object partitionKey) {
+-    return maxConnectionsPerHost > 0 ?
+-            freeChannelsPerHost.computeIfAbsent(partitionKey, pk -> new Semaphore(maxConnectionsPerHost)) :
+-            BlockingSemaphoreInfinite.INSTANCE;
+-  }
+-}
+diff --git a/client/src/main/java/org/asynchttpclient/netty/channel/PerHostConnectionSemaphore.java b/client/src/main/java/org/asynchttpclient/netty/channel/PerHostConnectionSemaphore.java
+index 5ebb348ab..9ce1f20e9 100644
+--- a/client/src/main/java/org/asynchttpclient/netty/channel/PerHostConnectionSemaphore.java
++++ b/client/src/main/java/org/asynchttpclient/netty/channel/PerHostConnectionSemaphore.java
+@@ -17,6 +17,8 @@
+ 
+ import java.io.IOException;
+ import java.util.concurrent.ConcurrentHashMap;
++import java.util.concurrent.Semaphore;
++import java.util.concurrent.TimeUnit;
+ 
+ import static org.asynchttpclient.util.ThrowableUtil.unknownStackTrace;
+ 
+@@ -25,37 +27,36 @@
+  */
+ public class PerHostConnectionSemaphore implements ConnectionSemaphore {
+ 
+-  private final ConnectionSemaphore globalSemaphore;
++  protected final ConcurrentHashMap<Object, Semaphore> freeChannelsPerHost = new ConcurrentHashMap<>();
++  protected final int maxConnectionsPerHost;
++  protected final IOException tooManyConnectionsPerHost;
++  protected final int acquireTimeout;
+ 
+-  private final ConcurrentHashMap<Object, NonBlockingSemaphore> freeChannelsPerHost = new ConcurrentHashMap<>();
+-  private final int maxConnectionsPerHost;
+-  private final IOException tooManyConnectionsPerHost;
+-
+-  PerHostConnectionSemaphore(int maxConnectionsPerHost, ConnectionSemaphore globalSemaphore) {
+-    this.globalSemaphore = globalSemaphore;
++  PerHostConnectionSemaphore(int maxConnectionsPerHost, int acquireTimeout) {
+     tooManyConnectionsPerHost = unknownStackTrace(new TooManyConnectionsPerHostException(maxConnectionsPerHost), PerHostConnectionSemaphore.class, "acquireChannelLock");
+     this.maxConnectionsPerHost = maxConnectionsPerHost;
++    this.acquireTimeout = Math.max(0, acquireTimeout);
+   }
+ 
+   @Override
+   public void acquireChannelLock(Object partitionKey) throws IOException {
+-    globalSemaphore.acquireChannelLock(partitionKey);
+-
+-    if (!getFreeConnectionsForHost(partitionKey).tryAcquire()) {
+-      globalSemaphore.releaseChannelLock(partitionKey);
+-      throw tooManyConnectionsPerHost;
++    try {
++      if (!getFreeConnectionsForHost(partitionKey).tryAcquire(acquireTimeout, TimeUnit.MILLISECONDS)) {
++        throw tooManyConnectionsPerHost;
++      }
++    } catch (InterruptedException e) {
++      throw new RuntimeException(e);
+     }
+   }
+ 
+   @Override
+   public void releaseChannelLock(Object partitionKey) {
+-    globalSemaphore.releaseChannelLock(partitionKey);
+     getFreeConnectionsForHost(partitionKey).release();
+   }
+ 
+-  private NonBlockingSemaphoreLike getFreeConnectionsForHost(Object partitionKey) {
++  protected Semaphore getFreeConnectionsForHost(Object partitionKey) {
+     return maxConnectionsPerHost > 0 ?
+-            freeChannelsPerHost.computeIfAbsent(partitionKey, pk -> new NonBlockingSemaphore(maxConnectionsPerHost)) :
+-            NonBlockingSemaphoreInfinite.INSTANCE;
++            freeChannelsPerHost.computeIfAbsent(partitionKey, pk -> new Semaphore(maxConnectionsPerHost)) :
++            InfiniteSemaphore.INSTANCE;
+   }
+ }
+diff --git a/client/src/test/java/org/asynchttpclient/netty/channel/NonBlockingSemaphoreTest.java b/client/src/test/java/org/asynchttpclient/netty/channel/NonBlockingSemaphoreTest.java
+deleted file mode 100644
+index a387ba408..000000000
+--- a/client/src/test/java/org/asynchttpclient/netty/channel/NonBlockingSemaphoreTest.java
++++ /dev/null
+@@ -1,76 +0,0 @@
+-/*
+- * Copyright (c) 2017 AsyncHttpClient Project. All rights reserved.
+- *
+- * This program is licensed to you under the Apache License Version 2.0,
+- * and you may not use this file except in compliance with the Apache License Version 2.0.
+- * You may obtain a copy of the Apache License Version 2.0 at
+- *     http://www.apache.org/licenses/LICENSE-2.0.
+- *
+- * Unless required by applicable law or agreed to in writing,
+- * software distributed under the Apache License Version 2.0 is distributed on an
+- * "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+- * See the Apache License Version 2.0 for the specific language governing permissions and limitations there under.
+- */
+-package org.asynchttpclient.netty.channel;
+-
+-import org.testng.annotations.Test;
+-
+-import java.util.concurrent.Semaphore;
+-
+-import static org.testng.Assert.*;
+-
+-/**
+- * @author Stepan Koltsov
+- */
+-public class NonBlockingSemaphoreTest {
+-
+-  @Test
+-  public void test0() {
+-    Mirror mirror = new Mirror(0);
+-    assertFalse(mirror.tryAcquire());
+-  }
+-
+-  @Test
+-  public void three() {
+-    Mirror mirror = new Mirror(3);
+-    for (int i = 0; i < 3; ++i) {
+-      assertTrue(mirror.tryAcquire());
+-    }
+-    assertFalse(mirror.tryAcquire());
+-    mirror.release();
+-    assertTrue(mirror.tryAcquire());
+-  }
+-
+-  @Test
+-  public void negative() {
+-    Mirror mirror = new Mirror(-1);
+-    assertFalse(mirror.tryAcquire());
+-    mirror.release();
+-    assertFalse(mirror.tryAcquire());
+-    mirror.release();
+-    assertTrue(mirror.tryAcquire());
+-  }
+-
+-  private static class Mirror {
+-    private final Semaphore real;
+-    private final NonBlockingSemaphore nonBlocking;
+-
+-    Mirror(int permits) {
+-      real = new Semaphore(permits);
+-      nonBlocking = new NonBlockingSemaphore(permits);
+-    }
+-
+-    boolean tryAcquire() {
+-      boolean a = real.tryAcquire();
+-      boolean b = nonBlocking.tryAcquire();
+-      assertEquals(a, b);
+-      return a;
+-    }
+-
+-    void release() {
+-      real.release();
+-      nonBlocking.release();
+-    }
+-  }
+-
+-}

@@ -1,0 +1,151 @@
+diff --git a/okhttp-tests/src/test/java/okhttp3/DispatcherTest.java b/okhttp-tests/src/test/java/okhttp3/DispatcherTest.java
+index 4dc3d0c6bd..6c04901464 100644
+--- a/okhttp-tests/src/test/java/okhttp3/DispatcherTest.java
++++ b/okhttp-tests/src/test/java/okhttp3/DispatcherTest.java
+@@ -1,6 +1,7 @@
+ package okhttp3;
+ 
+ import java.io.IOException;
++import java.io.InterruptedIOException;
+ import java.util.ArrayList;
+ import java.util.Arrays;
+ import java.util.Collections;
+@@ -11,10 +12,12 @@
+ import java.util.concurrent.AbstractExecutorService;
+ import java.util.concurrent.CountDownLatch;
+ import java.util.concurrent.TimeUnit;
++import java.util.concurrent.atomic.AtomicBoolean;
+ import okhttp3.RealCall.AsyncCall;
+ import org.junit.Before;
+ import org.junit.Test;
+ 
++import static java.util.concurrent.TimeUnit.SECONDS;
+ import static org.junit.Assert.assertEquals;
+ import static org.junit.Assert.assertFalse;
+ import static org.junit.Assert.assertTrue;
+@@ -213,6 +216,45 @@
+     assertFalse(a4.isCanceled());
+   }
+ 
++  @Test public void idleCallbackInvokedWhenIdle() throws InterruptedException {
++    final AtomicBoolean idle = new AtomicBoolean();
++    dispatcher.setIdleCallback(new Runnable() {
++      @Override public void run() {
++        idle.set(true);
++      }
++    });
++
++    client.newCall(newRequest("http://a/1")).enqueue(callback);
++    client.newCall(newRequest("http://a/2")).enqueue(callback);
++    executor.finishJob("http://a/1");
++    assertFalse(idle.get());
++
++    final CountDownLatch ready = new CountDownLatch(1);
++    final CountDownLatch proceed = new CountDownLatch(1);
++    client = client.newBuilder()
++        .addInterceptor(new Interceptor() {
++          @Override public Response intercept(Chain chain) throws IOException {
++            ready.countDown();
++            try {
++              proceed.await(5, SECONDS);
++            } catch (InterruptedException e) {
++              throw new RuntimeException(e);
++            }
++            return chain.proceed(chain.request());
++          }
++        })
++        .build();
++
++    Thread t1 = makeSynchronousCall(client.newCall(newRequest("http://a/3")));
++    ready.await(5, SECONDS);
++    executor.finishJob("http://a/2");
++    assertFalse(idle.get());
++
++    proceed.countDown();
++    t1.join();
++    assertTrue(idle.get());
++  }
++
+   private <T> Set<T> set(T... values) {
+     return set(Arrays.asList(values));
+   }
+diff --git a/okhttp/src/main/java/okhttp3/Dispatcher.java b/okhttp/src/main/java/okhttp3/Dispatcher.java
+index 5a135b325d..0d30547afb 100644
+--- a/okhttp/src/main/java/okhttp3/Dispatcher.java
++++ b/okhttp/src/main/java/okhttp3/Dispatcher.java
+@@ -38,6 +38,7 @@
+ public final class Dispatcher {
+   private int maxRequests = 64;
+   private int maxRequestsPerHost = 5;
++  private Runnable idleCallback;
+ 
+   /** Executes calls. Created lazily. */
+   private ExecutorService executorService;
+@@ -106,6 +107,22 @@ public synchronized int getMaxRequestsPerHost() {
+     return maxRequestsPerHost;
+   }
+ 
++  /**
++   * Set a callback to be invoked each time the dispatcher becomes idle (when the number of running
++   * calls returns to zero).
++   *
++   * <p>Note: The time at which a {@linkplain Call call} is considered idle is different depending
++   * on whether it was run {@linkplain Call#enqueue(Callback) asynchronously} or
++   * {@linkplain Call#execute() synchronously}. Asynchronous calls become idle after the
++   * {@link Callback#onResponse onResponse} or {@link Callback#onFailure onFailure} callback has
++   * returned. Synchronous calls become idle once {@link Call#execute() execute()} returns. This
++   * means that if you are doing synchronous calls the network layer will not truly be idle until
++   * every returned {@link Response} has been closed.
++   */
++  public synchronized void setIdleCallback(Runnable idleCallback) {
++    this.idleCallback = idleCallback;
++  }
++
+   synchronized void enqueue(AsyncCall call) {
+     if (runningAsyncCalls.size() < maxRequests && runningCallsForHost(call) < maxRequestsPerHost) {
+       runningAsyncCalls.add(call);
+@@ -133,12 +150,6 @@ public synchronized void cancelAll() {
+     }
+   }
+ 
+-  /** Used by {@code AsyncCall#run} to signal completion. */
+-  synchronized void finished(AsyncCall call) {
+-    if (!runningAsyncCalls.remove(call)) throw new AssertionError("AsyncCall wasn't running!");
+-    promoteCalls();
+-  }
+-
+   private void promoteCalls() {
+     if (runningAsyncCalls.size() >= maxRequests) return; // Already running max capacity.
+     if (readyAsyncCalls.isEmpty()) return; // No ready calls to promote.
+@@ -170,9 +181,29 @@ synchronized void executed(RealCall call) {
+     runningSyncCalls.add(call);
+   }
+ 
++  /** Used by {@code AsyncCall#run} to signal completion. */
++  void finished(AsyncCall call) {
++    finished(runningAsyncCalls, call, true);
++  }
++
+   /** Used by {@code Call#execute} to signal completion. */
+-  synchronized void finished(Call call) {
+-    if (!runningSyncCalls.remove(call)) throw new AssertionError("Call wasn't in-flight!");
++  void finished(RealCall call) {
++    finished(runningSyncCalls, call, false);
++  }
++
++  private <T> void finished(Deque<T> calls, T call, boolean promoteCalls) {
++    int runningCallsCount;
++    Runnable idleCallback;
++    synchronized (this) {
++      if (!calls.remove(call)) throw new AssertionError("Call wasn't in-flight!");
++      if (promoteCalls) promoteCalls();
++      runningCallsCount = runningCallsCount();
++      idleCallback = this.idleCallback;
++    }
++
++    if (runningCallsCount == 0 && idleCallback != null) {
++      idleCallback.run();
++    }
+   }
+ 
+   /** Returns a snapshot of the calls currently awaiting execution. */

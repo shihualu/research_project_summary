@@ -1,0 +1,527 @@
+diff --git a/java/dagger/internal/codegen/BUILD b/java/dagger/internal/codegen/BUILD
+index 9ef511d56..e3d3bc3dd 100644
+--- a/java/dagger/internal/codegen/BUILD
++++ b/java/dagger/internal/codegen/BUILD
+@@ -286,6 +286,9 @@ java_library(
+         "ModifiableBindingMethods.java",
+         "ModifiableBindingType.java",
+         "ModifiableConcreteMethodBindingExpression.java",
++        "ModuleConstructorProxyGenerator.java",
++        "ModuleGenerator.java",
++        "ModuleProxies.java",
+         "MonitoringModuleGenerator.java",
+         "MonitoringModuleProcessingStep.java",
+         "MultibindingExpression.java",
+diff --git a/java/dagger/internal/codegen/ComponentCreatorImplementation.java b/java/dagger/internal/codegen/ComponentCreatorImplementation.java
+index 7e76cd207..ab95a781f 100644
+--- a/java/dagger/internal/codegen/ComponentCreatorImplementation.java
++++ b/java/dagger/internal/codegen/ComponentCreatorImplementation.java
+@@ -16,10 +16,12 @@
+ 
+ package dagger.internal.codegen;
+ 
++import static com.google.common.base.Preconditions.checkState;
+ import static com.google.common.collect.Iterables.getOnlyElement;
+ import static com.squareup.javapoet.MethodSpec.constructorBuilder;
+ import static com.squareup.javapoet.MethodSpec.methodBuilder;
+ import static com.squareup.javapoet.TypeSpec.classBuilder;
++import static dagger.internal.codegen.ModuleProxies.newModuleInstance;
+ import static dagger.internal.codegen.SourceFiles.simpleVariableName;
+ import static dagger.internal.codegen.TypeSpecs.addSupertype;
+ import static javax.lang.model.element.Modifier.ABSTRACT;
+@@ -46,8 +48,6 @@
+ import javax.lang.model.element.Modifier;
+ import javax.lang.model.element.VariableElement;
+ import javax.lang.model.type.TypeMirror;
+-import javax.lang.model.util.Elements;
+-import javax.lang.model.util.Types;
+ 
+ /** The implementation of a component creator type. */
+ final class ComponentCreatorImplementation {
+@@ -79,8 +79,8 @@ ClassName name() {
+   static Optional<ComponentCreatorImplementation> create(
+       ComponentImplementation componentImplementation,
+       BindingGraph graph,
+-      Elements elements,
+-      Types types) {
++      DaggerElements elements,
++      DaggerTypes types) {
+     if (componentImplementation.superclassImplementation().isPresent()
+         && componentImplementation.isAbstract()) {
+       // The component builder in ahead-of-time mode is generated with the base subcomponent
+@@ -110,14 +110,14 @@ ClassName name() {
+     final BindingGraph graph;
+     final TypeSpec.Builder componentCreatorClass;
+     final ComponentImplementation componentImplementation;
+-    final Elements elements;
+-    final Types types;
++    final DaggerElements elements;
++    final DaggerTypes types;
+ 
+     CreatorImplementationFactory(
+         ComponentImplementation componentImplementation,
+         BindingGraph graph,
+-        Elements elements,
+-        Types types) {
++        DaggerElements elements,
++        DaggerTypes types) {
+       this.componentImplementation = componentImplementation;
+       this.componentCreatorClass = classBuilder(componentImplementation.getCreatorName());
+       this.graph = graph;
+@@ -229,9 +229,14 @@ MethodSpec factoryMethod(ImmutableMap<ComponentRequirement, FieldSpec> builderFi
+           (requirement, field) -> {
+             switch (requirement.nullPolicy(elements, types)) {
+               case NEW:
++                checkState(requirement.kind().isModule());
+                 factoryMethod
+                     .beginControlFlow("if ($N == null)", field)
+-                    .addStatement("this.$N = new $T()", field, field.type)
++                    .addStatement(
++                        "this.$N = $L",
++                        field,
++                        newModuleInstance(
++                            requirement.typeElement(), componentImplementation.name(), elements))
+                     .endControlFlow();
+                 break;
+               case THROW:
+diff --git a/java/dagger/internal/codegen/ComponentRequirementExpressions.java b/java/dagger/internal/codegen/ComponentRequirementExpressions.java
+index fdd7a5563..8b56044a4 100644
+--- a/java/dagger/internal/codegen/ComponentRequirementExpressions.java
++++ b/java/dagger/internal/codegen/ComponentRequirementExpressions.java
+@@ -23,6 +23,7 @@
+ import static com.google.common.base.Suppliers.memoize;
+ import static com.squareup.javapoet.MethodSpec.methodBuilder;
+ import static dagger.internal.codegen.ComponentImplementation.FieldSpecKind.COMPONENT_REQUIREMENT_FIELD;
++import static dagger.internal.codegen.ModuleProxies.newModuleInstance;
+ import static javax.lang.model.element.Modifier.ABSTRACT;
+ import static javax.lang.model.element.Modifier.PRIVATE;
+ import static javax.lang.model.element.Modifier.PROTECTED;
+@@ -40,6 +41,7 @@
+ import java.util.Map;
+ import java.util.Optional;
+ import javax.inject.Inject;
++import javax.lang.model.element.TypeElement;
+ 
+ /**
+  * A central repository of expressions used to access any {@link ComponentRequirement} available to
+@@ -58,6 +60,7 @@
+   private final BindingGraph graph;
+   private final ComponentImplementation componentImplementation;
+   private final CompilerOptions compilerOptions;
++  private final DaggerElements elements;
+ 
+   // TODO(ronshapiro): give ComponentImplementation a graph() method
+   @Inject
+@@ -65,11 +68,13 @@
+       @ParentComponent Optional<ComponentRequirementExpressions> parent,
+       BindingGraph graph,
+       ComponentImplementation componentImplementation,
+-      CompilerOptions compilerOptions) {
++      CompilerOptions compilerOptions,
++      DaggerElements elements) {
+     this.parent = parent;
+     this.graph = graph;
+     this.componentImplementation = componentImplementation;
+     this.compilerOptions = compilerOptions;
++    this.elements = elements;
+   }
+ 
+   /**
+@@ -136,7 +141,7 @@ private ComponentRequirementExpression createField(ComponentRequirement requirem
+           ParameterSpec.get(graph.factoryMethodParameters().get(requirement));
+       return new ComponentParameterField(requirement, componentImplementation, factoryParameter);
+     } else if (requirement.kind().isModule()) {
+-      return new ComponentInstantiableField(requirement, componentImplementation);
++      return new InstantiableModuleField(requirement, componentImplementation);
+     } else {
+       throw new AssertionError(
+           String.format("Can't create %s in %s", requirement, componentImplementation.name()));
+@@ -212,16 +217,24 @@ CodeBlock fieldInitialization(FieldSpec componentField) {
+    * A {@link ComponentRequirementExpression} for {@link ComponentRequirement}s that can be
+    * instantiated by the component (i.e. a static class with a no-arg constructor).
+    */
+-  private static final class ComponentInstantiableField extends AbstractField {
+-    private ComponentInstantiableField(
+-        ComponentRequirement componentRequirement,
+-        ComponentImplementation componentImplementation) {
+-      super(componentRequirement, componentImplementation);
++  private final class InstantiableModuleField extends AbstractField {
++    private final TypeElement moduleElement;
++    private final ComponentImplementation componentImplementation;
++
++    private InstantiableModuleField(
++        ComponentRequirement module, ComponentImplementation componentImplementation) {
++      super(module, componentImplementation);
++      checkArgument(module.kind().isModule());
++      this.moduleElement = module.typeElement();
++      this.componentImplementation = componentImplementation;
+     }
+ 
+     @Override
+     CodeBlock fieldInitialization(FieldSpec componentField) {
+-      return CodeBlock.of("this.$N = new $T();", componentField, componentField.type);
++      return CodeBlock.of(
++          "this.$N = $L;",
++          componentField,
++          newModuleInstance(moduleElement, componentImplementation.name(), elements));
+     }
+   }
+ 
+diff --git a/java/dagger/internal/codegen/ModuleConstructorProxyGenerator.java b/java/dagger/internal/codegen/ModuleConstructorProxyGenerator.java
+new file mode 100644
+index 000000000..2798eba61
+--- /dev/null
++++ b/java/dagger/internal/codegen/ModuleConstructorProxyGenerator.java
+@@ -0,0 +1,84 @@
++/*
++ * Copyright (C) 2018 The Dagger Authors.
++ *
++ * Licensed under the Apache License, Version 2.0 (the "License");
++ * you may not use this file except in compliance with the License.
++ * You may obtain a copy of the License at
++ *
++ * http://www.apache.org/licenses/LICENSE-2.0
++ *
++ * Unless required by applicable law or agreed to in writing, software
++ * distributed under the License is distributed on an "AS IS" BASIS,
++ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++ * See the License for the specific language governing permissions and
++ * limitations under the License.
++ */
++
++package dagger.internal.codegen;
++
++import static com.squareup.javapoet.MethodSpec.constructorBuilder;
++import static com.squareup.javapoet.MethodSpec.methodBuilder;
++import static com.squareup.javapoet.TypeSpec.classBuilder;
++import static dagger.internal.codegen.ModuleKind.checkIsModule;
++import static dagger.internal.codegen.ModuleProxies.nonPublicNullaryConstructor;
++import static javax.lang.model.element.Modifier.FINAL;
++import static javax.lang.model.element.Modifier.PRIVATE;
++import static javax.lang.model.element.Modifier.PUBLIC;
++import static javax.lang.model.element.Modifier.STATIC;
++
++import com.squareup.javapoet.ClassName;
++import com.squareup.javapoet.TypeSpec;
++import java.util.Optional;
++import javax.annotation.processing.Filer;
++import javax.inject.Inject;
++import javax.lang.model.SourceVersion;
++import javax.lang.model.element.Element;
++import javax.lang.model.element.TypeElement;
++
++/**
++ * Generates a {@code public static} method that calls {@code new SomeModule()} for modules that
++ * don't have {@linkplain ModuleProxies#nonPublicNullaryConstructor(TypeElement,
++ * DaggerElements) publicly accessible constructors}.
++ */
++// TODO(dpb): See if this can become a SourceFileGenerator<ModuleDescriptor> instead. Doing so may
++// cause ModuleProcessingStep to defer elements multiple times.
++final class ModuleConstructorProxyGenerator extends SourceFileGenerator<TypeElement> {
++  private final DaggerElements elements;
++
++  @Inject
++  ModuleConstructorProxyGenerator(
++      Filer filer, DaggerElements elements, SourceVersion sourceVersion) {
++    super(filer, elements, sourceVersion);
++    this.elements = elements;
++  }
++
++  @Override
++  ClassName nameGeneratedType(TypeElement moduleElement) {
++    return ModuleProxies.constructorProxyTypeName(moduleElement);
++  }
++
++  @Override
++  Element originatingElement(TypeElement moduleElement) {
++    return moduleElement;
++  }
++
++  @Override
++  Optional<TypeSpec.Builder> write(ClassName generatedTypeName, TypeElement moduleElement) {
++    checkIsModule(moduleElement);
++    return nonPublicNullaryConstructor(moduleElement, elements).isPresent()
++        ? Optional.of(buildProxy(generatedTypeName, moduleElement))
++        : Optional.empty();
++  }
++
++  private TypeSpec.Builder buildProxy(ClassName generatedTypeName, TypeElement moduleElement) {
++    return classBuilder(generatedTypeName)
++        .addModifiers(PUBLIC, FINAL)
++        .addMethod(constructorBuilder().addModifiers(PRIVATE).build())
++        .addMethod(
++            methodBuilder("newInstance")
++                .addModifiers(PUBLIC, STATIC)
++                .returns(ClassName.get(moduleElement))
++                .addStatement("return new $T()", moduleElement)
++                .build());
++  }
++}
+diff --git a/java/dagger/internal/codegen/ModuleGenerator.java b/java/dagger/internal/codegen/ModuleGenerator.java
+new file mode 100644
+index 000000000..161b47b4a
+--- /dev/null
++++ b/java/dagger/internal/codegen/ModuleGenerator.java
+@@ -0,0 +1,27 @@
++/*
++ * Copyright (C) 2018 The Dagger Authors.
++ *
++ * Licensed under the Apache License, Version 2.0 (the "License");
++ * you may not use this file except in compliance with the License.
++ * You may obtain a copy of the License at
++ *
++ * http://www.apache.org/licenses/LICENSE-2.0
++ *
++ * Unless required by applicable law or agreed to in writing, software
++ * distributed under the License is distributed on an "AS IS" BASIS,
++ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++ * See the License for the specific language governing permissions and
++ * limitations under the License.
++ */
++
++package dagger.internal.codegen;
++
++import static java.lang.annotation.RetentionPolicy.RUNTIME;
++
++import java.lang.annotation.Retention;
++import javax.inject.Qualifier;
++
++/** Qualifier for a {@link SourceFileGenerator} for modules. */
++@Qualifier
++@Retention(RUNTIME)
++@interface ModuleGenerator {}
+diff --git a/java/dagger/internal/codegen/ModuleKind.java b/java/dagger/internal/codegen/ModuleKind.java
+index 7087f882a..91839d6de 100644
+--- a/java/dagger/internal/codegen/ModuleKind.java
++++ b/java/dagger/internal/codegen/ModuleKind.java
+@@ -69,6 +69,10 @@
+     return kinds.stream().findAny();
+   }
+ 
++  static void checkIsModule(TypeElement moduleElement) {
++    checkArgument(forAnnotatedElement(moduleElement).isPresent());
++  }
++
+   private final Class<? extends Annotation> moduleAnnotation;
+   private final Class<? extends Annotation> methodAnnotation;
+ 
+diff --git a/java/dagger/internal/codegen/ModuleProcessingStep.java b/java/dagger/internal/codegen/ModuleProcessingStep.java
+index 1ae025ffc..27cd531fc 100644
+--- a/java/dagger/internal/codegen/ModuleProcessingStep.java
++++ b/java/dagger/internal/codegen/ModuleProcessingStep.java
+@@ -50,6 +50,7 @@
+   private final BindingFactory bindingFactory;
+   private final SourceFileGenerator<ProvisionBinding> factoryGenerator;
+   private final SourceFileGenerator<ProductionBinding> producerFactoryGenerator;
++  private final SourceFileGenerator<TypeElement> moduleConstructorProxyGenerator;
+   private final InaccessibleMapKeyProxyGenerator inaccessibleMapKeyProxyGenerator;
+   private final DelegateDeclaration.Factory delegateDeclarationFactory;
+   private final Set<TypeElement> processedModuleElements = Sets.newLinkedHashSet();
+@@ -61,6 +62,7 @@
+       BindingFactory bindingFactory,
+       SourceFileGenerator<ProvisionBinding> factoryGenerator,
+       SourceFileGenerator<ProductionBinding> producerFactoryGenerator,
++      @ModuleGenerator SourceFileGenerator<TypeElement> moduleConstructorProxyGenerator,
+       InaccessibleMapKeyProxyGenerator inaccessibleMapKeyProxyGenerator,
+       Factory delegateDeclarationFactory) {
+     super(MoreElements::asType);
+@@ -69,6 +71,7 @@
+     this.bindingFactory = bindingFactory;
+     this.factoryGenerator = factoryGenerator;
+     this.producerFactoryGenerator = producerFactoryGenerator;
++    this.moduleConstructorProxyGenerator = moduleConstructorProxyGenerator;
+     this.inaccessibleMapKeyProxyGenerator = inaccessibleMapKeyProxyGenerator;
+     this.delegateDeclarationFactory = delegateDeclarationFactory;
+   }
+@@ -104,6 +107,7 @@ protected void process(
+           inaccessibleMapKeyProxyGenerator.generate(bindsMethodBinding(module, method), messager);
+         }
+       }
++      moduleConstructorProxyGenerator.generate(module, messager);
+     }
+     processedModuleElements.add(module);
+   }
+diff --git a/java/dagger/internal/codegen/ModuleProxies.java b/java/dagger/internal/codegen/ModuleProxies.java
+new file mode 100644
+index 000000000..f5db82a7a
+--- /dev/null
++++ b/java/dagger/internal/codegen/ModuleProxies.java
+@@ -0,0 +1,79 @@
++/*
++ * Copyright (C) 2018 The Dagger Authors.
++ *
++ * Licensed under the Apache License, Version 2.0 (the "License");
++ * you may not use this file except in compliance with the License.
++ * You may obtain a copy of the License at
++ *
++ * http://www.apache.org/licenses/LICENSE-2.0
++ *
++ * Unless required by applicable law or agreed to in writing, software
++ * distributed under the License is distributed on an "AS IS" BASIS,
++ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++ * See the License for the specific language governing permissions and
++ * limitations under the License.
++ */
++
++package dagger.internal.codegen;
++
++import static dagger.internal.codegen.Accessibility.isElementAccessibleFrom;
++import static javax.lang.model.element.Modifier.ABSTRACT;
++import static javax.lang.model.element.Modifier.PRIVATE;
++import static javax.lang.model.element.Modifier.STATIC;
++import static javax.lang.model.util.ElementFilter.constructorsIn;
++
++import com.squareup.javapoet.ClassName;
++import com.squareup.javapoet.CodeBlock;
++import java.util.Optional;
++import javax.lang.model.element.ExecutableElement;
++import javax.lang.model.element.TypeElement;
++
++/** Convenience methods for generating and using module constructor proxy methods. */
++final class ModuleProxies {
++  /** The name of the class that hosts the module constructor proxy method. */
++  static ClassName constructorProxyTypeName(TypeElement moduleElement) {
++    ModuleKind.checkIsModule(moduleElement);
++    ClassName moduleClassName = ClassName.get(moduleElement);
++    return moduleClassName
++        .topLevelClassName()
++        .peerClass(SourceFiles.classFileName(moduleClassName) + "_Proxy");
++  }
++
++  /**
++   * The module constructor being proxied. A proxy is generated if it is not publicly accessible and
++   * has no arguments. If an implicit reference to the enclosing class exists, or the module is
++   * abstract, no proxy method can be generated.
++   */
++  // TODO(ronshapiro): make this an @Injectable class that injects DaggerElements
++  static Optional<ExecutableElement> nonPublicNullaryConstructor(
++      TypeElement moduleElement, DaggerElements elements) {
++    ModuleKind.checkIsModule(moduleElement);
++    if (moduleElement.getModifiers().contains(ABSTRACT)
++        || (moduleElement.getNestingKind().isNested()
++            && !moduleElement.getModifiers().contains(STATIC))) {
++      return Optional.empty();
++    }
++    return constructorsIn(elements.getAllMembers(moduleElement)).stream()
++        .filter(constructor -> !Accessibility.isElementPubliclyAccessible(constructor))
++        .filter(constructor -> !constructor.getModifiers().contains(PRIVATE))
++        .filter(constructor -> constructor.getParameters().isEmpty())
++        .findAny();
++  }
++
++  /**
++   * Returns a code block that creates a new module instance, either by invoking the nullary
++   * constructor if it's accessible from {@code requestingClass} or else by invoking the
++   * constructor's generated proxy method.
++   */
++  static CodeBlock newModuleInstance(
++      TypeElement moduleElement, ClassName requestingClass, DaggerElements elements) {
++    ModuleKind.checkIsModule(moduleElement);
++    String packageName = requestingClass.packageName();
++    return nonPublicNullaryConstructor(moduleElement, elements)
++        .filter(constructor -> !isElementAccessibleFrom(constructor, packageName))
++        .map(
++            constructor ->
++                CodeBlock.of("$T.newInstance()", constructorProxyTypeName(moduleElement)))
++        .orElse(CodeBlock.of("new $T()", moduleElement));
++  }
++}
+diff --git a/java/dagger/internal/codegen/SourceFileGeneratorsModule.java b/java/dagger/internal/codegen/SourceFileGeneratorsModule.java
+index 2fe2a2f9b..c32262adc 100644
+--- a/java/dagger/internal/codegen/SourceFileGeneratorsModule.java
++++ b/java/dagger/internal/codegen/SourceFileGeneratorsModule.java
+@@ -22,6 +22,7 @@
+ import dagger.internal.codegen.SourceFileGeneratorsModule.MembersInjectionModule;
+ import dagger.internal.codegen.SourceFileGeneratorsModule.ProductionModule;
+ import dagger.internal.codegen.SourceFileGeneratorsModule.ProvisionModule;
++import javax.lang.model.element.TypeElement;
+ 
+ @Module(
+     includes = {
+@@ -53,4 +54,14 @@
+ 
+   @Module
+   class ComponentModule extends GeneratorModule<BindingGraph, ComponentGenerator> {}
++
++  // the abstract module is not available because we're using a qualifier
++  @Provides
++  @ModuleGenerator
++  static SourceFileGenerator<TypeElement> generator(
++      ModuleConstructorProxyGenerator generator, CompilerOptions compilerOptions) {
++    return compilerOptions.headerCompilation()
++        ? HjarSourceFileGenerator.wrap(generator)
++        : generator;
++  }
+ }
+diff --git a/javatests/dagger/functional/multipackage/UsesModuleWithInaccessibleConstructor.java b/javatests/dagger/functional/multipackage/UsesModuleWithInaccessibleConstructor.java
+new file mode 100644
+index 000000000..7764112b4
+--- /dev/null
++++ b/javatests/dagger/functional/multipackage/UsesModuleWithInaccessibleConstructor.java
+@@ -0,0 +1,25 @@
++/*
++ * Copyright (C) 2018 The Dagger Authors.
++ *
++ * Licensed under the Apache License, Version 2.0 (the "License");
++ * you may not use this file except in compliance with the License.
++ * You may obtain a copy of the License at
++ *
++ * http://www.apache.org/licenses/LICENSE-2.0
++ *
++ * Unless required by applicable law or agreed to in writing, software
++ * distributed under the License is distributed on an "AS IS" BASIS,
++ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++ * See the License for the specific language governing permissions and
++ * limitations under the License.
++ */
++
++package dagger.functional.multipackage;
++
++import dagger.Component;
++import dagger.functional.multipackage.moduleconstructor.ModuleWithInaccessibleConstructor;
++
++@Component(modules = ModuleWithInaccessibleConstructor.class)
++public interface UsesModuleWithInaccessibleConstructor {
++  int i();
++}
+diff --git a/javatests/dagger/functional/multipackage/moduleconstructor/ModuleWithInaccessibleConstructor.java b/javatests/dagger/functional/multipackage/moduleconstructor/ModuleWithInaccessibleConstructor.java
+new file mode 100644
+index 000000000..6ca0074ea
+--- /dev/null
++++ b/javatests/dagger/functional/multipackage/moduleconstructor/ModuleWithInaccessibleConstructor.java
+@@ -0,0 +1,35 @@
++/*
++ * Copyright (C) 2018 The Dagger Authors.
++ *
++ * Licensed under the Apache License, Version 2.0 (the "License");
++ * you may not use this file except in compliance with the License.
++ * You may obtain a copy of the License at
++ *
++ * http://www.apache.org/licenses/LICENSE-2.0
++ *
++ * Unless required by applicable law or agreed to in writing, software
++ * distributed under the License is distributed on an "AS IS" BASIS,
++ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++ * See the License for the specific language governing permissions and
++ * limitations under the License.
++ */
++
++package dagger.functional.multipackage.moduleconstructor;
++
++import dagger.Module;
++import dagger.Provides;
++import java.util.Random;
++
++@Module
++public class ModuleWithInaccessibleConstructor {
++  private final int i;
++
++  /* intentionally package private */ModuleWithInaccessibleConstructor() {
++    i = new Random().nextInt();
++  }
++
++  @Provides
++  int i() {
++    return i;
++  }
++}

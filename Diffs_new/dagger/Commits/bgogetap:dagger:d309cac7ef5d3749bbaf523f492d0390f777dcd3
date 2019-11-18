@@ -1,0 +1,288 @@
+diff --git a/java/dagger/internal/codegen/BUILD b/java/dagger/internal/codegen/BUILD
+index ab8d9a4ed..ff786dc66 100644
+--- a/java/dagger/internal/codegen/BUILD
++++ b/java/dagger/internal/codegen/BUILD
+@@ -84,6 +84,7 @@ java_library(
+         "ContributionType.java",
+         "DaggerElements.java",
+         "DaggerStatistics.java",
++        "DaggerStatisticsCollectingProcessingStep.java",
+         "DaggerStatisticsCollector.java",
+         "DaggerStatisticsRecorder.java",
+         "DaggerTypes.java",
+diff --git a/java/dagger/internal/codegen/ComponentProcessor.java b/java/dagger/internal/codegen/ComponentProcessor.java
+index fa030534f..dbbbef075 100644
+--- a/java/dagger/internal/codegen/ComponentProcessor.java
++++ b/java/dagger/internal/codegen/ComponentProcessor.java
+@@ -21,6 +21,7 @@
+ import com.google.common.annotations.VisibleForTesting;
+ import com.google.common.collect.ImmutableList;
+ import com.google.common.collect.ImmutableSet;
++import com.google.common.collect.Iterables;
+ import com.google.errorprone.annotations.CanIgnoreReturnValue;
+ import com.google.errorprone.annotations.CheckReturnValue;
+ import dagger.BindsInstance;
+@@ -112,7 +113,9 @@ public SourceVersion getSupportedSourceVersion() {
+ 
+     statisticsCollector.processingStarted();
+     bindingGraphPlugins.initializePlugins();
+-    return processingSteps;
++    return Iterables.transform(
++        processingSteps,
++        step -> new DaggerStatisticsCollectingProcessingStep(step, statisticsCollector));
+   }
+ 
+   @Singleton
+@@ -182,6 +185,7 @@ Builder testingPlugins(
+ 
+   @Override
+   protected void postRound(RoundEnvironment roundEnv) {
++    statisticsCollector.roundFinished();
+     if (roundEnv.processingOver()) {
+       statisticsCollector.processingStopped();
+     } else {
+diff --git a/java/dagger/internal/codegen/DaggerStatistics.java b/java/dagger/internal/codegen/DaggerStatistics.java
+index c6bd9a4f6..790ec7654 100644
+--- a/java/dagger/internal/codegen/DaggerStatistics.java
++++ b/java/dagger/internal/codegen/DaggerStatistics.java
+@@ -16,17 +16,75 @@
+ 
+ package dagger.internal.codegen;
+ 
++import com.google.auto.common.BasicAnnotationProcessor.ProcessingStep;
+ import com.google.auto.value.AutoValue;
++import com.google.common.collect.ImmutableList;
++import com.google.common.collect.ImmutableMap;
++import com.google.errorprone.annotations.CanIgnoreReturnValue;
+ import java.time.Duration;
+ 
+ /** Statistics collected over the course of Dagger annotation processing. */
+ @AutoValue
+ abstract class DaggerStatistics {
+-  /** Creates a new {@link DaggerStatistics}. */
+-  static DaggerStatistics create(Duration totalProcessingTime) {
+-    return new AutoValue_DaggerStatistics(totalProcessingTime);
++  /** Returns a new {@link Builder}. */
++  static Builder builder() {
++    return new AutoValue_DaggerStatistics.Builder();
++  }
++
++  /** Returns a new {@link RoundStatistics} builder. */
++  static RoundStatistics.Builder roundBuilder() {
++    return new AutoValue_DaggerStatistics_RoundStatistics.Builder();
+   }
+ 
+   /** Total time spent in Dagger annotation processing. */
+   abstract Duration totalProcessingTime();
++
++  /** List of statistics for processing rounds that the Dagger processor handled. */
++  abstract ImmutableList<RoundStatistics> rounds();
++
++  /** Builder for {@link DaggerStatistics}. */
++  @AutoValue.Builder
++  abstract static class Builder {
++    /** Sets the given duration for the total time spent in Dagger processing. */
++    @CanIgnoreReturnValue
++    abstract Builder setTotalProcessingTime(Duration totalProcessingTime);
++
++    /** Returns a builder for adding processing round statistics. */
++    abstract ImmutableList.Builder<RoundStatistics> roundsBuilder();
++
++    /** Adds the given {@code round} statistics. */
++    @CanIgnoreReturnValue
++    final Builder addRound(RoundStatistics round) {
++      roundsBuilder().add(round);
++      return this;
++    }
++
++    /** Creates a new {@link DaggerStatistics} instance. */
++    abstract DaggerStatistics build();
++  }
++
++  /** Statistics for each processing step in a single processing round. */
++  @AutoValue
++  abstract static class RoundStatistics {
++    /** Map of processing step class to duration of that step for this round. */
++    abstract ImmutableMap<Class<? extends ProcessingStep>, Duration> stepDurations();
++
++    /** Builder for {@link RoundStatistics}. */
++    @AutoValue.Builder
++    abstract static class Builder {
++      /** Returns a builder for adding durations for each processing step for the round. */
++      abstract ImmutableMap.Builder<Class<? extends ProcessingStep>, Duration>
++          stepDurationsBuilder();
++
++      /** Adds the given {@code duration} for the given {@code step}. */
++      @CanIgnoreReturnValue
++      final Builder addStepDuration(ProcessingStep step, Duration duration) {
++        stepDurationsBuilder().put(step.getClass(), duration);
++        return this;
++      }
++
++      /** Creates a new {@link RoundStatistics} instance. */
++      abstract RoundStatistics build();
++    }
++  }
+ }
+diff --git a/java/dagger/internal/codegen/DaggerStatisticsCollectingProcessingStep.java b/java/dagger/internal/codegen/DaggerStatisticsCollectingProcessingStep.java
+new file mode 100644
+index 000000000..51f6fc3b0
+--- /dev/null
++++ b/java/dagger/internal/codegen/DaggerStatisticsCollectingProcessingStep.java
+@@ -0,0 +1,57 @@
++/*
++ * Copyright (C) 2019 The Dagger Authors.
++ *
++ * Licensed under the Apache License, Version 2.0 (the "License");
++ * you may not use this file except in compliance with the License.
++ * You may obtain a copy of the License at
++ *
++ * http://www.apache.org/licenses/LICENSE-2.0
++ *
++ * Unless required by applicable law or agreed to in writing, software
++ * distributed under the License is distributed on an "AS IS" BASIS,
++ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++ * See the License for the specific language governing permissions and
++ * limitations under the License.
++ */
++
++package dagger.internal.codegen;
++
++import static com.google.common.base.Preconditions.checkNotNull;
++
++import com.google.auto.common.BasicAnnotationProcessor.ProcessingStep;
++import com.google.common.collect.SetMultimap;
++import java.lang.annotation.Annotation;
++import java.util.Set;
++import javax.lang.model.element.Element;
++
++/**
++ * {@link ProcessingStep} that delegates to another {@code ProcessingStep} and collects timing
++ * statistics for each processing round for that step.
++ */
++final class DaggerStatisticsCollectingProcessingStep implements ProcessingStep {
++
++  private final ProcessingStep delegate;
++  private final DaggerStatisticsCollector statisticsCollector;
++
++  DaggerStatisticsCollectingProcessingStep(
++      ProcessingStep delegate, DaggerStatisticsCollector statisticsCollector) {
++    this.delegate = checkNotNull(delegate);
++    this.statisticsCollector = checkNotNull(statisticsCollector);
++  }
++
++  @Override
++  public Set<? extends Class<? extends Annotation>> annotations() {
++    return delegate.annotations();
++  }
++
++  @Override
++  public Set<? extends Element> process(
++      SetMultimap<Class<? extends Annotation>, Element> elementsByAnnotation) {
++    statisticsCollector.stepStarted(delegate);
++    try {
++      return delegate.process(elementsByAnnotation);
++    } finally {
++      statisticsCollector.stepFinished(delegate);
++    }
++  }
++}
+diff --git a/java/dagger/internal/codegen/DaggerStatisticsCollector.java b/java/dagger/internal/codegen/DaggerStatisticsCollector.java
+index 5ccafe0dd..e14fbb759 100644
+--- a/java/dagger/internal/codegen/DaggerStatisticsCollector.java
++++ b/java/dagger/internal/codegen/DaggerStatisticsCollector.java
+@@ -19,9 +19,12 @@
+ import static com.google.common.base.Preconditions.checkState;
+ import static java.util.concurrent.TimeUnit.NANOSECONDS;
+ 
++import com.google.auto.common.BasicAnnotationProcessor.ProcessingStep;
+ import com.google.common.base.Stopwatch;
+ import com.google.common.base.Ticker;
+ import java.time.Duration;
++import java.util.HashMap;
++import java.util.Map;
+ import java.util.Optional;
+ import javax.inject.Inject;
+ import javax.inject.Singleton;
+@@ -30,11 +33,18 @@
+ @Singleton // for state sharing
+ final class DaggerStatisticsCollector {
+ 
++  private final Ticker ticker;
+   private final Stopwatch totalRuntimeStopwatch;
++  private final Map<ProcessingStep, Stopwatch> stepStopwatches = new HashMap<>();
++
++  private final DaggerStatistics.Builder statisticsBuilder = DaggerStatistics.builder();
++  private DaggerStatistics.RoundStatistics.Builder roundBuilder = DaggerStatistics.roundBuilder();
++
+   private final Optional<DaggerStatisticsRecorder> statisticsRecorder;
+ 
+   @Inject
+   DaggerStatisticsCollector(Ticker ticker, Optional<DaggerStatisticsRecorder> statisticsRecorder) {
++    this.ticker = ticker;
+     this.totalRuntimeStopwatch = Stopwatch.createUnstarted(ticker);
+     this.statisticsRecorder = statisticsRecorder;
+   }
+@@ -45,16 +55,34 @@ void processingStarted() {
+     totalRuntimeStopwatch.start();
+   }
+ 
++  /** Called when the given {@code step} starts processing for a round. */
++  void stepStarted(ProcessingStep step) {
++    Stopwatch stopwatch =
++        stepStopwatches.computeIfAbsent(step, unused -> Stopwatch.createUnstarted(ticker));
++    stopwatch.start();
++  }
++
++  /** Called when the given {@code step} finishes processing for a round. */
++  void stepFinished(ProcessingStep step) {
++    Stopwatch stopwatch = stepStopwatches.get(step);
++    roundBuilder.addStepDuration(step, elapsedTime(stopwatch));
++    stopwatch.reset();
++  }
++
++  /** Called when Dagger finishes a processing round. */
++  void roundFinished() {
++    statisticsBuilder.addRound(roundBuilder.build());
++    roundBuilder = DaggerStatistics.roundBuilder();
++  }
++
+   /** Called when Dagger annotation processing completes. */
+   void processingStopped() {
+     checkState(totalRuntimeStopwatch.isRunning());
+     totalRuntimeStopwatch.stop();
++    statisticsBuilder.setTotalProcessingTime(elapsedTime(totalRuntimeStopwatch));
+ 
+     statisticsRecorder.ifPresent(
+-        recorder -> {
+-          DaggerStatistics statistics = DaggerStatistics.create(elapsedTime(totalRuntimeStopwatch));
+-          recorder.recordStatistics(statistics);
+-        });
++        recorder -> recorder.recordStatistics(statisticsBuilder.build()));
+   }
+ 
+   @SuppressWarnings("StopwatchNanosToDuration") // intentional
+diff --git a/java/dagger/internal/codegen/dagger_statistics.proto b/java/dagger/internal/codegen/dagger_statistics.proto
+index 03a241ec4..273e47204 100644
+--- a/java/dagger/internal/codegen/dagger_statistics.proto
++++ b/java/dagger/internal/codegen/dagger_statistics.proto
+@@ -7,4 +7,19 @@ import "google/protobuf/duration.proto";
+ 
+ message DaggerBuildStatistics {
+   optional google.protobuf.Duration total_processing_time = 1;
++  repeated DaggerRound rounds = 2;
++}
++
++// Duration of each Dagger ProcessingStep for a single annotation processing
++// round.
++message DaggerRound {
++  optional google.protobuf.Duration map_key_step_time = 1;
++  optional google.protobuf.Duration inject_step_time = 2;
++  optional google.protobuf.Duration monitoring_module_step_time = 3;
++  optional google.protobuf.Duration multibinding_annotations_step_time = 4;
++  optional google.protobuf.Duration binds_instance_step_time = 5;
++  optional google.protobuf.Duration module_step_time = 6;
++  optional google.protobuf.Duration component_step_time = 7;
++  optional google.protobuf.Duration component_hjar_step_time = 8;
++  optional google.protobuf.Duration binding_method_step_time = 9;
+ }

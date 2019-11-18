@@ -1,0 +1,160 @@
+diff --git a/marmoset/src/main/java/com/graphhopper/marmoset/Marmoset.java b/marmoset/src/main/java/com/graphhopper/marmoset/Marmoset.java
+index 346c939c3c..3fc3096106 100644
+--- a/marmoset/src/main/java/com/graphhopper/marmoset/Marmoset.java
++++ b/marmoset/src/main/java/com/graphhopper/marmoset/Marmoset.java
+@@ -38,9 +38,7 @@ public static void main(String[] args) throws IOException, InterruptedException
+         {
+             startFileServer();
+             startWebSocketServer();
+-        }
+-        else if (args[0].equals("--file"))
+-        {
++        } else if (args[0].equals("--file")) {
+             runOfflineSimulation(args[1], Integer.parseInt(args[2]));
+             logger.info("Simulation complete.");
+             return;
+@@ -63,6 +61,8 @@ private static void runOfflineSimulation(String outfile, int initialVehicles) th
+         start(initialVehicles);
+         while (mh.getVehicleCount() > 0 && mh.timestep(false))
+         {
++            EventManager.trigger("timestep:start", iteration);
++            EventManager.trigger("timestep:end", iteration);
+             logger.info("===ITERATION [" + iteration + "] VEHICLES [" + mh.getVehicleCount() + "]===");
+             MarmosetHopper.Metrics metrics = mh.getMetrics();
+             if (metrics == null)
+diff --git a/marmoset/src/main/java/com/graphhopper/marmoset/MarmosetHopper.java b/marmoset/src/main/java/com/graphhopper/marmoset/MarmosetHopper.java
+index 04e7d2b578..19c60559fd 100644
+--- a/marmoset/src/main/java/com/graphhopper/marmoset/MarmosetHopper.java
++++ b/marmoset/src/main/java/com/graphhopper/marmoset/MarmosetHopper.java
+@@ -19,6 +19,7 @@
+ import java.io.IOException;
+ import java.nio.ByteBuffer;
+ import java.util.ArrayList;
++import java.util.Collections;
+ import java.util.List;
+ import java.util.Random;
+ import java.util.stream.Collectors;
+@@ -44,7 +45,7 @@
+ 
+     public MarmosetHopper() {
+         hopper = new MarmosetGraphHopper();
+-        vehicles = new ArrayList<>();
++        vehicles = Collections.synchronizedList(new ArrayList<>());
+     }
+ 
+     public void init()
+@@ -74,7 +75,7 @@ public void init()
+         assert randPercent >= 0 && randPercent <= 1;
+     }
+ 
+-    public synchronized void addVehicle()
++    public void addVehicle()
+     {
+         Vehicle v;
+         if (rand.nextDouble() < randPercent)
+@@ -93,7 +94,7 @@ public synchronized void addVehicle()
+     public synchronized void startSimulation(int initialVehicles)
+     {
+         logger.info("Starting simulation with " + initialVehicles + " vehicles");
+-        IntStream.range(0, initialVehicles).forEach(v -> addVehicle());
++        IntStream.range(0, initialVehicles).parallel().forEach(v -> addVehicle());
+     }
+ 
+     public boolean timestep()
+@@ -114,7 +115,8 @@ public synchronized boolean timestep(boolean webMode)
+         if (webMode)
+             vehicles.stream().forEach(Vehicle::updateLocation);
+ 
+-        vehicles = vehicles.parallelStream().filter(v -> !v.isFinished()).collect(Collectors.toList());
++        vehicles = Collections.synchronizedList(
++                vehicles.parallelStream().filter(v -> !v.isFinished()).collect(Collectors.toList()));
+ 
+         logger.info("Timestep took " + (System.nanoTime() - startTimestep) / 1e6 + "ms");
+         return true;
+diff --git a/marmoset/src/main/java/com/graphhopper/marmoset/util/ExpectedWeighting.java b/marmoset/src/main/java/com/graphhopper/marmoset/util/ExpectedWeighting.java
+index e51f4b826d..ff693366b2 100644
+--- a/marmoset/src/main/java/com/graphhopper/marmoset/util/ExpectedWeighting.java
++++ b/marmoset/src/main/java/com/graphhopper/marmoset/util/ExpectedWeighting.java
+@@ -9,6 +9,7 @@
+ import org.slf4j.LoggerFactory;
+ 
+ import java.util.List;
++import java.util.stream.Collectors;
+ 
+ /**
+  * Created by alexander on 20/04/2016.
+@@ -24,21 +25,37 @@ public ExpectedWeighting(FlagEncoder encoder, PMap pMap, int maxId)
+         super(encoder, pMap);
+         expectedRoutes = new double[maxId];
+         logger.info("Created new expected weighting");
++        Thread.dumpStack();
+     }
+ 
+     @Override
+     public double calcWeight(EdgeIteratorState edge, boolean reverse, int prevOrNextEdge)
+     {
+-        double weight = super.calcWeight(edge, reverse, prevOrNextEdge);
++        double speed = reverse ? flagEncoder.getReverseSpeed(edge.getFlags()) : flagEncoder.getSpeed(edge.getFlags());
+ 
+         if (edge.getEdge() < expectedRoutes.length)
+         {
+             double expectedVehicles = expectedRoutes[edge.getEdge()];
+-            double density = expectedVehicles / edge.getDistance();
++            if (expectedVehicles > 0)
++            {
++                double density = 1000 * expectedVehicles / edge.getDistance();
++
++                if (Math.random() < 0.0001)
++                {
++                    logger.info(String.format(
++                            "ev: %.2f, dns: %.2f, dst: %.2f, spd: %.2f, exp: %.2f",
++                            expectedVehicles, density, edge.getDistance(), speed, speed * densityFunction(density)));
++                }
+ 
++                speed *= densityFunction(density);
++            }
+         }
+ 
+-        return weight;
++        if (speed == 0)
++            return Double.POSITIVE_INFINITY;
++
++        return edge.getDistance() / speed * SPEED_CONV;
++
+     }
+ 
+     public void updateExpectedMap(double dampingFactor, List<SelfDrivingVehicle> vehicles)
+@@ -50,13 +67,26 @@ public void updateExpectedMap(double dampingFactor, List<SelfDrivingVehicle> veh
+                 expectedRoutes[i] *= dampingFactor;
+             }
+ 
+-            vehicles.stream().map(SelfDrivingVehicle::getCurrentPath)
+-                .forEach(edges -> edges.forEach(edge -> {
+-                    if (edge.getEdge() < expectedRoutes.length)
+-                    {
+-                        expectedRoutes[edge.getEdge()]++;
+-                    }
+-                }));
++            List<List<EdgeIteratorState>> routes = vehicles.stream().map(SelfDrivingVehicle::getCurrentPath).collect(Collectors.toList());
++            for (List<EdgeIteratorState> route : routes)
++            {
++                for (int i = 0; i < route.size(); i++)
++                {
++                    int edge = route.get(i).getEdge();
++                    if (edge < expectedRoutes.length)
++                        expectedRoutes[edge] += progressFunction(i / (double) route.size());
++                }
++            }
+         }
+     }
++
++    private double densityFunction(double density)
++    {
++        return (Math.tanh(2.0 - density / 15.0) + 1.5) / 2.5;
++    }
++
++    private double progressFunction(double progress)
++    {
++        return 1.0 / (4 * progress + 1.0);
++    }
+ }

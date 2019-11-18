@@ -1,0 +1,573 @@
+diff --git a/java/dagger/internal/DoubleCheck.java b/java/dagger/internal/DoubleCheck.java
+index 675a343aa..6313bb0db 100644
+--- a/java/dagger/internal/DoubleCheck.java
++++ b/java/dagger/internal/DoubleCheck.java
+@@ -45,16 +45,7 @@ public T get() {
+         result = instance;
+         if (result == UNINITIALIZED) {
+           result = provider.get();
+-          /* Get the current instance and test to see if the call to provider.get() has resulted
+-           * in a recursive call.  If it returns the same instance, we'll allow it, but if the
+-           * instances differ, throw. */
+-          Object currentInstance = instance;
+-          if (currentInstance != UNINITIALIZED && currentInstance != result) {
+-            throw new IllegalStateException("Scoped provider was invoked recursively returning "
+-                + "different results: " + currentInstance + " & " + result + ". This is likely "
+-                + "due to a circular dependency.");
+-          }
+-          instance = result;
++          instance = reentrantCheck(instance, result);
+           /* Null out the reference to the provider. We are never going to need it again, so we
+            * can make it eligible for GC. */
+           provider = null;
+@@ -64,6 +55,24 @@ public T get() {
+     return (T) result;
+   }
+ 
++  /**
++   * Checks to see if creating the new instance has resulted in a recursive call. If it has, and the
++   * new instance is the same as the current instance, return the instance. However, if the new
++   * instance differs from the current instance, an {@link IllegalStateException} is thrown.
++   */
++  public static Object reentrantCheck(Object currentInstance, Object newInstance) {
++    boolean isReentrant = !(currentInstance == UNINITIALIZED
++        // This check is needed for AndroidMode's implementation, which uses MemoizedSentinel types.
++        || currentInstance instanceof MemoizedSentinel);
++
++    if (isReentrant && currentInstance != newInstance) {
++      throw new IllegalStateException("Scoped provider was invoked recursively returning "
++          + "different results: " + currentInstance + " & " + newInstance + ". This is likely "
++          + "due to a circular dependency.");
++    }
++    return newInstance;
++  }
++
+   /** Returns a {@link Provider} that caches the value from the given delegate provider. */
+   // This method is declared this way instead of "<T> Provider<T> provider(Provider<T> delegate)"
+   // to work around an Eclipse type inference bug: https://github.com/google/dagger/issues/949.
+diff --git a/java/dagger/internal/codegen/DoubleCheckedMethodImplementation.java b/java/dagger/internal/codegen/DoubleCheckedMethodImplementation.java
+index e8a2a09d7..31b51e46c 100644
+--- a/java/dagger/internal/codegen/DoubleCheckedMethodImplementation.java
++++ b/java/dagger/internal/codegen/DoubleCheckedMethodImplementation.java
+@@ -25,6 +25,7 @@
+ import com.squareup.javapoet.CodeBlock;
+ import com.squareup.javapoet.FieldSpec;
+ import com.squareup.javapoet.TypeName;
++import dagger.internal.DoubleCheck;
+ import dagger.internal.MemoizedSentinel;
+ import dagger.model.RequestKind;
+ 
+@@ -51,17 +52,16 @@
+ 
+   @Override
+   CodeBlock body() {
+-    String fieldExpression =
+-        fieldName.get().equals("local") ? "this." + fieldName.get() : fieldName.get();
++    String fieldExpression = fieldName.get().equals("local") ? "this.local" : fieldName.get();
+     return CodeBlock.builder()
+         .addStatement("$T local = $L", TypeName.OBJECT, fieldExpression)
+         .beginControlFlow("if (local instanceof $T)", MemoizedSentinel.class)
+         .beginControlFlow("synchronized (local)")
+-        // TODO(user): benchmark to see if this is really faster than instanceof check?
+-        .beginControlFlow("if (local == $L)", fieldExpression)
+-        .addStatement("$L = $L", fieldExpression, simpleBindingExpression())
+-        .endControlFlow()
+         .addStatement("local = $L", fieldExpression)
++        .beginControlFlow("if (local instanceof $T)", MemoizedSentinel.class)
++        .addStatement("local = $L", simpleBindingExpression())
++        .addStatement("$1L = $2T.reentrantCheck($1L, local)", fieldExpression, DoubleCheck.class)
++        .endControlFlow()
+         .endControlFlow()
+         .endControlFlow()
+         .addStatement("return ($T) local", returnType())
+diff --git a/javatests/dagger/functional/cycle/DoubleCheckCycleTest.java b/javatests/dagger/functional/cycle/DoubleCheckCycleTest.java
+new file mode 100644
+index 000000000..4eaf2d924
+--- /dev/null
++++ b/javatests/dagger/functional/cycle/DoubleCheckCycleTest.java
+@@ -0,0 +1,76 @@
++/*
++ * Copyright (C) 2015 The Dagger Authors.
++ *
++ * Licensed under the Apache License, Version 2.0 (the "License");
++ * you may not use this file except in compliance with the License.
++ * You may obtain a copy of the License at
++ *
++ * http://www.apache.org/licenses/LICENSE-2.0
++ *
++ * Unless required by applicable law or agreed to in writing, software
++ * distributed under the License is distributed on an "AS IS" BASIS,
++ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++ * See the License for the specific language governing permissions and
++ * limitations under the License.
++ */
++
++package dagger.functional.cycle;
++
++import static com.google.common.truth.Truth.assertThat;
++import static org.junit.Assert.fail;
++
++import dagger.functional.cycle.DoubleCheckCycles.FailingReentrantModule;
++import dagger.functional.cycle.DoubleCheckCycles.NonReentrantModule;
++import dagger.functional.cycle.DoubleCheckCycles.ReentrantModule;
++import org.junit.Test;
++import org.junit.runner.RunWith;
++import org.junit.runners.JUnit4;
++
++@RunWith(JUnit4.class)
++public class DoubleCheckCycleTest {
++  // TODO(b/77916397): Migrate remaining tests in DoubleCheckTest to functional tests in this class.
++
++  @Test
++  public void testNonReentrant() {
++    NonReentrantModule module = new NonReentrantModule();
++    DoubleCheckCycles.TestComponent component =
++        DaggerDoubleCheckCycles_TestComponent.builder().nonReentrantModule(module).build();
++
++    assertThat(module.callCount).isEqualTo(0);
++    Object first = component.getNonReentrant();
++    assertThat(module.callCount).isEqualTo(1);
++    Object second = component.getNonReentrant();
++    assertThat(module.callCount).isEqualTo(1);
++    assertThat(first).isSameAs(second);
++  }
++
++  @Test
++  public void testReentrant() {
++    ReentrantModule module = new ReentrantModule();
++    DoubleCheckCycles.TestComponent component =
++        DaggerDoubleCheckCycles_TestComponent.builder().reentrantModule(module).build();
++
++    assertThat(module.callCount).isEqualTo(0);
++    Object first = component.getReentrant();
++    assertThat(module.callCount).isEqualTo(2);
++    Object second = component.getReentrant();
++    assertThat(module.callCount).isEqualTo(2);
++    assertThat(first).isSameAs(second);
++  }
++
++  @Test
++  public void testFailingReentrant() {
++    FailingReentrantModule module = new FailingReentrantModule();
++    DoubleCheckCycles.TestComponent component =
++        DaggerDoubleCheckCycles_TestComponent.builder().failingReentrantModule(module).build();
++
++    assertThat(module.callCount).isEqualTo(0);
++    try {
++      component.getFailingReentrant();
++      fail("Expected IllegalStateException");
++    } catch (IllegalStateException e) {
++      assertThat(e).hasMessageThat().contains("Scoped provider was invoked recursively");
++    }
++    assertThat(module.callCount).isEqualTo(2);
++  }
++}
+diff --git a/javatests/dagger/functional/cycle/DoubleCheckCycles.java b/javatests/dagger/functional/cycle/DoubleCheckCycles.java
+new file mode 100644
+index 000000000..bffb9f77c
+--- /dev/null
++++ b/javatests/dagger/functional/cycle/DoubleCheckCycles.java
+@@ -0,0 +1,117 @@
++/*
++ * Copyright (C) 2017 The Dagger Authors.
++ *
++ * Licensed under the Apache License, Version 2.0 (the "License");
++ * you may not use this file except in compliance with the License.
++ * You may obtain a copy of the License at
++ *
++ * http://www.apache.org/licenses/LICENSE-2.0
++ *
++ * Unless required by applicable law or agreed to in writing, software
++ * distributed under the License is distributed on an "AS IS" BASIS,
++ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++ * See the License for the specific language governing permissions and
++ * limitations under the License.
++ */
++
++package dagger.functional.cycle;
++
++import static java.lang.annotation.RetentionPolicy.RUNTIME;
++
++import dagger.Component;
++import dagger.Module;
++import dagger.Provides;
++import java.lang.annotation.Retention;
++import javax.inject.Provider;
++import javax.inject.Qualifier;
++import javax.inject.Singleton;
++
++/**
++ * A functional test for scoped providers that recursively call {@link Provider#get()} during
++ * construction (b/28829473).
++ */
++interface DoubleCheckCycles {
++
++  /** A qualifier for a non-reentrant scoped binding. */
++  @Qualifier
++  @Retention(RUNTIME)
++  @interface NonReentrant {}
++
++  /** Provides a non-reentrant scoped binding. The provides method should only be called once. */
++  @Module
++  final class NonReentrantModule {
++    int callCount;
++
++    @Provides
++    @Singleton
++    @NonReentrant
++    Object provideNonReentrant() {
++      callCount++;
++      return new Object();
++    }
++  }
++
++  /** A qualifier for a reentrant scoped binding. */
++  @Qualifier
++  @Retention(RUNTIME)
++  @interface Reentrant {}
++
++  /**
++   * Provides a reentrant scoped binding. The provides method is actually called twice even though
++   * it's scoped, but we allow this since the same instance is returned both times.
++   */
++  @Module
++  final class ReentrantModule {
++    int callCount;
++
++    @Provides
++    @Singleton
++    @Reentrant
++    Object provideReentrant(@Reentrant Provider<Object> provider) {
++      callCount++;
++      if (callCount == 1) {
++        return provider.get();
++      }
++      return new Object();
++    }
++  }
++
++  /** A qualifier for a failing reentrant scoped binding. */
++  @Qualifier
++  @Retention(RUNTIME)
++  @interface FailingReentrant {}
++
++  /**
++   * Provides a failing reentrant scoped binding. Similar to the other reentrant module, the
++   * provides method is called twice. However, in this case we throw since a different instance is
++   * provided for each call.
++   */
++  @Module
++  final class FailingReentrantModule {
++    int callCount;
++
++    @Provides
++    @Singleton
++    @FailingReentrant
++    Object provideFailingReentrantA(@FailingReentrant Provider<Object> provider) {
++      callCount++;
++      if (callCount == 1) {
++        provider.get();
++        return new Object();
++      }
++      return new Object();
++    }
++  }
++
++  @Singleton
++  @Component(modules = {
++    NonReentrantModule.class,
++    ReentrantModule.class,
++    FailingReentrantModule.class,
++  })
++  interface TestComponent {
++    @NonReentrant Object getNonReentrant();
++    @Reentrant Object getReentrant();
++    @FailingReentrant Object getFailingReentrant();
++  }
++}
+diff --git a/javatests/dagger/internal/codegen/ComponentProcessorTest.java b/javatests/dagger/internal/codegen/ComponentProcessorTest.java
+index b96b7d86a..f2884dc43 100644
+--- a/javatests/dagger/internal/codegen/ComponentProcessorTest.java
++++ b/javatests/dagger/internal/codegen/ComponentProcessorTest.java
+@@ -429,10 +429,12 @@ public void componentWithInvalidModule() {
+                 "    Object local = someInjectableType;",
+                 "    if (local instanceof MemoizedSentinel) {",
+                 "      synchronized (local) {",
+-                "        if (local == someInjectableType) {",
+-                "          someInjectableType = new SomeInjectableType();",
+-                "        }",
+                 "        local = someInjectableType;",
++                "        if (local instanceof MemoizedSentinel) {",
++                "          local = new SomeInjectableType();",
++                "          someInjectableType =",
++                "              DoubleCheck.reentrantCheck(someInjectableType, local);",
++                "        }",
+                 "      }",
+                 "    }",
+                 "    return (SomeInjectableType) local;")
+diff --git a/javatests/dagger/internal/codegen/DelegateBindingExpressionTest.java b/javatests/dagger/internal/codegen/DelegateBindingExpressionTest.java
+index 8840885a0..2be29852b 100644
+--- a/javatests/dagger/internal/codegen/DelegateBindingExpressionTest.java
++++ b/javatests/dagger/internal/codegen/DelegateBindingExpressionTest.java
+@@ -185,10 +185,11 @@ public void toDoubleCheck() {
+                     "    Object local = regularScoped;",
+                     "    if (local instanceof MemoizedSentinel) {",
+                     "      synchronized (local) {",
+-                    "        if (local == regularScoped) {",
+-                    "          regularScoped = new RegularScoped();",
+-                    "        }",
+                     "        local = regularScoped;",
++                    "        if (local instanceof MemoizedSentinel) {",
++                    "          local = new RegularScoped();",
++                    "          regularScoped = DoubleCheck.reentrantCheck(regularScoped, local);",
++                    "        }",
+                     "      }",
+                     "    }",
+                     "    return (RegularScoped) local;",
+@@ -282,10 +283,11 @@ public void toSingleCheck() {
+                     "    Object local = regularScoped;",
+                     "    if (local instanceof MemoizedSentinel) {",
+                     "      synchronized (local) {",
+-                    "        if (local == regularScoped) {",
+-                    "          regularScoped = new RegularScoped();",
+-                    "        }",
+                     "        local = regularScoped;",
++                    "        if (local instanceof MemoizedSentinel) {",
++                    "          local = new RegularScoped();",
++                    "          regularScoped = DoubleCheck.reentrantCheck(regularScoped, local);",
++                    "        }",
+                     "      }",
+                     "    }",
+                     "    return (RegularScoped) local;",
+@@ -377,10 +379,11 @@ public void toReleasableCheck() {
+                     "    Object local = regularScoped;",
+                     "    if (local instanceof MemoizedSentinel) {",
+                     "      synchronized (local) {",
+-                    "        if (local == regularScoped) {",
+-                    "          regularScoped = new RegularScoped();",
+-                    "        }",
+                     "        local = regularScoped;",
++                    "        if (local instanceof MemoizedSentinel) {",
++                    "          local = new RegularScoped();",
++                    "          regularScoped = DoubleCheck.reentrantCheck(regularScoped, local);",
++                    "        }",
+                     "      }",
+                     "    }",
+                     "    return (RegularScoped) local;",
+@@ -496,10 +499,11 @@ public void toUnscoped() {
+                     "    Object local = regularScoped;",
+                     "    if (local instanceof MemoizedSentinel) {",
+                     "      synchronized (local) {",
+-                    "        if (local == regularScoped) {",
+-                    "          regularScoped = new RegularScoped();",
+-                    "        }",
+                     "        local = regularScoped;",
++                    "        if (local instanceof MemoizedSentinel) {",
++                    "          local = new RegularScoped();",
++                    "          regularScoped = DoubleCheck.reentrantCheck(regularScoped, local);",
++                    "        }",
+                     "      }",
+                     "    }",
+                     "    return (RegularScoped) local;",
+@@ -622,10 +626,11 @@ public void castNeeded_rawTypes_Provider_get() {
+                     "    Object local = subtype;",
+                     "    if (local instanceof MemoizedSentinel) {",
+                     "      synchronized (local) {",
+-                    "        if (local == subtype) {",
+-                    "          subtype = Subtype_Factory.newSubtype();",
+-                    "        }",
+                     "        local = subtype;",
++                    "        if (local instanceof MemoizedSentinel) {",
++                    "          local = Subtype_Factory.newSubtype();",
++                    "          subtype = DoubleCheck.reentrantCheck(subtype, local);",
++                    "        }",
+                     "      }",
+                     "    }",
+                     "    return (Object) local;",
+@@ -727,10 +732,11 @@ public void noCast_rawTypes_Provider_get_toInaccessibleType() {
+                     "    Object local = subtype;",
+                     "    if (local instanceof MemoizedSentinel) {",
+                     "      synchronized (local) {",
+-                    "        if (local == subtype) {",
+-                    "          subtype = Subtype_Factory.newSubtype();",
+-                    "        }",
+                     "        local = subtype;",
++                    "        if (local instanceof MemoizedSentinel) {",
++                    "          local = Subtype_Factory.newSubtype();",
++                    "          subtype = DoubleCheck.reentrantCheck(subtype, local);",
++                    "        }",
+                     "      }",
+                     "    }",
+                     "    return (Object) local;",
+@@ -1141,10 +1147,11 @@ public void providerWhenBindsScopeGreaterThanDependencyScope() {
+                     "    Object local = object;",
+                     "    if (local instanceof MemoizedSentinel) {",
+                     "      synchronized (local) {",
+-                    "        if (local == object) {",
+-                    "          object = getString();",
+-                    "        }",
+                     "        local = object;",
++                    "        if (local instanceof MemoizedSentinel) {",
++                    "          local = getString();",
++                    "          object = DoubleCheck.reentrantCheck(object, local);",
++                    "        }",
+                     "      }",
+                     "    }",
+                     "    return (Object) local;",
+diff --git a/javatests/dagger/internal/codegen/ElidedFactoriesTest.java b/javatests/dagger/internal/codegen/ElidedFactoriesTest.java
+index c3ae7ad7b..9de7df603 100644
+--- a/javatests/dagger/internal/codegen/ElidedFactoriesTest.java
++++ b/javatests/dagger/internal/codegen/ElidedFactoriesTest.java
+@@ -180,6 +180,7 @@ public void simpleComponent_injectsProviderOf_dependsOnScoped() {
+                 "test.DaggerSimpleComponent",
+                 "package test;",
+                 "",
++                "import dagger.internal.DoubleCheck;",
+                 "import dagger.internal.MemoizedSentinel;",
+                 IMPORT_GENERATED_ANNOTATION,
+                 "import javax.inject.Provider;",
+@@ -203,10 +204,11 @@ public void simpleComponent_injectsProviderOf_dependsOnScoped() {
+                 "    Object local = scopedType;",
+                 "    if (local instanceof MemoizedSentinel) {",
+                 "      synchronized (local) {",
+-                "        if (local == scopedType) {",
+-                "          scopedType = new ScopedType();",
+-                "        }",
+                 "        local = scopedType;",
++                "        if (local instanceof MemoizedSentinel) {",
++                "          local = new ScopedType();",
++                "          scopedType = DoubleCheck.reentrantCheck(scopedType, local);",
++                "        }",
+                 "      }",
+                 "    }",
+                 "    return (ScopedType) local;",
+@@ -372,6 +374,7 @@ public void scopedBinding_onlyUsedInSubcomponent() {
+                 "test.DaggerSimpleComponent",
+                 "package test;",
+                 "",
++                "import dagger.internal.DoubleCheck;",
+                 "import dagger.internal.MemoizedSentinel;",
+                 IMPORT_GENERATED_ANNOTATION,
+                 "",
+@@ -393,10 +396,11 @@ public void scopedBinding_onlyUsedInSubcomponent() {
+                 "    Object local = scopedType;",
+                 "    if (local instanceof MemoizedSentinel) {",
+                 "      synchronized (local) {",
+-                "        if (local == scopedType) {",
+-                "          scopedType = new ScopedType();",
+-                "        }",
+                 "        local = scopedType;",
++                "        if (local instanceof MemoizedSentinel) {",
++                "          local = new ScopedType();",
++                "          scopedType = DoubleCheck.reentrantCheck(scopedType, local);",
++                "        }",
+                 "      }",
+                 "    }",
+                 "    return (ScopedType) local;",
+diff --git a/javatests/dagger/internal/codegen/MembersInjectionTest.java b/javatests/dagger/internal/codegen/MembersInjectionTest.java
+index 91e953209..203249564 100644
+--- a/javatests/dagger/internal/codegen/MembersInjectionTest.java
++++ b/javatests/dagger/internal/codegen/MembersInjectionTest.java
+@@ -1372,11 +1372,12 @@ public void accessibleRawType_ofInaccessibleType() {
+                 "    Object local = listOfInaccessible;",
+                 "    if (local instanceof MemoizedSentinel) {",
+                 "      synchronized (local) {",
+-                "        if (local == listOfInaccessible) {",
++                "        local = listOfInaccessible;",
++                "        if (local instanceof MemoizedSentinel) {",
++                "          local = InaccessiblesModule_InaccessiblesFactory.proxyInaccessibles();",
+                 "          listOfInaccessible =",
+-                "              InaccessiblesModule_InaccessiblesFactory.proxyInaccessibles();",
++                "              DoubleCheck.reentrantCheck(listOfInaccessible, local);",
+                 "        }",
+-                "        local = listOfInaccessible;",
+                 "      }",
+                 "    }",
+                 "    return (List) local;",
+diff --git a/javatests/dagger/internal/codegen/ProductionComponentProcessorTest.java b/javatests/dagger/internal/codegen/ProductionComponentProcessorTest.java
+index 514095ef1..1bde5eba6 100644
+--- a/javatests/dagger/internal/codegen/ProductionComponentProcessorTest.java
++++ b/javatests/dagger/internal/codegen/ProductionComponentProcessorTest.java
+@@ -228,6 +228,7 @@ public void simpleComponent() {
+                 "",
+                 "import com.google.common.collect.ImmutableSet;",
+                 "import com.google.common.util.concurrent.ListenableFuture;",
++                "import dagger.internal.DoubleCheck;",
+                 "import dagger.internal.InstanceFactory;",
+                 "import dagger.internal.MemoizedSentinel;",
+                 "import dagger.internal.Preconditions;",
+@@ -271,13 +272,16 @@ public void simpleComponent() {
+                 "    Object local = productionImplementationExecutor;",
+                 "    if (local instanceof MemoizedSentinel) {",
+                 "      synchronized (local) {",
+-                "        if (local == productionImplementationExecutor) {",
+-                "          productionImplementationExecutor =",
++                "        local = productionImplementationExecutor;",
++                "        if (local instanceof MemoizedSentinel) {",
++                "          local =",
+                 "              TestClass_SimpleComponent_ProductionExecutorModule_ExecutorFactory",
+                 "                  .proxyExecutor(",
+                 "                      TestClass_BModule_ExecutorFactory.proxyExecutor(bModule));",
++                "          productionImplementationExecutor =",
++                "              DoubleCheck.reentrantCheck(",
++                "                  productionImplementationExecutor, local);",
+                 "        }",
+-                "        local = productionImplementationExecutor;",
+                 "      }",
+                 "    }",
+                 "    return (Executor) local;",
+@@ -307,14 +311,17 @@ public void simpleComponent() {
+                 "    Object local = productionComponentMonitor;",
+                 "    if (local instanceof MemoizedSentinel) {",
+                 "      synchronized (local) {",
+-                "        if (local == productionComponentMonitor) {",
+-                "          productionComponentMonitor =",
++                "        local = productionComponentMonitor;",
++                "        if (local instanceof MemoizedSentinel) {",
++                "          local =",
+                 "              TestClass_SimpleComponent_MonitoringModule_MonitorFactory",
+                 "                  .proxyMonitor(",
+                 "                      simpleComponentProvider,",
+                 "                      getSetOfFactoryProvider());",
++                "          productionComponentMonitor =",
++                "              DoubleCheck.reentrantCheck(",
++                "                  productionComponentMonitor, local);",
+                 "        }",
+-                "        local = productionComponentMonitor;",
+                 "      }",
+                 "    }",
+                 "    return (ProductionComponentMonitor) local;",
+diff --git a/javatests/dagger/internal/codegen/SubcomponentValidationTest.java b/javatests/dagger/internal/codegen/SubcomponentValidationTest.java
+index b5207f46c..e8def7a4c 100644
+--- a/javatests/dagger/internal/codegen/SubcomponentValidationTest.java
++++ b/javatests/dagger/internal/codegen/SubcomponentValidationTest.java
+@@ -413,10 +413,11 @@ public void delegateFactoryNotCreatedForSubcomponentWhenProviderExistsInParent()
+                 "   Object local = dep1;",
+                 "    if (local instanceof MemoizedSentinel) {",
+                 "      synchronized (local) {",
+-                "        if (local == dep1) {",
+-                "          dep1 = injectDep1(Dep1_Factory.newDep1());",
+-                "        }",
+                 "        local = dep1;",
++                "        if (local instanceof MemoizedSentinel) {",
++                "          local = injectDep1(Dep1_Factory.newDep1());",
++                "          dep1 = DoubleCheck.reentrantCheck(dep1, local);",
++                "        }",
+                 "      }",
+                 "    }",
+                 "    return (Dep1) local;")
+@@ -433,10 +434,11 @@ public void delegateFactoryNotCreatedForSubcomponentWhenProviderExistsInParent()
+                 "   Object local = dep2;",
+                 "    if (local instanceof MemoizedSentinel) {",
+                 "      synchronized (local) {",
+-                "        if (local == dep2) {",
+-                "          dep2 = injectDep2(Dep2_Factory.newDep2());",
+-                "        }",
+                 "        local = dep2;",
++                "        if (local instanceof MemoizedSentinel) {",
++                "          local = injectDep2(Dep2_Factory.newDep2());",
++                "          dep2 = DoubleCheck.reentrantCheck(dep2, local);",
++                "        }",
+                 "      }",
+                 "    }",
+                 "    return (Dep2) local;")

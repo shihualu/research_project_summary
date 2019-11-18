@@ -1,0 +1,209 @@
+diff --git a/compiler/src/main/java/dagger/internal/codegen/BindingGraph.java b/compiler/src/main/java/dagger/internal/codegen/BindingGraph.java
+index e880aa009..7ca284831 100644
+--- a/compiler/src/main/java/dagger/internal/codegen/BindingGraph.java
++++ b/compiler/src/main/java/dagger/internal/codegen/BindingGraph.java
+@@ -547,28 +547,49 @@ private boolean multibindingsRequireProduction(
+           ImmutableSet<DelegateDeclaration> delegateDeclarations) {
+         ImmutableSet.Builder<ContributionBinding> builder = ImmutableSet.builder();
+         for (DelegateDeclaration delegateDeclaration : delegateDeclarations) {
+-          DependencyRequest delegateRequest = delegateDeclaration.delegateRequest();
+-          ResolvedBindings resolvedDelegate = lookUpBindings(delegateRequest);
+-          for (ContributionBinding explicitDelegate : resolvedDelegate.contributionBindings()) {
+-            switch (explicitDelegate.bindingType()) {
+-              case PRODUCTION:
+-                builder.add(
+-                    productionBindingFactory.delegate(
+-                        delegateDeclaration, (ProductionBinding) explicitDelegate));
+-                break;
+-              case PROVISION:
+-                builder.add(
+-                    provisionBindingFactory.delegate(
+-                        delegateDeclaration, (ProvisionBinding) explicitDelegate));
+-                break;
+-              default:
+-                throw new AssertionError();
+-            }
+-          }
++          builder.add(createDelegateBinding(delegateDeclaration));
+         }
+         return builder.build();
+       }
+ 
++      /**
++       * Creates one (and only one) delegate binding for a delegate declaration, based on the
++       * resolved bindings of the right-hand-side of a {@link dagger.Binds} method. If there are
++       * duplicate bindings for the dependency key, there should still be only one binding for the
++       * delegate key.
++       */
++      private ContributionBinding createDelegateBinding(DelegateDeclaration delegateDeclaration) {
++        ResolvedBindings resolvedDelegate = lookUpBindings(delegateDeclaration.delegateRequest());
++        if (resolvedDelegate.contributionBindings().isEmpty()) {
++          // This is guaranteed to result in a missing binding error, so it doesn't matter if the
++          // binding is a Provision or Production, except if it is a @IntoMap method, in which
++          // case the key will be of type Map<K, Provider<V>>, which will be "upgraded" into a
++          // Map<K, Producer<V>> if it's requested in a ProductionComponent. This may result in a
++          // strange error, that the RHS needs to be provided with an @Inject or @Provides
++          // annotated method, but a user should be able to figure out if a @Produces annotation
++          // is needed.
++          // TODO(gak): revisit how we model missing delegates if/when we clean up how we model
++          // binding declarations
++          return provisionBindingFactory.missingDelegate(delegateDeclaration);
++        }
++        // It doesn't matter which of these is selected, since they will later on produce a
++        // duplicate binding error.
++        // TODO(ronshapiro): Once compile-testing has a CompilationResult, add a test which asserts
++        // that a duplicate binding for the RHS does not result in a duplicate binding for the LHS.
++        ContributionBinding explicitDelegate =
++            resolvedDelegate.contributionBindings().iterator().next();
++        switch (explicitDelegate.bindingType()) {
++          case PRODUCTION:
++            return productionBindingFactory.delegate(
++                delegateDeclaration, (ProductionBinding) explicitDelegate);
++          case PROVISION:
++            return provisionBindingFactory.delegate(
++                delegateDeclaration, (ProvisionBinding) explicitDelegate);
++          default:
++            throw new AssertionError("bindingType: " + explicitDelegate);
++        }
++      }
++
+       private ImmutableSetMultimap<ComponentDescriptor, ContributionBinding>
+           indexBindingsByOwningComponent(
+               DependencyRequest request, Iterable<? extends ContributionBinding> bindings) {
+diff --git a/compiler/src/main/java/dagger/internal/codegen/ProvisionBinding.java b/compiler/src/main/java/dagger/internal/codegen/ProvisionBinding.java
+index be42fd0c5..4690145b3 100644
+--- a/compiler/src/main/java/dagger/internal/codegen/ProvisionBinding.java
++++ b/compiler/src/main/java/dagger/internal/codegen/ProvisionBinding.java
+@@ -273,17 +273,27 @@ ProvisionBinding forSubcomponentBuilderMethod(
+ 
+     ProvisionBinding delegate(
+         DelegateDeclaration delegateDeclaration, ProvisionBinding delegate) {
++      return delegateBuilder(delegateDeclaration).nullableType(delegate.nullableType()).build();
++    }
++
++    /**
++     * A form of {@link #delegate(DelegateDeclaration, ProvisionBinding)} when the right-hand-side
++     * of a {@link dagger.Binds} method cannot be resolved.
++     */
++    ProvisionBinding missingDelegate(DelegateDeclaration delegateDeclaration) {
++      return delegateBuilder(delegateDeclaration).build();
++    }
++
++    private ProvisionBinding.Builder delegateBuilder(DelegateDeclaration delegateDeclaration) {
+       return ProvisionBinding.builder()
+           .contributionType(delegateDeclaration.contributionType())
+           .bindingElement(delegateDeclaration.bindingElement().get())
+           .contributingModule(delegateDeclaration.contributingModule().get())
+           .key(keyFactory.forDelegateBinding(delegateDeclaration, Provider.class))
+           .dependencies(delegateDeclaration.delegateRequest())
+-          .nullableType(delegate.nullableType())
+           .wrappedMapKey(delegateDeclaration.wrappedMapKey())
+           .bindingKind(Kind.SYNTHETIC_DELEGATE_BINDING)
+-          .scope(Scope.uniqueScopeOf(delegateDeclaration.bindingElement().get()))
+-          .build();
++          .scope(Scope.uniqueScopeOf(delegateDeclaration.bindingElement().get()));
+     }
+   }
+ }
+diff --git a/compiler/src/test/java/dagger/internal/codegen/GraphValidationTest.java b/compiler/src/test/java/dagger/internal/codegen/GraphValidationTest.java
+index 1d97a29d9..701f56d64 100644
+--- a/compiler/src/test/java/dagger/internal/codegen/GraphValidationTest.java
++++ b/compiler/src/test/java/dagger/internal/codegen/GraphValidationTest.java
+@@ -18,6 +18,7 @@
+ 
+ import static com.google.common.truth.Truth.assertAbout;
+ import static com.google.testing.compile.JavaSourceSubjectFactory.javaSource;
++import static com.google.testing.compile.JavaSourcesSubject.assertThat;
+ import static com.google.testing.compile.JavaSourcesSubjectFactory.javaSources;
+ import static dagger.internal.codegen.ErrorMessages.nullableToNonNullable;
+ 
+@@ -1065,6 +1066,89 @@ public void bindsMethodAppearsInTrace() {
+         .onLine(5);
+   }
+ 
++  @Test
++  public void bindsMissingRightHandSide() {
++    JavaFileObject duplicates =
++        JavaFileObjects.forSourceLines(
++            "test.Duplicates",
++            "package test;",
++            "",
++            "import dagger.Binds;",
++            "import dagger.Component;",
++            "import dagger.Module;",
++            "import dagger.multibindings.IntKey;",
++            "import dagger.multibindings.IntoSet;",
++            "import dagger.multibindings.IntoMap;",
++            "import dagger.multibindings.LongKey;",
++            "import dagger.Provides;",
++            "import javax.inject.Inject;",
++            "",
++            "interface Duplicates {",
++            "",
++            "  interface BoundTwice {}",
++            "",
++            "  class BoundImpl implements BoundTwice {",
++            "    @Inject BoundImpl() {}",
++            "  }",
++            "",
++            "  class NotBound implements BoundTwice {}",
++            "",
++            "  @Module",
++            "  abstract class DuplicatesModule {",
++            "    @Binds abstract BoundTwice bindWithResolvedKey(BoundImpl impl);",
++            "    @Binds abstract BoundTwice bindWithUnresolvedKey(NotBound notBound);",
++            "",
++            "    @Binds abstract Object bindObject(NotBound notBound);",
++            "",
++            "    @Binds @IntoSet abstract BoundTwice bindWithUnresolvedKey_set(NotBound notBound);",
++            "",
++            "    @Binds @IntoMap @IntKey(1)",
++            "    abstract BoundTwice bindWithUnresolvedKey_intMap(NotBound notBound);",
++            "",
++            "    @Provides @IntoMap @LongKey(2L)",
++            "    static BoundTwice provideWithUnresolvedKey_longMap(BoundImpl impl) {",
++            "      return impl;",
++            "    }",
++            "    @Binds @IntoMap @LongKey(2L)",
++            "    abstract BoundTwice bindWithUnresolvedKey_longMap(NotBound notBound);",
++            "  }",
++            "}");
++    JavaFileObject component =
++        JavaFileObjects.forSourceLines(
++            "test.C",
++            "package test;",
++            "",
++            "import dagger.Component;",
++            "import java.util.Set;",
++            "import java.util.Map;",
++            "import test.Duplicates.BoundTwice;",
++            "",
++            "@Component(modules = Duplicates.DuplicatesModule.class)",
++            "interface C {",
++            "  BoundTwice boundTwice();",
++            "  Object object();",
++            "  Set<BoundTwice> set();",
++            "  Map<Integer, BoundTwice> intMap();",
++            "  Map<Long, BoundTwice> longMap();",
++            "}");
++
++    assertThat(duplicates, component)
++        .processedWith(new ComponentProcessor())
++        .failsToCompile()
++        .withErrorContaining("test.Duplicates.BoundTwice is bound multiple times:")
++            .in(component).onLine(10)
++        .and().withErrorContaining("test.Duplicates.DuplicatesModule.bindWithUnresolvedKey")
++            .in(component).onLine(10)
++        .and().withErrorContaining("test.Duplicates.NotBound cannot be provided")
++            .in(component).onLine(11)
++        .and().withErrorContaining("test.Duplicates.NotBound cannot be provided")
++            .in(component).onLine(12)
++        .and().withErrorContaining("test.Duplicates.NotBound cannot be provided")
++            .in(component).onLine(13)
++        .and().withErrorContaining("same map key is bound more than once")
++            .in(component).onLine(14);
++  }
++
+   @Test public void resolvedParametersInDependencyTrace() {
+     JavaFileObject generic = JavaFileObjects.forSourceLines("test.Generic",
+         "package test;",

@@ -1,0 +1,404 @@
+diff --git a/CHANGELOG.md b/CHANGELOG.md
+index efb1ecdb1e..b99f00f4e3 100644
+--- a/CHANGELOG.md
++++ b/CHANGELOG.md
+@@ -1,6 +1,15 @@
+ Change Log
+ ==========
+ 
++## Version 3.4.2
++
++_2016-11-03_
++
++ *  Fix: Recover gracefully when an HTTP/2 connection is shutdown. We had a
++    bug where shutdown HTTP/2 connections were considered usable. This caused
++    infinite loops when calls attempted to recover.
++
++
+ ## Version 3.4.1
+ 
+ _2016-07-10_
+diff --git a/README.md b/README.md
+index ffb46f8f70..5b70072b86 100644
+--- a/README.md
++++ b/README.md
+@@ -11,12 +11,12 @@ Download [the latest JAR][3] or grab via Maven:
+ <dependency>
+   <groupId>com.squareup.okhttp3</groupId>
+   <artifactId>okhttp</artifactId>
+-  <version>3.4.1</version>
++  <version>3.4.2</version>
+ </dependency>
+ ```
+ or Gradle:
+ ```groovy
+-compile 'com.squareup.okhttp3:okhttp:3.4.1'
++compile 'com.squareup.okhttp3:okhttp:3.4.2'
+ ```
+ 
+ Snapshots of the development version are available in [Sonatype's `snapshots` repository][snap].
+@@ -36,13 +36,13 @@ Download [the latest JAR][4] or grab via Maven:
+ <dependency>
+   <groupId>com.squareup.okhttp3</groupId>
+   <artifactId>mockwebserver</artifactId>
+-  <version>3.4.1</version>
++  <version>3.4.2</version>
+   <scope>test</scope>
+ </dependency>
+ ```
+ or Gradle:
+ ```groovy
+-testCompile 'com.squareup.okhttp3:mockwebserver:3.4.1'
++testCompile 'com.squareup.okhttp3:mockwebserver:3.4.2'
+ ```
+ 
+ 
+diff --git a/okhttp-tests/src/test/java/okhttp3/URLConnectionTest.java b/okhttp-tests/src/test/java/okhttp3/URLConnectionTest.java
+index a883500b5c..85e99edca9 100644
+--- a/okhttp-tests/src/test/java/okhttp3/URLConnectionTest.java
++++ b/okhttp-tests/src/test/java/okhttp3/URLConnectionTest.java
+@@ -3555,6 +3555,37 @@ private void zeroLengthPayload(String method)
+     assertEquals(0, dispatcher.runningCallsCount());
+   }
+ 
++  @Ignore // TODO: recover gracefully when a connection is shutdown.
++  @Test public void streamedBodyIsRetriedOnHttp2Shutdown() throws Exception {
++    enableProtocol(Protocol.HTTP_2);
++    server.enqueue(new MockResponse()
++        .setSocketPolicy(SocketPolicy.DISCONNECT_AT_END)
++        .setBody("abc"));
++    server.enqueue(new MockResponse()
++        .setBody("def"));
++
++    HttpURLConnection connection1 = urlFactory.open(server.url("/").url());
++    connection1.setChunkedStreamingMode(4096);
++    connection1.setRequestMethod("POST");
++    connection1.connect(); // Establish healthy HTTP/2 connection, but don't write yet.
++
++    // Send a separate request which will trigger a GOAWAY frame on the healthy connection.
++    HttpURLConnection connection2 = urlFactory.open(server.url("/").url());
++    assertContent("abc", connection2);
++
++    OutputStream os = connection1.getOutputStream();
++    os.write(new byte[] { '1', '2', '3' });
++    os.close();
++    assertContent("def", connection1);
++
++    RecordedRequest request1 = server.takeRequest();
++    assertEquals(0, request1.getSequenceNumber());
++
++    RecordedRequest request2 = server.takeRequest();
++    assertEquals("123", request2.getBody().readUtf8());
++    assertEquals(0, request2.getSequenceNumber());
++  }
++
+   private void testInstanceFollowsRedirects(String spec) throws Exception {
+     URL url = new URL(spec);
+     HttpURLConnection urlConnection = urlFactory.open(url);
+diff --git a/okhttp-tests/src/test/java/okhttp3/internal/http2/HttpOverHttp2Test.java b/okhttp-tests/src/test/java/okhttp3/internal/http2/HttpOverHttp2Test.java
+index 6643a9db42..41aa761c1f 100644
+--- a/okhttp-tests/src/test/java/okhttp3/internal/http2/HttpOverHttp2Test.java
++++ b/okhttp-tests/src/test/java/okhttp3/internal/http2/HttpOverHttp2Test.java
+@@ -30,6 +30,7 @@
+ import okhttp3.Cookie;
+ import okhttp3.Credentials;
+ import okhttp3.Headers;
++import okhttp3.Interceptor;
+ import okhttp3.MediaType;
+ import okhttp3.OkHttpClient;
+ import okhttp3.Protocol;
+@@ -566,6 +567,7 @@
+   }
+ 
+   /** https://github.com/square/okhttp/issues/1191 */
++  @Ignore // TODO: recover gracefully when a connection is shutdown.
+   @Test public void cancelWithStreamNotCompleted() throws Exception {
+     // Ensure that the (shared) connection pool is in a consistent state.
+     client.connectionPool().evictAll();
+@@ -805,6 +807,69 @@ private void noRecoveryFromErrorWithRetryDisabled(ErrorCode errorCode) throws Ex
+     assertEquals(0, server.takeRequest().getSequenceNumber()); // New connection!
+   }
+ 
++  @Test public void connectionNotReusedAfterShutdown() throws Exception {
++    server.enqueue(new MockResponse()
++        .setSocketPolicy(SocketPolicy.DISCONNECT_AT_END)
++        .setBody("ABC"));
++    server.enqueue(new MockResponse()
++        .setBody("DEF"));
++
++    Call call1 = client.newCall(new Request.Builder()
++        .url(server.url("/"))
++        .build());
++    Response response1 = call1.execute();
++    assertEquals("ABC", response1.body().string());
++
++    Call call2 = client.newCall(new Request.Builder()
++        .url(server.url("/"))
++        .build());
++    Response response2 = call2.execute();
++    assertEquals("DEF", response2.body().string());
++    assertEquals(0, server.takeRequest().getSequenceNumber());
++    assertEquals(0, server.takeRequest().getSequenceNumber());
++  }
++
++  /**
++   * This simulates a race condition where we receive a healthy HTTP/2 connection and just prior to
++   * writing our request, we get a GOAWAY frame from the server.
++   */
++  @Test public void connectionShutdownAfterHealthCheck() throws Exception {
++    server.enqueue(new MockResponse()
++        .setSocketPolicy(SocketPolicy.DISCONNECT_AT_END)
++        .setBody("ABC"));
++    server.enqueue(new MockResponse()
++        .setBody("DEF"));
++
++    OkHttpClient client2 = client.newBuilder()
++        .addNetworkInterceptor(new Interceptor() {
++          boolean executedCall;
++
++          @Override public Response intercept(Chain chain) throws IOException {
++            if (!executedCall) {
++              // At this point, we have a healthy HTTP/2 connection. This call will trigger the
++              // server to send a GOAWAY frame, leaving the connection in a shutdown state.
++              executedCall = true;
++              Call call = client.newCall(new Request.Builder()
++                  .url(server.url("/"))
++                  .build());
++              Response response = call.execute();
++              assertEquals("ABC", response.body().string());
++            }
++            return chain.proceed(chain.request());
++          }
++        })
++        .build();
++
++    Call call = client2.newCall(new Request.Builder()
++        .url(server.url("/"))
++        .build());
++    Response response = call.execute();
++    assertEquals("DEF", response.body().string());
++
++    assertEquals(0, server.takeRequest().getSequenceNumber());
++    assertEquals(0, server.takeRequest().getSequenceNumber());
++  }
++
+   public Buffer gzip(String bytes) throws IOException {
+     Buffer bytesOut = new Buffer();
+     BufferedSink sink = Okio.buffer(new GzipSink(bytesOut));
+diff --git a/okhttp/src/main/java/okhttp3/Cache.java b/okhttp/src/main/java/okhttp3/Cache.java
+index 2f8a9c2405..b66ad68e62 100644
+--- a/okhttp/src/main/java/okhttp3/Cache.java
++++ b/okhttp/src/main/java/okhttp3/Cache.java
+@@ -165,11 +165,11 @@
+     }
+   };
+ 
+-  private final DiskLruCache cache;
++  final DiskLruCache cache;
+ 
+   /* read and write statistics, all guarded by 'this' */
+-  private int writeSuccessCount;
+-  private int writeAbortCount;
++  int writeSuccessCount;
++  int writeAbortCount;
+   private int networkCount;
+   private int hitCount;
+   private int requestCount;
+@@ -217,7 +217,7 @@ Response get(Request request) {
+     return response;
+   }
+ 
+-  private CacheRequest put(Response response) {
++  CacheRequest put(Response response) {
+     String requestMethod = response.request().method();
+ 
+     if (HttpMethod.invalidatesCache(response.request().method())) {
+@@ -254,11 +254,11 @@ private CacheRequest put(Response response) {
+     }
+   }
+ 
+-  private void remove(Request request) throws IOException {
++  void remove(Request request) throws IOException {
+     cache.remove(urlToKey(request));
+   }
+ 
+-  private void update(Response cached, Response network) {
++  void update(Response cached, Response network) {
+     Entry entry = new Entry(network);
+     DiskLruCache.Snapshot snapshot = ((CacheResponseBody) cached.body()).snapshot;
+     DiskLruCache.Editor editor = null;
+@@ -398,7 +398,7 @@ public boolean isClosed() {
+     return cache.isClosed();
+   }
+ 
+-  private synchronized void trackResponse(CacheStrategy cacheStrategy) {
++  synchronized void trackResponse(CacheStrategy cacheStrategy) {
+     requestCount++;
+ 
+     if (cacheStrategy.networkRequest != null) {
+@@ -410,7 +410,7 @@ private synchronized void trackResponse(CacheStrategy cacheStrategy) {
+     }
+   }
+ 
+-  private synchronized void trackConditionalCacheHit() {
++  synchronized void trackConditionalCacheHit() {
+     hitCount++;
+   }
+ 
+@@ -429,8 +429,8 @@ public synchronized int requestCount() {
+   private final class CacheRequestImpl implements CacheRequest {
+     private final DiskLruCache.Editor editor;
+     private Sink cacheOut;
+-    private boolean done;
+     private Sink body;
++    boolean done;
+ 
+     public CacheRequestImpl(final DiskLruCache.Editor editor) {
+       this.editor = editor;
+@@ -720,7 +720,7 @@ public Response response(DiskLruCache.Snapshot snapshot) {
+     }
+   }
+ 
+-  private static int readInt(BufferedSource source) throws IOException {
++  static int readInt(BufferedSource source) throws IOException {
+     try {
+       long result = source.readDecimalLong();
+       String line = source.readUtf8LineStrict();
+@@ -734,7 +734,7 @@ private static int readInt(BufferedSource source) throws IOException {
+   }
+ 
+   private static class CacheResponseBody extends ResponseBody {
+-    private final DiskLruCache.Snapshot snapshot;
++    final DiskLruCache.Snapshot snapshot;
+     private final BufferedSource bodySource;
+     private final String contentType;
+     private final String contentLength;
+diff --git a/okhttp/src/main/java/okhttp3/Request.java b/okhttp/src/main/java/okhttp3/Request.java
+index 17da07747c..36aa6acfe7 100644
+--- a/okhttp/src/main/java/okhttp3/Request.java
++++ b/okhttp/src/main/java/okhttp3/Request.java
+@@ -25,15 +25,15 @@
+  * immutable.
+  */
+ public final class Request {
+-  private final HttpUrl url;
+-  private final String method;
+-  private final Headers headers;
+-  private final RequestBody body;
+-  private final Object tag;
++  final HttpUrl url;
++  final String method;
++  final Headers headers;
++  final RequestBody body;
++  final Object tag;
+ 
+   private volatile CacheControl cacheControl; // Lazily initialized.
+ 
+-  private Request(Builder builder) {
++  Request(Builder builder) {
+     this.url = builder.url;
+     this.method = builder.method;
+     this.headers = builder.headers.build();
+@@ -97,18 +97,18 @@ public boolean isHttps() {
+   }
+ 
+   public static class Builder {
+-    private HttpUrl url;
+-    private String method;
+-    private Headers.Builder headers;
+-    private RequestBody body;
+-    private Object tag;
++    HttpUrl url;
++    String method;
++    Headers.Builder headers;
++    RequestBody body;
++    Object tag;
+ 
+     public Builder() {
+       this.method = "GET";
+       this.headers = new Headers.Builder();
+     }
+ 
+-    private Builder(Request request) {
++    Builder(Request request) {
+       this.url = request.url;
+       this.method = request.method;
+       this.body = request.body;
+diff --git a/okhttp/src/main/java/okhttp3/Response.java b/okhttp/src/main/java/okhttp3/Response.java
+index 5b42375e21..810309b013 100644
+--- a/okhttp/src/main/java/okhttp3/Response.java
++++ b/okhttp/src/main/java/okhttp3/Response.java
+@@ -40,22 +40,22 @@
+  * {@link ResponseBody} for an explanation and examples.
+  */
+ public final class Response implements Closeable {
+-  private final Request request;
+-  private final Protocol protocol;
+-  private final int code;
+-  private final String message;
+-  private final Handshake handshake;
+-  private final Headers headers;
+-  private final ResponseBody body;
+-  private final Response networkResponse;
+-  private final Response cacheResponse;
+-  private final Response priorResponse;
+-  private final long sentRequestAtMillis;
+-  private final long receivedResponseAtMillis;
++  final Request request;
++  final Protocol protocol;
++  final int code;
++  final String message;
++  final Handshake handshake;
++  final Headers headers;
++  final ResponseBody body;
++  final Response networkResponse;
++  final Response cacheResponse;
++  final Response priorResponse;
++  final long sentRequestAtMillis;
++  final long receivedResponseAtMillis;
+ 
+   private volatile CacheControl cacheControl; // Lazily initialized.
+ 
+-  private Response(Builder builder) {
++  Response(Builder builder) {
+     this.request = builder.request;
+     this.protocol = builder.protocol;
+     this.code = builder.code;
+@@ -286,24 +286,24 @@ public long receivedResponseAtMillis() {
+   }
+ 
+   public static class Builder {
+-    private Request request;
+-    private Protocol protocol;
+-    private int code = -1;
+-    private String message;
+-    private Handshake handshake;
+-    private Headers.Builder headers;
+-    private ResponseBody body;
+-    private Response networkResponse;
+-    private Response cacheResponse;
+-    private Response priorResponse;
+-    private long sentRequestAtMillis;
+-    private long receivedResponseAtMillis;
++    Request request;
++    Protocol protocol;
++    int code = -1;
++    String message;
++    Handshake handshake;
++    Headers.Builder headers;
++    ResponseBody body;
++    Response networkResponse;
++    Response cacheResponse;
++    Response priorResponse;
++    long sentRequestAtMillis;
++    long receivedResponseAtMillis;
+ 
+     public Builder() {
+       headers = new Headers.Builder();
+     }
+ 
+-    private Builder(Response response) {
++    Builder(Response response) {
+       this.request = response.request;
+       this.protocol = response.protocol;
+       this.code = response.code;

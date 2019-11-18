@@ -1,0 +1,265 @@
+diff --git a/CHANGELOG.md b/CHANGELOG.md
+index 314aeebc..9e00ee1d 100644
+--- a/CHANGELOG.md
++++ b/CHANGELOG.md
+@@ -1,5 +1,11 @@
+ ### Development
+ 
++Enhancements:
++
++- Don't restart BLE scanning periodically if the library confrims device can detect duplicate
++  advertisements in a single scan, leading to more reliable detections with short scan cycles
++  (#491, David G. Young)
++
+ Bug Fixes:
+ 
+ - Deprecate misspelled methods `removeMonitoreNotifier` and
+diff --git a/src/main/java/org/altbeacon/beacon/service/BeaconService.java b/src/main/java/org/altbeacon/beacon/service/BeaconService.java
+index 362c2858..63f38787 100644
+--- a/src/main/java/org/altbeacon/beacon/service/BeaconService.java
++++ b/src/main/java/org/altbeacon/beacon/service/BeaconService.java
+@@ -50,6 +50,7 @@
+ import org.altbeacon.beacon.logging.LogManager;
+ import org.altbeacon.beacon.service.scanner.CycledLeScanCallback;
+ import org.altbeacon.beacon.service.scanner.CycledLeScanner;
++import org.altbeacon.beacon.service.scanner.DistinctPacketDetector;
+ import org.altbeacon.beacon.service.scanner.NonBeaconLeScanCallback;
+ import org.altbeacon.beacon.startup.StartupBroadcastReceiver;
+ import org.altbeacon.beacon.utils.ProcessUtils;
+@@ -91,7 +92,8 @@
+     private boolean mBackgroundFlag = false;
+     private ExtraDataBeaconTracker mExtraDataBeaconTracker;
+     private ExecutorService mExecutor;
+-
++    private final DistinctPacketDetector mDistinctPacketDetector = new DistinctPacketDetector();
++    
+     /*
+      * The scan period is how long we wait between restarting the BLE advertisement scans
+      * Each time we restart we only see the unique advertisements once (e.g. unique beacons)
+@@ -389,6 +391,7 @@ public void onLeScan(BluetoothDevice device, int rssi, byte[] scanRecord) {
+ 
+         @Override
+         public void onCycleEnd() {
++            mDistinctPacketDetector.clearDetections();
+             monitoringStatus.updateNewlyOutside();
+             processRangeData();
+             // If we want to use simulated scanning data, do it here.  This is used for testing in an emulator
+@@ -512,6 +515,13 @@ protected Void doInBackground(ScanData... params) {
+                     LogManager.d(TAG, "Beacon packet detected for: "+beacon+" with rssi "+beacon.getRssi());
+                 }
+                 mDetectionTracker.recordDetection();
++                if (!mCycledScanner.getDistinctPacketsDetectedPerScan()) {
++                    if (!mDistinctPacketDetector.isPacketDistinct(scanData.device.getAddress(),
++                            scanData.scanRecord)) {
++                        LogManager.i(TAG, "Non-distinct packets detected in a single scan.  Restarting scans unecessary.");
++                        mCycledScanner.setDistinctPacketsDetectedPerScan(true);
++                    }
++                }
+                 trackedBeaconsPacketCount++;
+                 processBeaconFromScan(beacon);
+             } else {
+diff --git a/src/main/java/org/altbeacon/beacon/service/scanner/CycledLeScanner.java b/src/main/java/org/altbeacon/beacon/service/scanner/CycledLeScanner.java
+index 6221c65d..33691685 100644
+--- a/src/main/java/org/altbeacon/beacon/service/scanner/CycledLeScanner.java
++++ b/src/main/java/org/altbeacon/beacon/service/scanner/CycledLeScanner.java
+@@ -20,7 +20,6 @@
+ import org.altbeacon.beacon.logging.LogManager;
+ import org.altbeacon.beacon.startup.StartupBroadcastReceiver;
+ import org.altbeacon.bluetooth.BluetoothCrashResolver;
+-
+ import java.util.Date;
+ 
+ @TargetApi(18)
+@@ -52,6 +51,7 @@
+     protected boolean mBackgroundFlag = false;
+     protected boolean mRestartNeeded = false;
+ 
++    private boolean mDistinctPacketsDetectedPerScan = false;
+     private static final long ANDROID_N_MIN_SCAN_CYCLE_MILLIS = 6000l;
+ 
+     protected CycledLeScanner(Context context, long scanPeriod, long betweenScanPeriod, boolean backgroundFlag, CycledLeScanCallback cycledLeScanCallback, BluetoothCrashResolver crashResolver) {
+@@ -162,6 +162,14 @@ public void stop() {
+         }
+     }
+ 
++    public boolean getDistinctPacketsDetectedPerScan() {
++        return mDistinctPacketsDetectedPerScan;
++    }
++
++    public void setDistinctPacketsDetectedPerScan(boolean detected) {
++        mDistinctPacketsDetectedPerScan = detected;
++    }
++
+     public void destroy() {
+         mScanThread.quit();
+     }
+@@ -268,25 +276,39 @@ private void finishScanCycle() {
+             if (mScanning) {
+                 if (getBluetoothAdapter() != null) {
+                     if (getBluetoothAdapter().isEnabled()) {
+-                        long now = SystemClock.elapsedRealtime();
+-                        if (android.os.Build.VERSION.SDK_INT >= Build.VERSION_CODES.N &&
+-                                mBetweenScanPeriod+mScanPeriod < ANDROID_N_MIN_SCAN_CYCLE_MILLIS &&
+-                                now-mLastScanCycleStartTime < ANDROID_N_MIN_SCAN_CYCLE_MILLIS) {
+-                            // As of Android N, only 5 scans may be started in a 30 second period (6
+-                            // seconds per cycle)  otherwise they are blocked.  So we check here to see
+-                            // if the scan period is 6 seconds or less, and if we last stopped scanning
+-                            // fewer than 6 seconds ag and if so, we simply do not stop scanning
+-                            LogManager.d(TAG, "Not stopping scan because this is Android N and we" +
+-                                    " keep scanning for a minimum of 6 seconds at a time. "+
+-                                    "We will stop in "+(ANDROID_N_MIN_SCAN_CYCLE_MILLIS-(now-mLastScanCycleStartTime))+" millisconds.");
++                        // Determine if we need to restart scanning.  Restarting scanning is only
++                        // needed on devices incapable of detecting multiple distinct BLE advertising
++                        // packets in a single cycle, typically older Android devices (e.g. Nexus 4)
++                        // On such devices, it is necessary to stop scanning and restart to detect
++                        // multiple beacon packets in the same scan, allowing collection of multiple
++                        // rssi measurements.  Restarting however, causes brief detection dropouts
++                        // so it is best avoided.  If we know the device has detected to distinct
++                        // packets in the same cycle, we will not restart scanning and just keep it
++                        // going.
++                        if (!getDistinctPacketsDetectedPerScan()) {
++                            long now = SystemClock.elapsedRealtime();
++                            if (android.os.Build.VERSION.SDK_INT >= Build.VERSION_CODES.N &&
++                                    mBetweenScanPeriod+mScanPeriod < ANDROID_N_MIN_SCAN_CYCLE_MILLIS &&
++                                    now-mLastScanCycleStartTime < ANDROID_N_MIN_SCAN_CYCLE_MILLIS) {
++                                // As of Android N, only 5 scans may be started in a 30 second period (6
++                                // seconds per cycle)  otherwise they are blocked.  So we check here to see
++                                // if the scan period is 6 seconds or less, and if we last stopped scanning
++                                // fewer than 6 seconds ag and if so, we simply do not stop scanning
++                                LogManager.d(TAG, "Not stopping scan because this is Android N and we" +
++                                        " keep scanning for a minimum of 6 seconds at a time. "+
++                                        "We will stop in "+(ANDROID_N_MIN_SCAN_CYCLE_MILLIS-(now-mLastScanCycleStartTime))+" millisconds.");
++                            }
++                            else {
++                                try {
++                                    LogManager.d(TAG, "stopping bluetooth le scan");
++                                    finishScan();
++                                } catch (Exception e) {
++                                    LogManager.w(e, TAG, "Internal Android exception scanning for beacons");
++                                }
++                            }
+                         }
+                         else {
+-                            try {
+-                                LogManager.d(TAG, "stopping bluetooth le scan");
+-                                finishScan();
+-                            } catch (Exception e) {
+-                                LogManager.w(e, TAG, "Internal Android exception scanning for beacons");
+-                            }
++                            LogManager.d(TAG, "Not stopping scanning.  Device capable of multiple indistinct detections per scan.");
+                         }
+ 
+                         mLastScanCycleEndTime = SystemClock.elapsedRealtime();
+diff --git a/src/main/java/org/altbeacon/beacon/service/scanner/DistinctPacketDetector.java b/src/main/java/org/altbeacon/beacon/service/scanner/DistinctPacketDetector.java
+new file mode 100644
+index 00000000..42978d30
+--- /dev/null
++++ b/src/main/java/org/altbeacon/beacon/service/scanner/DistinctPacketDetector.java
+@@ -0,0 +1,43 @@
++package org.altbeacon.beacon.service.scanner;
++
++import android.util.Log;
++
++import java.nio.ByteBuffer;
++import java.util.HashSet;
++import java.util.Set;
++
++/**
++ * Created by dyoung on 4/8/17.
++ *
++ * This class tracks whether multiple distinct BLE packets have been seen, with the purpose of
++ * determining if the Android device supports detecting multiple distinct packets in a single scan.
++ * Some older devices are not capable of this (e.g. Nexus 4, Moto G1), so detecting multiple packets
++ * requires stopping and restarting scanning on these devices.  This allows detecting if that is
++ * neessary
++ */
++public class DistinctPacketDetector {
++    // Sanity limit for the number of packets to track, so we don't use too much memory
++    private static final int MAX_PACKETS_TO_TRACK = 1000;
++    protected Set<ByteBuffer> mDistinctPacketsDetected = new HashSet<ByteBuffer>();
++
++    public void clearDetections() {
++        mDistinctPacketsDetected.clear();
++    }
++
++    public boolean isPacketDistinct(String originMacAddress, byte[] scanRecord) {
++        byte[] macBytes = originMacAddress.getBytes();
++        ByteBuffer buffer = ByteBuffer.allocate(macBytes.length+scanRecord.length);
++        buffer.put(macBytes);
++        buffer.put(scanRecord);
++        buffer.rewind(); // rewind puts position back to beginning so .equals and .hashCode work
++
++        boolean distinct = !mDistinctPacketsDetected.contains(buffer);
++        if (mDistinctPacketsDetected.size() == MAX_PACKETS_TO_TRACK) {
++            return mDistinctPacketsDetected.contains(buffer);
++        }
++        else {
++            return mDistinctPacketsDetected.add(buffer);
++        }
++    }
++
++}
+diff --git a/src/test/java/org/altbeacon/beacon/service/scanner/DistinctPacketDetectorTest.java b/src/test/java/org/altbeacon/beacon/service/scanner/DistinctPacketDetectorTest.java
+new file mode 100644
+index 00000000..f82e152c
+--- /dev/null
++++ b/src/test/java/org/altbeacon/beacon/service/scanner/DistinctPacketDetectorTest.java
+@@ -0,0 +1,57 @@
++package org.altbeacon.beacon.service.scanner;
++import org.junit.AfterClass;
++import org.junit.BeforeClass;
++import org.junit.Test;
++import org.junit.runner.RunWith;
++import org.robolectric.RobolectricTestRunner;
++import org.robolectric.annotation.Config;
++import static org.junit.Assert.assertFalse;
++import static org.junit.Assert.assertTrue;
++
++@Config(sdk = 18)
++
++@RunWith(RobolectricTestRunner.class)
++public class DistinctPacketDetectorTest {
++    @BeforeClass
++    public static void testSetup() {
++    }
++
++    @AfterClass
++    public static void testCleanup() {
++
++    }
++
++    @Test
++    public void testSecondDuplicatePacketIsNotDistinct() throws Exception {
++        DistinctPacketDetector dpd = new DistinctPacketDetector();
++        dpd.isPacketDistinct("01:02:03:04:05:06", new byte[] {0x01, 0x02});
++        boolean secondResult = dpd.isPacketDistinct("01:02:03:04:05:06", new byte[] {0x01, 0x02});
++        assertFalse("second call with same packet should not be distinct", secondResult);
++    }
++
++    @Test
++    public void testSecondNonDuplicatePacketIsDistinct() throws Exception {
++        DistinctPacketDetector dpd = new DistinctPacketDetector();
++        dpd.isPacketDistinct("01:02:03:04:05:06", new byte[] {0x01, 0x02});
++        boolean secondResult = dpd.isPacketDistinct("01:02:03:04:05:06", new byte[] {0x03, 0x04});
++        assertTrue("second call with different packet should be distinct", secondResult);
++    }
++
++    @Test
++    public void testSamePacketForDifferentMacIsDistinct() throws Exception {
++        DistinctPacketDetector dpd = new DistinctPacketDetector();
++        dpd.isPacketDistinct("01:02:03:04:05:06", new byte[] {0x01, 0x02});
++        boolean secondResult = dpd.isPacketDistinct("01:01:01:01:01:01", new byte[] {0x01, 0x02});
++        assertTrue("second packet with different mac should be distinct", secondResult);
++    }
++
++    @Test
++    public void clearingDetectionsPreventsDistinctDetection() throws Exception {
++        DistinctPacketDetector dpd = new DistinctPacketDetector();
++        dpd.isPacketDistinct("01:02:03:04:05:06", new byte[] {0x01, 0x02});
++        dpd.clearDetections();
++        boolean secondResult = dpd.isPacketDistinct("01:02:03:04:05:06", new byte[] {0x01, 0x02});
++        assertTrue("second call with same packet after clear should be distinct", secondResult);
++    }
++
++}
+\ No newline at end of file

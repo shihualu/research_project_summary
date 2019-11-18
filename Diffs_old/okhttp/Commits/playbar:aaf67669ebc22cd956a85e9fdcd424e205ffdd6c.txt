@@ -1,0 +1,143 @@
+diff --git a/okhttp-logging-interceptor/src/main/java/okhttp3/logging/HttpLoggingInterceptor.java b/okhttp-logging-interceptor/src/main/java/okhttp3/logging/HttpLoggingInterceptor.java
+index a88cef1390..e843d1bda0 100644
+--- a/okhttp-logging-interceptor/src/main/java/okhttp3/logging/HttpLoggingInterceptor.java
++++ b/okhttp-logging-interceptor/src/main/java/okhttp3/logging/HttpLoggingInterceptor.java
+@@ -207,7 +207,13 @@ public Level getLevel() {
+     }
+ 
+     long startNs = System.nanoTime();
+-    Response response = chain.proceed(request);
++    Response response;
++    try {
++      response = chain.proceed(request);
++    } catch (Exception e) {
++      logger.log("<-- HTTP FAILED: " + e);
++      throw e;
++    }
+     long tookMs = TimeUnit.NANOSECONDS.toMillis(System.nanoTime() - startNs);
+ 
+     ResponseBody responseBody = response.body();
+diff --git a/okhttp-logging-interceptor/src/test/java/okhttp3/logging/HttpLoggingInterceptorTest.java b/okhttp-logging-interceptor/src/test/java/okhttp3/logging/HttpLoggingInterceptorTest.java
+index 429aa12127..ad507a90d2 100644
+--- a/okhttp-logging-interceptor/src/test/java/okhttp3/logging/HttpLoggingInterceptorTest.java
++++ b/okhttp-logging-interceptor/src/test/java/okhttp3/logging/HttpLoggingInterceptorTest.java
+@@ -16,9 +16,12 @@
+ package okhttp3.logging;
+ 
+ import java.io.IOException;
++import java.net.InetAddress;
++import java.net.UnknownHostException;
+ import java.util.ArrayList;
+ import java.util.List;
+ import java.util.regex.Pattern;
++import okhttp3.Dns;
+ import okhttp3.HttpUrl;
+ import okhttp3.MediaType;
+ import okhttp3.OkHttpClient;
+@@ -641,6 +644,29 @@ private void bodyGetNoBody(int code) throws IOException {
+         .assertNoMoreLogs();
+   }
+ 
++  @Test public void connectFail() throws IOException {
++    setLevel(Level.BASIC);
++    client = new OkHttpClient.Builder()
++        .dns(new Dns() {
++          @Override public List<InetAddress> lookup(String hostname) throws UnknownHostException {
++            throw new UnknownHostException("reason");
++          }
++        })
++        .addInterceptor(applicationInterceptor)
++        .build();
++
++    try {
++      client.newCall(request().build()).execute();
++      fail();
++    } catch (UnknownHostException expected) {
++    }
++
++    applicationLogs
++        .assertLogEqual("--> GET " + url + " http/1.1")
++        .assertLogEqual("<-- HTTP FAILED: java.net.UnknownHostException: reason")
++        .assertNoMoreLogs();
++  }
++
+   private Request.Builder request() {
+     return new Request.Builder().url(url);
+   }
+diff --git a/okhttp-tests/src/test/java/okhttp3/ConnectionReuseTest.java b/okhttp-tests/src/test/java/okhttp3/ConnectionReuseTest.java
+index a25d8debef..2dc6bd9fd6 100644
+--- a/okhttp-tests/src/test/java/okhttp3/ConnectionReuseTest.java
++++ b/okhttp-tests/src/test/java/okhttp3/ConnectionReuseTest.java
+@@ -15,6 +15,7 @@
+  */
+ package okhttp3;
+ 
++import java.io.IOException;
+ import java.util.Arrays;
+ import java.util.concurrent.TimeUnit;
+ import javax.net.ssl.SSLContext;
+@@ -31,6 +32,7 @@
+ 
+ import static okhttp3.TestUtil.defaultClient;
+ import static org.junit.Assert.assertEquals;
++import static org.junit.Assert.assertTrue;
+ import static org.junit.Assert.fail;
+ 
+ public final class ConnectionReuseTest {
+@@ -287,6 +289,42 @@
+     assertEquals(0, server.takeRequest().getSequenceNumber());
+   }
+ 
++  /**
++   * Regression test for an edge case where closing response body in the HTTP engine doesn't release
++   * the corresponding stream allocation. This test keeps those response bodies alive and reads
++   * them after the redirect has completed. This forces a connection to not be reused where it would
++   * be otherwise.
++   *
++   * https://github.com/square/okhttp/issues/2409
++   */
++  @Test public void connectionsAreNotReusedIfNetworkInterceptorInterferes() throws Exception {
++    client = client.newBuilder().addNetworkInterceptor(new Interceptor() {
++      @Override public Response intercept(Chain chain) throws IOException {
++        Response response = chain.proceed(chain.request());
++        return response.newBuilder()
++            .body(ResponseBody.create(null, "unrelated response body!"))
++            .build();
++      }
++    }).build();
++
++    server.enqueue(new MockResponse()
++        .setResponseCode(301)
++        .addHeader("Location: /b")
++        .setBody("/a has moved!"));
++    server.enqueue(new MockResponse()
++        .setBody("/b is here"));
++
++    Request request = new Request.Builder()
++        .url(server.url("/"))
++        .build();
++    try {
++      client.newCall(request).execute();
++      fail();
++    } catch (IllegalStateException expected) {
++      assertTrue(expected.getMessage().startsWith("Closing the body of"));
++    }
++  }
++
+   private void enableHttps() {
+     enableHttpsAndAlpn(Protocol.HTTP_1_1);
+   }
+diff --git a/okhttp/src/main/java/okhttp3/RealCall.java b/okhttp/src/main/java/okhttp3/RealCall.java
+index d2ecfdcbdd..57431fccd0 100644
+--- a/okhttp/src/main/java/okhttp3/RealCall.java
++++ b/okhttp/src/main/java/okhttp3/RealCall.java
+@@ -295,6 +295,9 @@ Response getResponse(Request request, boolean forWebSocket) throws IOException {
+       if (!engine.sameConnection(followUp.url())) {
+         streamAllocation.release();
+         streamAllocation = null;
++      } else if (streamAllocation.stream() != null) {
++        throw new IllegalStateException("Closing the body of " + response
++            + " didn't close its backing stream. Bad interceptor?");
+       }
+ 
+       request = followUp;

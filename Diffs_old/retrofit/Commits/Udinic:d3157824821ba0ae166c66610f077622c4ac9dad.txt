@@ -1,0 +1,451 @@
+diff --git a/README.md b/README.md
+index 2440a2ee1..6f61197e9 100644
+--- a/README.md
++++ b/README.md
+@@ -25,6 +25,9 @@ example interface:
+       @GET("foo/bar")
+       void normalGet(@Named("id") String id, Callback<SimpleResponse> callback);
+ 
++      @GET("foo/bar")
++      SimpleResponse normalGetSynchronous(@Named("id") String id) throws ResponseNotOKException;
++
+       // Produces a url like "foo/idValue/bar?category=categoryValue".
+       @GET("foo/{id}/bar")
+       void getWithPathParam(@Named("id") String id, @Named("category") String category, Callback<SimpleResponse> callback);
+@@ -38,9 +41,13 @@ example interface:
+       void singleEntityPost(@SingleEntity MyJsonObj card, @Named("id") String id, Callback<SimpleResponse> callback);
+     }
+ 
+-Note that each method _must_ have a `Callback` object at the end of the parameter list.  This is how
+-your application will handle the results of your network calls: errors and successful responses are
+-both handled by the `Callback` interface.
++If the method has a `Callback` object at the end of the parameter list - the method will run asynchronously:
++errors and successful responses are both handled by the `Callback` interface.
++
++If the method doesn't have a `Callback' argument, it will be run synchronously on the current thread.
++This is useful in case you're calling multiple Http requests in a background process (a Service for
++instance). Thus, saving the trouble of many Callbacks calling each other. See `normalGetSynchronous`
++above for an example. Note: a ResponseNotOKException will be thrown in case of an error response.
+ 
+ If you want to use the `@SingleEntity` method of specifying request body (see `singleEntityPost` above),
+ your `MyJsonObject` will need to implement `TypedBytes`.  For convenience, you can extend
+diff --git a/http/src/main/java/retrofit/http/HttpRequestBuilder.java b/http/src/main/java/retrofit/http/HttpRequestBuilder.java
+index 976acf5b8..5787a0e29 100644
+--- a/http/src/main/java/retrofit/http/HttpRequestBuilder.java
++++ b/http/src/main/java/retrofit/http/HttpRequestBuilder.java
+@@ -108,9 +108,9 @@ String getHost() {
+   /** Converts all but the last method argument to a list of HTTP request parameters. */
+   private List<NameValuePair> createParamList() {
+     Annotation[][] parameterAnnotations = javaMethod.getParameterAnnotations();
+-    int count = parameterAnnotations.length - 1;
++    int count = parameterAnnotations.length;
+ 
+-    List<NameValuePair> params = new ArrayList<NameValuePair>(count);
++    List<NameValuePair> params = new ArrayList<NameValuePair>();
+ 
+     // Add query parameter(s), if specified.
+     QueryParams queryParams = javaMethod.getAnnotation(QueryParams.class);
+diff --git a/http/src/main/java/retrofit/http/ResponseNotOKException.java b/http/src/main/java/retrofit/http/ResponseNotOKException.java
+new file mode 100644
+index 000000000..2254f4912
+--- /dev/null
++++ b/http/src/main/java/retrofit/http/ResponseNotOKException.java
+@@ -0,0 +1,34 @@
++package retrofit.http;
++
++/**
++ * Created by IntelliJ IDEA.
++ * User: udic
++ * Date: 02/02/12
++ * Time: 21:07
++ * To change this template use File | Settings | File Templates.
++ */
++public class ResponseNotOKException extends Exception {
++
++    int statusCode;
++
++    public ResponseNotOKException(int statusCode, String message) {
++        super(message);
++        this.statusCode = statusCode;
++    }
++    
++    public ResponseNotOKException(int statusCode) {
++        super();    //To change body of overridden methods use File | Settings | File Templates.
++        this.statusCode = statusCode;
++    }
++    
++    
++
++    public int getStatusCode() {
++        return statusCode;
++    }
++
++    @Override
++    public String toString() {
++        return "Http status code ["+statusCode+"]. " + super.toString();
++    }
++}
+diff --git a/http/src/main/java/retrofit/http/RestAdapter.java b/http/src/main/java/retrofit/http/RestAdapter.java
+index 3b21fc3cf..88bab07fa 100644
+--- a/http/src/main/java/retrofit/http/RestAdapter.java
++++ b/http/src/main/java/retrofit/http/RestAdapter.java
+@@ -1,15 +1,18 @@
+ package retrofit.http;
+ 
+ import com.google.gson.Gson;
++import com.google.gson.JsonSyntaxException;
+ import com.google.inject.Binder;
+ import com.google.inject.Inject;
+ import com.google.inject.Module;
+ import com.google.inject.Provider;
+ import com.google.inject.Singleton;
++import org.apache.http.HttpEntity;
+ import org.apache.http.HttpResponse;
+ import org.apache.http.client.HttpClient;
+ import org.apache.http.client.ResponseHandler;
+ import org.apache.http.client.methods.HttpUriRequest;
++import org.apache.http.util.EntityUtils;
+ import retrofit.core.Callback;
+ import retrofit.core.MainThread;
+ 
+@@ -101,9 +104,6 @@
+   private class RestHandler implements InvocationHandler {
+ 
+     @Override public Object invoke(Object proxy, final Method method, final Object[] args) {
+-      // Construct HTTP request.
+-      final UiCallback<?> callback =
+-          UiCallback.create((Callback<?>) args[args.length - 1], mainThread);
+ 
+       String url = server.apiUrl();
+       String startTime = "NULL";
+@@ -116,40 +116,122 @@
+             .build();
+         url = request.getURI().toString();
+ 
+-        // The last parameter should be of type Callback<T>. Determine T.
+-        Type[] genericParameterTypes = method.getGenericParameterTypes();
+-        final Type resultType = getCallbackParameterType(method, genericParameterTypes);
+         LOGGER.fine("Sending " + request.getMethod() + " to " + request.getURI());
+         final Date start = new Date();
+         startTime = dateFormat.get().format(start);
+ 
+-        final GsonResponseHandler<?> gsonResponseHandler =
+-            GsonResponseHandler.create(gson, resultType, callback, url, startTime);
+-
+-        // Optionally wrap the response handler for server call profiling.
+-        final ResponseHandler<Void> rh = (profiler == null) ? gsonResponseHandler
+-            : createProfiler(gsonResponseHandler, profiler, method, server.apiUrl(), start);
+-
+         // Execute HTTP request in the background.
+         final String finalUrl = url;
+         final String finalStartTime = startTime;
+-        executor.execute(new Runnable() {
+-          @Override public void run() {
+-            backgroundInvoke(request, rh, callback, finalUrl, finalStartTime);
+-          }
+-        });
++
++        // Get the last arg, will determine if we have a callback or not
++        final Object lastArg = (args == null || args.length == 0)? null : args[args.length - 1];
++
++        // Going the Async way
++        if (lastArg instanceof Callback<?>) {
++
++            executor.execute(new Runnable() {
++              @Override public void run() {
++                backgroundInvoke(request, method, finalUrl, start, (Callback<?>)lastArg);
++              }
++            });
++        // The last arg is not a Callback - we do the request on the current thread
++        } else {
++            return foregroundInvoke(request, method, finalUrl, finalStartTime);
++        }
+       } catch (Throwable t) {
+         LOGGER.log(Level.WARNING, t.getMessage() + " from " + url + " at " + startTime, t);
+-        callback.unexpectedError(t);
+       }
+ 
+       // Methods should return void.
+       return null;
+     }
+ 
+-    private void backgroundInvoke(HttpUriRequest request, ResponseHandler<Void> rh,
+-        UiCallback<?> callback, String url, String startTime) {
+-      try {
++      /**
++       * Invoking the Http request on the current thread. The result will be returned by this method.
++       * In case of an error response (404, 501 etc.) a ResponseNotOKException will be thrown.
++       * @param request
++       * @param method
++       * @param url
++       * @param startTime
++       * @return The response from the server
++       * @throws Throwable
++       */
++    private Object foregroundInvoke(HttpUriRequest request, Method method, String url, String startTime) throws Throwable {
++        HttpResponse response = httpClientProvider.get().execute(request);
++
++        int statusCode = response.getStatusLine().getStatusCode();
++        HttpEntity entity = response.getEntity();
++
++        if (LOGGER.isLoggable(Level.FINE)) {
++            entity = HttpClients.copyAndLog(entity, url, startTime);
++        }
++
++        // If we got an OK response and non-empty entity - let parse it!
++        if (statusCode >= 200 && statusCode < 300) {
++            if (entity != null) {
++                // TODO: Use specified encoding.
++                String bodyString = EntityUtils.toString(entity, "UTF-8");
++
++                // If the return type is not void,
++                // parse the body with the Gson parser, The return type of the method is the object here
++                if (!method.getReturnType().equals(void.class)) {
++                    try {
++                        return gson.fromJson(bodyString, method.getReturnType());
++                    } catch (JsonSyntaxException e) {
++                        Throwable ex = e.getCause();
++                        // If from some reason we get an IllegalStateException,
++                        // let's document the body for further investigation (helped me in the past)
++                        if (ex instanceof IllegalStateException) {
++                            String msg = ex.getMessage();
++                            msg += " | Body is: " + bodyString;
++                            IllegalStateException ise = new IllegalStateException(msg);
++                            ise.setStackTrace(e.getStackTrace());
++                            throw ise;
++                        } else {
++                            throw e;
++                        }
++                    }
++                }
++            }
++        } else {
++            ResponseNotOKException exception = new ResponseNotOKException(statusCode);
++
++            if (entity != null) {
++                try {
++                    String dataString = EntityUtils.toString(entity);
++                    exception = new ResponseNotOKException(statusCode, dataString);
++                } catch (IllegalStateException e) {
++                    // Could happen if the content has been consumed already. We'll ignore that situation
++                }
++            }
++
++            throw exception;
++        }
++
++        return null;
++    }
++
++    private void backgroundInvoke(HttpUriRequest request, Method method, String url, Date start, Callback<?> callbackObj) {
++
++        // The last parameter should be of type Callback<T>. Determine T.
++        Type[] genericParameterTypes = method.getGenericParameterTypes();
++        final Type resultType = getCallbackParameterType(method, genericParameterTypes);
++
++        // Construct HTTP request.
++        final UiCallback<?> callback =
++                UiCallback.create(callbackObj, mainThread);
++
++        String startTime = dateFormat.get().format(start);
++
++        final GsonResponseHandler<?> gsonResponseHandler =
++                GsonResponseHandler.create(gson, resultType, callback, url, startTime);
++
++        // Optionally wrap the response handler for server call profiling.
++        final ResponseHandler<Void> rh = (profiler == null) ? gsonResponseHandler
++                : createProfiler(gsonResponseHandler, profiler, method, server.apiUrl(), start);
++
++        try {
+         httpClientProvider.get().execute(request, rh);
+       } catch (IOException e) {
+         LOGGER.log(Level.WARNING, e.getMessage() + " from " + url + " at " + startTime, e);
+diff --git a/http/src/test/java/retrofit/http/RestAdapterTest.java b/http/src/test/java/retrofit/http/RestAdapterTest.java
+index c90745ef0..3cb76b5c2 100644
+--- a/http/src/test/java/retrofit/http/RestAdapterTest.java
++++ b/http/src/test/java/retrofit/http/RestAdapterTest.java
+@@ -134,6 +134,22 @@ public void testServiceDeleteWithMultipleFixedParam() throws IOException {
+     verifyAll();
+   }
+ 
++  @SuppressWarnings("unchecked") public void testServiceGetSimpleNoCallback() throws IOException {
++    expectLifecycle(HttpGet.class, GET_DELETE_SIMPLE_URL, false);
++    replayAll();
++
++    GetService service = injector.getInstance(GetService.class);
++    try {
++      service.get();
++    } catch (ResponseNotOKException e) {
++      e.printStackTrace();
++    } catch (Throwable throwable) {
++      throwable.printStackTrace();
++    }
++
++      verifyAll();
++  }
++
+   @SuppressWarnings("unchecked") public void testServiceGetParam() throws IOException {
+     expectLifecycle(HttpGet.class, GET_DELETE_SIMPLE_URL + "id=" + ID);
+     replayAll();
+@@ -143,6 +159,21 @@ public void testServiceDeleteWithMultipleFixedParam() throws IOException {
+     verifyAll();
+   }
+ 
++  @SuppressWarnings("unchecked") public void testServiceGetParamNoCallback() throws IOException {
++    expectLifecycle(HttpGet.class, GET_DELETE_SIMPLE_URL + "id=" + ID, false);
++    replayAll();
++
++    GetService service = injector.getInstance(GetService.class);
++      try {
++          service.getWithParam(ID);
++      } catch (ResponseNotOKException e) {
++          e.printStackTrace();
++      } catch (Throwable throwable) {
++          throwable.printStackTrace();
++      }
++    verifyAll();
++  }
++
+   @SuppressWarnings("unchecked") public void testServiceGetWithFixedParam() throws IOException {
+     expectLifecycle(HttpGet.class, GET_DELETE_SIMPLE_URL + "filter=merchant&"
+         + "id=" + ID);
+@@ -182,6 +213,19 @@ public void testServiceGetWithMultipleFixedParams() throws IOException {
+     verifyAll();
+   }
+ 
++  @SuppressWarnings("unchecked") public void testServicePostSimpleClientErrorNoCallback() throws IOException {
++    expectLifecycleClientError(HttpPost.class, BASE_URL, false);
++    replayAll();
++
++    PostService service = injector.getInstance(PostService.class);
++      try {
++          service.post();
++      } catch (ResponseNotOKException e) {
++          e.printStackTrace();
++      }
++    verifyAll();
++  }
++
+   @SuppressWarnings("unchecked") public void testServicePostSimpleClientError() throws IOException {
+     expectLifecycleClientError(HttpPost.class, BASE_URL);
+     replayAll();
+@@ -257,19 +301,38 @@ private void verifyAll() {
+   }
+ 
+   private <T extends HttpUriRequest> void expectLifecycle(Class<T> requestClass,
+-      String requestUrl) throws IOException {
+-    Response response = expectCallAndResponse(requestClass, requestUrl);
+-    expectResponseCalls(gson.toJson(response), 200);
+-    expectHttpClientExecute();
+-    expectCallbacks(response);
++     String requestUrl) throws IOException {
++      // Default case - there's a callback
++      expectLifecycle(requestClass, requestUrl, true);
++  }
++  private <T extends HttpUriRequest> void expectLifecycle(Class<T> requestClass,
++     String requestUrl, boolean usingCallback) throws IOException {
++        Response response = usingCallback ? expectCallAndResponse(requestClass, requestUrl) : expectResponse(requestClass,requestUrl);
++        expectResponseCalls(gson.toJson(response), 200);
++        if (usingCallback) {
++          expectCallbacks(response);
++          expectHttpClientExecute();
++        } else {
++          expectHttpClientExecuteNoCallback();
++        }
+   }
+ 
+   private <T extends HttpUriRequest> void expectLifecycleClientError(Class<T> requestClass,
+       String requestUrl) throws IOException {
+-    Response response = expectCallAndResponse(requestClass, requestUrl);
++      // Default behavior - has a callback
++      expectLifecycleClientError(requestClass,requestUrl, true);
++  }
++
++  private <T extends HttpUriRequest> void expectLifecycleClientError(Class<T> requestClass,
++      String requestUrl, boolean usingCallback) throws IOException {
++    Response response = usingCallback ? expectCallAndResponse(requestClass, requestUrl): expectResponse(requestClass, requestUrl);
+     expectResponseCalls(gson.toJson(response), 409);
+-    expectHttpClientExecute();
+-    expectClientErrorCallbacks(response, 409);
++    if (!usingCallback)
++        expectHttpClientExecuteNoCallback();
++    else {
++        expectHttpClientExecute();
++        expectClientErrorCallbacks(response, 409);
++    }
+   }
+ 
+   private <T extends HttpUriRequest> void expectLifecycleServerError(Class<T> requestClass,
+@@ -280,6 +343,12 @@ private void verifyAll() {
+     expectServerErrorCallbacks(501);
+   }
+ 
++  private <T extends HttpUriRequest> Response expectResponse(Class<T> requestClass,
++                                                             String requestUrl) {
++      expectSetOnWithRequest(requestClass, requestUrl);
++      return new Response("some text");
++  }
++
+   private <T extends HttpUriRequest> Response expectCallAndResponse(Class<T> requestClass,
+       String requestUrl) {
+     expectExecution(mockExecutor);
+@@ -304,7 +373,11 @@ private void verifyAll() {
+     expectLastCall().once();
+   }
+ 
+-  private void expectHttpClientExecute() throws IOException {
++    private void expectHttpClientExecuteNoCallback() throws IOException {
++        expect(mockHttpClient.execute(isA(HttpUriRequest.class))).andReturn(mockResponse);
++    }
++
++    private void expectHttpClientExecute() throws IOException {
+     final Capture<GsonResponseHandler<?>> capture
+         = new Capture<GsonResponseHandler<?>>();
+     mockHttpClient.execute(isA(HttpUriRequest.class), capture(capture));
+@@ -317,7 +390,7 @@ private void expectHttpClientExecute() throws IOException {
+     });
+   }
+ 
+-  private void expectResponseCalls(String jsonToReturn, int statusCode)
++    private void expectResponseCalls(String jsonToReturn, int statusCode)
+       throws UnsupportedEncodingException {
+     expect(mockResponse.getEntity()).andReturn(new StringEntity(jsonToReturn));
+     expect(mockResponse.getStatusLine()).andReturn(new BasicStatusLine(new ProtocolVersion("HTTP", 1, 1), statusCode, ""));
+@@ -329,11 +402,12 @@ private void expectResponseCalls(String jsonToReturn, int statusCode)
+     final Capture<String> captureMime = new Capture<String>();
+     mockHeaders.setOn(capture(capture), capture(captureMime));
+     expectLastCall().andAnswer(new IAnswer<Object>() {
+-      @Override public Object answer() throws Throwable {
+-        T request = expectedRequestClass.cast(capture.getValue());
+-        assertEquals("uri should match expectations", expectedUri, request.getURI().toString());
+-        return null;
+-      }
++        @Override
++        public Object answer() throws Throwable {
++            T request = expectedRequestClass.cast(capture.getValue());
++            assertEquals("uri should match expectations", expectedUri, request.getURI().toString());
++            return null;
++        }
+     });
+   }
+ 
+@@ -373,9 +447,11 @@ void deleteWithMultipleFixedParams(@Named("id") String id,
+ 
+   private interface GetService {
+     @GET(ENTITY) void get(Callback<Response> callback);
++    @GET(ENTITY) Response get() throws ResponseNotOKException;
+ 
+     @GET(ENTITY) void getWithParam(@Named("id") String id,
+         Callback<Response> callback);
++    @GET(ENTITY) Response getWithParam(@Named("id") String id) throws ResponseNotOKException;
+ 
+     @GET(ENTITY) @QueryParam(name="filter", value="merchant")
+     void getWithFixedParam(@Named("id") String id, Callback<Response> callback);
+@@ -393,6 +469,7 @@ void getWithMultipleFixedParams(@Named("id") String id,
+   }
+ 
+   private interface PostService {
++    @POST(ENTITY) Response post() throws ResponseNotOKException;
+     @POST(ENTITY) void post(Callback<Response> callback);
+ 
+     @POST(ENTITY) void postWithParam(@Named("id") String id,

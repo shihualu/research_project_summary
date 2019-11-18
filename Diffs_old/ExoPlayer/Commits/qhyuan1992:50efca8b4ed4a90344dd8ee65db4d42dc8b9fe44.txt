@@ -1,0 +1,130 @@
+diff --git a/extensions/vp9/src/main/java/com/google/android/exoplayer/ext/vp9/VpxDecoder.java b/extensions/vp9/src/main/java/com/google/android/exoplayer/ext/vp9/VpxDecoder.java
+index 322063035e..c43c29ed0e 100644
+--- a/extensions/vp9/src/main/java/com/google/android/exoplayer/ext/vp9/VpxDecoder.java
++++ b/extensions/vp9/src/main/java/com/google/android/exoplayer/ext/vp9/VpxDecoder.java
+@@ -113,8 +113,11 @@ protected VpxDecoderException decode(VpxInputBuffer inputBuffer, VpxOutputBuffer
+       return new VpxDecoderException("Decode error: " + vpxGetErrorMessage(vpxDecContext));
+     }
+     outputBuffer.mode = outputMode;
+-    if (vpxGetFrame(vpxDecContext, outputBuffer) != 0) {
++    int getFrameResult = vpxGetFrame(vpxDecContext, outputBuffer);
++    if (getFrameResult == 1) {
+       outputBuffer.setFlag(Buffer.FLAG_DECODE_ONLY);
++    } else if (getFrameResult == -1) {
++      return new VpxDecoderException("Buffer initialization failed.");
+     }
+     return null;
+   }
+diff --git a/extensions/vp9/src/main/java/com/google/android/exoplayer/ext/vp9/VpxOutputBuffer.java b/extensions/vp9/src/main/java/com/google/android/exoplayer/ext/vp9/VpxOutputBuffer.java
+index 0875f877fd..911a794e4f 100644
+--- a/extensions/vp9/src/main/java/com/google/android/exoplayer/ext/vp9/VpxOutputBuffer.java
++++ b/extensions/vp9/src/main/java/com/google/android/exoplayer/ext/vp9/VpxOutputBuffer.java
+@@ -54,10 +54,14 @@ public void release() {
+ 
+   /**
+    * Resizes the buffer based on the given dimensions. Called via JNI after decoding completes.
++   * @return Whether the buffer was resized successfully.
+    */
+-  /* package */ void initForRgbFrame(int width, int height) {
++  /* package */ boolean initForRgbFrame(int width, int height) {
+     this.width = width;
+     this.height = height;
++    if (!isSafeToMultiply(width, height) || !isSafeToMultiply(width * height, 2)) {
++      return false;
++    }
+     int minimumRgbSize = width * height * 2;
+     if (data == null || data.capacity() < minimumRgbSize) {
+       data = ByteBuffer.allocateDirect(minimumRgbSize);
+@@ -65,19 +69,28 @@ public void release() {
+     }
+     data.position(0);
+     data.limit(minimumRgbSize);
++    return true;
+   }
+ 
+   /**
+    * Resizes the buffer based on the given stride. Called via JNI after decoding completes.
++   * @return Whether the buffer was resized successfully.
+    */
+-  /* package */ void initForYuvFrame(int width, int height, int yStride, int uvStride,
+-      int colorspace) {
++  /* package */ boolean initForYuvFrame(
++      int width, int height, int yStride, int uvStride, int colorspace) {
+     this.width = width;
+     this.height = height;
+     this.colorspace = colorspace;
++    int uvHeight = (int) (((long) height + 1) / 2);
++    if (!isSafeToMultiply(yStride, height) || !isSafeToMultiply(uvStride, uvHeight)) {
++      return false;
++    }
+     int yLength = yStride * height;
+-    int uvLength = uvStride * ((height + 1) / 2);
++    int uvLength = uvStride * uvHeight;
+     int minimumYuvSize = yLength + (uvLength * 2);
++    if (!isSafeToMultiply(uvLength, 2) || minimumYuvSize < yLength) {
++      return false;
++    }
+     if (data == null || data.capacity() < minimumYuvSize) {
+       data = ByteBuffer.allocateDirect(minimumYuvSize);
+     }
+@@ -101,6 +114,15 @@ public void release() {
+     yuvStrides[0] = yStride;
+     yuvStrides[1] = uvStride;
+     yuvStrides[2] = uvStride;
++    return true;
++  }
++
++  /**
++   * Ensures that the result of multiplying individual numbers can fit into the size limit of an
++   * integer.
++   */
++  private boolean isSafeToMultiply(int a, int b) {
++    return a >= 0 && b >= 0 && !(b > 0 && a >= Integer.MAX_VALUE / b);
+   }
+ 
+ }
+diff --git a/extensions/vp9/src/main/jni/vpx_jni.cc b/extensions/vp9/src/main/jni/vpx_jni.cc
+index d15574c12c..358e884fbe 100644
+--- a/extensions/vp9/src/main/jni/vpx_jni.cc
++++ b/extensions/vp9/src/main/jni/vpx_jni.cc
+@@ -71,9 +71,9 @@ FUNC(jlong, vpxInit) {
+   const jclass outputBufferClass = env->FindClass(
+       "com/google/android/exoplayer/ext/vp9/VpxOutputBuffer");
+   initForYuvFrame = env->GetMethodID(outputBufferClass, "initForYuvFrame",
+-                                     "(IIIII)V");
++                                     "(IIIII)Z");
+   initForRgbFrame = env->GetMethodID(outputBufferClass, "initForRgbFrame",
+-                                     "(II)V");
++                                     "(II)Z");
+   dataField = env->GetFieldID(outputBufferClass, "data",
+                               "Ljava/nio/ByteBuffer;");
+   outputModeField = env->GetFieldID(outputBufferClass, "mode", "I");
+@@ -116,7 +116,11 @@ FUNC(jint, vpxGetFrame, jlong jContext, jobject jOutputBuffer) {
+   int outputMode = env->GetIntField(jOutputBuffer, outputModeField);
+   if (outputMode == kOutputModeRgb) {
+     // resize buffer if required.
+-    env->CallVoidMethod(jOutputBuffer, initForRgbFrame, img->d_w, img->d_h);
++    jboolean initResult = env->CallBooleanMethod(jOutputBuffer, initForRgbFrame,
++                                                 img->d_w, img->d_h);
++    if (initResult == JNI_FALSE) {
++      return -1;
++    }
+ 
+     // get pointer to the data buffer.
+     const jobject dataObject = env->GetObjectField(jOutputBuffer, dataField);
+@@ -145,9 +149,12 @@ FUNC(jint, vpxGetFrame, jlong jContext, jobject jOutputBuffer) {
+     }
+ 
+     // resize buffer if required.
+-    env->CallVoidMethod(jOutputBuffer, initForYuvFrame, img->d_w, img->d_h,
+-                        img->stride[VPX_PLANE_Y], img->stride[VPX_PLANE_U],
+-                        colorspace);
++    jboolean initResult = env->CallBooleanMethod(
++        jOutputBuffer, initForYuvFrame, img->d_w, img->d_h,
++        img->stride[VPX_PLANE_Y], img->stride[VPX_PLANE_U], colorspace);
++    if (initResult == JNI_FALSE) {
++      return -1;
++    }
+ 
+     // get pointer to the data buffer.
+     const jobject dataObject = env->GetObjectField(jOutputBuffer, dataField);

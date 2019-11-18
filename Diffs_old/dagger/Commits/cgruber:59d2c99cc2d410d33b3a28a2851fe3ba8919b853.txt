@@ -1,0 +1,846 @@
+diff --git a/compiler/src/main/java/dagger/internal/codegen/ComponentGenerator.java b/compiler/src/main/java/dagger/internal/codegen/ComponentGenerator.java
+index acd1a10b8..251fccca3 100644
+--- a/compiler/src/main/java/dagger/internal/codegen/ComponentGenerator.java
++++ b/compiler/src/main/java/dagger/internal/codegen/ComponentGenerator.java
+@@ -52,7 +52,6 @@
+ import dagger.internal.codegen.writer.MethodWriter;
+ import dagger.internal.codegen.writer.Snippet;
+ import dagger.internal.codegen.writer.StringLiteral;
+-import dagger.internal.codegen.writer.TypeName;
+ import dagger.internal.codegen.writer.TypeNames;
+ import dagger.internal.codegen.writer.TypeWriter;
+ import dagger.internal.codegen.writer.VoidName;
+@@ -89,6 +88,7 @@
+ import static dagger.internal.codegen.ProvisionBinding.Kind.COMPONENT_PROVISION;
+ import static dagger.internal.codegen.ProvisionBinding.Kind.INJECTION;
+ import static dagger.internal.codegen.ProvisionBinding.Kind.PROVISION;
++import static dagger.internal.codegen.ProvisionBinding.Kind.SYNTHETIC_PROVISON;
+ import static dagger.internal.codegen.SourceFiles.factoryNameForProvisionBinding;
+ import static dagger.internal.codegen.SourceFiles.frameworkTypeUsageStatement;
+ import static dagger.internal.codegen.SourceFiles.membersInjectorNameForMembersInjectionBinding;
+@@ -161,9 +161,6 @@ static ProxyClassAndField create(ClassWriter proxyWriter, FieldWriter proxyField
+     builderFactoryMethod.addModifiers(PUBLIC, STATIC);
+     builderFactoryMethod.body().addSnippet("return new %s();", builderWriter.name());
+ 
+-    ImmutableMap<BindingKey, BindingField> bindingFields =
+-        generateBindingFields(input);
+-
+     // the full set of types that calling code uses to construct a component instance
+     ImmutableMap<TypeElement, String> componentContributionNames =
+         ImmutableMap.copyOf(Maps.asMap(
+@@ -229,14 +226,14 @@ static ProxyClassAndField create(ClassWriter proxyWriter, FieldWriter proxyField
+ 
+     ImmutableMap.Builder<BindingKey, Snippet> memberSelectSnippetsBuilder =
+         ImmutableMap.builder();
++    ImmutableMap.Builder<ContributionBinding, Snippet> multibindingContributionSnippetsBuilder =
++        ImmutableMap.builder();
+ 
+     ImmutableSet.Builder<JavaWriter> proxyWriters = ImmutableSet.builder();
+     Map<String, ProxyClassAndField> packageProxies = Maps.newHashMap();
+ 
+-    for (Entry<BindingKey, ResolvedBindings> resolvedBindingsEntry :
+-        input.resolvedBindings().entrySet()) {
+-      BindingKey bindingKey = resolvedBindingsEntry.getKey();
+-      ResolvedBindings resolvedBindings = resolvedBindingsEntry.getValue();
++    for (ResolvedBindings resolvedBindings : input.resolvedBindings().values()) {
++      BindingKey bindingKey = resolvedBindings.bindingKey();
+ 
+       if (resolvedBindings.bindings().size() == 1
+           && bindingKey.kind().equals(BindingKey.Kind.CONTRIBUTION)) {
+@@ -254,9 +251,8 @@ static ProxyClassAndField create(ClassWriter proxyWriter, FieldWriter proxyField
+         }
+       }
+ 
+-      ImmutableSet<? extends Binding> bindings = resolvedBindings.bindings();
+-
+-      String bindingPackage = bindingPackageFor(bindings).or(componentName.packageName());
++      String bindingPackage = bindingPackageFor(resolvedBindings.bindings())
++          .or(componentName.packageName());
+ 
+       final Optional<String> proxySelector;
+       final TypeWriter classWithFields;
+@@ -297,10 +293,34 @@ static ProxyClassAndField create(ClassWriter proxyWriter, FieldWriter proxyField
+         fieldModifiers = EnumSet.of(PUBLIC);
+       }
+ 
+-      BindingField bindingField = bindingFields.get(bindingKey);
+-      TypeName frameworkTypeName = bindingField.frameworkType();
++      if (bindingKey.kind().equals(BindingKey.Kind.CONTRIBUTION)) {
++        ImmutableSet<? extends ContributionBinding> contributionBindings =
++            resolvedBindings.contributionBindings();
++        if (ContributionBinding.bindingTypeFor(contributionBindings).isMultibinding()) {
++          int contributionNumber = 0;
++          for (ContributionBinding contributionBinding : contributionBindings) {
++            if (isSytheticProvisionBinding(contributionBinding)) {
++              contributionNumber++;
++              FrameworkField contributionBindingField = frameworkFieldForSyntheticProvisionBinding(
++                  bindingKey, contributionNumber, contributionBinding);
++              FieldWriter contributionField = classWithFields.addField(
++                  contributionBindingField.frameworkType(), contributionBindingField.name());
++              contributionField.addModifiers(fieldModifiers);
++
++              ImmutableList<String> contirubtionSelectTokens = new ImmutableList.Builder<String>()
++                  .addAll(proxySelector.asSet())
++                  .add(contributionField.name())
++                  .build();
++              multibindingContributionSnippetsBuilder.put(contributionBinding,
++                  Snippet.memberSelectSnippet(contirubtionSelectTokens));
++            }
++          }
++        }
++      }
+ 
+-      FieldWriter frameworkField = classWithFields.addField(frameworkTypeName, bindingField.name());
++      FrameworkField bindingField = frameworkFieldForResolvedBindings(resolvedBindings);
++      FieldWriter frameworkField =
++          classWithFields.addField(bindingField.frameworkType(), bindingField.name());
+       frameworkField.addModifiers(fieldModifiers);
+ 
+       ImmutableList<String> memberSelectTokens = new ImmutableList.Builder<String>()
+@@ -309,6 +329,7 @@ static ProxyClassAndField create(ClassWriter proxyWriter, FieldWriter proxyField
+           .build();
+       memberSelectSnippetsBuilder.put(bindingKey,
+           Snippet.memberSelectSnippet(memberSelectTokens));
++
+     }
+ 
+     buildMethod.body().addSnippet("return new %s(this);", componentWriter.name());
+@@ -321,6 +342,8 @@ static ProxyClassAndField create(ClassWriter proxyWriter, FieldWriter proxyField
+     }
+ 
+     ImmutableMap<BindingKey, Snippet> memberSelectSnippets = memberSelectSnippetsBuilder.build();
++    ImmutableMap<ContributionBinding, Snippet> multibindingContributionSnippets =
++        multibindingContributionSnippetsBuilder.build();
+ 
+     List<List<BindingKey>> partitions = Lists.partition(
+         input.resolvedBindings().keySet().asList(), 100);
+@@ -341,28 +364,37 @@ static ProxyClassAndField create(ClassWriter proxyWriter, FieldWriter proxyField
+                 .get(bindingKey)
+                 .contributionBindings();
+ 
+-            BindingType bindingsType = ProvisionBinding.bindingTypeFor(bindings);
+-            switch (bindingsType) {
++            switch (ContributionBinding.bindingTypeFor(bindings)) {
+               case SET:
+-                ImmutableList.Builder<Snippet> setFactoryParameters = ImmutableList.builder();
+-                for (ProvisionBinding binding : bindings) {
+-                  setFactoryParameters.add(initializeFactoryForBinding(binding,
+-                      input.componentDescriptor().dependencyMethodIndex(),
+-                      componentContributionFields,
+-                      memberSelectSnippets));
++                for (ProvisionBinding provisionBinding : bindings) {
++                  initializeMethod.body().addSnippet("this.%s = %s;",
++                      multibindingContributionSnippets.get(provisionBinding),
++                      initializeFactoryForBinding(provisionBinding,
++                          input.componentDescriptor().dependencyMethodIndex(),
++                          componentContributionFields,
++                          memberSelectSnippets));
+                 }
+                 Snippet initializeSetSnippet = Snippet.format("%s.create(%s)",
+                     ClassName.fromClass(SetFactory.class),
+-                    Snippet.makeParametersSnippet(setFactoryParameters.build()));
++                    Snippet.makeParametersSnippet(Iterables.transform(bindings,
++                        Functions.forMap(multibindingContributionSnippets))));
+                 initializeMethod.body().addSnippet("this.%s = %s;",
+                     memberSelectSnippet, initializeSetSnippet);
+                 break;
+               case MAP:
++                for (ProvisionBinding provisionBinding : bindings) {
++                  if (!isNonProviderMap(provisionBinding)) {
++                    initializeMethod.body().addSnippet("this.%s = %s;",
++                        multibindingContributionSnippets.get(provisionBinding),
++                        initializeFactoryForBinding(provisionBinding,
++                            input.componentDescriptor().dependencyMethodIndex(),
++                            componentContributionFields,
++                            memberSelectSnippets));
++                  }
++                }
+                 if (!bindings.isEmpty()) {
+-                  Snippet initializeMapSnippet =
+-                      initializeMapBinding(componentContributionFields,
+-                          input.componentDescriptor().dependencyMethodIndex(),
+-                          memberSelectSnippets, bindings);
++                  Snippet initializeMapSnippet = initializeMapBinding(
++                      memberSelectSnippets, multibindingContributionSnippets, bindings);
+                   initializeMethod.body().addSnippet("this.%s = %s;",
+                       memberSelectSnippet, initializeMapSnippet);
+                 }
+@@ -417,7 +449,7 @@ static ProxyClassAndField create(ClassWriter proxyWriter, FieldWriter proxyField
+               interfaceMethod.addParameter(
+                   TypeNames.forTypeMirror(parameter.asType()), parameterName.toString());
+               interfaceMethod.body()
+-              .addSnippet("%s.injectMembers(%s);", membersInjectorName, parameterName);
++                  .addSnippet("%s.injectMembers(%s);", membersInjectorName, parameterName);
+               if (!requestElement.getReturnType().getKind().equals(VOID)) {
+                 interfaceMethod.body().addSnippet("return %s;", parameterName);
+               }
+@@ -435,69 +467,92 @@ static ProxyClassAndField create(ClassWriter proxyWriter, FieldWriter proxyField
+         .build();
+   }
+ 
+-  private ImmutableMap<BindingKey, BindingField> generateBindingFields(BindingGraph graph) {
+-    ImmutableMap.Builder<BindingKey, BindingField> fields = ImmutableMap.builder();
+-    for (Entry<BindingKey, ResolvedBindings> entry : graph.resolvedBindings().entrySet()) {
+-      BindingKey bindingKey = entry.getKey();
+-      switch (bindingKey.kind()) {
+-        case CONTRIBUTION:
+-          @SuppressWarnings("unchecked")  // checked during validation
+-          ImmutableSet<ProvisionBinding> bindingsForKey =
+-              (ImmutableSet<ProvisionBinding>) entry.getValue().contributionBindings();
+-          BindingType bindingsType = ProvisionBinding.bindingTypeFor(bindingsForKey);
+-          switch (bindingsType) {
+-            case SET:
+-              fields.put(bindingKey, BindingField.create(
+-                  Provider.class,
+-                  bindingKey,
+-                  new KeyVariableNamer().apply(bindingKey.key())));
+-              break;
+-            case MAP:
+-              fields.put(bindingKey, BindingField.create(
+-                  Provider.class,
+-                  bindingKey,
+-                  new KeyVariableNamer().apply(bindingKey.key())));
+-              break;
+-            case UNIQUE:
+-              ProvisionBinding binding = Iterables.getOnlyElement(bindingsForKey);
+-              fields.put(bindingKey, BindingField.create(
+-                  Provider.class,
+-                  bindingKey,
+-                  binding.bindingElement().accept(new ElementKindVisitor6<String, Void>() {
+-                    @Override
+-                    public String visitExecutableAsConstructor(ExecutableElement e, Void p) {
+-                      return e.getEnclosingElement().accept(this, null);
+-                    }
+-
+-                    @Override
+-                    public String visitExecutableAsMethod(ExecutableElement e, Void p) {
+-                      return e.getSimpleName().toString();
+-                    }
+-
+-                    @Override
+-                    public String visitType(TypeElement e, Void p) {
+-                      return CaseFormat.UPPER_CAMEL.to(CaseFormat.LOWER_CAMEL,
+-                          e.getSimpleName().toString());
+-                    }
+-                  }, null)));
+-              break;
+-            default:
+-              throw new AssertionError();
+-          }
+-          break;
+-        case MEMBERS_INJECTION:
+-          fields.put(bindingKey, BindingField.create(
+-              MembersInjector.class,
+-              bindingKey,
+-              CaseFormat.UPPER_CAMEL.to(CaseFormat.LOWER_CAMEL,
+-                  Iterables.getOnlyElement(entry.getValue().bindings())
+-                  .bindingElement().getSimpleName().toString())));
+-          break;
+-        default:
+-          throw new AssertionError();
+-      }
++  private static FrameworkField frameworkFieldForSyntheticProvisionBinding(BindingKey bindingKey,
++      int contributionNumber, ContributionBinding contributionBinding) throws AssertionError {
++    FrameworkField contributionBindingField;
++    switch (contributionBinding.bindingType()) {
++      case MAP:
++        contributionBindingField = FrameworkField.createForMapBindingContribution(
++            Provider.class,
++            BindingKey.create(bindingKey.kind(), contributionBinding.key()),
++            KeyVariableNamer.INSTANCE.apply(bindingKey.key())
++                + "Contribution" + contributionNumber);
++        break;
++      case SET:
++        contributionBindingField = FrameworkField.createWithTypeFromKey(
++            Provider.class,
++            bindingKey,
++            KeyVariableNamer.INSTANCE.apply(bindingKey.key())
++                + "Contribution" + contributionNumber);
++        break;
++      case UNIQUE:
++        contributionBindingField = FrameworkField.createWithTypeFromKey(
++            Provider.class,
++            bindingKey,
++            KeyVariableNamer.INSTANCE.apply(bindingKey.key())
++                + "Contribution" + contributionNumber);
++        break;
++      default:
++        throw new AssertionError();
++    }
++    return contributionBindingField;
++  }
++
++  private static boolean isSytheticProvisionBinding(ContributionBinding contributionBinding) {
++    return !(contributionBinding instanceof ProvisionBinding
++        && ((ProvisionBinding) contributionBinding)
++            .bindingKind().equals(SYNTHETIC_PROVISON));
++  }
++
++  private FrameworkField frameworkFieldForResolvedBindings(ResolvedBindings resolvedBindings) {
++    BindingKey bindingKey = resolvedBindings.bindingKey();
++    switch (bindingKey.kind()) {
++      case CONTRIBUTION:
++        ImmutableSet<? extends ContributionBinding> contributionBindings =
++            resolvedBindings.contributionBindings();
++        BindingType bindingsType = ProvisionBinding.bindingTypeFor(contributionBindings);
++        switch (bindingsType) {
++          case SET:
++          case MAP:
++            return FrameworkField.createWithTypeFromKey(
++                Provider.class,
++                bindingKey,
++                KeyVariableNamer.INSTANCE.apply(bindingKey.key()));
++          case UNIQUE:
++            ContributionBinding binding = Iterables.getOnlyElement(contributionBindings);
++            return FrameworkField.createWithTypeFromKey(
++                Provider.class,
++                bindingKey,
++                binding.bindingElement().accept(new ElementKindVisitor6<String, Void>() {
++                  @Override
++                  public String visitExecutableAsConstructor(ExecutableElement e, Void p) {
++                    return e.getEnclosingElement().accept(this, null);
++                  }
++
++                  @Override
++                  public String visitExecutableAsMethod(ExecutableElement e, Void p) {
++                    return e.getSimpleName().toString();
++                  }
++
++                  @Override
++                  public String visitType(TypeElement e, Void p) {
++                    return CaseFormat.UPPER_CAMEL.to(CaseFormat.LOWER_CAMEL,
++                        e.getSimpleName().toString());
++                  }
++                }, null));
++          default:
++            throw new AssertionError();
++        }
++      case MEMBERS_INJECTION:
++        return FrameworkField.createWithTypeFromKey(
++            MembersInjector.class,
++            bindingKey,
++            CaseFormat.UPPER_CAMEL.to(CaseFormat.LOWER_CAMEL,
++                Iterables.getOnlyElement(resolvedBindings.bindings())
++                .bindingElement().getSimpleName().toString()));
++      default:
++        throw new AssertionError();
+     }
+-    return fields.build();
+   }
+ 
+   private Snippet initializeFactoryForBinding(ProvisionBinding binding,
+@@ -583,9 +638,8 @@ private static Snippet initializeMembersInjectorForBinding(
+   }
+ 
+   private Snippet initializeMapBinding(
+-      Map<TypeElement, FieldWriter> contributionFields,
+-      ImmutableMap<ExecutableElement, TypeElement> dependencyMethodIndex,
+       ImmutableMap<BindingKey, Snippet> memberSelectSnippets,
++      ImmutableMap<ContributionBinding, Snippet> multibindingContributionSnippets,
+       Set<ProvisionBinding> bindings) {
+     Iterator<ProvisionBinding> iterator = bindings.iterator();
+     // get type information from first binding in iterator
+@@ -611,12 +665,10 @@ private Snippet initializeMapBinding(
+       argsBuilder.add(TypeNames.forTypeMirror(mapValueType));
+       argsBuilder.add(bindings.size());
+ 
+-      writeEntry(argsBuilder, firstBinding, initializeFactoryForBinding(
+-          firstBinding, dependencyMethodIndex, contributionFields, memberSelectSnippets));
++      writeEntry(argsBuilder, firstBinding, multibindingContributionSnippets.get(firstBinding));
+       while (iterator.hasNext()) {
+         ProvisionBinding binding = iterator.next();
+-        writeEntry(argsBuilder, binding, initializeFactoryForBinding(
+-            binding, dependencyMethodIndex, contributionFields, memberSelectSnippets));
++        writeEntry(argsBuilder, binding, multibindingContributionSnippets.get(binding));
+       }
+ 
+       return Snippet.format(snippetFormatBuilder.toString(),
+diff --git a/compiler/src/main/java/dagger/internal/codegen/ContributionBinding.java b/compiler/src/main/java/dagger/internal/codegen/ContributionBinding.java
+index 394bacc7f..688018fac 100644
+--- a/compiler/src/main/java/dagger/internal/codegen/ContributionBinding.java
++++ b/compiler/src/main/java/dagger/internal/codegen/ContributionBinding.java
+@@ -39,6 +39,10 @@
+     SET,
+     /** Represents a valid non-collection binding. */
+     UNIQUE;
++
++    boolean isMultibinding() {
++      return !this.equals(UNIQUE);
++    }
+   }
+ 
+   abstract BindingType bindingType();
+diff --git a/compiler/src/main/java/dagger/internal/codegen/FactoryGenerator.java b/compiler/src/main/java/dagger/internal/codegen/FactoryGenerator.java
+index 40808e009..8136c4283 100644
+--- a/compiler/src/main/java/dagger/internal/codegen/FactoryGenerator.java
++++ b/compiler/src/main/java/dagger/internal/codegen/FactoryGenerator.java
+@@ -138,12 +138,12 @@ ClassName nameGeneratedType(ProvisionBinding binding) {
+           .addSnippet("this.membersInjector = membersInjector;");
+     }
+ 
+-    ImmutableMap<BindingKey, BindingField> fields =
++    ImmutableMap<BindingKey, FrameworkField> fields =
+         SourceFiles.generateBindingFieldsForDependencies(
+             dependencyRequestMapper, binding.dependencies());
+ 
+-    for (BindingField bindingField : fields.values()) {
+-      ParameterizedTypeName fieldType = bindingField.frameworkType();
++    for (FrameworkField bindingField : fields.values()) {
++      TypeName fieldType = bindingField.frameworkType();
+       FieldWriter field = factoryWriter.addField(fieldType, bindingField.name());
+       field.addModifiers(PRIVATE, FINAL);
+       constructorWriter.get().addParameter(field.type(), field.name());
+diff --git a/compiler/src/main/java/dagger/internal/codegen/BindingField.java b/compiler/src/main/java/dagger/internal/codegen/FrameworkField.java
+similarity index 50%
+rename from compiler/src/main/java/dagger/internal/codegen/BindingField.java
+rename to compiler/src/main/java/dagger/internal/codegen/FrameworkField.java
+index 05e95c80c..f6b207c09 100644
+--- a/compiler/src/main/java/dagger/internal/codegen/BindingField.java
++++ b/compiler/src/main/java/dagger/internal/codegen/FrameworkField.java
+@@ -15,33 +15,47 @@
+  */
+ package dagger.internal.codegen;
+ 
++import com.google.auto.common.MoreTypes;
+ import com.google.auto.value.AutoValue;
+ import dagger.internal.codegen.writer.ClassName;
+ import dagger.internal.codegen.writer.ParameterizedTypeName;
++import dagger.internal.codegen.writer.TypeName;
+ import dagger.internal.codegen.writer.TypeNames;
++import javax.lang.model.type.TypeMirror;
+ 
+ /**
+- * A value object that represents a field for a binding in a generated source file.
++ * A value object that represents a field used by Dagger-generated code.
+  *
+- *  @author Jesse Beder
+- *  @since 2.0
++ * @author Jesse Beder
++ * @since 2.0
+  */
+ @AutoValue
+-abstract class BindingField {
+-  static BindingField create(
++abstract class FrameworkField {
++  // TODO(gak): reexamine the this class and how consistently we're using it and its creation
++  // methods
++
++  static FrameworkField createWithTypeFromKey(
+       Class<?> frameworkClass, BindingKey bindingKey, String name) {
+     String suffix = frameworkClass.getSimpleName();
+-    return new AutoValue_BindingField(frameworkClass, bindingKey,
++    ParameterizedTypeName frameworkType = ParameterizedTypeName.create(
++        ClassName.fromClass(frameworkClass),
++        TypeNames.forTypeMirror(bindingKey.key().type()));
++    return new AutoValue_FrameworkField(frameworkClass, frameworkType, bindingKey,
+         name.endsWith(suffix) ? name : name + suffix);
+   }
+ 
+-  ParameterizedTypeName frameworkType() {
+-    return ParameterizedTypeName.create(
+-        ClassName.fromClass(frameworkClass()),
+-        TypeNames.forTypeMirror(bindingKey().key().type()));
++  static FrameworkField createForMapBindingContribution(
++      Class<?> frameworkClass, BindingKey bindingKey, String name) {
++    TypeMirror mapValueType =
++        MoreTypes.asDeclared(bindingKey.key().type()).getTypeArguments().get(1);
++    return new AutoValue_FrameworkField(frameworkClass,
++        TypeNames.forTypeMirror(mapValueType),
++        bindingKey,
++        name);
+   }
+ 
+   abstract Class<?> frameworkClass();
++  abstract TypeName frameworkType();
+   abstract BindingKey bindingKey();
+   abstract String name();
+ }
+diff --git a/compiler/src/main/java/dagger/internal/codegen/KeyVariableNamer.java b/compiler/src/main/java/dagger/internal/codegen/KeyVariableNamer.java
+index 7bca5500c..c32d50806 100644
+--- a/compiler/src/main/java/dagger/internal/codegen/KeyVariableNamer.java
++++ b/compiler/src/main/java/dagger/internal/codegen/KeyVariableNamer.java
+@@ -31,7 +31,9 @@
+  * @author Gregory Kick
+  * @since 2.0
+  */
+-final class KeyVariableNamer implements Function<Key, String> {
++enum KeyVariableNamer implements Function<Key, String> {
++  INSTANCE;
++
+   @Override
+   public String apply(Key key) {
+     StringBuilder builder = new StringBuilder();
+diff --git a/compiler/src/main/java/dagger/internal/codegen/MembersInjectorGenerator.java b/compiler/src/main/java/dagger/internal/codegen/MembersInjectorGenerator.java
+index 5a66043e7..c87f42442 100644
+--- a/compiler/src/main/java/dagger/internal/codegen/MembersInjectorGenerator.java
++++ b/compiler/src/main/java/dagger/internal/codegen/MembersInjectorGenerator.java
+@@ -34,6 +34,7 @@
+ import dagger.internal.codegen.writer.MethodWriter;
+ import dagger.internal.codegen.writer.ParameterizedTypeName;
+ import dagger.internal.codegen.writer.Snippet;
++import dagger.internal.codegen.writer.TypeName;
+ import dagger.internal.codegen.writer.VoidName;
+ import java.util.Map.Entry;
+ import javax.annotation.Generated;
+@@ -132,16 +133,16 @@ ClassName nameGeneratedType(MembersInjectionBinding binding) {
+       injectMembersWriter.body().addSnippet("supertypeInjector.injectMembers(instance);");
+     }
+ 
+-    ImmutableMap<BindingKey, BindingField> fields =
++    ImmutableMap<BindingKey, FrameworkField> fields =
+         SourceFiles.generateBindingFieldsForDependencies(
+             dependencyRequestMapper, ImmutableSet.copyOf(binding.dependencies()));
+ 
+     ImmutableMap.Builder<BindingKey, FieldWriter> dependencyFieldsBuilder =
+         ImmutableMap.builder();
+ 
+-    for (Entry<BindingKey, BindingField> fieldEntry : fields.entrySet()) {
+-      BindingField bindingField = fieldEntry.getValue();
+-      ParameterizedTypeName fieldType = bindingField.frameworkType();
++    for (Entry<BindingKey, FrameworkField> fieldEntry : fields.entrySet()) {
++      FrameworkField bindingField = fieldEntry.getValue();
++      TypeName fieldType = bindingField.frameworkType();
+       FieldWriter field = injectorWriter.addField(fieldType, bindingField.name());
+       field.addModifiers(PRIVATE, FINAL);
+       constructorWriter.addParameter(field.type(), field.name());
+diff --git a/compiler/src/main/java/dagger/internal/codegen/ProducerFactoryGenerator.java b/compiler/src/main/java/dagger/internal/codegen/ProducerFactoryGenerator.java
+index 0fa05f04a..3c4d73ff8 100644
+--- a/compiler/src/main/java/dagger/internal/codegen/ProducerFactoryGenerator.java
++++ b/compiler/src/main/java/dagger/internal/codegen/ProducerFactoryGenerator.java
+@@ -125,12 +125,12 @@ ClassName nameGeneratedType(ProductionBinding binding) {
+     getMethodWriter.annotate(Override.class);
+     getMethodWriter.addModifiers(PUBLIC);
+ 
+-    final ImmutableMap<BindingKey, BindingField> fields =
++    final ImmutableMap<BindingKey, FrameworkField> fields =
+         SourceFiles.generateBindingFieldsForDependencies(
+             dependencyRequestMapper, binding.dependencies());
+ 
+-    for (BindingField bindingField : fields.values()) {
+-      ParameterizedTypeName fieldType = bindingField.frameworkType();
++    for (FrameworkField bindingField : fields.values()) {
++      TypeName fieldType = bindingField.frameworkType();
+       FieldWriter field = factoryWriter.addField(fieldType, bindingField.name());
+       field.addModifiers(PRIVATE, FINAL);
+       constructorWriter.addParameter(field.type(), field.name());
+@@ -300,7 +300,7 @@ private TypeName asyncDependencyType(DependencyRequest dependency) {
+   }
+ 
+   private ImmutableList<Snippet> getParameterSnippets(ProductionBinding binding,
+-      ImmutableMap<BindingKey, BindingField> fields,
++      ImmutableMap<BindingKey, FrameworkField> fields,
+       String listArgName) {
+     int argIndex = 0;
+     ImmutableList.Builder<Snippet> snippets = ImmutableList.builder();
+diff --git a/compiler/src/main/java/dagger/internal/codegen/ProvisionBinding.java b/compiler/src/main/java/dagger/internal/codegen/ProvisionBinding.java
+index eb788142e..99ab9e825 100644
+--- a/compiler/src/main/java/dagger/internal/codegen/ProvisionBinding.java
++++ b/compiler/src/main/java/dagger/internal/codegen/ProvisionBinding.java
+@@ -66,6 +66,11 @@
+     INJECTION,
+     /** Represents a binding configured by {@link Provides}. */
+     PROVISION,
++    /**
++     * Represents a binding that is not explicitly tied to code, but generated implicitly by the
++     * framework.
++     */
++    SYNTHETIC_PROVISON,
+     /** Represents the implicit binding to the component. */
+     COMPONENT,
+     /** Represents a binding from a provision method on a component dependency. */
+@@ -207,7 +212,7 @@ ProvisionBinding forImplicitMapBinding(DependencyRequest explicitRequest,
+           implicitRequest.requestElement(),
+           dependencies,
+           findBindingPackage(explicitRequest.key()),
+-          Kind.PROVISION,
++          Kind.SYNTHETIC_PROVISON,
+           Provides.Type.MAP,
+           wrapOptionalInEquivalence(AnnotationMirrors.equivalence(), scope),
+           Optional.<DependencyRequest>absent());
+diff --git a/compiler/src/main/java/dagger/internal/codegen/SourceFiles.java b/compiler/src/main/java/dagger/internal/codegen/SourceFiles.java
+index 26c170d38..fe87c5306 100644
+--- a/compiler/src/main/java/dagger/internal/codegen/SourceFiles.java
++++ b/compiler/src/main/java/dagger/internal/codegen/SourceFiles.java
+@@ -82,14 +82,14 @@ public int compare(DependencyRequest left, DependencyRequest right) {
+    *
+    * @return Returns the mapping from {@link BindingKey} to field, sorted by the name of the field.
+    */
+-  static ImmutableMap<BindingKey, BindingField> generateBindingFieldsForDependencies(
++  static ImmutableMap<BindingKey, FrameworkField> generateBindingFieldsForDependencies(
+       DependencyRequestMapper dependencyRequestMapper,
+       Iterable<? extends DependencyRequest> dependencies) {
+     ImmutableSetMultimap<BindingKey, DependencyRequest> dependenciesByKey =
+         indexDependenciesByKey(dependencies);
+     Map<BindingKey, Collection<DependencyRequest>> dependenciesByKeyMap =
+         dependenciesByKey.asMap();
+-    ImmutableMap.Builder<BindingKey, BindingField> bindingFields = ImmutableMap.builder();
++    ImmutableMap.Builder<BindingKey, FrameworkField> bindingFields = ImmutableMap.builder();
+     for (Entry<BindingKey, Collection<DependencyRequest>> entry
+         : dependenciesByKeyMap.entrySet()) {
+       BindingKey bindingKey = entry.getKey();
+@@ -103,7 +103,7 @@ public int compare(DependencyRequest left, DependencyRequest right) {
+       if (dependencyNames.size() == 1) {
+         // if there's only one name, great! use it!
+         String name = Iterables.getOnlyElement(dependencyNames);
+-        bindingFields.put(bindingKey, BindingField.create(frameworkClass, bindingKey, name));
++        bindingFields.put(bindingKey, FrameworkField.createWithTypeFromKey(frameworkClass, bindingKey, name));
+       } else {
+         // in the event that a field is being used for a bunch of deps with different names,
+         // add all the names together with "And"s in the middle. E.g.: stringAndS
+@@ -114,7 +114,7 @@ public int compare(DependencyRequest left, DependencyRequest right) {
+           compositeNameBuilder.append("And").append(
+               CaseFormat.LOWER_CAMEL.to(UPPER_CAMEL, namesIterator.next()));
+         }
+-        bindingFields.put(bindingKey, BindingField.create(
++        bindingFields.put(bindingKey, FrameworkField.createWithTypeFromKey(
+             frameworkClass, bindingKey, compositeNameBuilder.toString()));
+       }
+     }
+@@ -146,6 +146,8 @@ static ClassName factoryNameForProvisionBinding(ProvisionBinding binding) {
+       case PROVISION:
+         return enclosingClassName.topLevelClassName().peerNamed(
+             enclosingClassName.classFileName() + "$$" + factoryPrefix(binding) + "Factory");
++      case SYNTHETIC_PROVISON:
++        throw new IllegalArgumentException();
+       default:
+         throw new AssertionError();
+     }
+diff --git a/compiler/src/main/java/dagger/internal/codegen/writer/Snippet.java b/compiler/src/main/java/dagger/internal/codegen/writer/Snippet.java
+index 07cbf766b..52aeb44b0 100644
+--- a/compiler/src/main/java/dagger/internal/codegen/writer/Snippet.java
++++ b/compiler/src/main/java/dagger/internal/codegen/writer/Snippet.java
+@@ -25,7 +25,6 @@
+ import java.util.Collections;
+ import java.util.Formatter;
+ import java.util.Iterator;
+-import java.util.List;
+ import java.util.Set;
+ 
+ public final class Snippet implements HasClassReferences, Writable {
+@@ -111,7 +110,7 @@ public static Snippet memberSelectSnippet(Iterable<? extends Object> selectors)
+         selectors);
+   }
+ 
+-  public static Snippet makeParametersSnippet(List<Snippet> parameterSnippets) {
++  public static Snippet makeParametersSnippet(Iterable<Snippet> parameterSnippets) {
+     Iterator<Snippet> iterator = parameterSnippets.iterator();
+     StringBuilder stringBuilder = new StringBuilder();
+     ImmutableSet.Builder<TypeName> typesBuilder = ImmutableSet.builder();
+diff --git a/compiler/src/test/java/dagger/internal/codegen/BindingFieldTest.java b/compiler/src/test/java/dagger/internal/codegen/BindingFieldTest.java
+index df06e1e57..f18e90b0a 100644
+--- a/compiler/src/test/java/dagger/internal/codegen/BindingFieldTest.java
++++ b/compiler/src/test/java/dagger/internal/codegen/BindingFieldTest.java
+@@ -38,7 +38,7 @@
+ import static com.google.common.truth.Truth.assertThat;
+ 
+ /**
+- * Test case for {@link BindingField}.
++ * Test case for {@link FrameworkField}.
+  */
+ @RunWith(JUnit4.class)
+ public class BindingFieldTest {
+@@ -63,12 +63,12 @@ private ExecutableElement getXConstructor() {
+   @Test public void frameworkType() {
+     Key key = keyFactory.forInjectConstructor(getXConstructor());
+     TypeName xClass = TypeNames.forTypeMirror(key.type());
+-    assertThat(BindingField.create(Provider.class,
++    assertThat(FrameworkField.createWithTypeFromKey(Provider.class,
+             BindingKey.create(BindingKey.Kind.CONTRIBUTION, key), "test")
+         .frameworkType())
+         .isEqualTo(ParameterizedTypeName.create(
+             ClassName.fromClass(Provider.class), xClass));
+-    assertThat(BindingField.create(MembersInjector.class,
++    assertThat(FrameworkField.createWithTypeFromKey(MembersInjector.class,
+             BindingKey.create(BindingKey.Kind.MEMBERS_INJECTION, key), "test")
+         .frameworkType())
+         .isEqualTo(ParameterizedTypeName.create(
+@@ -77,10 +77,10 @@ private ExecutableElement getXConstructor() {
+ 
+   @Test public void nameSuffix() {
+     Key key = keyFactory.forInjectConstructor(getXConstructor());
+-    assertThat(BindingField.create(Provider.class,
++    assertThat(FrameworkField.createWithTypeFromKey(Provider.class,
+             BindingKey.create(BindingKey.Kind.CONTRIBUTION, key), "foo").name())
+         .isEqualTo("fooProvider");
+-    assertThat(BindingField.create(Provider.class,
++    assertThat(FrameworkField.createWithTypeFromKey(Provider.class,
+             BindingKey.create(BindingKey.Kind.CONTRIBUTION, key), "fooProvider").name())
+         .isEqualTo("fooProvider");
+ 
+diff --git a/compiler/src/test/java/dagger/internal/codegen/ComponentProcessorTest.java b/compiler/src/test/java/dagger/internal/codegen/ComponentProcessorTest.java
+index 2bcf3b5d3..ec07c0984 100644
+--- a/compiler/src/test/java/dagger/internal/codegen/ComponentProcessorTest.java
++++ b/compiler/src/test/java/dagger/internal/codegen/ComponentProcessorTest.java
+@@ -629,6 +629,8 @@
+         "public final class Dagger_TestComponent implements TestComponent {",
+         "  private final EmptySetModule emptySetModule;",
+         "  private final SetModule setModule;",
++        "  private Provider<Set<String>> setOfStringContribution1Provider;",
++        "  private Provider<Set<String>> setOfStringContribution2Provider;",
+         "  private Provider<Set<String>> setOfStringProvider;",
+         "",
+         "  private Dagger_TestComponent(Builder builder) {",
+@@ -647,9 +649,11 @@
+         "  }",
+         "",
+         "  private void initialize() {",
+-        "    this.setOfStringProvider =",
+-        "        SetFactory.create(new EmptySetModule$$EmptySetFactory(emptySetModule),",
+-        "            new SetModule$$StringFactory(setModule));",
++        "    this.setOfStringContribution1Provider =",
++        "        new EmptySetModule$$EmptySetFactory(emptySetModule);",
++        "    this.setOfStringContribution2Provider = new SetModule$$StringFactory(setModule);",
++        "    this.setOfStringProvider = SetFactory.create(",
++        "        setOfStringContribution1Provider, setOfStringContribution2Provider);",
+         "  }",
+         "",
+         "  @Override",
+diff --git a/compiler/src/test/java/dagger/internal/codegen/MapBindingComponentProcessorTest.java b/compiler/src/test/java/dagger/internal/codegen/MapBindingComponentProcessorTest.java
+index ea13e5202..6ca89f8e4 100644
+--- a/compiler/src/test/java/dagger/internal/codegen/MapBindingComponentProcessorTest.java
++++ b/compiler/src/test/java/dagger/internal/codegen/MapBindingComponentProcessorTest.java
+@@ -120,6 +120,8 @@ public void mapBindingsWithEnumKey() {
+         "public final class Dagger_TestComponent implements TestComponent {",
+         "  private final MapModuleOne mapModuleOne;",
+         "  private final MapModuleTwo mapModuleTwo;",
++        "  private Provider<Handler> mapOfPathEnumAndProviderOfHandlerContribution1;",
++        "  private Provider<Handler> mapOfPathEnumAndProviderOfHandlerContribution2;",
+         "  private Provider<Map<PathEnum, Provider<Handler>>>",
+         "      mapOfPathEnumAndProviderOfHandlerProvider;",
+         "",
+@@ -139,12 +141,16 @@ public void mapBindingsWithEnumKey() {
+         "  }",
+         "",
+         "  private void initialize() {",
++        "    this.mapOfPathEnumAndProviderOfHandlerContribution1 =",
++        "        new MapModuleOne$$ProvideAdminHandlerFactory(mapModuleOne);",
++        "    this.mapOfPathEnumAndProviderOfHandlerContribution2 =",
++        "        new MapModuleTwo$$ProvideLoginHandlerFactory(mapModuleTwo);",
+         "    this.mapOfPathEnumAndProviderOfHandlerProvider =",
+         "        MapProviderFactory.<PathEnum, Handler>builder(2)",
+         "            .put(test.PathEnum.ADMIN,",
+-        "                new MapModuleOne$$ProvideAdminHandlerFactory(mapModuleOne))",
++        "                mapOfPathEnumAndProviderOfHandlerContribution1)",
+         "            .put(test.PathEnum.LOGIN,",
+-        "                new MapModuleTwo$$ProvideLoginHandlerFactory(mapModuleTwo))",
++        "                mapOfPathEnumAndProviderOfHandlerContribution2)",
+         "            .build();",
+         "  }",
+         "",
+@@ -286,7 +292,10 @@ public void mapBindingsWithStringKey() {
+         "public final class Dagger_TestComponent implements TestComponent {",
+         "  private final MapModuleOne mapModuleOne;",
+         "  private final MapModuleTwo mapModuleTwo;",
+-        "  private Provider<Map<String, Provider<Handler>>> mapOfStringAndProviderOfHandlerProvider;",
++        "  private Provider<Handler> mapOfStringAndProviderOfHandlerContribution1;",
++        "  private Provider<Handler> mapOfStringAndProviderOfHandlerContribution2;",
++        "  private Provider<Map<String, Provider<Handler>>>",
++        "      mapOfStringAndProviderOfHandlerProvider;",
+         "",
+         "  private Dagger_TestComponent(Builder builder) {",
+         "    assert builder != null;",
+@@ -304,10 +313,14 @@ public void mapBindingsWithStringKey() {
+         "  }",
+         "",
+         "  private void initialize() {",
++        "    this.mapOfStringAndProviderOfHandlerContribution1 =",
++        "        new MapModuleOne$$ProvideAdminHandlerFactory(mapModuleOne);",
++        "    this.mapOfStringAndProviderOfHandlerContribution2 =",
++        "        new MapModuleTwo$$ProvideLoginHandlerFactory(mapModuleTwo);",
+         "    this.mapOfStringAndProviderOfHandlerProvider =",
+         "        MapProviderFactory.<String, Handler>builder(2)",
+-        "            .put(\"Admin\", new MapModuleOne$$ProvideAdminHandlerFactory(mapModuleOne))",
+-        "            .put(\"Login\", new MapModuleTwo$$ProvideLoginHandlerFactory(mapModuleTwo))",
++        "            .put(\"Admin\", mapOfStringAndProviderOfHandlerContribution1)",
++        "            .put(\"Login\", mapOfStringAndProviderOfHandlerContribution2)",
+         "            .build();",
+         "  }",
+         "",
+@@ -452,6 +465,8 @@ public void mapBindingsWithNonProviderValue() {
+         "public final class Dagger_TestComponent implements TestComponent {",
+         "  private final MapModuleOne mapModuleOne;",
+         "  private final MapModuleTwo mapModuleTwo;",
++        "  private Provider<Handler> mapOfPathEnumAndProviderOfHandlerContribution1;",
++        "  private Provider<Handler> mapOfPathEnumAndProviderOfHandlerContribution2;",
+         "  private Provider<Map<PathEnum, Provider<Handler>>>",
+         "      mapOfPathEnumAndProviderOfHandlerProvider;",
+         "  private Provider<Map<PathEnum, Handler>> mapOfPathEnumAndHandlerProvider;",
+@@ -472,12 +487,16 @@ public void mapBindingsWithNonProviderValue() {
+         "  }",
+         "",
+         "  private void initialize() {",
++        "    this.mapOfPathEnumAndProviderOfHandlerContribution1 =",
++        "        new MapModuleOne$$ProvideAdminHandlerFactory(mapModuleOne);",
++        "    this.mapOfPathEnumAndProviderOfHandlerContribution2 =",
++        "        new MapModuleTwo$$ProvideLoginHandlerFactory(mapModuleTwo);",
+         "    this.mapOfPathEnumAndProviderOfHandlerProvider =",
+         "        MapProviderFactory.<PathEnum, Handler>builder(2)",
+         "            .put(test.PathEnum.ADMIN,",
+-        "                new MapModuleOne$$ProvideAdminHandlerFactory(mapModuleOne))",
++        "                mapOfPathEnumAndProviderOfHandlerContribution1)",
+         "            .put(test.PathEnum.LOGIN,",
+-        "                new MapModuleTwo$$ProvideLoginHandlerFactory(mapModuleTwo))",
++        "                mapOfPathEnumAndProviderOfHandlerContribution2)",
+         "            .build();",
+         "    this.mapOfPathEnumAndHandlerProvider =",
+         "        MapFactory.create(mapOfPathEnumAndProviderOfHandlerProvider);",
+diff --git a/compiler/src/test/java/dagger/internal/codegen/MapKeyProcessorTest.java b/compiler/src/test/java/dagger/internal/codegen/MapKeyProcessorTest.java
+index 64749c9aa..ed0d99322 100644
+--- a/compiler/src/test/java/dagger/internal/codegen/MapKeyProcessorTest.java
++++ b/compiler/src/test/java/dagger/internal/codegen/MapKeyProcessorTest.java
+@@ -161,6 +161,8 @@ public void mapKeyComponentFileWithDisorderedKeyField() {
+         "public final class Dagger_TestComponent implements TestComponent {",
+         "  private final MapModuleOne mapModuleOne;",
+         "  private final MapModuleTwo mapModuleTwo;",
++        "  private Provider<Handler> mapOfPathKeyAndProviderOfHandlerContribution1;",
++        "  private Provider<Handler> mapOfPathKeyAndProviderOfHandlerContribution2;",
+         "  private Provider<Map<PathKey, Provider<Handler>>>",
+         "      mapOfPathKeyAndProviderOfHandlerProvider;",
+         "",
+@@ -180,12 +182,16 @@ public void mapKeyComponentFileWithDisorderedKeyField() {
+         "  }",
+         "",
+         "  private void initialize() {",
++        "    this.mapOfPathKeyAndProviderOfHandlerContribution1 =",
++        "        new MapModuleOne$$ProvideAdminHandlerFactory(mapModuleOne);",
++        "    this.mapOfPathKeyAndProviderOfHandlerContribution2 =",
++        "        new MapModuleTwo$$ProvideLoginHandlerFactory(mapModuleTwo);",
+         "    this.mapOfPathKeyAndProviderOfHandlerProvider =",
+         "        MapProviderFactory.<PathKey, Handler>builder(2)",
+         "            .put(PathKeyCreator.create(PathEnum.ADMIN, \"AdminPath\"),",
+-        "                new MapModuleOne$$ProvideAdminHandlerFactory(mapModuleOne))",
++        "                mapOfPathKeyAndProviderOfHandlerContribution1)",
+         "            .put(PathKeyCreator.create(PathEnum.LOGIN, \"LoginPath\"),",
+-        "                new MapModuleTwo$$ProvideLoginHandlerFactory(mapModuleTwo))",
++        "                mapOfPathKeyAndProviderOfHandlerContribution2)",
+         "            .build();",
+         "  }",
+         "",
+@@ -333,6 +339,8 @@ public void mapKeyComponentFileWithDefaultField() {
+         "public final class Dagger_TestComponent implements TestComponent {",
+         "  private final MapModuleOne mapModuleOne;",
+         "  private final MapModuleTwo mapModuleTwo;",
++        "  private Provider<Handler> mapOfPathKeyAndProviderOfHandlerContribution1;",
++        "  private Provider<Handler> mapOfPathKeyAndProviderOfHandlerContribution2;",
+         "  private Provider<Map<PathKey, Provider<Handler>>>",
+         "      mapOfPathKeyAndProviderOfHandlerProvider;",
+         "",
+@@ -352,12 +360,16 @@ public void mapKeyComponentFileWithDefaultField() {
+         "  }",
+         "",
+         "  private void initialize() {",
++        "    this.mapOfPathKeyAndProviderOfHandlerContribution1 =",
++        "        new MapModuleOne$$ProvideAdminHandlerFactory(mapModuleOne);",
++        "    this.mapOfPathKeyAndProviderOfHandlerContribution2 =",
++        "        new MapModuleTwo$$ProvideLoginHandlerFactory(mapModuleTwo);",
+         "    this.mapOfPathKeyAndProviderOfHandlerProvider =",
+         "        MapProviderFactory.<PathKey, Handler>builder(2)",
+         "            .put(PathKeyCreator.create(PathEnum.ADMIN, \"DefaultPath\"),",
+-        "                new MapModuleOne$$ProvideAdminHandlerFactory(mapModuleOne))",
++        "                mapOfPathKeyAndProviderOfHandlerContribution1)",
+         "            .put(PathKeyCreator.create(PathEnum.LOGIN, \"LoginPath\"),",
+-        "                new MapModuleTwo$$ProvideLoginHandlerFactory(mapModuleTwo))",
++        "                mapOfPathKeyAndProviderOfHandlerContribution2)",
+         "            .build();",
+         "  }",
+         "",

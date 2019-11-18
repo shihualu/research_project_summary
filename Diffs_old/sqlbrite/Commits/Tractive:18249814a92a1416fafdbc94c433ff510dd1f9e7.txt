@@ -1,0 +1,201 @@
+diff --git a/sqlbrite/build.gradle b/sqlbrite/build.gradle
+index f39c562..b617eb4 100644
+--- a/sqlbrite/build.gradle
++++ b/sqlbrite/build.gradle
+@@ -44,6 +44,7 @@ android {
+ 
+   lintOptions {
+     textOutput 'stdout'
++    textReport true
+   }
+ 
+   buildTypes {
+diff --git a/sqlbrite/src/androidTest/java/com/squareup/sqlbrite/BriteDatabaseTest.java b/sqlbrite/src/androidTest/java/com/squareup/sqlbrite/BriteDatabaseTest.java
+index bda04d0..d2e2b0d 100644
+--- a/sqlbrite/src/androidTest/java/com/squareup/sqlbrite/BriteDatabaseTest.java
++++ b/sqlbrite/src/androidTest/java/com/squareup/sqlbrite/BriteDatabaseTest.java
+@@ -32,7 +32,9 @@
+ import java.util.concurrent.CountDownLatch;
+ import org.junit.After;
+ import org.junit.Before;
++import org.junit.Rule;
+ import org.junit.Test;
++import org.junit.rules.TemporaryFolder;
+ import org.junit.runner.RunWith;
+ import rx.Observable;
+ import rx.Subscription;
+@@ -53,6 +55,7 @@
+ import static com.squareup.sqlbrite.TestDb.employee;
+ import static com.squareup.sqlbrite.TestDb.manager;
+ import static java.util.concurrent.TimeUnit.MILLISECONDS;
++import static java.util.concurrent.TimeUnit.SECONDS;
+ import static org.junit.Assert.fail;
+ 
+ @RunWith(AndroidJUnit4.class)
+@@ -65,8 +68,11 @@
+   private SQLiteDatabase real;
+   private BriteDatabase db;
+ 
+-  @Before public void setUp() {
+-    helper = new TestDb(InstrumentationRegistry.getContext());
++  @Rule
++  public TemporaryFolder dbFolder = new TemporaryFolder();
++
++  @Before public void setUp() throws IOException {
++    helper = new TestDb(InstrumentationRegistry.getContext(), dbFolder.newFile().getPath());
+     real = helper.getWritableDatabase();
+ 
+     SqlBrite.Logger logger = new SqlBrite.Logger() {
+@@ -745,6 +751,40 @@
+     o.assertNoMoreEvents();
+   }
+ 
++  @Test public void nonExclusiveTransactionWorks() throws InterruptedException {
++    final CountDownLatch transactionStarted = new CountDownLatch(1);
++    final CountDownLatch transactionProceed = new CountDownLatch(1);
++    final CountDownLatch transactionCompleted = new CountDownLatch(1);
++
++    new Thread() {
++      @Override public void run() {
++        Transaction transaction = db.newNonExclusiveTransaction();
++        transactionStarted.countDown();
++        try {
++          db.insert(TABLE_EMPLOYEE, employee("hans", "Hans Hanson"));
++          transactionProceed.await(10, SECONDS);
++        } catch (InterruptedException e) {
++          throw new RuntimeException("Exception in transaction thread", e);
++        }
++        transaction.markSuccessful();
++        transaction.close();
++        transactionCompleted.countDown();
++      }
++    }.start();
++
++    assertThat(transactionStarted.await(10, SECONDS)).isTrue();
++
++    //Simple query
++    Employee employees = db.createQuery(TABLE_EMPLOYEE, SELECT_EMPLOYEES + " LIMIT 1")
++            .lift(Query.mapToOne(Employee.MAPPER))
++            .toBlocking()
++            .first();
++    assertThat(employees).isEqualTo(new Employee("alice", "Alice Allison"));
++
++    transactionProceed.countDown();
++    assertThat(transactionCompleted.await(10, SECONDS)).isTrue();
++  }
++
+   @Test public void backpressureSupportedWhenConsumerSlow() {
+     o.doRequest(2);
+ 
+diff --git a/sqlbrite/src/androidTest/java/com/squareup/sqlbrite/QueryTest.java b/sqlbrite/src/androidTest/java/com/squareup/sqlbrite/QueryTest.java
+index 9aaa91d..3bed90a 100644
+--- a/sqlbrite/src/androidTest/java/com/squareup/sqlbrite/QueryTest.java
++++ b/sqlbrite/src/androidTest/java/com/squareup/sqlbrite/QueryTest.java
+@@ -41,7 +41,7 @@
+ 
+   @Before public void setUp() {
+     SqlBrite sqlBrite = SqlBrite.create();
+-    TestDb helper = new TestDb(InstrumentationRegistry.getContext());
++    TestDb helper = new TestDb(InstrumentationRegistry.getContext(), null /* memory */);
+     db = sqlBrite.wrapDatabaseHelper(helper, Schedulers.immediate());
+   }
+ 
+diff --git a/sqlbrite/src/androidTest/java/com/squareup/sqlbrite/TestDb.java b/sqlbrite/src/androidTest/java/com/squareup/sqlbrite/TestDb.java
+index 6fa8d20..04f9681 100644
+--- a/sqlbrite/src/androidTest/java/com/squareup/sqlbrite/TestDb.java
++++ b/sqlbrite/src/androidTest/java/com/squareup/sqlbrite/TestDb.java
+@@ -105,8 +105,8 @@
+   long bobId;
+   long eveId;
+ 
+-  TestDb(Context context) {
+-    super(context, null /* memory */, null /* cursor factory */, 1 /* version */);
++  TestDb(Context context, String path) {
++    super(context, path, null /* cursor factory */, 1 /* version */);
+   }
+ 
+   @Override public void onCreate(@NonNull SQLiteDatabase db) {
+diff --git a/sqlbrite/src/main/java/com/squareup/sqlbrite/BriteDatabase.java b/sqlbrite/src/main/java/com/squareup/sqlbrite/BriteDatabase.java
+index e265cab..78da0d0 100644
+--- a/sqlbrite/src/main/java/com/squareup/sqlbrite/BriteDatabase.java
++++ b/sqlbrite/src/main/java/com/squareup/sqlbrite/BriteDatabase.java
+@@ -15,6 +15,7 @@
+  */
+ package com.squareup.sqlbrite;
+ 
++import android.annotation.TargetApi;
+ import android.content.ContentValues;
+ import android.database.Cursor;
+ import android.database.sqlite.SQLiteDatabase;
+@@ -24,6 +25,7 @@
+ import android.support.annotation.IntDef;
+ import android.support.annotation.NonNull;
+ import android.support.annotation.Nullable;
++import android.support.annotation.RequiresApi;
+ import com.squareup.sqlbrite.SqlBrite.Query;
+ import java.io.Closeable;
+ import java.lang.annotation.Retention;
+@@ -45,6 +47,7 @@
+ import static android.database.sqlite.SQLiteDatabase.CONFLICT_NONE;
+ import static android.database.sqlite.SQLiteDatabase.CONFLICT_REPLACE;
+ import static android.database.sqlite.SQLiteDatabase.CONFLICT_ROLLBACK;
++import static android.os.Build.VERSION_CODES.HONEYCOMB;
+ import static java.lang.System.nanoTime;
+ import static java.lang.annotation.RetentionPolicy.SOURCE;
+ import static java.util.concurrent.TimeUnit.NANOSECONDS;
+@@ -216,6 +219,55 @@ public Transaction newTransaction() {
+     return this.transaction;
+   }
+ 
++  /**
++   * Begins a transaction in IMMEDIATE mode for this thread.
++   * <p>
++   * Transactions may nest. If the transaction is not in progress, then a database connection is
++   * obtained and a new transaction is started. Otherwise, a nested transaction is started.
++   * <p>
++   * Each call to {@code newNonExclusiveTransaction} must be matched exactly by a call to
++   * {@link Transaction#end()}. To mark a transaction as successful, call
++   * {@link Transaction#markSuccessful()} before calling {@link Transaction#end()}. If the
++   * transaction is not successful, or if any of its nested transactions were not successful, then
++   * the entire transaction will be rolled back when the outermost transaction is ended.
++   * <p>
++   * Transactions queue up all query notifications until they have been applied.
++   * <p>
++   * Here is the standard idiom for transactions:
++   *
++   * <pre>{@code
++   * try (Transaction transaction = db.newNonExclusiveTransaction()) {
++   *   ...
++   *   transaction.markSuccessful();
++   * }
++   * }</pre>
++   *
++   * Manually call {@link Transaction#end()} when try-with-resources is not available:
++   * <pre>{@code
++   * Transaction transaction = db.newNonExclusiveTransaction();
++   * try {
++   *   ...
++   *   transaction.markSuccessful();
++   * } finally {
++   *   transaction.end();
++   * }
++   * }</pre>
++   *
++   *
++   * @see SQLiteDatabase#beginTransactionNonExclusive()
++   */
++  @TargetApi(HONEYCOMB)
++  @RequiresApi(HONEYCOMB)
++  @CheckResult @NonNull
++  public Transaction newNonExclusiveTransaction() {
++    SqliteTransaction transaction = new SqliteTransaction(transactions.get());
++    transactions.set(transaction);
++    if (logging) log("TXN BEGIN %s", transaction);
++    getWriteableDatabase().beginTransactionWithListenerNonExclusive(transaction);
++
++    return this.transaction;
++  }
++
+   /**
+    * Close the underlying {@link SQLiteOpenHelper} and remove cached readable and writeable
+    * databases. This does not prevent existing observables from retaining existing references as

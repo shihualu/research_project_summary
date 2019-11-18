@@ -1,0 +1,524 @@
+diff --git a/compiler/src/main/java/dagger/internal/codegen/BindingGraphValidator.java b/compiler/src/main/java/dagger/internal/codegen/BindingGraphValidator.java
+index 947a753a7..2d639c9d3 100644
+--- a/compiler/src/main/java/dagger/internal/codegen/BindingGraphValidator.java
++++ b/compiler/src/main/java/dagger/internal/codegen/BindingGraphValidator.java
+@@ -23,6 +23,7 @@
+ import com.google.common.base.Joiner;
+ import com.google.common.base.Optional;
+ import com.google.common.base.Predicate;
++import com.google.common.base.Predicates;
+ import com.google.common.collect.FluentIterable;
+ import com.google.common.collect.ImmutableList;
+ import com.google.common.collect.ImmutableListMultimap;
+@@ -65,14 +66,17 @@
+   private final Types types;
+   private final InjectBindingRegistry injectBindingRegistry;
+   private final ScopeCycleValidation disableInterComponentScopeCycles;
++  private final DependencyRequestFormatter dependencyRequestFormatter;
+ 
+   BindingGraphValidator(
+       Types types,
+       InjectBindingRegistry injectBindingRegistry,
+-      ScopeCycleValidation disableInterComponentScopeCycles) {
++      ScopeCycleValidation disableInterComponentScopeCycles,
++      DependencyRequestFormatter dependencyRequestFormatter) {
+     this.types = types;
+     this.injectBindingRegistry = injectBindingRegistry;
+     this.disableInterComponentScopeCycles = disableInterComponentScopeCycles;
++    this.dependencyRequestFormatter = dependencyRequestFormatter;
+   }
+ 
+   @Override
+@@ -393,7 +397,8 @@ private void reportMissingBinding(
+     }
+     ImmutableList<String> printableDependencyPath =
+         FluentIterable.from(requestPath)
+-            .transform(DependencyRequestFormatter.instance())
++            .transform(dependencyRequestFormatter)
++            .filter(Predicates.not(Predicates.equalTo("")))
+             .toList()
+             .reverse();
+     for (String dependency :
+@@ -465,7 +470,10 @@ private String formatBindingType(BindingType type) {
+   private void reportCycle(Deque<DependencyRequest> requestPath,
+       BindingGraph graph, final ValidationReport.Builder<BindingGraph> reportBuilder) {
+     ImmutableList<String> printableDependencyPath = FluentIterable.from(requestPath)
+-        .transform(DependencyRequestFormatter.instance()).toList().reverse();
++        .transform(dependencyRequestFormatter)
++        .filter(Predicates.not(Predicates.equalTo("")))
++        .toList()
++        .reverse();
+     DependencyRequest rootRequest = requestPath.getLast();
+     TypeElement componentType =
+         MoreElements.asType(rootRequest.requestElement().getEnclosingElement());
+diff --git a/compiler/src/main/java/dagger/internal/codegen/ComponentProcessor.java b/compiler/src/main/java/dagger/internal/codegen/ComponentProcessor.java
+index 3e449e4fe..dbbbe057b 100644
+--- a/compiler/src/main/java/dagger/internal/codegen/ComponentProcessor.java
++++ b/compiler/src/main/java/dagger/internal/codegen/ComponentProcessor.java
+@@ -65,6 +65,8 @@ public SourceVersion getSupportedSourceVersion() {
+     Types types = processingEnv.getTypeUtils();
+     Elements elements = processingEnv.getElementUtils();
+     Filer filer = processingEnv.getFiler();
++    
++    DependencyRequestFormatter dependencyRequestFormatter = new DependencyRequestFormatter(types);
+ 
+     InjectConstructorValidator injectConstructorValidator = new InjectConstructorValidator();
+     InjectFieldValidator injectFieldValidator = new InjectFieldValidator();
+@@ -112,7 +114,8 @@ public SourceVersion getSupportedSourceVersion() {
+     BindingGraphValidator bindingGraphValidator = new BindingGraphValidator(
+         types,
+         injectBindingRegistry,
+-        disableInterComponentScopeValidation(processingEnv));
++        disableInterComponentScopeValidation(processingEnv),
++        dependencyRequestFormatter);
+ 
+     return ImmutableList.<ProcessingStep>of(
+         new MapKeyProcessingStep(
+diff --git a/compiler/src/main/java/dagger/internal/codegen/DependencyRequest.java b/compiler/src/main/java/dagger/internal/codegen/DependencyRequest.java
+index 68c2a6a18..9e0952d8e 100644
+--- a/compiler/src/main/java/dagger/internal/codegen/DependencyRequest.java
++++ b/compiler/src/main/java/dagger/internal/codegen/DependencyRequest.java
+@@ -15,6 +15,8 @@
+  */
+ package dagger.internal.codegen;
+ 
++import com.google.auto.common.MoreTypes;
++
+ import com.google.auto.value.AutoValue;
+ import com.google.common.base.Function;
+ import com.google.common.base.Optional;
+@@ -36,7 +38,6 @@
+ import javax.lang.model.type.DeclaredType;
+ import javax.lang.model.type.TypeKind;
+ import javax.lang.model.type.TypeMirror;
+-
+ import static com.google.auto.common.MoreTypes.isTypeOf;
+ import static com.google.common.base.Preconditions.checkArgument;
+ import static com.google.common.base.Preconditions.checkNotNull;
+@@ -70,6 +71,12 @@
+   abstract Kind kind();
+   abstract Key key();
+   abstract Element requestElement();
++  
++  /**
++   * Returns the possibly resolved type that contained the requesting element. For members injection
++   * requests, this is the type itself.
++   */
++  abstract DeclaredType enclosingType();
+ 
+   static final class Factory {
+     private final Key.Factory keyFactory;
+@@ -78,12 +85,12 @@
+       this.keyFactory = keyFactory;
+     }
+ 
+-    ImmutableSet<DependencyRequest> forRequiredResolvedVariables(
++    ImmutableSet<DependencyRequest> forRequiredResolvedVariables(DeclaredType container,
+         List<? extends VariableElement> variables, List<? extends TypeMirror> resolvedTypes) {
+       checkState(resolvedTypes.size() == variables.size());
+       ImmutableSet.Builder<DependencyRequest> builder = ImmutableSet.builder();
+       for (int i = 0; i < variables.size(); i++) {
+-         builder.add(forRequiredResolvedVariable(variables.get(i), resolvedTypes.get(i)));
++        builder.add(forRequiredResolvedVariable(container, variables.get(i), resolvedTypes.get(i)));
+       }
+       return builder.build();
+     }
+@@ -107,22 +114,25 @@
+     DependencyRequest forImplicitMapBinding(DependencyRequest delegatingRequest, Key delegateKey) {
+       checkNotNull(delegatingRequest);
+       return new AutoValue_DependencyRequest(Kind.PROVIDER, delegateKey,
+-          delegatingRequest.requestElement());
++          delegatingRequest.requestElement(), 
++          MoreTypes.asDeclared(delegatingRequest.requestElement().getEnclosingElement().asType()));
+     }
+ 
+     DependencyRequest forRequiredVariable(VariableElement variableElement) {
+       checkNotNull(variableElement);
+       TypeMirror type = variableElement.asType();
+       Optional<AnnotationMirror> qualifier = InjectionAnnotations.getQualifier(variableElement);
+-      return newDependencyRequest(variableElement, type, qualifier);
++      return newDependencyRequest(variableElement, type, qualifier, MoreTypes.asDeclared(
++          variableElement.getEnclosingElement().getEnclosingElement().asType()));
+     }
+ 
+-    DependencyRequest forRequiredResolvedVariable(VariableElement variableElement,
++    DependencyRequest forRequiredResolvedVariable(DeclaredType container,
++        VariableElement variableElement,
+         TypeMirror resolvedType) {
+       checkNotNull(variableElement);
+       checkNotNull(resolvedType);
+       Optional<AnnotationMirror> qualifier = InjectionAnnotations.getQualifier(variableElement);
+-      return newDependencyRequest(variableElement, resolvedType, qualifier);
++      return newDependencyRequest(variableElement, resolvedType, qualifier, container);
+     }
+ 
+     DependencyRequest forComponentProvisionMethod(ExecutableElement provisionMethod) {
+@@ -131,7 +141,8 @@ DependencyRequest forComponentProvisionMethod(ExecutableElement provisionMethod)
+           "Component provision methods must be empty: " + provisionMethod);
+       TypeMirror type = provisionMethod.getReturnType();
+       Optional<AnnotationMirror> qualifier = InjectionAnnotations.getQualifier(provisionMethod);
+-      return newDependencyRequest(provisionMethod, type, qualifier);
++      return newDependencyRequest(provisionMethod, type, qualifier,
++          MoreTypes.asDeclared(provisionMethod.getEnclosingElement().asType()));
+     }
+ 
+     DependencyRequest forComponentMembersInjectionMethod(ExecutableElement membersInjectionMethod) {
+@@ -142,24 +153,27 @@ DependencyRequest forComponentMembersInjectionMethod(ExecutableElement membersIn
+       return new AutoValue_DependencyRequest(Kind.MEMBERS_INJECTOR,
+           keyFactory.forMembersInjectedType(
+               Iterables.getOnlyElement(membersInjectionMethod.getParameters()).asType()),
+-          membersInjectionMethod);
++          membersInjectionMethod,
++          MoreTypes.asDeclared(membersInjectionMethod.getEnclosingElement().asType()));
+     }
+ 
+     DependencyRequest forMembersInjectedType(DeclaredType type) {
+       return new AutoValue_DependencyRequest(Kind.MEMBERS_INJECTOR,
+           keyFactory.forMembersInjectedType(type),
+-          type.asElement());
++          type.asElement(),
++          type);
+     }
+ 
+-    private DependencyRequest newDependencyRequest(Element requestElement, TypeMirror type,
+-        Optional<AnnotationMirror> qualifier) {
++    private DependencyRequest newDependencyRequest(Element requestElement,
++        TypeMirror type, Optional<AnnotationMirror> qualifier, DeclaredType container) {
+       KindAndType kindAndType = extractKindAndType(type);
+       if (kindAndType.kind() == Kind.MEMBERS_INJECTOR) {
+         checkArgument(!qualifier.isPresent());
+       }
+       return new AutoValue_DependencyRequest(kindAndType.kind(),
+             keyFactory.forQualifiedType(qualifier, kindAndType.type()),
+-            requestElement);
++            requestElement,
++            container);
+     }
+     
+     @AutoValue
+diff --git a/compiler/src/main/java/dagger/internal/codegen/DependencyRequestFormatter.java b/compiler/src/main/java/dagger/internal/codegen/DependencyRequestFormatter.java
+index fa36084ee..dd97665df 100644
+--- a/compiler/src/main/java/dagger/internal/codegen/DependencyRequestFormatter.java
++++ b/compiler/src/main/java/dagger/internal/codegen/DependencyRequestFormatter.java
+@@ -16,17 +16,21 @@
+ package dagger.internal.codegen;
+ 
+ import com.google.auto.common.MoreElements;
++import com.google.auto.common.MoreTypes;
+ import com.google.common.base.Optional;
+-import com.google.common.collect.Queues;
+-import java.util.Deque;
++import java.util.List;
+ import javax.lang.model.element.AnnotationMirror;
+ import javax.lang.model.element.Element;
+ import javax.lang.model.element.ElementKind;
+ import javax.lang.model.element.ExecutableElement;
+ import javax.lang.model.element.TypeElement;
+ import javax.lang.model.element.VariableElement;
++import javax.lang.model.type.ExecutableType;
++import javax.lang.model.type.TypeMirror;
+ import javax.lang.model.util.SimpleElementVisitor6;
++import javax.lang.model.util.Types;
+ 
++import static com.google.common.base.Preconditions.checkState;
+ import static com.google.common.collect.Iterables.getOnlyElement;
+ import static dagger.internal.codegen.ErrorMessages.INDENT;
+ 
+@@ -38,10 +42,10 @@
+  * @since 2.0
+  */
+ final class DependencyRequestFormatter extends Formatter<DependencyRequest> {
+-  private static final DependencyRequestFormatter INSTANCE = new DependencyRequestFormatter();
++  private final Types types;
+ 
+-  static DependencyRequestFormatter instance() {
+-    return INSTANCE;
++  DependencyRequestFormatter(Types types) {
++    this.types = types;
+   }
+ 
+   // TODO(user): Sweep this class for TypeMirror.toString() usage and do some preventive format.
+@@ -58,7 +62,7 @@ static DependencyRequestFormatter instance() {
+         if (method.getParameters().isEmpty()) {
+           // some.package.name.MyComponent.myMethod()
+           //     [component method with return type: @other.package.Qualifier some.package.name.Foo]
+-          appendMember(method, builder).append("()\n")
++          appendEnclosingTypeAndMemberName(method, builder).append("()\n")
+               .append(INDENT).append(INDENT).append("[component method with return type: ");
+           if (qualifier.isPresent()) {
+             // TODO(user) use chenying's annotation mirror stringifier
+@@ -69,8 +73,8 @@ static DependencyRequestFormatter instance() {
+           // some.package.name.MyComponent.myMethod(some.package.name.Foo foo)
+           //     [component injection method for type: some.package.name.Foo]
+           VariableElement componentMethodParameter = getOnlyElement(method.getParameters());
+-          appendMember(method, builder).append("(");
+-          appendParameter(componentMethodParameter, builder);
++          appendEnclosingTypeAndMemberName(method, builder).append("(");
++          appendParameter(componentMethodParameter, componentMethodParameter.asType(), builder);
+           builder.append(")\n");
+           builder.append(INDENT).append(INDENT).append("[component injection method for type: ")
+               .append(componentMethodParameter.asType())
+@@ -83,38 +87,47 @@ static DependencyRequestFormatter instance() {
+       @Override public String visitVariable(
+           VariableElement variable, Optional<AnnotationMirror> qualifier) {
+         StringBuilder builder = new StringBuilder(INDENT);
++        TypeMirror resolvedVariableType =
++            MoreTypes.asMemberOf(types, request.enclosingType(), variable);
+         if (variable.getKind().equals(ElementKind.PARAMETER)) {
+           // some.package.name.MyClass.myMethod(some.package.name.Foo arg0, some.package.Bar arg1)
+           //     [parameter: @other.package.Qualifier some.package.name.Foo arg0]
+           ExecutableElement methodOrConstructor =
+               MoreElements.asExecutable(variable.getEnclosingElement());
+-          appendMember(methodOrConstructor, builder).append('(');
+-          Deque<VariableElement> parameters =
+-              Queues.newArrayDeque(methodOrConstructor.getParameters());
+-          if (!parameters.isEmpty()) {
+-            appendParameter(parameters.poll(), builder);
+-          }
+-          for(VariableElement current : parameters) {
+-            appendParameter(current, builder.append(", "));
++          ExecutableType resolvedMethodOrConstructor = MoreTypes.asExecutable(
++              types.asMemberOf(request.enclosingType(), methodOrConstructor));
++          appendEnclosingTypeAndMemberName(methodOrConstructor, builder).append('(');
++          List<? extends VariableElement> parameters = methodOrConstructor.getParameters();
++          List<? extends TypeMirror> parameterTypes =
++              resolvedMethodOrConstructor.getParameterTypes();
++          checkState(parameters.size() == parameterTypes.size());
++          for (int i = 0; i < parameters.size(); i++) {
++            appendParameter(parameters.get(i), parameterTypes.get(i), builder);
++            if (i != parameters.size() - 1) {
++              builder.append(", ");
++            }
+           }
+           builder.append(")\n").append(INDENT).append(INDENT).append("[parameter: ");
+         } else {
+           // some.package.name.MyClass.myField
+           //     [injected field of type: @other.package.Qualifier some.package.name.Foo myField]
+-          appendMember(variable, builder).append("()\n")
++          appendEnclosingTypeAndMemberName(variable, builder).append("\n")
+               .append(INDENT).append(INDENT).append("[injected field of type: ");
+         }
+         if (qualifier.isPresent()) {
+           // TODO(user) use chenying's annotation mirror stringifier
+           builder.append(qualifier.get()).append(' ');
+         }
+-        builder.append(variable.asType()).append(' ').append(variable.getSimpleName()).append(']');
++        builder.append(resolvedVariableType)
++            .append(' ')
++            .append(variable.getSimpleName())
++            .append(']');
+         return builder.toString();
+       }
+ 
+       @Override
+       public String visitType(TypeElement e, Optional<AnnotationMirror> p) {
+-        return INDENT + e.getQualifiedName();
++        return ""; // types by themselves provide no useful information.
+       }
+ 
+       @Override protected String defaultAction(Element element, Optional<AnnotationMirror> ignore) {
+@@ -124,11 +137,12 @@ public String visitType(TypeElement e, Optional<AnnotationMirror> p) {
+     }, qualifier);
+   }
+ 
+-  private StringBuilder appendParameter(VariableElement parameter, StringBuilder builder) {
+-    return builder.append(parameter.asType()).append(' ').append(parameter.getSimpleName());
++  private StringBuilder appendParameter(VariableElement parameter, TypeMirror type,
++      StringBuilder builder) {
++    return builder.append(type).append(' ').append(parameter.getSimpleName());
+   }
+ 
+-  private StringBuilder appendMember(Element member, StringBuilder builder) {
++  private StringBuilder appendEnclosingTypeAndMemberName(Element member, StringBuilder builder) {
+     TypeElement type = MoreElements.asType(member.getEnclosingElement());
+     return builder.append(type.getQualifiedName())
+         .append('.')
+diff --git a/compiler/src/main/java/dagger/internal/codegen/Formatter.java b/compiler/src/main/java/dagger/internal/codegen/Formatter.java
+index 76a2facba..880b78705 100644
+--- a/compiler/src/main/java/dagger/internal/codegen/Formatter.java
++++ b/compiler/src/main/java/dagger/internal/codegen/Formatter.java
+@@ -37,7 +37,8 @@
+    * conformity with the {@link Function}{@code <T, String>} contract, delegating
+    * to {@link #format(Object)}.
+    *
+-   * @deprecated Override {@link #format(T)} instead.
++   * @deprecated Call {@link #format(T)} instead.  This method exists to make
++   * formatters easy to use when functions are required, but shouldn't be called directly.
+    */
+   @SuppressWarnings("javadoc")
+   @Deprecated
+diff --git a/compiler/src/main/java/dagger/internal/codegen/MembersInjectionBinding.java b/compiler/src/main/java/dagger/internal/codegen/MembersInjectionBinding.java
+index bebbcf727..14b2fb2a9 100644
+--- a/compiler/src/main/java/dagger/internal/codegen/MembersInjectionBinding.java
++++ b/compiler/src/main/java/dagger/internal/codegen/MembersInjectionBinding.java
+@@ -119,6 +119,7 @@ private InjectionSite injectionSiteForInjectMethod(ExecutableElement methodEleme
+       return new AutoValue_MembersInjectionBinding_InjectionSite(InjectionSite.Kind.METHOD,
+           methodElement,
+           dependencyRequestFactory.forRequiredResolvedVariables(
++              containingType,
+               methodElement.getParameters(),
+               resolved.getParameterTypes()));
+     }
+@@ -130,9 +131,9 @@ private InjectionSite injectionSiteForInjectField(VariableElement fieldElement,
+       checkArgument(isAnnotationPresent(fieldElement, Inject.class));
+       TypeMirror resolved = types.asMemberOf(containingType, fieldElement);
+       return new AutoValue_MembersInjectionBinding_InjectionSite(InjectionSite.Kind.FIELD,
+-          fieldElement,
+-          ImmutableSet.of(
+-              dependencyRequestFactory.forRequiredResolvedVariable(fieldElement, resolved)));
++          fieldElement, 
++          ImmutableSet.of(dependencyRequestFactory.forRequiredResolvedVariable(
++              containingType, fieldElement, resolved)));
+     }
+     
+     
+diff --git a/compiler/src/main/java/dagger/internal/codegen/ProvisionBinding.java b/compiler/src/main/java/dagger/internal/codegen/ProvisionBinding.java
+index dff5c16a6..6298db33d 100644
+--- a/compiler/src/main/java/dagger/internal/codegen/ProvisionBinding.java
++++ b/compiler/src/main/java/dagger/internal/codegen/ProvisionBinding.java
+@@ -187,7 +187,8 @@ ProvisionBinding forInjectConstructor(ExecutableElement constructorElement,
+       Key key = keyFactory.forInjectConstructorWithResolvedType(enclosingCxtorType);
+       checkArgument(!key.qualifier().isPresent());
+       ImmutableSet<DependencyRequest> dependencies =
+-          dependencyRequestFactory.forRequiredResolvedVariables(constructorElement.getParameters(),
++          dependencyRequestFactory.forRequiredResolvedVariables(enclosingCxtorType,
++              constructorElement.getParameters(),
+               cxtorType.getParameterTypes());
+       Optional<DependencyRequest> membersInjectionRequest =
+           membersInjectionRequest(enclosingCxtorType);
+diff --git a/compiler/src/test/java/dagger/internal/codegen/GraphValidationTest.java b/compiler/src/test/java/dagger/internal/codegen/GraphValidationTest.java
+index 68b684588..d9e56d04a 100644
+--- a/compiler/src/test/java/dagger/internal/codegen/GraphValidationTest.java
++++ b/compiler/src/test/java/dagger/internal/codegen/GraphValidationTest.java
+@@ -15,13 +15,15 @@
+  */
+ package dagger.internal.codegen;
+ 
++import com.google.common.base.Joiner;
++
++import com.google.common.collect.ImmutableList;
+ import com.google.testing.compile.JavaFileObjects;
+ import java.util.Arrays;
+ import javax.tools.JavaFileObject;
+ import org.junit.Test;
+ import org.junit.runner.RunWith;
+ import org.junit.runners.JUnit4;
+-
+ import static com.google.common.truth.Truth.assertAbout;
+ import static com.google.testing.compile.JavaSourceSubjectFactory.javaSource;
+ import static com.google.testing.compile.JavaSourcesSubjectFactory.javaSources;
+@@ -545,7 +547,7 @@
+         + "      test.TestClass.B.<init>(test.TestClass.A a)\n"
+         + "          [parameter: test.TestClass.A a]";
+     String secondError = errorText
+-        + "      test.TestClass.C.b()\n"
++        + "      test.TestClass.C.b\n"
+         + "          [injected field of type: test.TestClass.B b]\n"
+         + "      test.TestClass.B.<init>(test.TestClass.A a)\n"
+         + "          [parameter: test.TestClass.A a]";
+@@ -555,4 +557,105 @@
+         .withErrorContaining(firstError).in(component).onLine(33)
+         .and().withErrorContaining(secondError).in(component).onLine(34);
+   }
++  
++  @Test public void resolvedParametersInDependencyTrace() {
++    JavaFileObject generic = JavaFileObjects.forSourceLines("test.Generic",
++        "package test;",
++        "",
++        "import javax.inject.Inject;",
++        "import javax.inject.Provider;",
++        "",
++        "final class Generic<T> {",
++        "  @Inject Generic(T t) {}",
++        "}");
++    JavaFileObject testClass = JavaFileObjects.forSourceLines("test.TestClass",
++        "package test;",
++        "",
++        "import javax.inject.Inject;",
++        "import java.util.List;",
++        "",
++        "final class TestClass {",
++        "  @Inject TestClass(List list) {}",
++        "}");
++    JavaFileObject usesTest = JavaFileObjects.forSourceLines("test.UsesTest",
++        "package test;",
++        "",
++        "import javax.inject.Inject;",
++        "",
++        "final class UsesTest {",
++        "  @Inject UsesTest(Generic<TestClass> genericTestClass) {}",
++        "}");
++    JavaFileObject component = JavaFileObjects.forSourceLines("test.TestComponent",
++        "package test;",
++        "",
++        "import dagger.Component;",
++        "",
++        "@Component",
++        "interface TestComponent {",
++        "  UsesTest usesTest();",
++        "}");
++    String expectedMsg = Joiner.on("\n").join(
++        "java.util.List cannot be provided without an @Provides-annotated method.",
++        "      test.UsesTest.<init>(test.Generic<test.TestClass> genericTestClass)", 
++        "          [parameter: test.Generic<test.TestClass> genericTestClass]", 
++        "      test.Generic.<init>(test.TestClass t)", 
++        "          [parameter: test.TestClass t]", 
++        "      test.TestClass.<init>(java.util.List list)", 
++        "          [parameter: java.util.List list]");
++    assertAbout(javaSources()).that(ImmutableList.of(generic, testClass, usesTest, component))
++        .processedWith(new ComponentProcessor())
++        .failsToCompile()
++        .withErrorContaining(expectedMsg);
++  }
++  
++  @Test public void resolvedVariablesInDependencyTrace() {
++    JavaFileObject generic = JavaFileObjects.forSourceLines("test.Generic",
++        "package test;",
++        "",
++        "import javax.inject.Inject;",
++        "import javax.inject.Provider;",
++        "",
++        "final class Generic<T> {",
++        "  @Inject T t;",
++        "  @Inject Generic() {}",
++        "}");
++    JavaFileObject testClass = JavaFileObjects.forSourceLines("test.TestClass",
++        "package test;",
++        "",
++        "import javax.inject.Inject;",
++        "import java.util.List;",
++        "",
++        "final class TestClass {",
++        "  @Inject TestClass(List list) {}",
++        "}");
++    JavaFileObject usesTest = JavaFileObjects.forSourceLines("test.UsesTest",
++        "package test;",
++        "",
++        "import javax.inject.Inject;",
++        "",
++        "final class UsesTest {",
++        "  @Inject UsesTest(Generic<TestClass> genericTestClass) {}",
++        "}");
++    JavaFileObject component = JavaFileObjects.forSourceLines("test.TestComponent",
++        "package test;",
++        "",
++        "import dagger.Component;",
++        "",
++        "@Component",
++        "interface TestComponent {",
++        "  UsesTest usesTest();",
++        "}");
++    String expectedMsg = Joiner.on("\n").join(
++        "java.util.List cannot be provided without an @Provides-annotated method.",
++        "      test.UsesTest.<init>(test.Generic<test.TestClass> genericTestClass)", 
++        "          [parameter: test.Generic<test.TestClass> genericTestClass]", 
++        "      test.Generic.t",
++        "          [injected field of type: test.TestClass t]", 
++        "      test.TestClass.<init>(java.util.List list)", 
++        "          [parameter: java.util.List list]");
++    assertAbout(javaSources()).that(ImmutableList.of(generic, testClass, usesTest, component))
++        .processedWith(new ComponentProcessor())
++        .failsToCompile()
++        .withErrorContaining(expectedMsg);
++  }
+ }

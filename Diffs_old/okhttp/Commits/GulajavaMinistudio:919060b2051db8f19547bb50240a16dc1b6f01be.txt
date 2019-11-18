@@ -1,0 +1,311 @@
+diff --git a/build.gradle b/build.gradle
+index 1b9da798ee..3da7b348c1 100644
+--- a/build.gradle
++++ b/build.gradle
+@@ -8,7 +8,7 @@ buildscript {
+       'bouncycastle': '1.62',
+       'brotli': '0.1.2',
+       'checkstyle': '8.15',
+-      'conscrypt': '2.1.0',
++      'conscrypt': '2.2.1',
+       'findbugs': '3.0.2',
+       'guava': '27.0.1-jre',
+       'java': '1.8',
+diff --git a/okhttp/src/main/java/okhttp3/OkHttpClient.kt b/okhttp/src/main/java/okhttp3/OkHttpClient.kt
+index c35dafb054..009f303cf9 100644
+--- a/okhttp/src/main/java/okhttp3/OkHttpClient.kt
++++ b/okhttp/src/main/java/okhttp3/OkHttpClient.kt
+@@ -160,7 +160,12 @@ open class OkHttpClient internal constructor(
+ 
+   @get:JvmName("proxy") val proxy: Proxy? = builder.proxy
+ 
+-  @get:JvmName("proxySelector") val proxySelector: ProxySelector = builder.proxySelector
++  @get:JvmName("proxySelector") val proxySelector: ProxySelector =
++      when {
++        // Avoid possible SecurityException from ProxySelector.getDefault
++        builder.proxy != null -> NullProxySelector()
++        else -> builder.proxySelector ?: ProxySelector.getDefault() ?: NullProxySelector()
++      }
+ 
+   @get:JvmName("proxyAuthenticator") val proxyAuthenticator: Authenticator =
+       builder.proxyAuthenticator
+@@ -172,6 +177,8 @@ open class OkHttpClient internal constructor(
+   @get:JvmName("sslSocketFactory") val sslSocketFactory: SSLSocketFactory
+     get() = sslSocketFactoryOrNull ?: throw IllegalStateException("CLEARTEXT-only client")
+ 
++  @get:JvmName("x509TrustManager") val x509TrustManager: X509TrustManager?
++
+   @get:JvmName("connectionSpecs") val connectionSpecs: List<ConnectionSpec> =
+       builder.connectionSpecs
+ 
+@@ -207,11 +214,12 @@ open class OkHttpClient internal constructor(
+     if (builder.sslSocketFactoryOrNull != null || connectionSpecs.none { it.isTls }) {
+       this.sslSocketFactoryOrNull = builder.sslSocketFactoryOrNull
+       this.certificateChainCleaner = builder.certificateChainCleaner
++      this.x509TrustManager = builder.x509TrustManagerOrNull
+     } else {
+-      val trustManager = Platform.get().platformTrustManager()
+-      Platform.get().configureTrustManager(trustManager)
+-      this.sslSocketFactoryOrNull = newSslSocketFactory(trustManager)
+-      this.certificateChainCleaner = CertificateChainCleaner.get(trustManager)
++      this.x509TrustManager = Platform.get().platformTrustManager()
++      Platform.get().configureTrustManager(x509TrustManager)
++      this.sslSocketFactoryOrNull = newSslSocketFactory(x509TrustManager!!)
++      this.certificateChainCleaner = CertificateChainCleaner.get(x509TrustManager!!)
+     }
+ 
+     if (sslSocketFactoryOrNull != null) {
+@@ -439,10 +447,11 @@ open class OkHttpClient internal constructor(
+     internal var cache: Cache? = null
+     internal var dns: Dns = Dns.SYSTEM
+     internal var proxy: Proxy? = null
+-    internal var proxySelector: ProxySelector = ProxySelector.getDefault() ?: NullProxySelector()
++    internal var proxySelector: ProxySelector? = null
+     internal var proxyAuthenticator: Authenticator = Authenticator.NONE
+     internal var socketFactory: SocketFactory = SocketFactory.getDefault()
+     internal var sslSocketFactoryOrNull: SSLSocketFactory? = null
++    internal var x509TrustManagerOrNull: X509TrustManager? = null
+     internal var connectionSpecs: List<ConnectionSpec> = DEFAULT_CONNECTION_SPECS
+     internal var protocols: List<Protocol> = DEFAULT_PROTOCOLS
+     internal var hostnameVerifier: HostnameVerifier = OkHostnameVerifier
+@@ -472,6 +481,7 @@ open class OkHttpClient internal constructor(
+       this.proxyAuthenticator = okHttpClient.proxyAuthenticator
+       this.socketFactory = okHttpClient.socketFactory
+       this.sslSocketFactoryOrNull = okHttpClient.sslSocketFactoryOrNull
++      this.x509TrustManagerOrNull = okHttpClient.x509TrustManager
+       this.connectionSpecs = okHttpClient.connectionSpecs
+       this.protocols = okHttpClient.protocols
+       this.hostnameVerifier = okHttpClient.hostnameVerifier
+@@ -716,6 +726,7 @@ open class OkHttpClient internal constructor(
+     ) = apply {
+       this.sslSocketFactoryOrNull = sslSocketFactory
+       this.certificateChainCleaner = CertificateChainCleaner.get(trustManager)
++      this.x509TrustManagerOrNull = trustManager
+     }
+ 
+     fun connectionSpecs(connectionSpecs: List<ConnectionSpec>) = apply {
+diff --git a/okhttp/src/main/java/okhttp3/internal/connection/ExchangeFinder.kt b/okhttp/src/main/java/okhttp3/internal/connection/ExchangeFinder.kt
+index 448a67dffd..122e8f5c8d 100644
+--- a/okhttp/src/main/java/okhttp3/internal/connection/ExchangeFinder.kt
++++ b/okhttp/src/main/java/okhttp3/internal/connection/ExchangeFinder.kt
+@@ -254,6 +254,10 @@ class ExchangeFinder(
+         result!!.noNewExchanges = true
+         socket = result!!.socket()
+         result = transmitter.connection
++
++        // It's possible for us to obtain a coalesced connection that is immediately unhealthy. In
++        // that case we will retry the route we just successfully connected with.
++        nextRouteToTry = selectedRoute
+       } else {
+         connectionPool.put(result!!)
+         transmitter.acquireConnectionNoEvents(result!!)
+diff --git a/okhttp/src/test/java/okhttp3/ConnectionCoalescingTest.java b/okhttp/src/test/java/okhttp3/ConnectionCoalescingTest.java
+index daaec3191c..0895bbe11c 100644
+--- a/okhttp/src/test/java/okhttp3/ConnectionCoalescingTest.java
++++ b/okhttp/src/test/java/okhttp3/ConnectionCoalescingTest.java
+@@ -21,6 +21,7 @@
+ import java.net.Proxy;
+ import java.util.Collections;
+ import java.util.List;
++import java.util.concurrent.CountDownLatch;
+ import java.util.concurrent.atomic.AtomicInteger;
+ import java.util.concurrent.atomic.AtomicReference;
+ import javax.net.ssl.HostnameVerifier;
+@@ -151,6 +152,107 @@
+     assertThat(client.connectionPool().connectionCount()).isEqualTo(1);
+   }
+ 
++  /**
++   * This is an extraordinary test case. Here's what it's trying to simulate.
++   * - 2 requests happen concurrently to a host that can be coalesced onto a single connection.
++   * - Both request discover no existing connection. They both make a connection.
++   * - The first request "wins the race".
++   * - The second request discovers it "lost the race" and closes the connection it just opened.
++   * - The second request uses the coalesced connection from request1.
++   * - The coalesced connection is violently closed after servicing the first request.
++   * - The second request discovers the coalesced connection is unhealthy just after acquiring it.
++   */
++  @Test public void coalescedConnectionDestroyedAfterAcquire() throws Exception {
++    server.enqueue(new MockResponse().setResponseCode(200));
++    server.enqueue(new MockResponse().setResponseCode(200));
++
++    dns.set("san.com", Dns.SYSTEM.lookup(server.getHostName()).subList(0, 1));
++    HttpUrl sanUrl = url.newBuilder().host("san.com").build();
++
++    CountDownLatch latch1 = new CountDownLatch(1);
++    CountDownLatch latch2 = new CountDownLatch(1);
++    CountDownLatch latch3 = new CountDownLatch(1);
++    CountDownLatch latch4 = new CountDownLatch(1);
++    EventListener listener1 = new EventListener() {
++      @Override public void connectStart(Call call, InetSocketAddress inetSocketAddress,
++          Proxy proxy) {
++        try {
++          // Wait for request2 to guarantee we make 2 separate connections to the server.
++          latch1.await();
++        } catch (InterruptedException e) {
++          throw new AssertionError(e);
++        }
++      }
++
++      @Override public void connectionAcquired(Call call, Connection connection) {
++        // We have the connection and it's in the pool. Let request2 proceed to make a connection.
++        latch2.countDown();
++      }
++    };
++
++    EventListener request2Listener = new EventListener() {
++      @Override public void connectStart(Call call, InetSocketAddress inetSocketAddress,
++          Proxy proxy) {
++        // Let request1 proceed to make a connection.
++        latch1.countDown();
++        try {
++          // Wait until request1 makes the connection and puts it in the connection pool.
++          latch2.await();
++        } catch (InterruptedException e) {
++          throw new AssertionError(e);
++        }
++      }
++
++      @Override public void connectionAcquired(Call call, Connection connection) {
++        // We obtained the coalesced connection. Let request1 violently destroy it.
++        latch3.countDown();
++        try {
++          latch4.await();
++        } catch (InterruptedException e) {
++          throw new AssertionError(e);
++        }
++      }
++    };
++
++    // Get a reference to the connection so we can violently destroy it.
++    AtomicReference<Connection> connection = new AtomicReference<>();
++    OkHttpClient client1 = client.newBuilder()
++        .addNetworkInterceptor(chain -> {
++          connection.set(chain.connection());
++          return chain.proceed(chain.request());
++        })
++        .eventListener(listener1)
++        .build();
++
++    Request request = new Request.Builder().url(sanUrl).build();
++    Call call1 = client1.newCall(request);
++    call1.enqueue(new Callback() {
++      @Override public void onResponse(Call call, Response response) throws IOException {
++        try {
++          // Wait until request2 acquires the connection before we destroy it violently.
++          latch3.await();
++        } catch (InterruptedException e) {
++          throw new AssertionError(e);
++        }
++        assert200Http2Response(response, "san.com");
++        connection.get().socket().close();
++        latch4.countDown();
++      }
++
++      @Override public void onFailure(Call call, IOException e) {
++        fail();
++      }
++    });
++
++    OkHttpClient client2 = client.newBuilder()
++        .eventListener(request2Listener)
++        .build();
++    Call call2 = client2.newCall(request);
++    Response response = call2.execute();
++
++    assert200Http2Response(response, "san.com");
++  }
++
+   /** If the existing connection matches a SAN but not a match for DNS then skip. */
+   @Test public void skipsWhenDnsDontMatch() throws Exception {
+     server.enqueue(new MockResponse().setResponseCode(200));
+@@ -301,10 +403,6 @@
+     assertThat(client.connectionPool().connectionCount()).isEqualTo(1);
+   }
+ 
+-  private Response execute(String url) throws IOException {
+-    return execute(HttpUrl.get(url));
+-  }
+-
+   private Response execute(HttpUrl url) throws IOException {
+     return client.newCall(new Request.Builder().url(url).build()).execute();
+   }
+diff --git a/okhttp/src/test/java/okhttp3/ConscryptTest.kt b/okhttp/src/test/java/okhttp3/ConscryptTest.kt
+index c36e0186c3..547e822cd1 100644
+--- a/okhttp/src/test/java/okhttp3/ConscryptTest.kt
++++ b/okhttp/src/test/java/okhttp3/ConscryptTest.kt
+@@ -94,12 +94,14 @@ class ConscryptTest {
+ 
+   @Test
+   fun testVersion() {
++    val version = Conscrypt.version()
++
+     assertTrue(ConscryptPlatform.atLeastVersion(1, 4, 9))
+-    assertTrue(ConscryptPlatform.atLeastVersion(2))
+-    assertTrue(ConscryptPlatform.atLeastVersion(2, 1))
+-    assertTrue(ConscryptPlatform.atLeastVersion(2, 1, 0))
+-    assertFalse(ConscryptPlatform.atLeastVersion(2, 1, 1))
+-    assertFalse(ConscryptPlatform.atLeastVersion(2, 2))
+-    assertFalse(ConscryptPlatform.atLeastVersion(9))
++    assertTrue(ConscryptPlatform.atLeastVersion(version.major()))
++    assertTrue(ConscryptPlatform.atLeastVersion(version.major(), version.minor()))
++    assertTrue(ConscryptPlatform.atLeastVersion(version.major(), version.minor(), version.patch()))
++    assertFalse(ConscryptPlatform.atLeastVersion(version.major(), version.minor(), version.patch() + 1))
++    assertFalse(ConscryptPlatform.atLeastVersion(version.major(), version.minor() + 1))
++    assertFalse(ConscryptPlatform.atLeastVersion(version.major() + 1))
+   }
+ }
+diff --git a/okhttp/src/test/java/okhttp3/OkHttpClientTest.java b/okhttp/src/test/java/okhttp3/OkHttpClientTest.java
+index c104635f0e..1e4c4b84c4 100644
+--- a/okhttp/src/test/java/okhttp3/OkHttpClientTest.java
++++ b/okhttp/src/test/java/okhttp3/OkHttpClientTest.java
+@@ -17,6 +17,7 @@
+ 
+ import java.net.CookieHandler;
+ import java.net.CookieManager;
++import java.net.Proxy;
+ import java.net.ProxySelector;
+ import java.net.ResponseCache;
+ import java.util.AbstractList;
+@@ -24,6 +25,7 @@
+ import java.util.List;
+ import java.util.concurrent.TimeUnit;
+ import javax.net.ssl.SSLSocketFactory;
++import okhttp3.internal.proxy.NullProxySelector;
+ import okhttp3.mockwebserver.MockResponse;
+ import okhttp3.mockwebserver.MockWebServer;
+ import org.junit.After;
+@@ -117,12 +119,14 @@
+     assertThat(a.dispatcher()).isNotNull();
+     assertThat(a.connectionPool()).isNotNull();
+     assertThat(a.sslSocketFactory()).isNotNull();
++    assertThat(a.x509TrustManager()).isNotNull();
+ 
+     // Multiple clients share the instances.
+     OkHttpClient b = client.newBuilder().build();
+     assertThat(b.dispatcher()).isSameAs(a.dispatcher());
+     assertThat(b.connectionPool()).isSameAs(a.connectionPool());
+     assertThat(b.sslSocketFactory()).isSameAs(a.sslSocketFactory());
++    assertThat(b.x509TrustManager()).isSameAs(a.x509TrustManager());
+   }
+ 
+   @Test public void setProtocolsRejectsHttp10() throws Exception {
+@@ -283,4 +287,18 @@
+       assertThat(expected.getMessage()).isEqualTo(("protocols must not contain null"));
+     }
+   }
++
++  @Test public void testProxyDefaults() {
++    OkHttpClient client = new OkHttpClient.Builder().build();
++    assertThat(client.proxy()).isNull();
++    assertThat(client.proxySelector()).isNotInstanceOf(NullProxySelector.class);
++
++    client = new OkHttpClient.Builder().proxy(Proxy.NO_PROXY).build();
++    assertThat(client.proxy()).isSameAs(Proxy.NO_PROXY);
++    assertThat(client.proxySelector()).isInstanceOf(NullProxySelector.class);
++
++    client = new OkHttpClient.Builder().proxySelector(new FakeProxySelector()).build();
++    assertThat(client.proxy()).isNull();
++    assertThat(client.proxySelector()).isInstanceOf(FakeProxySelector.class);
++  }
+ }

@@ -1,0 +1,216 @@
+diff --git a/mockwebserver/src/main/java/com/squareup/okhttp/mockwebserver/MockWebServer.java b/mockwebserver/src/main/java/com/squareup/okhttp/mockwebserver/MockWebServer.java
+index d036d53c50..6ab78ad5ca 100644
+--- a/mockwebserver/src/main/java/com/squareup/okhttp/mockwebserver/MockWebServer.java
++++ b/mockwebserver/src/main/java/com/squareup/okhttp/mockwebserver/MockWebServer.java
+@@ -25,6 +25,7 @@
+ import java.io.BufferedInputStream;
+ import java.io.BufferedOutputStream;
+ import java.io.ByteArrayOutputStream;
++import java.io.Closeable;
+ import java.io.IOException;
+ import java.io.InputStream;
+ import java.io.OutputStream;
+@@ -246,7 +247,7 @@ public void run() {
+ 
+         // This gnarly block of code will release all sockets and all thread,
+         // even if any close fails.
+-        Util.closeQuietly(serverSocket);
++        Util.closeQuietly((Closeable) serverSocket);
+         for (Iterator<Socket> s = openClientSockets.keySet().iterator(); s.hasNext(); ) {
+           Util.closeQuietly(s.next());
+           s.remove();
+diff --git a/okhttp/src/main/java/com/squareup/okhttp/Connection.java b/okhttp/src/main/java/com/squareup/okhttp/Connection.java
+index a6b798da9d..dd0a639e0a 100644
+--- a/okhttp/src/main/java/com/squareup/okhttp/Connection.java
++++ b/okhttp/src/main/java/com/squareup/okhttp/Connection.java
+@@ -86,9 +86,16 @@
+   private SpdyConnection spdyConnection;
+   private int httpMinorVersion = 1; // Assume HTTP/1.1
+   private long idleStartTimeNs;
++  private long keepAliveDurationNs;
+ 
+   public Connection(Route route) {
+     this.route = route;
++    this.keepAliveDurationNs = ConnectionPool.DEFAULT_KEEP_ALIVE_DURATION_MS  * 1000 * 1000;
++  }
++
++  public Connection(Route route, long keepAliveDuration) {
++    this.route = route;
++    this.keepAliveDurationNs = keepAliveDuration;
+   }
+ 
+   public void connect(int connectTimeout, int readTimeout, TunnelRequest tunnelRequest)
+@@ -234,6 +241,10 @@ public void resetIdleStartTime() {
+     this.idleStartTimeNs = System.nanoTime();
+   }
+ 
++  public void setKeepAliveDurationNs(long keepAliveDuration) {
++    this.keepAliveDurationNs = keepAliveDuration;
++  }
++
+   /** Returns true if this connection is idle. */
+   public boolean isIdle() {
+     return spdyConnection == null || spdyConnection.isIdle();
+@@ -243,7 +254,7 @@ public boolean isIdle() {
+    * Returns true if this connection has been idle for longer than
+    * {@code keepAliveDurationNs}.
+    */
+-  public boolean isExpired(long keepAliveDurationNs) {
++  public boolean isExpired() {
+     return getIdleStartTimeNs() < System.nanoTime() - keepAliveDurationNs;
+   }
+ 
+diff --git a/okhttp/src/main/java/com/squareup/okhttp/ConnectionPool.java b/okhttp/src/main/java/com/squareup/okhttp/ConnectionPool.java
+index 42b70b9806..05a1eea3ac 100644
+--- a/okhttp/src/main/java/com/squareup/okhttp/ConnectionPool.java
++++ b/okhttp/src/main/java/com/squareup/okhttp/ConnectionPool.java
+@@ -54,7 +54,7 @@
+  */
+ public class ConnectionPool {
+   private static final int MAX_CONNECTIONS_TO_CLEANUP = 2;
+-  private static final long DEFAULT_KEEP_ALIVE_DURATION_MS = 5 * 60 * 1000; // 5 min
++  static final long DEFAULT_KEEP_ALIVE_DURATION_MS = 5 * 60 * 1000; // 5 min
+ 
+   private static final ConnectionPool systemDefault;
+ 
+@@ -91,7 +91,7 @@
+         for (ListIterator<Connection> i = connections.listIterator(connections.size());
+             i.hasPrevious(); ) {
+           Connection connection = i.previous();
+-          if (!connection.isAlive() || connection.isExpired(keepAliveDurationNs)) {
++          if (!connection.isAlive() || connection.isExpired()) {
+             i.remove();
+             expiredConnections.add(connection);
+             if (expiredConnections.size() == MAX_CONNECTIONS_TO_CLEANUP) break;
+@@ -133,6 +133,10 @@ public ConnectionPool(int maxIdleConnections, long keepAliveDurationMs) {
+     }
+   }
+ 
++  public long getKeepAliveDurationNs() {
++    return keepAliveDurationNs;
++  }
++
+   /**
+    * Blocks until the executor service has processed all currently enqueued
+    * jobs.
+@@ -183,7 +187,7 @@ public synchronized Connection get(Address address) {
+       Connection connection = i.previous();
+       if (!connection.getRoute().getAddress().equals(address)
+           || !connection.isAlive()
+-          || System.nanoTime() - connection.getIdleStartTimeNs() >= keepAliveDurationNs) {
++          || connection.isExpired()) {
+         continue;
+       }
+       i.remove();
+diff --git a/okhttp/src/main/java/com/squareup/okhttp/internal/http/HttpEngine.java b/okhttp/src/main/java/com/squareup/okhttp/internal/http/HttpEngine.java
+index df5af0c47a..8efe56f405 100644
+--- a/okhttp/src/main/java/com/squareup/okhttp/internal/http/HttpEngine.java
++++ b/okhttp/src/main/java/com/squareup/okhttp/internal/http/HttpEngine.java
+@@ -87,6 +87,7 @@
+     }
+   };
+   public static final int HTTP_CONTINUE = 100;
++  public static final long SEC2NS = 1000 * 1000 * 1000;
+ 
+   protected final Policy policy;
+   protected final OkHttpClient client;
+@@ -333,6 +334,30 @@ private void setResponse(ResponseHeaders headers, InputStream body) throws IOExc
+       throw new IllegalStateException();
+     }
+     this.responseHeaders = headers;
++    // if connection is not SPDY, search headers for Keep-Alive, parse and set timeout
++    if (connection != null && !connection.isSpdy()) {
++      String keepAliveHeader = headers.getHeaders().get("Keep-Alive");
++      if (keepAliveHeader != null) {    // parse header
++        // we only care about the timeout, the server will issue
++        // "Connection: Close" on the last allowable request, so we do
++        // not need to handle max
++        int i = keepAliveHeader.indexOf("timeout");
++        if (i > -1) {
++          int j = keepAliveHeader.indexOf(' ', i + 8);
++          String timeoutStr;
++          if (j > -1) {
++            timeoutStr = keepAliveHeader.substring(i + 8, j);
++          } else {
++            timeoutStr = keepAliveHeader.substring(i + 8);
++          }
++          try {
++            connection.setKeepAliveDurationNs(Integer.decode(timeoutStr) * SEC2NS);
++          } catch (NumberFormatException e) {
++            //Log.w("OkHTTP","failed to parse string ("+timeoutStr+") as integer", e);
++          }
++        }
++      }
++    }
+     if (body != null) {
+       initContentStream(body);
+     }
+diff --git a/okhttp/src/main/java/com/squareup/okhttp/internal/http/RouteSelector.java b/okhttp/src/main/java/com/squareup/okhttp/internal/http/RouteSelector.java
+index 1055e4f09f..3d7a71ec6a 100644
+--- a/okhttp/src/main/java/com/squareup/okhttp/internal/http/RouteSelector.java
++++ b/okhttp/src/main/java/com/squareup/okhttp/internal/http/RouteSelector.java
+@@ -116,7 +116,7 @@ public Connection next(String method) throws IOException {
+           if (!hasNextPostponed()) {
+             throw new NoSuchElementException();
+           }
+-          return new Connection(nextPostponed());
++          return new Connection(nextPostponed(), pool.getKeepAliveDurationNs());
+         }
+         lastProxy = nextProxy();
+         resetNextInetSocketAddress(lastProxy);
+@@ -134,7 +134,7 @@ public Connection next(String method) throws IOException {
+       return next(method);
+     }
+ 
+-    return new Connection(route);
++    return new Connection(route, pool.getKeepAliveDurationNs());
+   }
+ 
+   /**
+diff --git a/okhttp/src/test/java/com/squareup/okhttp/ConnectionPoolTest.java b/okhttp/src/test/java/com/squareup/okhttp/ConnectionPoolTest.java
+index e243857333..12f7a3c0f3 100644
+--- a/okhttp/src/test/java/com/squareup/okhttp/ConnectionPoolTest.java
++++ b/okhttp/src/test/java/com/squareup/okhttp/ConnectionPoolTest.java
+@@ -160,6 +160,7 @@
+ 
+   @Test public void idleConnectionNotReturned() throws Exception {
+     ConnectionPool pool = new ConnectionPool(2, KEEP_ALIVE_DURATION_MS);
++    httpA.setKeepAliveDurationNs(((long) KEEP_ALIVE_DURATION_MS) * 1000 * 1000);
+     pool.recycle(httpA);
+     Thread.sleep(KEEP_ALIVE_DURATION_MS * 2);
+     assertNull(pool.get(httpAddress));
+@@ -177,6 +178,8 @@
+ 
+   @Test public void expiredConnectionsAreEvicted() throws Exception {
+     ConnectionPool pool = new ConnectionPool(2, KEEP_ALIVE_DURATION_MS);
++    httpA.setKeepAliveDurationNs(((long) KEEP_ALIVE_DURATION_MS) * 1000 * 1000);
++    httpB.setKeepAliveDurationNs(((long) KEEP_ALIVE_DURATION_MS) * 1000 * 1000);
+     pool.recycle(httpA);
+     pool.recycle(httpB);
+     Thread.sleep(2 * KEEP_ALIVE_DURATION_MS);
+@@ -236,6 +239,7 @@
+ 
+   @Test public void validateIdleSpdyConnectionTimeout() throws Exception {
+     ConnectionPool pool = new ConnectionPool(2, KEEP_ALIVE_DURATION_MS);
++    spdyA.setKeepAliveDurationNs(((long) KEEP_ALIVE_DURATION_MS) * 1000 * 1000);
+     pool.maybeShare(spdyA);
+     Thread.sleep((int) (KEEP_ALIVE_DURATION_MS * 0.7));
+     assertNull(pool.get(httpAddress));
+@@ -247,6 +251,7 @@
+ 
+   @Test public void validateIdleHttpConnectionTimeout() throws Exception {
+     ConnectionPool pool = new ConnectionPool(2, KEEP_ALIVE_DURATION_MS);
++    httpA.setKeepAliveDurationNs(((long) KEEP_ALIVE_DURATION_MS) * 1000 * 1000);
+     pool.recycle(httpA);
+     Thread.sleep((int) (KEEP_ALIVE_DURATION_MS * 0.7));
+     assertNull(pool.get(spdyAddress));
+@@ -360,6 +365,9 @@
+     ConnectionPool pool = new ConnectionPool(10, KEEP_ALIVE_DURATION_MS);
+ 
+     // Add 3 connections to the pool.
++    httpA.setKeepAliveDurationNs(((long) KEEP_ALIVE_DURATION_MS) * 1000 * 1000);
++    httpB.setKeepAliveDurationNs(((long) KEEP_ALIVE_DURATION_MS) * 1000 * 1000);
++    spdyA.setKeepAliveDurationNs(((long) KEEP_ALIVE_DURATION_MS) * 1000 * 1000);
+     pool.recycle(httpA);
+     pool.recycle(httpB);
+     pool.maybeShare(spdyA);

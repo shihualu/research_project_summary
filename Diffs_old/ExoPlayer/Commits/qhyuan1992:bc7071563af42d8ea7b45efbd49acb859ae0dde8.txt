@@ -1,0 +1,120 @@
+diff --git a/library/src/main/java/com/google/android/exoplayer/MediaCodecTrackRenderer.java b/library/src/main/java/com/google/android/exoplayer/MediaCodecTrackRenderer.java
+index 9143219368..4ddf9d70c5 100644
+--- a/library/src/main/java/com/google/android/exoplayer/MediaCodecTrackRenderer.java
++++ b/library/src/main/java/com/google/android/exoplayer/MediaCodecTrackRenderer.java
+@@ -224,6 +224,7 @@ private static String buildCustomDiagnosticInfo(int errorCode) {
+   private boolean codecNeedsAdaptationWorkaround;
+   private boolean codecNeedsEosPropagationWorkaround;
+   private boolean codecNeedsEosFlushWorkaround;
++  private boolean codecNeedsEosOutputExceptionWorkaround;
+   private boolean codecNeedsMonoChannelCountWorkaround;
+   private boolean codecNeedsAdaptationWorkaroundBuffer;
+   private boolean shouldSkipAdaptationWorkaroundOutputBuffer;
+@@ -392,6 +393,7 @@ protected final void maybeInitCodec() throws ExoPlaybackException {
+     codecNeedsAdaptationWorkaround = codecNeedsAdaptationWorkaround(codecName);
+     codecNeedsEosPropagationWorkaround = codecNeedsEosPropagationWorkaround(codecName);
+     codecNeedsEosFlushWorkaround = codecNeedsEosFlushWorkaround(codecName);
++    codecNeedsEosOutputExceptionWorkaround = codecNeedsEosOutputExceptionWorkaround(codecName);
+     codecNeedsMonoChannelCountWorkaround = codecNeedsMonoChannelCountWorkaround(codecName, format);
+     try {
+       long codecInitializingTimestamp = SystemClock.elapsedRealtime();
+@@ -551,7 +553,6 @@ protected void flushCodec() throws ExoPlaybackException {
+     codecNeedsAdaptationWorkaroundBuffer = false;
+     shouldSkipAdaptationWorkaroundOutputBuffer = false;
+     if (codecNeedsFlushWorkaround || (codecNeedsEosFlushWorkaround && codecReceivedEos)) {
+-      // Workaround framework bugs. See [Internal: b/8347958, b/8578467, b/8543366, b/23361053].
+       releaseCodec();
+       maybeInitCodec();
+     } else if (codecReinitializationState != REINITIALIZATION_STATE_NONE) {
+@@ -919,7 +920,22 @@ private boolean drainOutputBuffer(long positionUs, long elapsedRealtimeUs)
+     }
+ 
+     if (outputIndex < 0) {
+-      outputIndex = codec.dequeueOutputBuffer(outputBufferInfo, getDequeueOutputBufferTimeoutUs());
++      if (codecNeedsEosOutputExceptionWorkaround && codecReceivedEos) {
++        try {
++          outputIndex = codec.dequeueOutputBuffer(outputBufferInfo,
++              getDequeueOutputBufferTimeoutUs());
++        } catch (IllegalStateException e) {
++          processEndOfStream();
++          if (outputStreamEnded) {
++            // Release the codec, as it's in an error state.
++            releaseCodec();
++          }
++          return false;
++        }
++      } else {
++        outputIndex = codec.dequeueOutputBuffer(outputBufferInfo,
++            getDequeueOutputBufferTimeoutUs());
++      }
+     }
+ 
+     if (outputIndex == MediaCodec.INFO_OUTPUT_FORMAT_CHANGED) {
+@@ -951,8 +967,25 @@ private boolean drainOutputBuffer(long positionUs, long elapsedRealtimeUs)
+     }
+ 
+     int decodeOnlyIndex = getDecodeOnlyIndex(outputBufferInfo.presentationTimeUs);
+-    if (processOutputBuffer(positionUs, elapsedRealtimeUs, codec, outputBuffers[outputIndex],
+-        outputBufferInfo, outputIndex, decodeOnlyIndex != -1)) {
++    boolean processedOutputBuffer;
++    if (codecNeedsEosOutputExceptionWorkaround && codecReceivedEos) {
++      try {
++        processedOutputBuffer = processOutputBuffer(positionUs, elapsedRealtimeUs, codec,
++            outputBuffers[outputIndex], outputBufferInfo, outputIndex, decodeOnlyIndex != -1);
++      } catch (IllegalStateException e) {
++        processEndOfStream();
++        if (outputStreamEnded) {
++          // Release the codec, as it's in an error state.
++          releaseCodec();
++        }
++        return false;
++      }
++    } else {
++      processedOutputBuffer = processOutputBuffer(positionUs, elapsedRealtimeUs, codec,
++          outputBuffers[outputIndex], outputBufferInfo, outputIndex, decodeOnlyIndex != -1);
++    }
++
++    if (processedOutputBuffer) {
+       onProcessedOutputBuffer(outputBufferInfo.presentationTimeUs);
+       if (decodeOnlyIndex != -1) {
+         decodeOnlyPresentationTimestamps.remove(decodeOnlyIndex);
+@@ -1064,6 +1097,8 @@ private int getDecodeOnlyIndex(long presentationTimeUs) {
+    * <p>
+    * If true is returned, the renderer will work around the issue by releasing the decoder and
+    * instantiating a new one rather than flushing the current instance.
++   * <p>
++   * See [Internal: b/8347958, b/8543366].
+    *
+    * @param name The name of the decoder.
+    * @return True if the decoder is known to fail when flushed.
+@@ -1133,6 +1168,8 @@ private static boolean codecNeedsEosPropagationWorkaround(String name) {
+    * <p>
+    * If true is returned, the renderer will work around the issue by instantiating a new decoder
+    * when this case occurs.
++   * <p>
++   * See [Internal: b/8578467, b/23361053].
+    *
+    * @param name The name of the decoder.
+    * @return True if the decoder is known to behave incorrectly if flushed after receiving an input
+@@ -1145,6 +1182,21 @@ private static boolean codecNeedsEosFlushWorkaround(String name) {
+                 || "OMX.amlogic.avc.decoder.awesome.secure".equals(name)));
+   }
+ 
++  /**
++   * Returns whether the decoder may throw an {@link IllegalStateException} from
++   * {@link MediaCodec#dequeueOutputBuffer(MediaCodec.BufferInfo, long)} or
++   * {@link MediaCodec#releaseOutputBuffer(int, boolean)} after receiving an input
++   * buffer with {@link MediaCodec#BUFFER_FLAG_END_OF_STREAM} set.
++   * <p>
++   * See [Internal: b/17933838].
++   *
++   * @param name The name of the decoder.
++   * @return True if the decoder may throw an exception after receiving an end-of-stream buffer.
++   */
++  private static boolean codecNeedsEosOutputExceptionWorkaround(String name) {
++    return Util.SDK_INT == 21 && "OMX.google.aac.decoder".equals(name);
++  }
++
+   /**
+    * Returns whether the decoder is known to set the number of audio channels in the output format
+    * to 2 for the given input format, whilst only actually outputting a single channel.

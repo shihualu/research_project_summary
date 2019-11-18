@@ -1,0 +1,268 @@
+diff --git a/library/src/main/java/com/evernote/android/job/JobCreatorHolder.java b/library/src/main/java/com/evernote/android/job/JobCreatorHolder.java
+index 5781f1e..1e1ad2a 100644
+--- a/library/src/main/java/com/evernote/android/job/JobCreatorHolder.java
++++ b/library/src/main/java/com/evernote/android/job/JobCreatorHolder.java
+@@ -4,8 +4,8 @@
+ 
+ import net.vrallev.android.cat.CatLog;
+ 
+-import java.util.ArrayList;
+ import java.util.List;
++import java.util.concurrent.CopyOnWriteArrayList;
+ 
+ /**
+  * @author rwondratschek
+@@ -15,62 +15,40 @@
+     private static final CatLog CAT = new JobCat("JobCreatorHolder");
+ 
+     private final List<JobCreator> mJobCreators;
+-    private final Object mMonitor;
+ 
+     public JobCreatorHolder() {
+-        mJobCreators = new ArrayList<>();
+-        mMonitor = new Object();
++        mJobCreators = new CopyOnWriteArrayList<>();
+     }
+ 
+     public void addJobCreator(JobCreator creator) {
+-        synchronized (mMonitor) {
+-            mJobCreators.add(creator);
+-        }
++        mJobCreators.add(creator);
+     }
+ 
+     public void removeJobCreator(JobCreator creator) {
+-        synchronized (mMonitor) {
+-            mJobCreators.remove(creator);
+-        }
++        mJobCreators.remove(creator);
+     }
+ 
+     public Job createJob(String tag) {
+-        ArrayList<JobCreator> jobCreators = null;
+-        JobCreator singleJobCreator = null;
++        Job job = null;
++        boolean atLeastOneCreatorSeen = false;
+ 
+-        synchronized (mMonitor) {
+-            int count = mJobCreators.size();
+-            if (count == 0) {
+-                CAT.w("no JobCreator added");
+-                return null;
++        for (JobCreator jobCreator : mJobCreators) {
++            atLeastOneCreatorSeen = true;
+ 
+-            } else if (count == 1) {
+-                // avoid creating an extra list when it's not necessary
+-                singleJobCreator = mJobCreators.get(0);
+-            } else {
+-                jobCreators = new ArrayList<>(mJobCreators);
++            job = jobCreator.create(tag);
++            if (job != null) {
++                break;
+             }
+         }
+ 
+-        if (singleJobCreator != null) {
+-            return singleJobCreator.create(tag);
+-        }
+-
+-        if (jobCreators != null) {
+-            for (JobCreator jobCreator : jobCreators) {
+-                Job job = jobCreator.create(tag);
+-                if (job != null) {
+-                    return job;
+-                }
+-            }
++        if (!atLeastOneCreatorSeen) {
++            CAT.w("no JobCreator added");
+         }
+ 
+-        return null;
++        return job;
+     }
+ 
+     public boolean isEmpty() {
+-        synchronized (mMonitor) {
+-            return mJobCreators.isEmpty();
+-        }
++        return mJobCreators.isEmpty();
+     }
+ }
+diff --git a/library/src/test/java/com/evernote/android/job/JobCreatorHolderTest.java b/library/src/test/java/com/evernote/android/job/JobCreatorHolderTest.java
+new file mode 100644
+index 0000000..e8afe5c
+--- /dev/null
++++ b/library/src/test/java/com/evernote/android/job/JobCreatorHolderTest.java
+@@ -0,0 +1,171 @@
++package com.evernote.android.job;
++
++import com.evernote.android.job.util.JobCat;
++
++import net.vrallev.android.cat.print.CatPrinter;
++
++import org.junit.After;
++import org.junit.Before;
++import org.junit.Test;
++import org.junit.runner.RunWith;
++import org.mockito.ArgumentMatchers;
++import org.mockito.Mock;
++import org.mockito.junit.MockitoJUnitRunner;
++
++import java.util.concurrent.atomic.AtomicBoolean;
++import java.util.concurrent.atomic.AtomicReference;
++import java.util.concurrent.locks.Condition;
++import java.util.concurrent.locks.Lock;
++import java.util.concurrent.locks.ReentrantLock;
++
++import static org.assertj.core.api.Java6Assertions.assertThat;
++import static org.mockito.ArgumentMatchers.anyInt;
++import static org.mockito.ArgumentMatchers.eq;
++import static org.mockito.Mockito.verify;
++import static org.mockito.Mockito.verifyZeroInteractions;
++
++@RunWith(MockitoJUnitRunner.class)
++public class JobCreatorHolderTest {
++    @Mock CatPrinter catPrinter;
++    @Mock JobCreator mockJobCreator;
++
++    private JobCreatorHolder holder;
++
++    @Before
++    public void setup() {
++        JobCat.addLogPrinter(catPrinter);
++
++        holder = new JobCreatorHolder();
++    }
++
++    @After
++    public void tearDown() {
++        JobCat.removeLogPrinter(catPrinter);
++    }
++
++    @Test
++    public void createJobLogsWarningWhenNoCreatorsAreAdded() {
++        holder.createJob("DOES_NOT_EXIST");
++
++        verify(catPrinter).println(
++                anyInt(),                  // priority
++                eq("JobCreatorHolder"),    // tag
++                eq("no JobCreator added"), // message
++                ArgumentMatchers.<Throwable>isNull());
++    }
++
++    @Test
++    public void createJobLogsNothingWhenAtLeastOneCreatorIsAdded() {
++        holder.addJobCreator(mockJobCreator);
++
++        holder.createJob("DOES_NOT_EXIST");
++
++        verifyZeroInteractions(catPrinter);
++    }
++
++    @Test
++    public void createJobSucceedsWhenCreatorListIsModifiedConcurrently() {
++        // This test verifies that modifying the list of job-creators while
++        // another thread is in the middle of JobCreatorHolder#createJob(String)
++        // is safe, in that createJob will finish unexceptionally.
++        //
++        // We'll test thread-safety by beginning iteration through the
++        // job-creator list, then adding another creator while the iterator
++        // is active.  If we are thread-safe, then iteration will complete
++        // without an exception.
++        //
++        // To coordinate this, we'll need a custom job creator that blocks
++        // until it receives a signal to continue.  A "reader" thread will
++        // invoke "createJob", iterating over the list, and blocking. While
++        // the reader is blocked, a "mutator" thread will modify the creator
++        // list, then signal the reader thread to resume.  Any
++        // ConcurrentModificationException will be caught and stored.  When
++        // both threads are finished, we can verify that no error was thrown.
++
++        final Lock lock = new ReentrantLock();
++        final Condition listModified = lock.newCondition();
++        final Condition iterationStarted = lock.newCondition();
++        final AtomicReference<Throwable> error = new AtomicReference<>();
++
++        final AtomicBoolean isIteratorActive = new AtomicBoolean(false);
++
++        class BlockingJobCreator implements JobCreator {
++            @Override
++            public Job create(String tag) {
++                lock.lock();
++                try {
++                    isIteratorActive.set(true);
++                    iterationStarted.signal();
++
++                    listModified.awaitUninterruptibly();
++                } finally {
++                    lock.unlock();
++                }
++
++                return null;
++            }
++        }
++
++        class Mutator extends Thread {
++            @Override
++            public void run() {
++                waitUntilIterationStarted();
++
++                holder.addJobCreator(mockJobCreator);
++
++                signalListModified();
++            }
++
++            private void waitUntilIterationStarted() {
++                lock.lock();
++                try {
++                    if (!isIteratorActive.get()) {
++                        iterationStarted.awaitUninterruptibly();
++                    }
++                } finally {
++                    lock.unlock();
++                }
++            }
++
++            private void signalListModified() {
++                lock.lock();
++                try {
++                    listModified.signal();
++                } finally {
++                    lock.unlock();
++                }
++            }
++        }
++
++        class Reader extends Thread {
++            @Override
++            public void run() {
++                try {
++                    holder.createJob("SOME_JOB_TAG");
++                } catch (Throwable t) {
++                    error.set(t);
++                }
++            }
++        }
++
++        holder.addJobCreator(new BlockingJobCreator());
++
++        Mutator mutator = new Mutator();
++        Reader reader = new Reader();
++
++        reader.start();
++        mutator.start();
++
++        join(mutator);
++        join(reader);
++
++        assertThat(error.get()).isNull();
++    }
++
++    private static void join(Thread thread) {
++        try {
++            thread.join();
++        } catch (InterruptedException ignored) {
++        }
++    }
++}

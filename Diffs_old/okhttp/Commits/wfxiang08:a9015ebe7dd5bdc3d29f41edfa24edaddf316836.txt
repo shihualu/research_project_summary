@@ -1,0 +1,308 @@
+diff --git a/okhttp-testing-support/src/main/java/com/squareup/okhttp/internal/io/InMemoryFileSystem.java b/okhttp-testing-support/src/main/java/com/squareup/okhttp/internal/io/InMemoryFileSystem.java
+index 3a043cbd1f..6498fe8320 100644
+--- a/okhttp-testing-support/src/main/java/com/squareup/okhttp/internal/io/InMemoryFileSystem.java
++++ b/okhttp-testing-support/src/main/java/com/squareup/okhttp/internal/io/InMemoryFileSystem.java
+@@ -18,32 +18,95 @@
+ import java.io.File;
+ import java.io.FileNotFoundException;
+ import java.io.IOException;
++import java.util.ArrayList;
++import java.util.IdentityHashMap;
+ import java.util.Iterator;
+ import java.util.LinkedHashMap;
++import java.util.List;
+ import java.util.Map;
+ import okio.Buffer;
++import okio.ForwardingSink;
++import okio.ForwardingSource;
+ import okio.Sink;
+ import okio.Source;
++import org.junit.rules.TestRule;
++import org.junit.runner.Description;
++import org.junit.runners.model.Statement;
+ 
+ /** A simple file system where all files are held in memory. Not safe for concurrent use. */
+-public final class InMemoryFileSystem implements FileSystem {
++public final class InMemoryFileSystem implements FileSystem, TestRule {
+   private final Map<File, Buffer> files = new LinkedHashMap<>();
++  private final Map<Source, File> openSources = new IdentityHashMap<>();
++  private final Map<Sink, File> openSinks = new IdentityHashMap<>();
++
++  @Override public Statement apply(final Statement base, Description description) {
++    return new Statement() {
++      @Override public void evaluate() throws Throwable {
++        base.evaluate();
++        ensureResourcesClosed();
++      }
++    };
++  }
++
++  public void ensureResourcesClosed() {
++    List<String> openResources = new ArrayList<>();
++    for (File file : openSources.values()) {
++      openResources.add("Source for " + file);
++    }
++    for (File file : openSinks.values()) {
++      openResources.add("Sink for " + file);
++    }
++    if (!openResources.isEmpty()) {
++      StringBuilder builder = new StringBuilder("Resources acquired but not closed:");
++      for (String resource : openResources) {
++        builder.append("\n * ").append(resource);
++      }
++      throw new IllegalStateException(builder.toString());
++    }
++  }
+ 
+   @Override public Source source(File file) throws FileNotFoundException {
+     Buffer result = files.get(file);
+     if (result == null) throw new FileNotFoundException();
+-    return result.clone();
++
++    final Source source = result.clone();
++    openSources.put(source, file);
++
++    return new ForwardingSource(source) {
++      @Override public void close() throws IOException {
++        openSources.remove(source);
++        super.close();
++      }
++    };
+   }
+ 
+   @Override public Sink sink(File file) throws FileNotFoundException {
+-    Buffer result = new Buffer();
+-    files.put(file, result);
+-    return result;
++    return sink(file, false);
+   }
+ 
+   @Override public Sink appendingSink(File file) throws FileNotFoundException {
+-    Buffer result = files.get(file);
+-    return result != null ? result : sink(file);
++    return sink(file, true);
++  }
++
++  private Sink sink(File file, boolean appending) {
++    Buffer result = null;
++    if (appending) {
++      result = files.get(file);
++    }
++    if (result == null) {
++      result = new Buffer();
++    }
++    files.put(file, result);
++
++    final Sink sink = result;
++    openSinks.put(sink, file);
++
++    return new ForwardingSink(sink) {
++      @Override public void close() throws IOException {
++        openSinks.remove(sink);
++        super.close();
++      }
++    };
+   }
+ 
+   @Override public void delete(File file) throws IOException {
+diff --git a/okhttp-tests/src/test/java/com/squareup/okhttp/CacheTest.java b/okhttp-tests/src/test/java/com/squareup/okhttp/CacheTest.java
+index b9e1d50139..03531184a7 100644
+--- a/okhttp-tests/src/test/java/com/squareup/okhttp/CacheTest.java
++++ b/okhttp-tests/src/test/java/com/squareup/okhttp/CacheTest.java
+@@ -19,7 +19,6 @@
+ import com.squareup.okhttp.internal.Internal;
+ import com.squareup.okhttp.internal.SslContextBuilder;
+ import com.squareup.okhttp.internal.Util;
+-import com.squareup.okhttp.internal.io.FileSystem;
+ import com.squareup.okhttp.internal.io.InMemoryFileSystem;
+ import com.squareup.okhttp.mockwebserver.MockResponse;
+ import com.squareup.okhttp.mockwebserver.MockWebServer;
+@@ -76,9 +75,9 @@
+ 
+   @Rule public MockWebServer server = new MockWebServer();
+   @Rule public MockWebServer server2 = new MockWebServer();
++  @Rule public InMemoryFileSystem fileSystem = new InMemoryFileSystem();
+ 
+   private final SSLContext sslContext = SslContextBuilder.localhost();
+-  private final FileSystem fileSystem = new InMemoryFileSystem();
+   private final OkHttpClient client = new OkHttpClient();
+   private Cache cache;
+   private final CookieManager cookieManager = new CookieManager();
+@@ -93,6 +92,7 @@
+   @After public void tearDown() throws Exception {
+     ResponseCache.setDefault(null);
+     CookieHandler.setDefault(null);
++    cache.delete();
+   }
+ 
+   /**
+@@ -266,7 +266,7 @@ private void testResponseCaching(TransferKind transferKind) throws IOException {
+     Principal localPrincipal = response1.handshake().localPrincipal();
+ 
+     Response response2 = client.newCall(request).execute(); // Cached!
+-    assertEquals("ABC", response2.body().source().readUtf8());
++    assertEquals("ABC", response2.body().string());
+ 
+     assertEquals(2, cache.getRequestCount());
+     assertEquals(1, cache.getNetworkCount());
+@@ -1873,6 +1873,7 @@ public void assertCookies(HttpUrl url, String... expectedCookies) throws Excepti
+ 
+     Response response = get(server.url("/"));
+     assertEquals("A", response.header(""));
++    assertEquals("body", response.body().string());
+   }
+ 
+   /**
+diff --git a/okhttp-tests/src/test/java/com/squareup/okhttp/CallTest.java b/okhttp-tests/src/test/java/com/squareup/okhttp/CallTest.java
+index 051eae4b07..639ae2efdc 100644
+--- a/okhttp-tests/src/test/java/com/squareup/okhttp/CallTest.java
++++ b/okhttp-tests/src/test/java/com/squareup/okhttp/CallTest.java
+@@ -22,7 +22,6 @@
+ import com.squareup.okhttp.internal.SslContextBuilder;
+ import com.squareup.okhttp.internal.Util;
+ import com.squareup.okhttp.internal.Version;
+-import com.squareup.okhttp.internal.io.FileSystem;
+ import com.squareup.okhttp.internal.io.InMemoryFileSystem;
+ import com.squareup.okhttp.mockwebserver.Dispatcher;
+ import com.squareup.okhttp.mockwebserver.MockResponse;
+@@ -88,9 +87,9 @@
+   @Rule public final TestRule timeout = new Timeout(30_000);
+   @Rule public final MockWebServer server = new MockWebServer();
+   @Rule public final MockWebServer server2 = new MockWebServer();
++  @Rule public final InMemoryFileSystem fileSystem = new InMemoryFileSystem();
+ 
+   private SSLContext sslContext = SslContextBuilder.localhost();
+-  private FileSystem fileSystem = new InMemoryFileSystem();
+   private OkHttpClient client = new OkHttpClient();
+   private RecordingCallback callback = new RecordingCallback();
+   private TestLogHandler logHandler = new TestLogHandler();
+diff --git a/okhttp-tests/src/test/java/com/squareup/okhttp/RecordingCallback.java b/okhttp-tests/src/test/java/com/squareup/okhttp/RecordingCallback.java
+index 9d651473bc..f2447ecc64 100644
+--- a/okhttp-tests/src/test/java/com/squareup/okhttp/RecordingCallback.java
++++ b/okhttp-tests/src/test/java/com/squareup/okhttp/RecordingCallback.java
+@@ -20,7 +20,6 @@
+ import java.util.Iterator;
+ import java.util.List;
+ import java.util.concurrent.TimeUnit;
+-import okio.Buffer;
+ 
+ /**
+  * Records received HTTP responses so they can be later retrieved by tests.
+@@ -36,11 +35,8 @@
+   }
+ 
+   @Override public synchronized void onResponse(Response response) throws IOException {
+-    Buffer buffer = new Buffer();
+-    ResponseBody body = response.body();
+-    body.source().readAll(buffer);
+-
+-    responses.add(new RecordedResponse(response.request(), response, null, buffer.readUtf8(), null));
++    String body = response.body().string();
++    responses.add(new RecordedResponse(response.request(), response, null, body, null));
+     notifyAll();
+   }
+ 
+diff --git a/okhttp-urlconnection/src/test/java/com/squareup/okhttp/OkUrlFactoryTest.java b/okhttp-urlconnection/src/test/java/com/squareup/okhttp/OkUrlFactoryTest.java
+index ab792b9906..5ca43fc25a 100644
+--- a/okhttp-urlconnection/src/test/java/com/squareup/okhttp/OkUrlFactoryTest.java
++++ b/okhttp-urlconnection/src/test/java/com/squareup/okhttp/OkUrlFactoryTest.java
+@@ -1,7 +1,6 @@
+ package com.squareup.okhttp;
+ 
+ import com.squareup.okhttp.internal.Platform;
+-import com.squareup.okhttp.internal.io.FileSystem;
+ import com.squareup.okhttp.internal.io.InMemoryFileSystem;
+ import com.squareup.okhttp.mockwebserver.MockResponse;
+ import com.squareup.okhttp.mockwebserver.MockWebServer;
+@@ -14,6 +13,8 @@
+ import java.util.Locale;
+ import java.util.TimeZone;
+ import java.util.concurrent.TimeUnit;
++import okio.BufferedSource;
++import org.junit.After;
+ import org.junit.Before;
+ import org.junit.Rule;
+ import org.junit.Test;
+@@ -26,16 +27,22 @@
+ 
+ public class OkUrlFactoryTest {
+   @Rule public MockWebServer server = new MockWebServer();
++  @Rule public InMemoryFileSystem fileSystem = new InMemoryFileSystem();
+ 
+-  private FileSystem fileSystem = new InMemoryFileSystem();
+   private OkUrlFactory factory;
++  private Cache cache;
+ 
+   @Before public void setUp() throws IOException {
+     OkHttpClient client = new OkHttpClient();
+-    client.setCache(new Cache(new File("/cache/"), 10 * 1024 * 1024, fileSystem));
++    cache = new Cache(new File("/cache/"), 10 * 1024 * 1024, fileSystem);
++    client.setCache(cache);
+     factory = new OkUrlFactory(client);
+   }
+ 
++  @After public void tearDown() throws IOException {
++    cache.delete();
++  }
++
+   /**
+    * Response code 407 should only come from proxy servers. Android's client
+    * throws if it is sent by an origin server.
+@@ -64,6 +71,7 @@
+ 
+     HttpURLConnection connection = factory.open(server.getUrl("/"));
+     assertResponseHeader(connection, "NETWORK 404");
++    connection.getErrorStream().close();
+   }
+ 
+   @Test public void conditionalCacheHitResponseSourceHeaders() throws Exception {
+@@ -140,7 +148,9 @@ public void setInstanceFollowRedirectsFalse() throws Exception {
+   }
+ 
+   private void assertResponseBody(HttpURLConnection connection, String expected) throws Exception {
+-    String actual = buffer(source(connection.getInputStream())).readString(US_ASCII);
++    BufferedSource source = buffer(source(connection.getInputStream()));
++    String actual = source.readString(US_ASCII);
++    source.close();
+     assertEquals(expected, actual);
+   }
+ 
+diff --git a/okhttp-urlconnection/src/test/java/com/squareup/okhttp/UrlConnectionCacheTest.java b/okhttp-urlconnection/src/test/java/com/squareup/okhttp/UrlConnectionCacheTest.java
+index 0af815b14e..172d586986 100644
+--- a/okhttp-urlconnection/src/test/java/com/squareup/okhttp/UrlConnectionCacheTest.java
++++ b/okhttp-urlconnection/src/test/java/com/squareup/okhttp/UrlConnectionCacheTest.java
+@@ -19,7 +19,6 @@
+ import com.squareup.okhttp.internal.Internal;
+ import com.squareup.okhttp.internal.SslContextBuilder;
+ import com.squareup.okhttp.internal.Util;
+-import com.squareup.okhttp.internal.io.FileSystem;
+ import com.squareup.okhttp.internal.io.InMemoryFileSystem;
+ import com.squareup.okhttp.mockwebserver.MockResponse;
+ import com.squareup.okhttp.mockwebserver.MockWebServer;
+@@ -81,9 +80,9 @@
+ 
+   @Rule public MockWebServer server = new MockWebServer();
+   @Rule public MockWebServer server2 = new MockWebServer();
++  @Rule public InMemoryFileSystem fileSystem = new InMemoryFileSystem();
+ 
+   private final SSLContext sslContext = SslContextBuilder.localhost();
+-  private final FileSystem fileSystem = new InMemoryFileSystem();
+   private final OkUrlFactory client = new OkUrlFactory(new OkHttpClient());
+   private Cache cache;
+   private final CookieManager cookieManager = new CookieManager();
+@@ -98,6 +97,7 @@
+   @After public void tearDown() throws Exception {
+     ResponseCache.setDefault(null);
+     CookieHandler.setDefault(null);
++    cache.delete();
+   }
+ 
+   @Test public void responseCacheAccessWithOkHttpMember() throws IOException {
+@@ -1586,6 +1586,7 @@ public void assertCookies(URL url, String... expectedCookies) throws Exception {
+ 
+     HttpURLConnection connection = client.open(server.getUrl("/"));
+     assertEquals("A", connection.getHeaderField(""));
++    assertEquals("body", readAscii(connection));
+   }
+ 
+   /**

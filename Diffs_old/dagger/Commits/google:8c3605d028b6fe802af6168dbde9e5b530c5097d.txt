@@ -1,0 +1,957 @@
+diff --git a/java/dagger/internal/codegen/BUILD b/java/dagger/internal/codegen/BUILD
+index 245226156..e891f2288 100644
+--- a/java/dagger/internal/codegen/BUILD
++++ b/java/dagger/internal/codegen/BUILD
+@@ -220,7 +220,6 @@ java_library(
+         "ProducerFactoryGenerator.java",
+         "ProducerFromProviderFieldInitializer.java",
+         "ProductionExecutorModuleGenerator.java",
+-        "ProviderOrProducerBindingExpression.java",
+         "ProviderOrProducerFieldInitializer.java",
+         "ReferenceReleasingManagerFields.java",
+         "SetBindingExpression.java",
+diff --git a/java/dagger/internal/codegen/BindingExpression.java b/java/dagger/internal/codegen/BindingExpression.java
+index ee6b09a3e..19406fed2 100644
+--- a/java/dagger/internal/codegen/BindingExpression.java
++++ b/java/dagger/internal/codegen/BindingExpression.java
+@@ -23,12 +23,25 @@
+ import com.squareup.javapoet.CodeBlock;
+ import dagger.internal.codegen.ComponentDescriptor.ComponentMethodDescriptor;
+ 
+-/** A factory of code expressions used to access a single binding in a component. */
++/** A factory of code expressions used to access a single request for a binding in a component. */
++// TODO(user): Rename this to RequestExpression?
+ abstract class BindingExpression {
+   private final ResolvedBindings resolvedBindings;
++  private final DependencyRequest.Kind requestKind;
+ 
+-  BindingExpression(ResolvedBindings resolvedBindings) {
++  BindingExpression(ResolvedBindings resolvedBindings, DependencyRequest.Kind requestKind) {
+     this.resolvedBindings = checkNotNull(resolvedBindings);
++    this.requestKind = checkNotNull(requestKind);
++  }
++
++  /** Returns the {@linkplain BindingKey} for this expression. */
++  final BindingKey bindingKey() {
++    return resolvedBindings.bindingKey();
++  }
++
++  /** Returns the {#linkplain DependencyRequest.Kind request kind} handled by this expression. */
++  final DependencyRequest.Kind requestKind() {
++    return requestKind;
+   }
+ 
+   /** The binding this instance uses to fulfill requests. */
+@@ -37,21 +50,31 @@ final ResolvedBindings resolvedBindings() {
+   }
+ 
+   /**
+-   * Returns an expression that evaluates to the value of a request for a given kind of dependency
+-   * on this binding.
++   * Returns an expression that evaluates to the value of a request based on the given requesting
++   * class.
+    *
+    * @param requestingClass the class that will contain the expression
+    */
+-  abstract Expression getDependencyExpression(
+-      DependencyRequest.Kind requestKind, ClassName requestingClass);
++  abstract Expression getDependencyExpression(ClassName requestingClass);
+ 
+   /** Returns an expression for the implementation of a component method with the given request. */
+-  CodeBlock getComponentMethodImplementation(
++  final CodeBlock getComponentMethodImplementation(
+       ComponentMethodDescriptor componentMethod, ClassName requestingClass) {
+     DependencyRequest request = componentMethod.dependencyRequest().get();
+-    checkArgument(request.bindingKey().equals(resolvedBindings().bindingKey()));
++    checkArgument(request.bindingKey().equals(bindingKey()));
++    checkArgument(request.kind().equals(requestKind()));
++    return doGetComponentMethodImplementation(componentMethod, requestingClass);
++  }
++
++  /**
++   * Returns an expression for the implementation of a component method with the given request.
++   *
++   * <p>This method is called only if {@code componentMethod}'s request key and kind matches this
++   * binding expression's.
++   */
++  protected CodeBlock doGetComponentMethodImplementation(
++      ComponentMethodDescriptor componentMethod, ClassName requestingClass) {
+     // By default, just delegate to #getDependencyExpression().
+-    CodeBlock expression = getDependencyExpression(request.kind(), requestingClass).codeBlock();
+-    return CodeBlock.of("return $L;", expression);
++    return CodeBlock.of("return $L;", getDependencyExpression(requestingClass).codeBlock());
+   }
+ }
+diff --git a/java/dagger/internal/codegen/BoundInstanceBindingExpression.java b/java/dagger/internal/codegen/BoundInstanceBindingExpression.java
+index b6cc12ba0..4177022ae 100644
+--- a/java/dagger/internal/codegen/BoundInstanceBindingExpression.java
++++ b/java/dagger/internal/codegen/BoundInstanceBindingExpression.java
+@@ -38,8 +38,7 @@
+   }
+ 
+   @Override
+-  Expression getInstanceDependencyExpression(
+-      DependencyRequest.Kind requestKind, ClassName requestingClass) {
++  Expression getInstanceDependencyExpression(ClassName requestingClass) {
+     return Expression.create(
+         componentRequirement.type(),
+         componentRequirementFields.getExpression(componentRequirement, requestingClass));
+diff --git a/java/dagger/internal/codegen/ComponentBindingExpressions.java b/java/dagger/internal/codegen/ComponentBindingExpressions.java
+index 96650d251..6ada054c5 100644
+--- a/java/dagger/internal/codegen/ComponentBindingExpressions.java
++++ b/java/dagger/internal/codegen/ComponentBindingExpressions.java
+@@ -26,13 +26,13 @@
+ import static dagger.internal.codegen.ContributionBinding.Kind.SYNTHETIC_MULTIBOUND_SET;
+ import static dagger.internal.codegen.MemberSelect.staticMemberSelect;
+ 
++import com.google.common.collect.HashBasedTable;
+ import com.google.common.collect.ImmutableSet;
++import com.google.common.collect.Table;
+ import com.squareup.javapoet.ClassName;
+ import com.squareup.javapoet.CodeBlock;
+ import dagger.internal.codegen.ComponentDescriptor.ComponentMethodDescriptor;
+ import java.util.EnumSet;
+-import java.util.HashMap;
+-import java.util.Map;
+ import java.util.Optional;
+ import javax.lang.model.type.TypeMirror;
+ import javax.lang.model.util.Elements;
+@@ -48,9 +48,8 @@
+   private final BindingGraph graph;
+   private final DaggerTypes types;
+   private final BindingExpressionFactory bindingExpressionFactory;
+-  // TODO(user): Switch to Table<BindingKey, DependencyRequest.Kind, BindingExpression>, and give
+-  // each BindingKey, DependencyRequest.Kind pair its own instance of BindingExpression.
+-  private final Map<BindingKey, BindingExpression> bindingExpressionsMap = new HashMap<>();
++  private final Table<BindingKey, DependencyRequest.Kind, BindingExpression> expressions =
++      HashBasedTable.create();
+ 
+   ComponentBindingExpressions(
+       BindingGraph graph,
+@@ -132,7 +131,7 @@ ComponentBindingExpressions forChildComponent(
+    */
+   Expression getDependencyExpression(
+       BindingKey bindingKey, DependencyRequest.Kind requestKind, ClassName requestingClass) {
+-    return getBindingExpression(bindingKey).getDependencyExpression(requestKind, requestingClass);
++    return getBindingExpression(bindingKey, requestKind).getDependencyExpression(requestingClass);
+   }
+ 
+   /**
+@@ -196,23 +195,28 @@ Expression getDependencyArgumentExpression(
+    */
+   CodeBlock getComponentMethodImplementation(
+       ComponentMethodDescriptor componentMethod, ClassName requestingClass) {
+-    return getBindingExpression(componentMethod.dependencyRequest().get().bindingKey())
++    return getBindingExpression(
++            componentMethod.dependencyRequest().get().bindingKey(),
++            componentMethod.dependencyRequest().get().kind())
+         .getComponentMethodImplementation(componentMethod, requestingClass);
+   }
+ 
+-  private BindingExpression getBindingExpression(BindingKey bindingKey) {
++  private BindingExpression getBindingExpression(
++      BindingKey bindingKey, DependencyRequest.Kind requestKind) {
+     if (graph.resolvedBindings().containsKey(bindingKey)
+         && !graph.resolvedBindings().get(bindingKey).ownedBindings().isEmpty()) {
+-      return bindingExpressionsMap.computeIfAbsent(bindingKey, this::createBindingExpression);
++      if (!expressions.contains(bindingKey, requestKind)) {
++        expressions.put(
++            bindingKey, requestKind, bindingExpressionFactory.create(bindingKey, requestKind));
++      }
++      return expressions.get(bindingKey, requestKind);
+     }
+     return parent
+-        .map(p -> p.getBindingExpression(bindingKey))
++        .map(p -> p.getBindingExpression(bindingKey, requestKind))
+         .orElseThrow(
+-            () -> new IllegalStateException("no binding expression found for " + bindingKey));
+-  }
+-
+-  private BindingExpression createBindingExpression(BindingKey bindingKey) {
+-    return bindingExpressionFactory.create(graph.resolvedBindings().get(bindingKey));
++            () ->
++                new IllegalStateException(
++                    String.format("no expression found for %s-%s", bindingKey, requestKind)));
+   }
+ 
+   /** Factory for building a {@link BindingExpression}. */
+@@ -261,16 +265,17 @@ private BindingExpression createBindingExpression(BindingKey bindingKey) {
+     }
+ 
+     /** Creates a binding expression. */
+-    BindingExpression create(ResolvedBindings resolvedBindings) {
++    BindingExpression create(BindingKey bindingKey, DependencyRequest.Kind requestKind) {
++      ResolvedBindings resolvedBindings = graph.resolvedBindings().get(bindingKey);
+       switch (resolvedBindings.bindingType()) {
+         case MEMBERS_INJECTION:
+-          return membersInjectionBindingExpression(resolvedBindings);
++          return membersInjectionBindingExpression(resolvedBindings, requestKind);
+ 
+         case PROVISION:
+-          return provisionBindingExpression(resolvedBindings);
++          return provisionBindingExpression(resolvedBindings, requestKind);
+ 
+         case PRODUCTION:
+-          return frameworkInstanceBindingExpression(resolvedBindings);
++          return frameworkInstanceBindingExpression(resolvedBindings, requestKind);
+ 
+         default:
+           throw new AssertionError(resolvedBindings);
+@@ -279,9 +284,9 @@ BindingExpression create(ResolvedBindings resolvedBindings) {
+ 
+     /** Returns a binding expression for a members injection binding. */
+     private MembersInjectionBindingExpression membersInjectionBindingExpression(
+-        ResolvedBindings resolvedBindings) {
++        ResolvedBindings resolvedBindings, DependencyRequest.Kind requestKind) {
+       return new MembersInjectionBindingExpression(
+-          frameworkInstanceBindingExpression(resolvedBindings),
++          frameworkInstanceBindingExpression(resolvedBindings, requestKind),
+           generatedComponentModel,
+           membersInjectionMethods);
+     }
+@@ -292,10 +297,11 @@ private MembersInjectionBindingExpression membersInjectionBindingExpression(
+      * dagger.MembersInjector} for members injection bindings.
+      */
+     private FrameworkInstanceBindingExpression frameworkInstanceBindingExpression(
+-        ResolvedBindings resolvedBindings) {
++        ResolvedBindings resolvedBindings, DependencyRequest.Kind requestKind) {
+       Optional<MemberSelect> staticMethod = staticMemberSelect(resolvedBindings);
+       return new FrameworkInstanceBindingExpression(
+           resolvedBindings,
++          requestKind,
+           componentBindingExpressions,
+           resolvedBindings.bindingType().frameworkType(),
+           staticMethod.isPresent()
+@@ -335,21 +341,18 @@ private FrameworkFieldInitializer frameworkFieldInitializer(ResolvedBindings res
+     }
+ 
+     /** Returns a binding expression for a provision binding. */
+-    private BindingExpression provisionBindingExpression(ResolvedBindings resolvedBindings) {
+-      // TODO(user): this can be removed once we pass DependencyRequest.Kind to the factory.
+-      // With DependencyRequest.Kind, we can know if it's a ProducerFromProvider or not, so we won't
+-      // have to pass in both types of binding expressions.
+-      BindingExpression bindingExpression =
+-          new ProviderOrProducerBindingExpression(
+-              frameworkInstanceBindingExpression(resolvedBindings),
+-              producerFromProviderInstanceBindingExpression(resolvedBindings));
++    private BindingExpression provisionBindingExpression(
++        ResolvedBindings resolvedBindings, DependencyRequest.Kind requestKind) {
++      FrameworkInstanceBindingExpression frameworkInstanceBindingExpression =
++          requestKind.equals(DependencyRequest.Kind.PRODUCER)
++              ? producerFromProviderInstanceBindingExpression(resolvedBindings, requestKind)
++              : frameworkInstanceBindingExpression(resolvedBindings, requestKind);
+ 
+       BindingExpression inlineBindingExpression =
+-          inlineProvisionBindingExpression(bindingExpression);
++          inlineProvisionBindingExpression(frameworkInstanceBindingExpression);
+ 
+       if (usePrivateMethod(resolvedBindings.contributionBinding())) {
+         return new PrivateMethodBindingExpression(
+-            resolvedBindings,
+             generatedComponentModel,
+             componentBindingExpressions,
+             inlineBindingExpression,
+@@ -367,10 +370,11 @@ private BindingExpression provisionBindingExpression(ResolvedBindings resolvedBi
+      * provision binding.
+      */
+     private FrameworkInstanceBindingExpression producerFromProviderInstanceBindingExpression(
+-        ResolvedBindings resolvedBindings) {
++        ResolvedBindings resolvedBindings, DependencyRequest.Kind requestKind) {
+       checkArgument(resolvedBindings.bindingType().frameworkType().equals(FrameworkType.PROVIDER));
+       return new FrameworkInstanceBindingExpression(
+           resolvedBindings,
++          requestKind,
+           componentBindingExpressions,
+           FrameworkType.PRODUCER,
+           new ProducerFromProviderFieldInitializer(
+@@ -408,7 +412,7 @@ private BindingExpression inlineProvisionBindingExpression(
+           return new SubcomponentBuilderBindingExpression(
+               bindingExpression,
+               provisionBinding,
+-              subcomponentNames.get(bindingExpression.resolvedBindings().bindingKey()),
++              subcomponentNames.get(bindingExpression.bindingKey()),
+               types);
+ 
+         case SYNTHETIC_MULTIBOUND_SET:
+diff --git a/java/dagger/internal/codegen/ComponentInstanceBindingExpression.java b/java/dagger/internal/codegen/ComponentInstanceBindingExpression.java
+index 6e04039ac..f1c2e6a23 100644
+--- a/java/dagger/internal/codegen/ComponentInstanceBindingExpression.java
++++ b/java/dagger/internal/codegen/ComponentInstanceBindingExpression.java
+@@ -35,8 +35,7 @@
+   }
+ 
+   @Override
+-  Expression getInstanceDependencyExpression(
+-      DependencyRequest.Kind requestKind, ClassName requestingClass) {
++  Expression getInstanceDependencyExpression(ClassName requestingClass) {
+     return Expression.create(
+         binding.key().type(),
+         componentName.equals(requestingClass)
+diff --git a/java/dagger/internal/codegen/ComponentProvisionBindingExpression.java b/java/dagger/internal/codegen/ComponentProvisionBindingExpression.java
+index afdaf381e..de81d2b15 100644
+--- a/java/dagger/internal/codegen/ComponentProvisionBindingExpression.java
++++ b/java/dagger/internal/codegen/ComponentProvisionBindingExpression.java
+@@ -47,8 +47,7 @@
+   }
+ 
+   @Override
+-  Expression getInstanceDependencyExpression(
+-      DependencyRequest.Kind requestKind, ClassName requestingClass) {
++  Expression getInstanceDependencyExpression(ClassName requestingClass) {
+     CodeBlock invocation =
+         CodeBlock.of(
+             "$L.$L()",
+diff --git a/java/dagger/internal/codegen/DelegateBindingExpression.java b/java/dagger/internal/codegen/DelegateBindingExpression.java
+index ad72e5a38..b3bff7b41 100644
+--- a/java/dagger/internal/codegen/DelegateBindingExpression.java
++++ b/java/dagger/internal/codegen/DelegateBindingExpression.java
+@@ -30,19 +30,18 @@
+   private final ContributionBinding binding;
+   private final ComponentBindingExpressions componentBindingExpressions;
+   private final DaggerTypes types;
+-  private final Elements elements;
+   private final BindsTypeChecker bindsTypeChecker;
+ 
+   private DelegateBindingExpression(
+       ResolvedBindings resolvedBindings,
++      DependencyRequest.Kind requestKind,
+       ComponentBindingExpressions componentBindingExpressions,
+       DaggerTypes types,
+       Elements elements) {
+-    super(resolvedBindings);
++    super(resolvedBindings, requestKind);
+     this.binding = checkNotNull(resolvedBindings.contributionBinding());
+     this.componentBindingExpressions = checkNotNull(componentBindingExpressions);
+     this.types = checkNotNull(types);
+-    this.elements = checkNotNull(elements);
+     this.bindsTypeChecker = new BindsTypeChecker(types, elements);
+   }
+ 
+@@ -62,28 +61,28 @@ static BindingExpression create(
+     ScopeKind bindsScope = ScopeKind.get(binding, graph, elements);
+     ScopeKind delegateScope = ScopeKind.get(delegateBinding, graph, elements);
+     if (bindsScope.isSimilarOrWeakerScopeThan(delegateScope)) {
++      DependencyRequest.Kind requestKind = bindingExpression.requestKind();
+       return new DelegateBindingExpression(
+-          resolvedBindings, componentBindingExpressions, types, elements);
++          resolvedBindings, requestKind, componentBindingExpressions, types, elements);
+     }
+     return bindingExpression;
+   }
+ 
+   @Override
+-  Expression getDependencyExpression(
+-      DependencyRequest.Kind requestKind, ClassName requestingClass) {
++  Expression getDependencyExpression(ClassName requestingClass) {
+     Expression delegateExpression =
+         componentBindingExpressions.getDependencyExpression(
+-            getOnlyElement(binding.dependencies()).bindingKey(), requestKind, requestingClass);
++            getOnlyElement(binding.dependencies()).bindingKey(), requestKind(), requestingClass);
+ 
+     TypeMirror contributedType = binding.contributedType();
+-    switch (requestKind) {
++    switch (requestKind()) {
+       case INSTANCE:
+         return instanceRequiresCast(delegateExpression, requestingClass)
+             ? delegateExpression.castTo(contributedType)
+             : delegateExpression;
+       default:
+         return castToRawTypeIfNecessary(
+-            delegateExpression, requestKind.type(contributedType, types));
++            delegateExpression, requestKind().type(contributedType, types));
+     }
+   }
+ 
+diff --git a/java/dagger/internal/codegen/FrameworkInstanceBindingExpression.java b/java/dagger/internal/codegen/FrameworkInstanceBindingExpression.java
+index a9198e1e7..7e4ed319e 100644
+--- a/java/dagger/internal/codegen/FrameworkInstanceBindingExpression.java
++++ b/java/dagger/internal/codegen/FrameworkInstanceBindingExpression.java
+@@ -37,12 +37,13 @@
+ 
+   FrameworkInstanceBindingExpression(
+       ResolvedBindings resolvedBindings,
++      DependencyRequest.Kind requestKind,
+       ComponentBindingExpressions componentBindingExpressions,
+       FrameworkType frameworkType,
+       MemberSelectSupplier frameworkFieldSupplier,
+       DaggerTypes types,
+       Elements elements) {
+-    super(resolvedBindings);
++    super(resolvedBindings, requestKind);
+     this.componentBindingExpressions = componentBindingExpressions;
+     this.frameworkType = frameworkType;
+     this.frameworkFieldSupplier = frameworkFieldSupplier;
+@@ -57,9 +58,8 @@
+    * FieldSpec) added} to the component the first time this method is invoked.
+    */
+   @Override
+-  Expression getDependencyExpression(
+-      DependencyRequest.Kind requestKind, ClassName requestingClass) {
+-    if (requestKind.equals(frameworkRequestKind())) {
++  Expression getDependencyExpression(ClassName requestingClass) {
++    if (requestKind().equals(frameworkRequestKind())) {
+       MemberSelect memberSelect = frameworkFieldSupplier.memberSelect();
+       TypeMirror expressionType =
+           isTypeAccessibleFrom(instanceType(), requestingClass.packageName())
+@@ -74,9 +74,9 @@ Expression getDependencyExpression(
+     // expression for a DependencyRequest.Kind.PROVIDER (the framework type):
+     //    lazyExpression = DoubleCheck.lazy(providerExpression);
+     return frameworkType.to(
+-        requestKind,
++        requestKind(),
+         componentBindingExpressions.getDependencyExpression(
+-            resolvedBindings().bindingKey(), frameworkRequestKind(), requestingClass),
++            bindingKey(), frameworkRequestKind(), requestingClass),
+         types);
+   }
+ 
+@@ -111,12 +111,11 @@ private TypeMirror instanceType() {
+    * the initialization {@code this.fooProvider = Foo_Factory.create(Bar_Factory.create());}, {@code
+    * Bar_Factory} is considered to be inline.
+    *
+-   * <p>This is used in {@link #getDependencyExpression(DependencyRequest.Kind, ClassName)} when
+-   * determining the type of a factory. Normally if the {@link #instanceType()} is not accessible
+-   * from the component, the type of the expression will be a raw {@link javax.inject.Provider}.
+-   * However, if the factory is created inline, even if contributed type is not accessible, javac
+-   * will still be able to determine the type that is returned from the {@code Foo_Factory.create()}
+-   * method.
++   * <p>This is used in {@link #getDependencyExpression(ClassName)} when determining the type of a
++   * factory. Normally if the {@link #instanceType()} is not accessible from the component, the type
++   * of the expression will be a raw {@link javax.inject.Provider}. However, if the factory is
++   * created inline, even if contributed type is not accessible, javac will still be able to
++   * determine the type that is returned from the {@code Foo_Factory.create()} method.
+    */
+   private static boolean isInlinedFactoryCreation(MemberSelect memberSelect) {
+     return memberSelect.staticMember();
+diff --git a/java/dagger/internal/codegen/MapBindingExpression.java b/java/dagger/internal/codegen/MapBindingExpression.java
+index 2b422709b..d2949fbe0 100644
+--- a/java/dagger/internal/codegen/MapBindingExpression.java
++++ b/java/dagger/internal/codegen/MapBindingExpression.java
+@@ -63,8 +63,7 @@
+   }
+ 
+   @Override
+-  Expression getInstanceDependencyExpression(
+-      DependencyRequest.Kind requestKind, ClassName requestingClass) {
++  Expression getInstanceDependencyExpression(ClassName requestingClass) {
+     return Expression.create(binding.key().type(), mapExpression(requestingClass));
+   }
+ 
+diff --git a/java/dagger/internal/codegen/MembersInjectionBindingExpression.java b/java/dagger/internal/codegen/MembersInjectionBindingExpression.java
+index 4707c668f..adaf9730e 100644
+--- a/java/dagger/internal/codegen/MembersInjectionBindingExpression.java
++++ b/java/dagger/internal/codegen/MembersInjectionBindingExpression.java
+@@ -39,8 +39,9 @@
+       FrameworkInstanceBindingExpression membersInjectorExpression,
+       GeneratedComponentModel generatedComponentModel,
+       MembersInjectionMethods membersInjectionMethods) {
+-    super(membersInjectorExpression.resolvedBindings());
+-    checkArgument(resolvedBindings().bindingKey().kind().equals(BindingKey.Kind.MEMBERS_INJECTION));
++    super(membersInjectorExpression.resolvedBindings(), membersInjectorExpression.requestKind());
++    checkArgument(bindingKey().kind().equals(BindingKey.Kind.MEMBERS_INJECTION));
++    checkArgument(requestKind().equals(DependencyRequest.Kind.MEMBERS_INJECTOR));
+     this.membersInjectorExpression = membersInjectorExpression;
+     this.generatedComponentModel = generatedComponentModel;
+     this.binding = resolvedBindings().membersInjectionBinding().get();
+@@ -48,19 +49,13 @@
+   }
+ 
+   @Override
+-  Expression getDependencyExpression(
+-      DependencyRequest.Kind requestKind, ClassName requestingClass) {
+-    checkArgument(requestKind.equals(DependencyRequest.Kind.MEMBERS_INJECTOR));
+-    return membersInjectorExpression.getDependencyExpression(requestKind, requestingClass);
++  Expression getDependencyExpression(ClassName requestingClass) {
++    return membersInjectorExpression.getDependencyExpression(requestingClass);
+   }
+ 
+   @Override
+-  CodeBlock getComponentMethodImplementation(
++  protected CodeBlock doGetComponentMethodImplementation(
+       ComponentMethodDescriptor componentMethod, ClassName requestingClass) {
+-    DependencyRequest request = componentMethod.dependencyRequest().get();
+-    checkArgument(request.bindingKey().equals(resolvedBindings().bindingKey()));
+-    checkArgument(request.kind().equals(DependencyRequest.Kind.MEMBERS_INJECTOR));
+-
+     ExecutableElement methodElement = componentMethod.methodElement();
+     List<? extends VariableElement> parameters = methodElement.getParameters();
+     if (parameters.isEmpty() /* i.e. it's a request for a MembersInjector<T> */) {
+diff --git a/java/dagger/internal/codegen/OptionalBindingExpression.java b/java/dagger/internal/codegen/OptionalBindingExpression.java
+index ceb0c905d..32b65e649 100644
+--- a/java/dagger/internal/codegen/OptionalBindingExpression.java
++++ b/java/dagger/internal/codegen/OptionalBindingExpression.java
+@@ -42,14 +42,13 @@
+   }
+ 
+   @Override
+-  Expression getInstanceDependencyExpression(
+-      DependencyRequest.Kind requestKind, ClassName requestingClass) {
++  Expression getInstanceDependencyExpression(ClassName requestingClass) {
+     OptionalType optionalType = OptionalType.from(binding.key());
+     OptionalKind optionalKind = optionalType.kind();
+     if (binding.dependencies().isEmpty()) {
+       // When compiling with -source 7, javac's type inference isn't strong enough to detect
+       // Futures.immediateFuture(Optional.absent()) for keys that aren't Object
+-      if (requestKind.equals(DependencyRequest.Kind.FUTURE)
++      if (requestKind().equals(DependencyRequest.Kind.FUTURE)
+           && isTypeAccessibleFrom(binding.key().type(), requestingClass.packageName())) {
+         return Expression.create(
+             binding.key().type(),
+diff --git a/java/dagger/internal/codegen/PrivateMethodBindingExpression.java b/java/dagger/internal/codegen/PrivateMethodBindingExpression.java
+index 705422e04..fa479c72c 100644
+--- a/java/dagger/internal/codegen/PrivateMethodBindingExpression.java
++++ b/java/dagger/internal/codegen/PrivateMethodBindingExpression.java
+@@ -19,7 +19,6 @@
+ import static com.google.common.base.CaseFormat.LOWER_CAMEL;
+ import static com.google.common.base.CaseFormat.UPPER_CAMEL;
+ import static com.google.common.base.CaseFormat.UPPER_UNDERSCORE;
+-import static com.google.common.base.Preconditions.checkArgument;
+ import static com.squareup.javapoet.MethodSpec.methodBuilder;
+ import static com.squareup.javapoet.TypeSpec.anonymousClassBuilder;
+ import static dagger.internal.codegen.ContributionBinding.FactoryCreationStrategy.SINGLETON_INSTANCE;
+@@ -54,6 +53,7 @@
+   private final GeneratedComponentModel generatedComponentModel;
+   private final ComponentBindingExpressions componentBindingExpressions;
+   private final BindingExpression delegate;
++  // TODO(user): No need for a map. Each PMBE instance only handles 1 request kind now.
+   private final Map<DependencyRequest.Kind, String> methodNames =
+       new EnumMap<>(DependencyRequest.Kind.class);
+   private final Map<DependencyRequest.Kind, String> fieldNames =
+@@ -65,7 +65,6 @@
+   private final Elements elements;
+ 
+   PrivateMethodBindingExpression(
+-      ResolvedBindings resolvedBindings,
+       GeneratedComponentModel generatedComponentModel,
+       ComponentBindingExpressions componentBindingExpressions,
+       BindingExpression delegate,
+@@ -73,11 +72,11 @@
+       CompilerOptions compilerOptions,
+       DaggerTypes types,
+       Elements elements) {
+-    super(resolvedBindings);
++    super(delegate.resolvedBindings(), delegate.requestKind());
+     this.generatedComponentModel = generatedComponentModel;
+     this.componentBindingExpressions = componentBindingExpressions;
+     this.delegate = delegate;
+-    binding = resolvedBindings.contributionBinding();
++    this.binding = resolvedBindings().contributionBinding();
+     this.referenceReleasingManagerFields = referenceReleasingManagerFields;
+     this.compilerOptions = compilerOptions;
+     this.types = types;
+@@ -85,46 +84,40 @@
+   }
+ 
+   @Override
+-  CodeBlock getComponentMethodImplementation(
++  protected CodeBlock doGetComponentMethodImplementation(
+       ComponentMethodDescriptor componentMethod, ClassName requestingClass) {
+-    DependencyRequest request = componentMethod.dependencyRequest().get();
+-    checkArgument(request.bindingKey().equals(resolvedBindings().bindingKey()));
+-    if (!canInlineScope() && ignorePrivateMethodStrategy(request.kind())) {
++    if (!canInlineScope() && ignorePrivateMethodStrategy()) {
+       return delegate.getComponentMethodImplementation(componentMethod, requestingClass);
+     }
+ 
+-    return findComponentMethod(request.kind())
+-            .map(method -> method.equals(componentMethod))
+-            .orElse(false)
+-        ? methodBody(request.kind())
+-        : super.getComponentMethodImplementation(componentMethod, requestingClass);
++    return findComponentMethod().map(method -> method.equals(componentMethod)).orElse(false)
++        ? methodBody()
++        : super.doGetComponentMethodImplementation(componentMethod, requestingClass);
+   }
+ 
+   @Override
+-  Expression getDependencyExpression(
+-      DependencyRequest.Kind requestKind, ClassName requestingClass) {
+-    if (!canInlineScope()
+-        && (ignorePrivateMethodStrategy(requestKind) || isNullaryProvisionMethod(requestKind))) {
+-      return delegate.getDependencyExpression(requestKind, requestingClass);
++  Expression getDependencyExpression(ClassName requestingClass) {
++    if (!canInlineScope() && (ignorePrivateMethodStrategy() || isNullaryProvisionMethod())) {
++      return delegate.getDependencyExpression(requestingClass);
+     }
+ 
+-    if (!methodNames.containsKey(requestKind)) {
+-      Optional<ComponentMethodDescriptor> componentMethod = findComponentMethod(requestKind);
++    if (!methodNames.containsKey(requestKind())) {
++      Optional<ComponentMethodDescriptor> componentMethod = findComponentMethod();
+       String name =
+           componentMethod.isPresent()
+               ? componentMethod.get().methodElement().getSimpleName().toString()
+-              : generatedComponentModel.getUniqueMethodName(methodName(requestKind));
+-      methodNames.put(requestKind, name);
++              : generatedComponentModel.getUniqueMethodName(methodName());
++      methodNames.put(requestKind(), name);
+       if (!componentMethod.isPresent()) {
+-        createMethod(name, requestKind);
++        createMethod(name);
+       }
+     }
+ 
+     CodeBlock invocation =
+         componentName().equals(requestingClass)
+-            ? CodeBlock.of("$N()", methodNames.get(requestKind))
+-            : CodeBlock.of("$T.this.$N()", componentName(), methodNames.get(requestKind));
+-    return Expression.create(returnType(requestKind), invocation);
++            ? CodeBlock.of("$N()", methodNames.get(requestKind()))
++            : CodeBlock.of("$T.this.$N()", componentName(), methodNames.get(requestKind()));
++    return Expression.create(returnType(), invocation);
+   }
+ 
+   private ClassName componentName() {
+@@ -132,8 +125,9 @@ private ClassName componentName() {
+   }
+ 
+   // TODO(user): Invert this method to return true if we are using the private method strategy.
+-  private boolean ignorePrivateMethodStrategy(DependencyRequest.Kind requestKind) {
+-    switch (requestKind) {
++  private boolean ignorePrivateMethodStrategy() {
++    // TODO(user): move experimental android logic out of this class
++    switch (requestKind()) {
+       case INSTANCE:
+       case FUTURE:
+         return false;
+@@ -148,11 +142,11 @@ private boolean ignorePrivateMethodStrategy(DependencyRequest.Kind requestKind)
+     }
+   }
+ 
+-  private boolean isNullaryProvisionMethod(DependencyRequest.Kind requestKind) {
+-    return (requestKind.equals(DependencyRequest.Kind.INSTANCE)
+-            || requestKind.equals(DependencyRequest.Kind.FUTURE))
++  private boolean isNullaryProvisionMethod() {
++    return (requestKind().equals(DependencyRequest.Kind.INSTANCE)
++            || requestKind().equals(DependencyRequest.Kind.FUTURE))
+         && binding.dependencies().isEmpty()
+-        && !findComponentMethod(requestKind).isPresent();
++        && !findComponentMethod().isPresent();
+   }
+ 
+   private boolean canInlineScope() {
+@@ -163,85 +157,80 @@ private boolean canInlineScope() {
+   }
+ 
+   /** Returns the first component method associated with this request kind, if one exists. */
+-  private Optional<ComponentMethodDescriptor> findComponentMethod(
+-      DependencyRequest.Kind requestKind) {
++  private Optional<ComponentMethodDescriptor> findComponentMethod() {
+     // There could be multiple component methods with the same request key and kind.
+     // We arbitrarily choose the first one, and designate it to contain the implementation code.
+     return resolvedBindings()
+         .owningComponent()
+         .componentMethods()
+         .stream()
+-        .filter(method -> componentMethodMatchesRequestBindingKeyAndKind(method, requestKind))
++        .filter(method -> componentMethodMatchesRequestBindingKeyAndKind(method))
+         .findFirst();
+   }
+ 
+   /** Returns true if the component method matches the dependency request binding key and kind. */
+   private boolean componentMethodMatchesRequestBindingKeyAndKind(
+-      ComponentMethodDescriptor componentMethod, DependencyRequest.Kind requestKind) {
++      ComponentMethodDescriptor componentMethod) {
+     return componentMethod
+         .dependencyRequest()
+-        .filter(request -> request.bindingKey().equals(resolvedBindings().bindingKey()))
+-        .filter(request -> request.kind().equals(requestKind))
++        .filter(request -> request.bindingKey().equals(bindingKey()))
++        .filter(request -> request.kind().equals(requestKind()))
+         .isPresent();
+   }
+ 
+   /** Creates the no-arg method used for dependency expressions. */
+-  private void createMethod(String name, DependencyRequest.Kind requestKind) {
++  private void createMethod(String name) {
+     // TODO(user): Consider when we can make this method static.
+     // TODO(user): Fix the order that these generated methods are written to the component.
+     generatedComponentModel.addMethod(
+         PRIVATE_METHOD,
+         methodBuilder(name)
+             .addModifiers(PRIVATE)
+-            .returns(TypeName.get(returnType(requestKind)))
+-            .addCode(methodBody(requestKind))
++            .returns(TypeName.get(returnType()))
++            .addCode(methodBody())
+             .build());
+   }
+ 
+   /** Returns the return type for the dependency request. */
+-  private TypeMirror returnType(DependencyRequest.Kind requestKind) {
+-    if (requestKind.equals(DependencyRequest.Kind.INSTANCE)
++  private TypeMirror returnType() {
++    if (requestKind().equals(DependencyRequest.Kind.INSTANCE)
+         && binding.contributedPrimitiveType().isPresent()) {
+       return binding.contributedPrimitiveType().get();
+     }
+-    return accessibleType(requestKind.type(binding.contributedType(), types));
++    return accessibleType(requestKind().type(binding.contributedType(), types));
+   }
+ 
+   /** Returns the method body for the dependency request. */
+-  private CodeBlock methodBody(DependencyRequest.Kind requestKind) {
+-    switch (requestKind) {
++  private CodeBlock methodBody() {
++    switch (requestKind()) {
+       case PROVIDER:
+         // TODO(user): Cache provider field instead of recreating each time.
+         return CodeBlock.of("return $L;", providerTypeSpec());
+       case INSTANCE:
+         if (canInlineScope()) {
+           Scope scope = resolvedBindings().scope().get();
+-          return scope.equals(reusableScope(elements))
+-              ? singleCheck(requestKind) : doubleCheck(requestKind);
++          return scope.equals(reusableScope(elements)) ? singleCheck() : doubleCheck();
+         }
+         // fall through
+       default:
+         return CodeBlock.of(
+-            "return $L;",
+-            delegate.getDependencyExpression(requestKind, componentName()).codeBlock());
++            "return $L;", delegate.getDependencyExpression(componentName()).codeBlock());
+     }
+   }
+ 
+-  private CodeBlock singleCheck(DependencyRequest.Kind requestKind) {
+-    String fieldName = getMemoizedFieldName(requestKind);
++  private CodeBlock singleCheck() {
++    String fieldName = getMemoizedFieldName();
+     return CodeBlock.builder()
+         .beginControlFlow("if ($N instanceof $T)", fieldName, MemoizedSentinel.class)
+         .addStatement(
+-            "$N = $L",
+-            fieldName,
+-            delegate.getDependencyExpression(requestKind, componentName()).codeBlock())
++            "$N = $L", fieldName, delegate.getDependencyExpression(componentName()).codeBlock())
+         .endControlFlow()
+-        .addStatement("return ($T) $N", returnType(requestKind), fieldName)
++        .addStatement("return ($T) $N", returnType(), fieldName)
+         .build();
+   }
+ 
+-  private CodeBlock doubleCheck(DependencyRequest.Kind requestKind) {
+-    String fieldName = getMemoizedFieldName(requestKind);
++  private CodeBlock doubleCheck() {
++    String fieldName = getMemoizedFieldName();
+     // add "this." if the fieldName clashes with the local variable name.
+     fieldName = fieldName.contentEquals("local") ? "this." + fieldName : fieldName;
+     return CodeBlock.builder()
+@@ -251,35 +240,33 @@ private CodeBlock doubleCheck(DependencyRequest.Kind requestKind) {
+         // TODO(user): benchmark to see if this is really faster than instanceof check?
+         .beginControlFlow("if (local == $L)", fieldName)
+         .addStatement(
+-            "$L = $L",
+-            fieldName,
+-            delegate.getDependencyExpression(requestKind, componentName()).codeBlock())
++            "$L = $L", fieldName, delegate.getDependencyExpression(componentName()).codeBlock())
+         .endControlFlow()
+         .addStatement("local = $L", fieldName)
+         .endControlFlow()
+         .endControlFlow()
+-        .addStatement("return ($T) local", returnType(requestKind))
++        .addStatement("return ($T) local", returnType())
+         .build();
+   }
+ 
+-  private String getMemoizedFieldName(DependencyRequest.Kind requestKind) {
+-    if (!fieldNames.containsKey(requestKind)) {
++  private String getMemoizedFieldName() {
++    if (!fieldNames.containsKey(requestKind())) {
+       String name = generatedComponentModel.getUniqueFieldName(BindingVariableNamer.name(binding));
+       generatedComponentModel.addField(
+           PRIVATE_METHOD_SCOPED_FIELD,
+           FieldSpec.builder(TypeName.OBJECT, name, PRIVATE, VOLATILE)
+               .initializer("new $T()", MemoizedSentinel.class)
+               .build());
+-      fieldNames.put(requestKind, name);
++      fieldNames.put(requestKind(), name);
+     }
+-    return fieldNames.get(requestKind);
++    return fieldNames.get(requestKind());
+   }
+ 
+   /** Returns a {@link TypeSpec} for an anonymous provider class. */
+   private TypeSpec providerTypeSpec() {
+     // TODO(user): For scoped bindings that have already been created, use InstanceFactory?
+     return anonymousClassBuilder("")
+-        .addSuperinterface(TypeName.get(returnType(DependencyRequest.Kind.PROVIDER)))
++        .addSuperinterface(TypeName.get(returnType()))
+         .addMethod(
+             methodBuilder("get")
+                 .addAnnotation(Override.class)
+@@ -289,22 +276,20 @@ private TypeSpec providerTypeSpec() {
+                     "return $L",
+                     componentBindingExpressions
+                         .getDependencyExpression(
+-                            resolvedBindings().bindingKey(),
+-                            DependencyRequest.Kind.INSTANCE,
+-                            componentName())
++                            bindingKey(), DependencyRequest.Kind.INSTANCE, componentName())
+                         .codeBlock())
+                 .build())
+         .build();
+   }
+ 
+   /** Returns the canonical name for a no-arg dependency expression method. */
+-  private String methodName(DependencyRequest.Kind dependencyKind) {
++  private String methodName() {
+     // TODO(user): Use a better name for @MapKey binding instances.
+     // TODO(user): Include the binding method as part of the method name.
+-    if (dependencyKind.equals(DependencyRequest.Kind.INSTANCE)) {
++    if (requestKind().equals(DependencyRequest.Kind.INSTANCE)) {
+       return "get" + bindingName();
+     }
+-    return "get" + bindingName() + dependencyKindName(dependencyKind);
++    return "get" + bindingName() + dependencyKindName(requestKind());
+   }
+ 
+   /** Returns the canonical name for the {@link Binding}. */
+diff --git a/java/dagger/internal/codegen/ProviderOrProducerBindingExpression.java b/java/dagger/internal/codegen/ProviderOrProducerBindingExpression.java
+deleted file mode 100644
+index 51275f773..000000000
+--- a/java/dagger/internal/codegen/ProviderOrProducerBindingExpression.java
++++ /dev/null
+@@ -1,50 +0,0 @@
+-/*
+- * Copyright (C) 2017 The Dagger Authors.
+- *
+- * Licensed under the Apache License, Version 2.0 (the "License");
+- * you may not use this file except in compliance with the License.
+- * You may obtain a copy of the License at
+- *
+- * http://www.apache.org/licenses/LICENSE-2.0
+- *
+- * Unless required by applicable law or agreed to in writing, software
+- * distributed under the License is distributed on an "AS IS" BASIS,
+- * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+- * See the License for the specific language governing permissions and
+- * limitations under the License.
+- */
+-
+-package dagger.internal.codegen;
+-
+-import com.squareup.javapoet.ClassName;
+-
+-/**
+- * A {@link FrameworkInstanceBindingExpression} that is expressed with a {@link
+- * javax.inject.Provider} for all {@link DependencyRequest.Kind}s except {@link
+- * DependencyRequest.Kind#PRODUCER}, for which it uses a {@link
+- * dagger.producers.internal.Producers#producerFromProvider(javax.inject.Provider) provider wrapped
+- * by a producer}.
+- */
+-final class ProviderOrProducerBindingExpression extends BindingExpression {
+-  private final FrameworkInstanceBindingExpression providerBindingExpression;
+-  private final FrameworkInstanceBindingExpression producerBindingExpression;
+-
+-  ProviderOrProducerBindingExpression(
+-      FrameworkInstanceBindingExpression providerBindingExpression,
+-      FrameworkInstanceBindingExpression producerBindingExpression) {
+-    super(providerBindingExpression.resolvedBindings());
+-    this.providerBindingExpression = providerBindingExpression;
+-    this.producerBindingExpression = producerBindingExpression;
+-  }
+-
+-  @Override
+-  Expression getDependencyExpression(
+-      DependencyRequest.Kind requestKind, ClassName requestingClass) {
+-    switch (requestKind) {
+-      case PRODUCER:
+-        return producerBindingExpression.getDependencyExpression(requestKind, requestingClass);
+-      default:
+-        return providerBindingExpression.getDependencyExpression(requestKind, requestingClass);
+-    }
+-  }
+-}
+diff --git a/java/dagger/internal/codegen/SetBindingExpression.java b/java/dagger/internal/codegen/SetBindingExpression.java
+index d97ced043..55816e819 100644
+--- a/java/dagger/internal/codegen/SetBindingExpression.java
++++ b/java/dagger/internal/codegen/SetBindingExpression.java
+@@ -51,8 +51,7 @@
+   }
+ 
+   @Override
+-  Expression getInstanceDependencyExpression(
+-      DependencyRequest.Kind requestKind, ClassName requestingClass) {
++  Expression getInstanceDependencyExpression(ClassName requestingClass) {
+     return Expression.create(binding.key().type(), setExpression(requestingClass));
+   }
+ 
+diff --git a/java/dagger/internal/codegen/SimpleInvocationBindingExpression.java b/java/dagger/internal/codegen/SimpleInvocationBindingExpression.java
+index 3b4d81756..2c57c4975 100644
+--- a/java/dagger/internal/codegen/SimpleInvocationBindingExpression.java
++++ b/java/dagger/internal/codegen/SimpleInvocationBindingExpression.java
+@@ -30,7 +30,7 @@
+   private final DaggerTypes types;
+ 
+   SimpleInvocationBindingExpression(BindingExpression delegate, DaggerTypes types) {
+-    super(delegate.resolvedBindings());
++    super(delegate.resolvedBindings(), delegate.requestKind());
+     this.delegate = delegate;
+     this.types = types;
+   }
+@@ -40,8 +40,7 @@
+    *
+    * @param requestingClass the class that will contain the expression
+    */
+-  abstract Expression getInstanceDependencyExpression(
+-      DependencyRequest.Kind requestKind, ClassName requestingClass);
++  abstract Expression getInstanceDependencyExpression(ClassName requestingClass);
+ 
+   /**
+    * Java 7 type inference is not as strong as in Java 8, and therefore some generated code must
+@@ -55,13 +54,12 @@ protected CodeBlock explicitTypeParameter(ClassName requestingClass) {
+   }
+ 
+   @Override
+-  final Expression getDependencyExpression(
+-      DependencyRequest.Kind requestKind, ClassName requestingClass) {
+-    switch (requestKind) {
++  final Expression getDependencyExpression(ClassName requestingClass) {
++    switch (requestKind()) {
+       case INSTANCE:
+-        return getInstanceDependencyExpression(requestKind, requestingClass);
++        return getInstanceDependencyExpression(requestingClass);
+       case FUTURE:
+-        Expression expression = getInstanceDependencyExpression(requestKind, requestingClass);
++        Expression expression = getInstanceDependencyExpression(requestingClass);
+         return Expression.create(
+             types.wrapType(expression.type(), ListenableFuture.class),
+             CodeBlock.builder()
+@@ -70,7 +68,7 @@ final Expression getDependencyExpression(
+                 .add("immediateFuture($L)", expression.codeBlock())
+                 .build());
+       default:
+-        return delegate.getDependencyExpression(requestKind, requestingClass);
++        return delegate.getDependencyExpression(requestingClass);
+     }
+   }
+ }
+diff --git a/java/dagger/internal/codegen/SimpleMethodBindingExpression.java b/java/dagger/internal/codegen/SimpleMethodBindingExpression.java
+index bf4d464d8..7ef3d3174 100644
+--- a/java/dagger/internal/codegen/SimpleMethodBindingExpression.java
++++ b/java/dagger/internal/codegen/SimpleMethodBindingExpression.java
+@@ -71,8 +71,7 @@
+   }
+ 
+   @Override
+-  Expression getInstanceDependencyExpression(
+-      DependencyRequest.Kind requestKind, ClassName requestingClass) {
++  Expression getInstanceDependencyExpression(ClassName requestingClass) {
+     return requiresInjectionMethod(provisionBinding, compilerOptions, requestingClass.packageName())
+         ? invokeInjectionMethod(requestingClass)
+         : invokeMethod(requestingClass);
+diff --git a/java/dagger/internal/codegen/SubcomponentBuilderBindingExpression.java b/java/dagger/internal/codegen/SubcomponentBuilderBindingExpression.java
+index 5215bced9..fec388fc9 100644
+--- a/java/dagger/internal/codegen/SubcomponentBuilderBindingExpression.java
++++ b/java/dagger/internal/codegen/SubcomponentBuilderBindingExpression.java
+@@ -35,8 +35,7 @@
+   }
+ 
+   @Override
+-  Expression getInstanceDependencyExpression(
+-      DependencyRequest.Kind requestKind, ClassName requestingClass) {
++  Expression getInstanceDependencyExpression(ClassName requestingClass) {
+     return Expression.create(
+         binding.key().type(), CodeBlock.of("new $LBuilder()", subcomponentBuilderName));
+   }

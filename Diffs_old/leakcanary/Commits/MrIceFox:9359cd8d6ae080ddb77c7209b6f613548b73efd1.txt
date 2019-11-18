@@ -1,0 +1,1423 @@
+diff --git a/leakcanary-android/src/main/AndroidManifest.xml b/leakcanary-android/src/main/AndroidManifest.xml
+index b5393171..0233b357 100644
+--- a/leakcanary-android/src/main/AndroidManifest.xml
++++ b/leakcanary-android/src/main/AndroidManifest.xml
+@@ -23,6 +23,9 @@
+   <uses-permission android:name="android.permission.READ_EXTERNAL_STORAGE" />
+   <uses-permission android:name="android.permission.WRITE_EXTERNAL_STORAGE" />
+ 
++    <!--to show assistive floating window-->
++    <uses-permission android:name="android.permission.SYSTEM_ALERT_WINDOW" />
++
+   <application>
+     <service
+         android:name=".internal.HeapAnalyzerService"
+@@ -33,6 +36,16 @@
+         android:name=".DisplayLeakService"
+         android:enabled="false"
+         />
++      <service
++          android:name=".assistivetouch.AssistiveGuardService"
++          android:process=":leakcanary"
++          android:enabled="false"
++          />
++      <service
++          android:name=".assistivetouch.AssistiveResultService"
++          android:process=":leakcanary"
++          android:enabled="false"
++          />
+     <activity
+         android:theme="@style/leak_canary_LeakCanary.Base"
+         android:name=".internal.DisplayLeakActivity"
+@@ -41,10 +54,11 @@
+         android:icon="@drawable/leak_canary_icon"
+         android:taskAffinity="com.squareup.leakcanary"
+         >
+-      <intent-filter>
+-        <action android:name="android.intent.action.MAIN"/>
+-        <category android:name="android.intent.category.LAUNCHER"/>
+-      </intent-filter>
++        <!-- mricefox modify, remove launcher icon-->
++      <!--<intent-filter>-->
++        <!--<action android:name="android.intent.action.MAIN"/>-->
++        <!--<category android:name="android.intent.category.LAUNCHER"/>-->
++      <!--</intent-filter>-->
+     </activity>
+     <activity
+         android:theme="@style/leak_canary_Theme.Transparent"
+diff --git a/leakcanary-android/src/main/java/com/squareup/leakcanary/LeakCanary.java b/leakcanary-android/src/main/java/com/squareup/leakcanary/LeakCanary.java
+index 69f02ba2..c11c6f68 100644
+--- a/leakcanary-android/src/main/java/com/squareup/leakcanary/LeakCanary.java
++++ b/leakcanary-android/src/main/java/com/squareup/leakcanary/LeakCanary.java
+@@ -22,6 +22,9 @@
+ import android.content.res.Resources;
+ import android.os.Build;
+ import android.util.Log;
++
++import com.squareup.leakcanary.assistivetouch.AssistiveGuardService;
++import com.squareup.leakcanary.assistivetouch.AssistiveResultService;
+ import com.squareup.leakcanary.internal.DisplayLeakActivity;
+ import com.squareup.leakcanary.internal.HeapAnalyzerService;
+ 
+@@ -36,8 +39,10 @@
+    * references (on ICS+).
+    */
+   public static RefWatcher install(Application application) {
+-    return install(application, DisplayLeakService.class,
+-        AndroidExcludedRefs.createAppDefaults().build());
++//    return install(application, DisplayLeakService.class,
++//        AndroidExcludedRefs.createAppDefaults().build());
++      return install(application, AssistiveResultService.class,
++              AndroidExcludedRefs.createAppDefaults().build());
+   }
+ 
+   /**
+@@ -51,6 +56,8 @@ public static RefWatcher install(Application application,
+       return RefWatcher.DISABLED;
+     }
+     enableDisplayLeakActivity(application);
++      //add assistive service
++    AssistiveGuardService.startAssistiveService(application);
+     HeapDump.Listener heapDumpListener =
+         new ServiceHeapDumpListener(application, listenerServiceClass);
+     RefWatcher refWatcher = androidWatcher(application, heapDumpListener, excludedRefs);
+diff --git a/leakcanary-android/src/main/java/com/squareup/leakcanary/assistivetouch/AssistiveGuardService.java b/leakcanary-android/src/main/java/com/squareup/leakcanary/assistivetouch/AssistiveGuardService.java
+new file mode 100644
+index 00000000..6d520d47
+--- /dev/null
++++ b/leakcanary-android/src/main/java/com/squareup/leakcanary/assistivetouch/AssistiveGuardService.java
+@@ -0,0 +1,358 @@
++package com.squareup.leakcanary.assistivetouch;
++
++import android.app.NotificationManager;
++import android.app.Service;
++import android.content.Context;
++import android.content.Intent;
++import android.content.SharedPreferences;
++import android.os.Handler;
++import android.os.IBinder;
++import android.os.Looper;
++import android.os.Message;
++import android.os.Messenger;
++import android.os.RemoteException;
++
++import com.squareup.leakcanary.AnalysisResult;
++import com.squareup.leakcanary.CanaryLog;
++import com.squareup.leakcanary.DefaultLeakDirectoryProvider;
++import com.squareup.leakcanary.HeapDump;
++import com.squareup.leakcanary.LeakDirectoryProvider;
++
++import java.io.File;
++import java.io.FileInputStream;
++import java.io.FilenameFilter;
++import java.io.IOException;
++import java.io.ObjectInputStream;
++import java.util.ArrayList;
++import java.util.Collections;
++import java.util.Comparator;
++import java.util.List;
++import java.util.concurrent.Executor;
++
++import static com.squareup.leakcanary.internal.LeakCanaryInternals.newSingleThreadExecutor;
++import static com.squareup.leakcanary.internal.LeakCanaryInternals.setEnabledBlocking;
++
++public class AssistiveGuardService extends Service {
++
++    public static final int MSG_REGISTER_CLIENT = 1 << 1;
++    public static final int MSG_UNREGISTER_CLIENT = 1 << 2;
++    public static final int MSG_DELETE_FILE = 1 << 3;
++    public static final int MSG_RECEIVED = 1 << 4;
++    public static final int MSG_RESULT_ANALYZED = 1 << 5;
++    public static final int MSG_SHOULD_SHOW_NOTIFICATION = 1 << 6;
++    public static final int MSG_SHOULD_SHOW_NOTIFICATION_RESULT = 1 << 7;
++
++    private static final Executor initExecutor = newSingleThreadExecutor("AssistiveInit");
++
++    private static AssistiveTouchWindow touchWindow;
++    private static AssistivePanelWindow panelWindow;
++
++    private static LeakDirectoryProvider leakDirectoryProvider = null;
++    private List<Leak> mLeaks;
++
++    //communicate with DisplayLeakActivity in different process
++    /**
++     * Keeps track of all current registered clients.
++     */
++    private final ArrayList<Messenger> mClients = new ArrayList<Messenger>();
++
++    /**
++     * Target we publish for clients to send messages to IncomingHandler.
++     */
++    final Messenger mMessenger = new Messenger(new IncomingHandler());
++
++    /**
++     * Handler of incoming messages from clients.
++     */
++    class IncomingHandler extends Handler {
++        @Override
++        public void handleMessage(Message msg) {
++            switch (msg.what) {
++                case MSG_REGISTER_CLIENT:
++                    mClients.add(msg.replyTo);
++                    break;
++                case MSG_UNREGISTER_CLIENT:
++                    mClients.remove(msg.replyTo);
++                    break;
++                case MSG_DELETE_FILE: {
++                    LoadLeaks.load(AssistiveGuardService.this);
++                    for (int i = mClients.size() - 1; i >= 0; i--) {
++                        Message message = Message.obtain(null,
++                                MSG_RECEIVED, 0, 0);
++                        sendMsgQuitely(mClients.get(i), message);
++                    }
++                    break;
++                }
++                case MSG_RESULT_ANALYZED:
++                    onResultAnalyzed();
++                    break;
++                case MSG_SHOULD_SHOW_NOTIFICATION:
++                    for (int i = mClients.size() - 1; i >= 0; i--) {
++                        Message message = Message.obtain(null,
++                                MSG_SHOULD_SHOW_NOTIFICATION_RESULT, 0, 0);
++                        message.arg1 = shouldShowNotification() ? 1 : 0;
++                        sendMsgQuitely(mClients.get(i), message);
++                    }
++                    break;
++                default:
++                    super.handleMessage(msg);
++            }
++        }
++    }
++
++    public void onResultAnalyzed() {
++        LoadLeaks.load(this);
++    }
++
++    public boolean shouldShowNotification() {
++        return getNotificationStatus();
++    }
++
++    public static void startAssistiveService(final Context context) {
++        initExecutor.execute(new Runnable() {
++            @Override
++            public void run() {
++                setEnabledBlocking(context, AssistiveGuardService.class, true);
++                Intent intent = new Intent(context, AssistiveGuardService.class);
++                context.startService(intent);
++            }
++        });
++    }
++
++    @Override
++    public void onLowMemory() {
++        super.onLowMemory();
++    }
++
++    @Override
++    public IBinder onBind(Intent intent) {
++        return mMessenger.getBinder();
++    }
++
++    @Override
++    public boolean onUnbind(Intent intent) {
++        return super.onUnbind(intent);
++    }
++
++    @Override
++    public void onRebind(Intent intent) {
++        super.onRebind(intent);
++    }
++
++    @Override
++    public void onCreate() {
++        super.onCreate();
++        touchWindow = new AssistiveTouchWindow(getApplicationContext(), assistTContract);
++        touchWindow.show();
++
++        LoadLeaks.load(this);
++    }
++
++    @Override
++    public void onDestroy() {
++        if (touchWindow != null) {
++            touchWindow.dismiss();
++        }
++        if (panelWindow != null) {
++            panelWindow.dismiss();
++        }
++
++        touchWindow = null;
++        panelWindow = null;
++
++        super.onDestroy();
++        LoadLeaks.forgetService();
++    }
++
++    private boolean putNotificationStatus(boolean status) {
++        SharedPreferences sp = getSharedPreferences("leakcanary", Context.MODE_PRIVATE);
++        SharedPreferences.Editor editor = sp.edit();
++        editor.putBoolean("notification_status", status);
++        return editor.commit();
++    }
++
++    private boolean getNotificationStatus() {
++        SharedPreferences sp = getSharedPreferences("leakcanary", Context.MODE_PRIVATE);
++        return sp.getBoolean("notification_status", true);
++    }
++
++    private void updateUi() {
++        if (touchWindow != null) {
++            touchWindow.updateNumDot(mLeaks == null ? 0 : mLeaks.size());
++        }
++    }
++
++    private AssistiveTouchWindow.AssistiveTouchContract assistTContract =
++            new AssistiveTouchWindow.AssistiveTouchContract() {
++                @Override
++                public void onClick() {
++                    if (touchWindow != null) {
++                        touchWindow.dismiss();
++                    }
++
++                    if (panelWindow == null) {
++                        panelWindow = new AssistivePanelWindow(getApplicationContext(), assistPContract);
++                    }
++                    boolean status = getNotificationStatus();
++                    panelWindow.show(status);
++                }
++            };
++
++    private AssistivePanelWindow.AssistivePanelContract assistPContract =
++            new AssistivePanelWindow.AssistivePanelContract() {
++                @Override
++                public void onDismiss() {
++                    if (touchWindow != null) {
++                        touchWindow.showAtLastLocation();
++                    }
++                }
++
++                @Override
++                public void onNotificationStatusChange(boolean status) {
++                    putNotificationStatus(status);
++
++                    if (!status) {
++                        //Cancel a previously shown notification
++                        NotificationManager notificationManager =
++                                (NotificationManager) AssistiveGuardService.this.
++                                        getSystemService(Context.NOTIFICATION_SERVICE);
++                        notificationManager.cancel(0xDEAFBEEF);
++                    }
++                }
++
++                @Override
++                public void stopButtonOnClick() {
++                    //dismiss window immediately
++                    if (touchWindow != null) {
++                        touchWindow.dismiss();
++                    }
++                    touchWindow = null;
++                    if (panelWindow != null) {
++                        panelWindow.dismiss();
++                    }
++                    panelWindow = null;
++
++                    stopService();
++                }
++            };
++
++    private void stopService() {
++        stopSelf();
++    }
++
++    static File getLeakDirectory(Context context) {
++        LeakDirectoryProvider leakDirectoryProvider = AssistiveGuardService.leakDirectoryProvider;
++        if (leakDirectoryProvider != null) {
++            return leakDirectoryProvider.leakDirectory();
++        } else {
++            return new DefaultLeakDirectoryProvider(context).leakDirectory();
++        }
++    }
++
++    static class Leak {
++        final HeapDump heapDump;
++        final AnalysisResult result;
++        final File resultFile;
++
++        Leak(HeapDump heapDump, AnalysisResult result, File resultFile) {
++            this.heapDump = heapDump;
++            this.result = result;
++            this.resultFile = resultFile;
++        }
++    }
++
++    static class LoadLeaks implements Runnable {
++
++        static final List<LoadLeaks> inFlight = new ArrayList<>();
++
++        static final Executor backgroundExecutor = newSingleThreadExecutor("LoadLeaks");
++
++        static void load(AssistiveGuardService service) {
++            LoadLeaks loadLeaks = new LoadLeaks(service);
++            inFlight.add(loadLeaks);
++            backgroundExecutor.execute(loadLeaks);
++        }
++
++        static void forgetService() {
++            for (LoadLeaks loadLeaks : inFlight) {
++                loadLeaks.serviceOrNull = null;
++            }
++            inFlight.clear();
++        }
++
++        AssistiveGuardService serviceOrNull;
++        private final File leakDirectory;
++        private final Handler mainHandler;
++
++        LoadLeaks(AssistiveGuardService service) {
++            this.serviceOrNull = service;
++            leakDirectory = getLeakDirectory(service);
++            mainHandler = new Handler(Looper.getMainLooper());
++        }
++
++        @Override
++        public void run() {
++            final List<Leak> leaks = new ArrayList<>();
++            File[] files = leakDirectory.listFiles(new FilenameFilter() {
++                @Override
++                public boolean accept(File dir, String filename) {
++                    return filename.endsWith(".result");
++                }
++            });
++
++            if (files != null) {
++                for (File resultFile : files) {
++                    FileInputStream fis = null;
++                    try {
++                        fis = new FileInputStream(resultFile);
++                        ObjectInputStream ois = new ObjectInputStream(fis);
++                        HeapDump heapDump = (HeapDump) ois.readObject();
++                        AnalysisResult result = (AnalysisResult) ois.readObject();
++                        leaks.add(new Leak(heapDump, result, resultFile));
++                    } catch (IOException | ClassNotFoundException e) {
++                        // Likely a change in the serializable result class.
++                        // Let's remove the files, we can't read them anymore.
++                        boolean deleted = resultFile.delete();
++                        if (deleted) {
++                            CanaryLog.d(e, "Could not read result file %s, deleted it.", resultFile);
++                        } else {
++                            CanaryLog.d(e, "Could not read result file %s, could not delete it either.",
++                                    resultFile);
++                        }
++                    } finally {
++                        if (fis != null) {
++                            try {
++                                fis.close();
++                            } catch (IOException ignored) {
++                            }
++                        }
++                    }
++                }
++                Collections.sort(leaks, new Comparator<Leak>() {
++                    @Override
++                    public int compare(Leak lhs, Leak rhs) {
++                        return Long.valueOf(rhs.resultFile.lastModified())
++                                .compareTo(lhs.resultFile.lastModified());
++                    }
++                });
++            }
++            mainHandler.post(new Runnable() {
++                @Override
++                public void run() {
++                    inFlight.remove(LoadLeaks.this);
++                    if (serviceOrNull != null) {
++                        serviceOrNull.mLeaks = leaks;
++                        serviceOrNull.updateUi();
++                    }
++                }
++            });
++        }
++    }
++
++    public static void sendMsgQuitely(Messenger messenger, Message msg) {
++        try {
++            messenger.send(msg);
++        } catch (RemoteException ignored) {
++        }
++    }
++}
+diff --git a/leakcanary-android/src/main/java/com/squareup/leakcanary/assistivetouch/AssistivePanelWindow.java b/leakcanary-android/src/main/java/com/squareup/leakcanary/assistivetouch/AssistivePanelWindow.java
+new file mode 100644
+index 00000000..d615ac7a
+--- /dev/null
++++ b/leakcanary-android/src/main/java/com/squareup/leakcanary/assistivetouch/AssistivePanelWindow.java
+@@ -0,0 +1,181 @@
++package com.squareup.leakcanary.assistivetouch;
++
++import android.content.Context;
++import android.content.Intent;
++import android.graphics.PixelFormat;
++import android.graphics.Point;
++import android.view.Gravity;
++import android.view.KeyEvent;
++import android.view.LayoutInflater;
++import android.view.MotionEvent;
++import android.view.View;
++import android.view.ViewGroup;
++import android.view.WindowManager;
++import android.widget.Button;
++import android.widget.CompoundButton;
++import android.widget.FrameLayout;
++import android.widget.ToggleButton;
++
++import com.squareup.leakcanary.R;
++import com.squareup.leakcanary.internal.DisplayLeakActivity;
++
++public class AssistivePanelWindow {
++    private final Context context;
++    private final WindowManager wm;
++    private View assistivePanelView;
++    private ToggleButton notificationSwitch;
++    private Button displayButton, dismissButton;
++    private final AssistivePanelContract contract;
++
++    public AssistivePanelWindow(Context context, AssistivePanelContract contract) {
++        this.context = context;
++        this.contract = contract;
++        wm = (WindowManager) context.getSystemService(Context.WINDOW_SERVICE);
++    }
++
++    public void show(boolean notificationStatus) {
++        final Point screenSize = ScreenUtil.getScreenSize(context);
++
++        int curFlags = 0;
++
++        WindowManager.LayoutParams p = new WindowManager.LayoutParams(
++                screenSize.x - 200,
++                ViewGroup.LayoutParams.WRAP_CONTENT,
++                0,
++                0,
++                WindowManager.LayoutParams.TYPE_TOAST, computeFlags(curFlags),
++//                WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE
++//                WindowManager.LayoutParams.FLAG_NOT_TOUCH_MODAL,
++//                        | WindowManager.LayoutParams.FLAG_NOT_TOUCHABLE,//lock the location
++                PixelFormat.TRANSLUCENT);
++        p.gravity = Gravity.CENTER;
++
++        p.windowAnimations = R.style.leak_canary_assistive_panel_anim;
++
++        wm.addView(getAssistivePanelView(), p);
++
++        notificationSwitch.setChecked(notificationStatus);
++    }
++
++    public void dismiss() {
++        if (assistivePanelView != null && assistivePanelView.getWindowToken() != null) {
++            wm.removeView(assistivePanelView);
++            if (contract != null) {
++                contract.onDismiss();
++            }
++        }
++    }
++
++    private int computeFlags(int curFlags) {
++        curFlags &= ~(
++                WindowManager.LayoutParams.FLAG_IGNORE_CHEEK_PRESSES
++                        | WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE
++                        | WindowManager.LayoutParams.FLAG_NOT_TOUCHABLE
++                        | WindowManager.LayoutParams.FLAG_WATCH_OUTSIDE_TOUCH
++                        | WindowManager.LayoutParams.FLAG_LAYOUT_NO_LIMITS
++                        | WindowManager.LayoutParams.FLAG_ALT_FOCUSABLE_IM
++                        | WindowManager.LayoutParams.FLAG_SPLIT_TOUCH);
++        return curFlags;
++    }
++
++    private View getAssistivePanelView() {
++        if (assistivePanelView == null) {
++            AssistivePanelContainer container = new AssistivePanelContainer(context);
++            final View content = LayoutInflater.from(context).inflate(R.layout.leak_canary_assistive_panel, null);
++            container.addView(content);
++            assistivePanelView = container;
++            notificationSwitch = (ToggleButton) content.findViewById(R.id.__leak_canary_notify_switch);
++            notificationSwitch.setOnCheckedChangeListener(new CompoundButton.OnCheckedChangeListener() {
++                @Override
++                public void onCheckedChanged(CompoundButton buttonView, boolean isChecked) {
++                    if (contract != null) {
++                        contract.onNotificationStatusChange(isChecked);
++                    }
++                }
++            });
++            displayButton = (Button) content.findViewById(R.id.__leak_canary_display_button);
++            displayButton.setOnClickListener(new View.OnClickListener() {
++                @Override
++                public void onClick(View v) {
++                    Intent intent = new Intent(context, DisplayLeakActivity.class);
++                    intent.setFlags(Intent.FLAG_ACTIVITY_NEW_TASK | Intent.FLAG_ACTIVITY_CLEAR_TOP);
++                    context.startActivity(intent);
++                    dismiss();
++                }
++            });
++            dismissButton = (Button) content.findViewById(R.id.__leak_canary_dismiss_button);
++            dismissButton.setOnClickListener(new View.OnClickListener() {
++                @Override
++                public void onClick(View v) {
++                    contract.stopButtonOnClick();
++                }
++            });
++        }
++        return assistivePanelView;
++    }
++
++    private class AssistivePanelContainer extends FrameLayout {
++
++        public AssistivePanelContainer(Context context) {
++            super(context);
++        }
++
++        @Override
++        public boolean dispatchKeyEvent(KeyEvent event) {
++            /**
++             * taken from {@link android.widget.PopupWindow}
++             */
++            if (event.getKeyCode() == KeyEvent.KEYCODE_BACK) {
++                if (getKeyDispatcherState() == null) {
++                    return super.dispatchKeyEvent(event);
++                }
++
++                if (event.getAction() == KeyEvent.ACTION_DOWN
++                        && event.getRepeatCount() == 0) {
++                    KeyEvent.DispatcherState state = getKeyDispatcherState();
++                    if (state != null) {
++                        state.startTracking(event, this);
++                    }
++                    return true;
++                } else if (event.getAction() == KeyEvent.ACTION_UP) {
++                    KeyEvent.DispatcherState state = getKeyDispatcherState();
++                    if (state != null && state.isTracking(event) && !event.isCanceled()) {
++                        dismiss();
++                        return true;
++                    }
++                }
++                return super.dispatchKeyEvent(event);
++            } else {
++                return super.dispatchKeyEvent(event);
++            }
++        }
++
++        @Override
++        public boolean onTouchEvent(MotionEvent event) {
++            /**
++             * taken from {@link android.widget.PopupWindow}
++             */
++            final int x = (int) event.getX();
++            final int y = (int) event.getY();
++
++            if ((event.getAction() == MotionEvent.ACTION_DOWN)
++                    && ((x < 0) || (x >= getWidth()) || (y < 0) || (y >= getHeight()))) {
++                dismiss();
++                return true;
++            } else if (event.getAction() == MotionEvent.ACTION_OUTSIDE) {
++                dismiss();
++                return true;
++            } else {
++                return super.onTouchEvent(event);
++            }
++        }
++    }
++
++    public interface AssistivePanelContract {
++        void onDismiss();
++
++        void onNotificationStatusChange(boolean status);
++
++        void stopButtonOnClick();
++    }
++}
+diff --git a/leakcanary-android/src/main/java/com/squareup/leakcanary/assistivetouch/AssistiveResultService.java b/leakcanary-android/src/main/java/com/squareup/leakcanary/assistivetouch/AssistiveResultService.java
+new file mode 100644
+index 00000000..d64b11e1
+--- /dev/null
++++ b/leakcanary-android/src/main/java/com/squareup/leakcanary/assistivetouch/AssistiveResultService.java
+@@ -0,0 +1,248 @@
++package com.squareup.leakcanary.assistivetouch;
++
++import android.app.PendingIntent;
++import android.content.ComponentName;
++import android.content.Context;
++import android.content.Intent;
++import android.content.ServiceConnection;
++import android.content.res.Resources;
++import android.os.Handler;
++import android.os.IBinder;
++import android.os.Message;
++import android.os.Messenger;
++
++import com.squareup.leakcanary.AbstractAnalysisResultService;
++import com.squareup.leakcanary.AnalysisResult;
++import com.squareup.leakcanary.CanaryLog;
++import com.squareup.leakcanary.HeapDump;
++import com.squareup.leakcanary.R;
++import com.squareup.leakcanary.internal.DisplayLeakActivity;
++import com.squareup.leakcanary.internal.LeakCanaryInternals;
++
++import java.io.File;
++import java.io.FileOutputStream;
++import java.io.FilenameFilter;
++import java.io.IOException;
++import java.io.ObjectOutputStream;
++import java.text.SimpleDateFormat;
++import java.util.Arrays;
++import java.util.Comparator;
++import java.util.Date;
++import java.util.Locale;
++
++import static android.text.format.Formatter.formatShortFileSize;
++import static com.squareup.leakcanary.LeakCanary.leakInfo;
++import static com.squareup.leakcanary.internal.LeakCanaryInternals.classSimpleName;
++
++public class AssistiveResultService extends AbstractAnalysisResultService {
++    private boolean isBind;
++    private final Object wakeLock = new Object();
++    private boolean shouldShowNotification = true;
++    private Messenger mService = null;
++    private final Messenger mMessenger = new Messenger(new IncomingHandler());
++
++    class IncomingHandler extends Handler {
++        @Override
++        public void handleMessage(Message msg) {
++            switch (msg.what) {
++                case AssistiveGuardService.MSG_RECEIVED:
++                    break;
++                case AssistiveGuardService.MSG_SHOULD_SHOW_NOTIFICATION_RESULT:
++                    shouldShowNotification = msg.arg1 == 1;
++                    synchronized (wakeLock) {
++                        wakeLock.notifyAll();
++                    }
++                    break;
++                default:
++                    super.handleMessage(msg);
++            }
++        }
++    }
++
++    private ServiceConnection connection = new ServiceConnection() {
++        @Override
++        public void onServiceConnected(ComponentName name, IBinder iBinder) {
++            mService = new Messenger(iBinder);
++
++            Message msg = Message.obtain(null,
++                    AssistiveGuardService.MSG_REGISTER_CLIENT);
++            msg.replyTo = mMessenger;
++            AssistiveGuardService.sendMsgQuitely(mService, msg);
++        }
++
++        @Override
++        public void onServiceDisconnected(ComponentName name) {
++            mService = null;
++        }
++    };
++
++    @Override
++    public void onCreate() {
++        super.onCreate();
++
++        bindGuardService();
++    }
++
++    @Override
++    public void onStart(Intent intent, int startId) {
++        super.onStart(intent, startId);
++    }
++
++    @Override
++    public int onStartCommand(Intent intent, int flags, int startId) {
++        return super.onStartCommand(intent, flags, startId);
++    }
++
++    @Override
++    public void onDestroy() {
++        unbindGuardService();
++        super.onDestroy();
++    }
++
++    public void bindGuardService() {
++        Intent intent = new Intent(this, AssistiveGuardService.class);
++        bindService(intent, connection, Context.BIND_AUTO_CREATE);
++        isBind = true;
++    }
++
++    public void unbindGuardService() {
++        if (isBind) {
++            if (mService != null) {
++                Message msg = Message.obtain(null,
++                        AssistiveGuardService.MSG_UNREGISTER_CLIENT);
++                msg.replyTo = mMessenger;
++                AssistiveGuardService.sendMsgQuitely(mService, msg);
++            }
++            unbindService(connection);
++            isBind = false;
++        }
++    }
++
++    @Override
++    protected void onHeapAnalyzed(HeapDump heapDump, AnalysisResult result) {
++        String leakInfo = leakInfo(this, heapDump, result, true);
++        CanaryLog.d(leakInfo);
++
++        boolean resultSaved = false;
++        boolean shouldSaveResult = result.leakFound || result.failure != null;
++        if (shouldSaveResult) {
++            heapDump = renameHeapdump(heapDump);
++            resultSaved = saveResult(heapDump, result);
++        }
++
++        PendingIntent pendingIntent;
++        String contentTitle;
++        String contentText;
++
++        if (!shouldSaveResult) {
++            contentTitle = getString(R.string.leak_canary_no_leak_title);
++            contentText = getString(R.string.leak_canary_no_leak_text);
++            pendingIntent = null;
++        } else if (resultSaved) {
++            pendingIntent = DisplayLeakActivity.createPendingIntent(this, heapDump.referenceKey);
++
++            if (result.failure == null) {
++                String size = formatShortFileSize(this, result.retainedHeapSize);
++                String className = classSimpleName(result.className);
++                if (result.excludedLeak) {
++                    contentTitle = getString(R.string.leak_canary_leak_excluded, className, size);
++                } else {
++                    contentTitle = getString(R.string.leak_canary_class_has_leaked, className, size);
++                }
++            } else {
++                contentTitle = getString(R.string.leak_canary_analysis_failed);
++            }
++            contentText = getString(R.string.leak_canary_notification_message);
++
++            Message msg = Message.obtain(null,
++                    AssistiveGuardService.MSG_RESULT_ANALYZED, 0, 0);
++            AssistiveGuardService.sendMsgQuitely(mService, msg);
++        } else {
++            contentTitle = getString(R.string.leak_canary_could_not_save_title);
++            contentText = getString(R.string.leak_canary_could_not_save_text);
++            pendingIntent = null;
++        }
++
++        Message msg = Message.obtain(null,
++                AssistiveGuardService.MSG_SHOULD_SHOW_NOTIFICATION, 0, 0);
++        AssistiveGuardService.sendMsgQuitely(mService, msg);
++
++        //wait until send result to guard service
++        synchronized (wakeLock) {
++            try {
++                wakeLock.wait(1000);
++            } catch (InterruptedException e) {
++                e.printStackTrace();
++            } finally {
++                wakeLock.notifyAll();
++            }
++        }
++
++        if (shouldShowNotification) {
++            LeakCanaryInternals.showNotification(this, contentTitle, contentText, pendingIntent);
++        }
++    }
++
++    private boolean saveResult(HeapDump heapDump, AnalysisResult result) {
++        File resultFile = new File(heapDump.heapDumpFile.getParentFile(),
++                heapDump.heapDumpFile.getName() + ".result");
++        FileOutputStream fos = null;
++        try {
++            fos = new FileOutputStream(resultFile);
++            ObjectOutputStream oos = new ObjectOutputStream(fos);
++            oos.writeObject(heapDump);
++            oos.writeObject(result);
++            return true;
++        } catch (IOException e) {
++            CanaryLog.d(e, "Could not save leak analysis result to disk.");
++        } finally {
++            if (fos != null) {
++                try {
++                    fos.close();
++                } catch (IOException ignored) {
++                }
++            }
++        }
++        return false;
++    }
++
++    private HeapDump renameHeapdump(HeapDump heapDump) {
++        String fileName =
++                new SimpleDateFormat("yyyy-MM-dd_HH-mm-ss_SSS'.hprof'", Locale.US).format(new Date());
++
++        File newFile = new File(heapDump.heapDumpFile.getParent(), fileName);
++        boolean renamed = heapDump.heapDumpFile.renameTo(newFile);
++        if (!renamed) {
++            CanaryLog.d("Could not rename heap dump file %s to %s", heapDump.heapDumpFile.getPath(),
++                    newFile.getPath());
++        }
++        heapDump =
++                new HeapDump(newFile, heapDump.referenceKey, heapDump.referenceName, heapDump.excludedRefs,
++                        heapDump.watchDurationMs, heapDump.gcDurationMs, heapDump.heapDumpDurationMs);
++
++        Resources resources = getResources();
++        int maxStoredHeapDumps =
++                Math.max(resources.getInteger(R.integer.leak_canary_max_stored_leaks), 1);
++        File[] hprofFiles = heapDump.heapDumpFile.getParentFile().listFiles(new FilenameFilter() {
++            @Override
++            public boolean accept(File dir, String filename) {
++                return filename.endsWith(".hprof");
++            }
++        });
++
++        if (hprofFiles.length > maxStoredHeapDumps) {
++            // Sort with oldest modified first.
++            Arrays.sort(hprofFiles, new Comparator<File>() {
++                @Override
++                public int compare(File lhs, File rhs) {
++                    return Long.valueOf(lhs.lastModified()).compareTo(rhs.lastModified());
++                }
++            });
++            boolean deleted = hprofFiles[0].delete();
++            if (!deleted) {
++                CanaryLog.d("Could not delete old hprof file %s", hprofFiles[0].getPath());
++            }
++        }
++        return heapDump;
++    }
++}
+diff --git a/leakcanary-android/src/main/java/com/squareup/leakcanary/assistivetouch/AssistiveTouchWindow.java b/leakcanary-android/src/main/java/com/squareup/leakcanary/assistivetouch/AssistiveTouchWindow.java
+new file mode 100644
+index 00000000..a6f76acc
+--- /dev/null
++++ b/leakcanary-android/src/main/java/com/squareup/leakcanary/assistivetouch/AssistiveTouchWindow.java
+@@ -0,0 +1,164 @@
++package com.squareup.leakcanary.assistivetouch;
++
++import android.content.Context;
++import android.graphics.PixelFormat;
++import android.view.GestureDetector;
++import android.view.Gravity;
++import android.view.LayoutInflater;
++import android.view.MotionEvent;
++import android.view.View;
++import android.view.WindowManager;
++import android.widget.TextView;
++
++import com.squareup.leakcanary.R;
++
++public class AssistiveTouchWindow extends GestureDetector.SimpleOnGestureListener implements View.OnTouchListener {
++    public static final int DEFAULT_OFFSET_X = 0;
++    public static final int DEFAULT_OFFSET_Y = 0;
++    public static final float MOVING_ALPHA = .5F;
++
++    private final int statusBarHeight;
++    private final Context context;
++    private final WindowManager wm;
++    private final GestureDetector gestureDetector;
++    private View assistiveTouchView;
++    private final AssistiveTouchContract contract;
++
++    private int lastX, lastY;
++    private boolean moveFlag;
++
++    public AssistiveTouchWindow(Context context, AssistiveTouchContract contract) {
++        this.context = context;
++        this.contract = contract;
++        wm = (WindowManager) context.getSystemService(Context.WINDOW_SERVICE);
++        gestureDetector = new GestureDetector(context, this);
++        statusBarHeight = ScreenUtil.getStatusBarHeight(context);
++    }
++
++    public void show() {
++        showAtLocation(DEFAULT_OFFSET_X, DEFAULT_OFFSET_Y);
++    }
++
++    public void showAtLastLocation() {
++        showAtLocation(lastX, lastY);
++    }
++
++    /**
++     * show at location, the x, y is the offset of the origin(0, status bar height)
++     *
++     * @param x
++     * @param y
++     */
++    public void showAtLocation(int x, int y) {
++        WindowManager.LayoutParams p = new WindowManager.LayoutParams(
++                WindowManager.LayoutParams.WRAP_CONTENT,
++                WindowManager.LayoutParams.WRAP_CONTENT,
++                x,
++                y,
++                WindowManager.LayoutParams.TYPE_TOAST,
++                WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE
++                        | WindowManager.LayoutParams.FLAG_NOT_TOUCH_MODAL,
++//                          |  WindowManager.LayoutParams.FLAG_NOT_TOUCHABLE,//lock the location
++                PixelFormat.TRANSLUCENT);
++        p.gravity = Gravity.TOP | Gravity.START;
++        p.alpha = MOVING_ALPHA;
++
++        View view = getAssistiveTouchView();
++
++        wm.addView(view, p);
++
++        lastX = x;
++        lastY = y;
++    }
++
++    public void dismiss() {
++        if (assistiveTouchView != null && assistiveTouchView.getWindowToken() != null) {
++            wm.removeView(assistiveTouchView);
++        }
++//        lastX = lastY = 0;
++    }
++
++    private View getAssistiveTouchView() {
++        if (assistiveTouchView == null) {
++            assistiveTouchView = LayoutInflater.from(context).inflate(R.layout.leak_canary_assistive_touch, null);
++            assistiveTouchView.setOnTouchListener(this);
++            assistiveTouchView.setOnClickListener(new View.OnClickListener() {
++                @Override
++                public void onClick(View v) {
++                    if (contract != null) {
++                        contract.onClick();
++                    }
++                }
++            });
++        }
++        return assistiveTouchView;
++    }
++
++    private void updateLocation(int rawX, int rawY) {
++        WindowManager.LayoutParams p = (WindowManager.LayoutParams) getAssistiveTouchView().getLayoutParams();
++
++        //window Y-Axis initial offset
++        p.x = rawX;
++        p.y = rawY - statusBarHeight;
++
++        /**
++         * adjust window to the center of the finger touch, otherwise the finger touch point match
++         * the left-top of the window
++         */
++        p.x -= assistiveTouchView.getWidth() / 2;
++        p.y -= assistiveTouchView.getHeight() / 2;
++        p.alpha = 1.0f;
++
++        wm.updateViewLayout(getAssistiveTouchView(), p);
++        lastX = p.x;
++        lastY = p.y;
++    }
++
++    @Override
++    public boolean onTouch(View v, MotionEvent event) {
++//        gestureDetector.onTouchEvent(event);
++
++        final int action = event.getActionMasked();
++
++        switch (action) {
++            case MotionEvent.ACTION_MOVE: {
++                updateLocation((int) event.getRawX(), (int) event.getRawY());
++                if (!moveFlag) {
++                    moveFlag = true;
++                }
++                break;
++            }
++            case MotionEvent.ACTION_UP: {
++                WindowManager.LayoutParams p = (WindowManager.LayoutParams) getAssistiveTouchView().getLayoutParams();
++                p.alpha = MOVING_ALPHA;
++                wm.updateViewLayout(getAssistiveTouchView(), p);
++                if (moveFlag) {
++                    moveFlag = false;
++                    return true;
++                }
++                break;
++            }
++            default:
++        }
++        return false;
++    }
++
++    @Override
++    public boolean onScroll(MotionEvent e1, MotionEvent e2, float distanceX, float distanceY) {
++
++        return true;
++    }
++
++    public void updateNumDot(int leakNum) {
++        final View dotArea = getAssistiveTouchView().findViewById(R.id.__leak_canary_dot_layout);
++        final TextView numTxt = (TextView) getAssistiveTouchView().findViewById(R.id.__leak_canary_leak_num_txt);
++
++        dotArea.setVisibility(leakNum <= 0 ? View.GONE : View.VISIBLE);
++        numTxt.setText("" + leakNum);
++    }
++
++    public interface AssistiveTouchContract {
++        void onClick();
++    }
++
++}
+diff --git a/leakcanary-android/src/main/java/com/squareup/leakcanary/assistivetouch/ScreenUtil.java b/leakcanary-android/src/main/java/com/squareup/leakcanary/assistivetouch/ScreenUtil.java
+new file mode 100644
+index 00000000..d6bf4194
+--- /dev/null
++++ b/leakcanary-android/src/main/java/com/squareup/leakcanary/assistivetouch/ScreenUtil.java
+@@ -0,0 +1,26 @@
++package com.squareup.leakcanary.assistivetouch;
++
++import android.content.Context;
++import android.graphics.Point;
++import android.util.DisplayMetrics;
++
++public class ScreenUtil {
++    private ScreenUtil() {
++    }
++
++    public static int getStatusBarHeight(Context context) {
++        int result = 0;
++        int resourceId = context.getResources().getIdentifier("status_bar_height", "dimen", "android");
++        if (resourceId > 0) {
++            result = context.getResources().getDimensionPixelSize(resourceId);
++        }
++        return result;
++    }
++
++    public static Point getScreenSize(Context context) {
++        DisplayMetrics metrics = context.getResources().getDisplayMetrics();
++        int width = metrics.widthPixels;
++        int height = metrics.heightPixels;
++        return new Point(width, height);
++    }
++}
+diff --git a/leakcanary-android/src/main/java/com/squareup/leakcanary/internal/DisplayLeakActivity.java b/leakcanary-android/src/main/java/com/squareup/leakcanary/internal/DisplayLeakActivity.java
+index 349b933f..ab8050e6 100644
+--- a/leakcanary-android/src/main/java/com/squareup/leakcanary/internal/DisplayLeakActivity.java
++++ b/leakcanary-android/src/main/java/com/squareup/leakcanary/internal/DisplayLeakActivity.java
+@@ -18,13 +18,18 @@
+ import android.annotation.TargetApi;
+ import android.app.Activity;
+ import android.app.PendingIntent;
++import android.content.ComponentName;
+ import android.content.Context;
+ import android.content.Intent;
++import android.content.ServiceConnection;
+ import android.net.Uri;
+ import android.os.Build;
+ import android.os.Bundle;
+ import android.os.Handler;
++import android.os.IBinder;
+ import android.os.Looper;
++import android.os.Message;
++import android.os.Messenger;
+ import android.text.format.DateUtils;
+ import android.util.Log;
+ import android.view.LayoutInflater;
+@@ -44,6 +49,8 @@
+ import com.squareup.leakcanary.HeapDump;
+ import com.squareup.leakcanary.LeakDirectoryProvider;
+ import com.squareup.leakcanary.R;
++import com.squareup.leakcanary.assistivetouch.AssistiveGuardService;
++
+ import java.io.File;
+ import java.io.FileInputStream;
+ import java.io.FilenameFilter;
+@@ -105,7 +112,6 @@ static File getLeakDirectory(Context context) {
+ 
+   @Override protected void onCreate(Bundle savedInstanceState) {
+     super.onCreate(savedInstanceState);
+-
+     if (savedInstanceState != null) {
+       visibleLeakRefKey = savedInstanceState.getString("visibleLeakRefKey");
+     } else {
+@@ -280,6 +286,7 @@ public void onItemClick(AdapterView<?> parent, View view, int position, long id)
+               if (!heapDumpDeleted) {
+                 CanaryLog.d("Could not delete heap dump file %s", heapDumpFile.getPath());
+               }
++              onDeleteSuccess();
+               visibleLeakRefKey = null;
+               leaks.remove(visibleLeak);
+               updateUi();
+@@ -321,6 +328,7 @@ public void onItemClick(AdapterView<?> parent, View view, int position, long id)
+                 }
+               }
+             }
++            onDeleteSuccess();
+             leaks = Collections.emptyList();
+             updateUi();
+           }
+@@ -495,4 +503,94 @@ static String classSimpleName(String className) {
+       return className.substring(separator + 1);
+     }
+   }
++  //add bind AssistiveGuardService for making leak num correspond with real num after delete
++  /** Messenger for communicating with service. */
++  Messenger mService = null;
++  private boolean mIsBound;
++
++  /**
++   * Handler of incoming messages from service.
++   */
++  class IncomingHandler extends Handler {
++    @Override
++    public void handleMessage(Message msg) {
++      switch (msg.what) {
++        case AssistiveGuardService.MSG_RECEIVED:
++          CanaryLog.d("MSG_RECEIVED msg.obj:" + msg.obj);
++          break;
++        default:
++          super.handleMessage(msg);
++      }
++    }
++  }
++
++  /**
++   * Target we publish for clients to send messages to IncomingHandler.
++   */
++  final Messenger mMessenger = new Messenger(new IncomingHandler());
++
++  private ServiceConnection connection = new ServiceConnection() {
++    @Override
++    public void onServiceConnected(ComponentName name, IBinder service) {
++      mService = new Messenger(service);
++
++      // We want to monitor the service for as long as we are
++      // connected to it.
++      Message msg = Message.obtain(null, AssistiveGuardService.MSG_REGISTER_CLIENT);
++      msg.replyTo = mMessenger;
++      AssistiveGuardService.sendMsgQuitely(mService, msg);
++    }
++
++    @Override
++    public void onServiceDisconnected(ComponentName name) {
++      // This is called when the connection with the service has been
++      // unexpectedly disconnected -- that is, its process crashed.
++      mService = null;
++    }
++  };
++
++  @Override
++  protected void onStart() {
++    super.onStart();
++    doBindService();
++  }
++
++  @Override
++  protected void onStop() {
++    super.onStop();
++    doUnbindService();
++  }
++
++  void doBindService() {
++    // Establish a connection with the service.  We use an explicit
++    // class name because there is no reason to be able to let other
++    // applications replace our component.
++    Intent intent = new Intent(DisplayLeakActivity.this,
++            AssistiveGuardService.class);
++    bindService(intent, connection, Context.BIND_AUTO_CREATE);
++    mIsBound = true;
++  }
++
++  void doUnbindService() {
++    if (mIsBound) {
++      // If we have received the service, and hence registered with
++      // it, then now is the time to unregister.
++      if (mService != null) {
++        Message msg = Message.obtain(null,
++                AssistiveGuardService.MSG_UNREGISTER_CLIENT);
++        msg.replyTo = mMessenger;
++        AssistiveGuardService.sendMsgQuitely(mService, msg);
++      }
++
++      // Detach our existing connection.
++      unbindService(connection);
++      mIsBound = false;
++    }
++  }
++
++  void onDeleteSuccess() {
++    Message msg = Message.obtain(null,
++            AssistiveGuardService.MSG_DELETE_FILE, 0, 0);
++    AssistiveGuardService.sendMsgQuitely(mService, msg);
++  }
+ }
+diff --git a/leakcanary-android/src/main/res/anim/leak_canary_decelerate_cubic.xml b/leakcanary-android/src/main/res/anim/leak_canary_decelerate_cubic.xml
+new file mode 100644
+index 00000000..272ab6a4
+--- /dev/null
++++ b/leakcanary-android/src/main/res/anim/leak_canary_decelerate_cubic.xml
+@@ -0,0 +1,3 @@
++<?xml version="1.0" encoding="utf-8"?>
++<android:decelerateInterpolator xmlns:android="http://schemas.android.com/apk/res/android"
++    android:factor="1.5" />
+diff --git a/leakcanary-android/src/main/res/anim/leak_canary_decelerate_quint.xml b/leakcanary-android/src/main/res/anim/leak_canary_decelerate_quint.xml
+new file mode 100644
+index 00000000..a805e413
+--- /dev/null
++++ b/leakcanary-android/src/main/res/anim/leak_canary_decelerate_quint.xml
+@@ -0,0 +1,3 @@
++<?xml version="1.0" encoding="utf-8"?>
++<android:decelerateInterpolator xmlns:android="http://schemas.android.com/apk/res/android"
++    android:factor="2.5" />
+diff --git a/leakcanary-android/src/main/res/anim/leak_canary_grow_fade_in_from_bottom.xml b/leakcanary-android/src/main/res/anim/leak_canary_grow_fade_in_from_bottom.xml
+new file mode 100644
+index 00000000..fd87bbaa
+--- /dev/null
++++ b/leakcanary-android/src/main/res/anim/leak_canary_grow_fade_in_from_bottom.xml
+@@ -0,0 +1,17 @@
++<?xml version="1.0" encoding="utf-8"?>
++<set xmlns:android="http://schemas.android.com/apk/res/android">
++    <scale
++        android:duration="220"
++        android:fromXScale="0.9"
++        android:fromYScale="0.9"
++        android:interpolator="@anim/leak_canary_decelerate_quint"
++        android:pivotX="50%"
++        android:pivotY="100%"
++        android:toXScale="1.0"
++        android:toYScale="1.0" />
++    <alpha
++        android:duration="150"
++        android:fromAlpha="0.0"
++        android:interpolator="@anim/leak_canary_decelerate_cubic"
++        android:toAlpha="1.0" />
++</set>
+\ No newline at end of file
+diff --git a/leakcanary-android/src/main/res/anim/leak_canary_shrink_fade_out_from_bottom.xml b/leakcanary-android/src/main/res/anim/leak_canary_shrink_fade_out_from_bottom.xml
+new file mode 100644
+index 00000000..6e973445
+--- /dev/null
++++ b/leakcanary-android/src/main/res/anim/leak_canary_shrink_fade_out_from_bottom.xml
+@@ -0,0 +1,17 @@
++<?xml version="1.0" encoding="utf-8"?>
++<set xmlns:android="http://schemas.android.com/apk/res/android">
++    <scale
++        android:duration="220"
++        android:fromXScale="1.0"
++        android:fromYScale="1.0"
++        android:interpolator="@anim/leak_canary_decelerate_quint"
++        android:pivotX="50%"
++        android:pivotY="100%"
++        android:toXScale="0.9"
++        android:toYScale="0.9" />
++    <alpha
++        android:duration="150"
++        android:fromAlpha="1.0"
++        android:interpolator="@anim/leak_canary_decelerate_cubic"
++        android:toAlpha="0.0" />
++</set>
+\ No newline at end of file
+diff --git a/leakcanary-android/src/main/res/drawable-mdpi/leak_canary_dot_icon.png b/leakcanary-android/src/main/res/drawable-mdpi/leak_canary_dot_icon.png
+new file mode 100644
+index 00000000..13f346c1
+Binary files /dev/null and b/leakcanary-android/src/main/res/drawable-mdpi/leak_canary_dot_icon.png differ
+diff --git a/leakcanary-android/src/main/res/layout/leak_canary_assistive_panel.xml b/leakcanary-android/src/main/res/layout/leak_canary_assistive_panel.xml
+new file mode 100644
+index 00000000..cf5e2583
+--- /dev/null
++++ b/leakcanary-android/src/main/res/layout/leak_canary_assistive_panel.xml
+@@ -0,0 +1,42 @@
++<?xml version="1.0" encoding="utf-8"?>
++<LinearLayout xmlns:android="http://schemas.android.com/apk/res/android"
++    android:layout_width="match_parent"
++    android:layout_height="wrap_content"
++    android:background="#3c3c3c"
++    android:orientation="vertical"
++    android:padding="16dp">
++
++
++    <LinearLayout
++        android:layout_width="match_parent"
++        android:layout_height="wrap_content"
++        android:orientation="horizontal">
++
++        <TextView
++            android:layout_width="0dp"
++            android:layout_height="wrap_content"
++            android:layout_gravity="center_vertical"
++            android:layout_weight="1"
++            android:text="@string/leak_canary_switch_notification" />
++
++        <ToggleButton
++            android:id="@+id/__leak_canary_notify_switch"
++            android:layout_width="wrap_content"
++            android:layout_height="wrap_content"
++            android:layout_marginLeft="16dp" />
++    </LinearLayout>
++
++    <Button
++        android:id="@+id/__leak_canary_display_button"
++        android:layout_width="match_parent"
++        android:layout_height="wrap_content"
++        android:layout_marginTop="16dp"
++        android:text="@string/leak_canary_enter_display_activity" />
++
++    <Button
++        android:id="@+id/__leak_canary_dismiss_button"
++        android:layout_width="match_parent"
++        android:layout_height="wrap_content"
++        android:layout_marginTop="16dp"
++        android:text="@string/leak_canary_enter_dismiss" />
++</LinearLayout>
+\ No newline at end of file
+diff --git a/leakcanary-android/src/main/res/layout/leak_canary_assistive_touch.xml b/leakcanary-android/src/main/res/layout/leak_canary_assistive_touch.xml
+new file mode 100644
+index 00000000..faef4c59
+--- /dev/null
++++ b/leakcanary-android/src/main/res/layout/leak_canary_assistive_touch.xml
+@@ -0,0 +1,29 @@
++<?xml version="1.0" encoding="utf-8"?>
++<RelativeLayout xmlns:android="http://schemas.android.com/apk/res/android"
++    android:layout_width="wrap_content"
++    android:layout_height="wrap_content">
++
++    <ImageView
++        android:id="@+id/__leak_canary_touch_icon"
++        android:layout_width="60dp"
++        android:layout_height="60dp"
++        android:src="@drawable/leak_canary_icon" />
++
++    <RelativeLayout
++        android:id="@+id/__leak_canary_dot_layout"
++        android:layout_width="20dp"
++        android:layout_height="20dp"
++        android:layout_alignRight="@id/__leak_canary_touch_icon"
++        android:background="@drawable/leak_canary_dot_icon"
++        android:visibility="gone">
++
++        <TextView
++            android:id="@+id/__leak_canary_leak_num_txt"
++            android:layout_width="match_parent"
++            android:layout_height="match_parent"
++            android:layout_centerInParent="true"
++            android:gravity="center"
++            android:textColor="#ffffff"
++            android:textSize="12sp" />
++    </RelativeLayout>
++</RelativeLayout>
+\ No newline at end of file
+diff --git a/leakcanary-android/src/main/res/values/leak_canary_anim.xml b/leakcanary-android/src/main/res/values/leak_canary_anim.xml
+new file mode 100644
+index 00000000..c40851e1
+--- /dev/null
++++ b/leakcanary-android/src/main/res/values/leak_canary_anim.xml
+@@ -0,0 +1,7 @@
++<?xml version="1.0" encoding="utf-8"?>
++<resources>
++    <style name="leak_canary_assistive_panel_anim" parent="android:Animation">
++        <item name="android:windowEnterAnimation">@anim/leak_canary_grow_fade_in_from_bottom</item>
++        <item name="android:windowExitAnimation">@anim/leak_canary_shrink_fade_out_from_bottom</item>
++    </style>
++</resources>
+\ No newline at end of file
+diff --git a/leakcanary-android/src/main/res/values/leak_canary_strings.xml b/leakcanary-android/src/main/res/values/leak_canary_strings.xml
+index b53e29ce..24f0987c 100644
+--- a/leakcanary-android/src/main/res/values/leak_canary_strings.xml
++++ b/leakcanary-android/src/main/res/values/leak_canary_strings.xml
+@@ -36,4 +36,8 @@
+   <string name="leak_canary_excluded_row">[Excluded] %s</string>
+   <string name="leak_canary_permission_notification_title">Leak detected, need permission</string>
+   <string name="leak_canary_permission_notification_text">Click to enable storage permission for %s.</string>
++
++  <string name="leak_canary_switch_notification">Notification on status bar when leak detected</string>
++  <string name="leak_canary_enter_display_activity">Enter display activity</string>
++  <string name="leak_canary_enter_dismiss">Dismiss the floating window</string>
+ </resources>

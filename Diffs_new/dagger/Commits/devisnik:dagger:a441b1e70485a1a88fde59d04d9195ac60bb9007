@@ -1,0 +1,671 @@
+diff --git a/java/dagger/internal/codegen/BUILD b/java/dagger/internal/codegen/BUILD
+index c87bfa7f4..d466dbb50 100644
+--- a/java/dagger/internal/codegen/BUILD
++++ b/java/dagger/internal/codegen/BUILD
+@@ -203,6 +203,7 @@ java_library(
+         "DelegateBindingExpression.java",
+         "FactoryGenerator.java",
+         "FrameworkFieldInitializer.java",
++        "FrameworkFieldSupplier.java",
+         "FrameworkInstanceBindingExpression.java",
+         "GeneratedComponentModel.java",
+         "GwtCompatibility.java",
+diff --git a/java/dagger/internal/codegen/FactoryGenerator.java b/java/dagger/internal/codegen/FactoryGenerator.java
+index 2984a9753..7e92de707 100644
+--- a/java/dagger/internal/codegen/FactoryGenerator.java
++++ b/java/dagger/internal/codegen/FactoryGenerator.java
+@@ -180,7 +180,7 @@ private void addCreateMethod(ProvisionBinding binding, TypeSpec.Builder factoryB
+     MethodSpec.Builder createMethodBuilder =
+         methodBuilder("create")
+             .addModifiers(PUBLIC, STATIC)
+-            .returns(factoryTypeName(binding))
++            .returns(parameterizedGeneratedTypeNameForBinding(binding))
+             .addTypeVariables(typeParameters(binding));
+ 
+     switch (binding.factoryCreationStrategy()) {
+@@ -193,14 +193,9 @@ private void addCreateMethod(ProvisionBinding binding, TypeSpec.Builder factoryB
+           // If the factory has type parameters, ignore them in the field declaration & initializer
+           instanceFieldBuilder.addAnnotation(suppressWarnings(RAWTYPES));
+ 
+-          // We use an unsafe cast here because the types are different.
+-          // It's safe because the type is never referenced anywhere.
+-          createMethodBuilder
+-              .addStatement("return ($T) INSTANCE", TypeNames.FACTORY)
+-              .addAnnotation(suppressWarnings(RAWTYPES, UNCHECKED));
+-        } else {
+-          createMethodBuilder.addStatement("return INSTANCE");
++          createMethodBuilder.addAnnotation(suppressWarnings(UNCHECKED));
+         }
++        createMethodBuilder.addStatement("return INSTANCE");
+         factoryBuilder.addField(instanceFieldBuilder.build());
+         break;
+       case CLASS_CONSTRUCTOR:
+diff --git a/java/dagger/internal/codegen/FrameworkFieldInitializer.java b/java/dagger/internal/codegen/FrameworkFieldInitializer.java
+index 1c30fcee4..1f5752d59 100644
+--- a/java/dagger/internal/codegen/FrameworkFieldInitializer.java
++++ b/java/dagger/internal/codegen/FrameworkFieldInitializer.java
+@@ -27,21 +27,29 @@
+ import com.squareup.javapoet.ClassName;
+ import com.squareup.javapoet.CodeBlock;
+ import com.squareup.javapoet.FieldSpec;
++import com.squareup.javapoet.TypeName;
+ import dagger.internal.DelegateFactory;
+-import dagger.internal.codegen.MemberSelect.MemberSelectSupplier;
+ import java.util.Optional;
+ 
+ /**
+  * An object that can initialize a framework-type component field for a binding. An instance should
+  * be created for each field.
+  */
+-abstract class FrameworkFieldInitializer implements MemberSelectSupplier {
++abstract class FrameworkFieldInitializer implements FrameworkFieldSupplier {
++
+   protected final GeneratedComponentModel generatedComponentModel;
+   private final ComponentBindingExpressions componentBindingExpressions;
+   private final ResolvedBindings resolvedBindings;
+   private FieldSpec fieldSpec;
+   private InitializationState fieldInitializationState = InitializationState.UNINITIALIZED;
+ 
++  /**
++   * Indicates the type of the initializer when has been replaced with a more-specific factory type.
++   * This is used by {@code FrameworkInstanceBindingExpression} to create fields with the
++   * most-specific type available.  This allows javac to complete much faster for large components.
++   */
++  private Optional<TypeName> fieldTypeReplacement = Optional.empty();
++
+   protected FrameworkFieldInitializer(
+       GeneratedComponentModel generatedComponentModel,
+       ComponentBindingExpressions componentBindingExpressions,
+@@ -61,6 +69,7 @@ public final MemberSelect memberSelect() {
+     return MemberSelect.localField(generatedComponentModel.name(), checkNotNull(fieldSpec).name);
+   }
+ 
++  /** Adds the field and its initialization code to the component. */
+   private void initializeField() {
+     switch (fieldInitializationState) {
+       case UNINITIALIZED:
+@@ -115,12 +124,24 @@ private FieldSpec getOrCreateField() {
+             resolvedBindings.key().type(), generatedComponentModel.name().packageName());
+     FrameworkField contributionBindingField =
+         FrameworkField.forResolvedBindings(resolvedBindings, alternativeFrameworkClass());
++
++    TypeName fieldType;
++    if (fieldTypeReplacement.isPresent()) {
++      // For some larger components, this causes javac to compile much faster by getting the
++      // field type to exactly match the type of the expression being assigned to it.
++      fieldType = fieldTypeReplacement.get();
++    } else if (useRawType) {
++      fieldType = contributionBindingField.type().rawType;
++    } else {
++      fieldType = contributionBindingField.type();
++    }
++
+     FieldSpec.Builder contributionField =
+         FieldSpec.builder(
+-            useRawType ? contributionBindingField.type().rawType : contributionBindingField.type(),
++            fieldType,
+             generatedComponentModel.getUniqueFieldName(contributionBindingField.name()));
+     contributionField.addModifiers(PRIVATE);
+-    if (useRawType) {
++    if (useRawType && !fieldTypeReplacement.isPresent()) {
+       contributionField.addAnnotation(AnnotationSpecs.suppressWarnings(RAWTYPES));
+     }
+     fieldSpec = contributionField.build();
+@@ -129,6 +150,11 @@ private FieldSpec getOrCreateField() {
+     return fieldSpec;
+   }
+ 
++  @Override
++  public boolean fieldTypeReplaced() {
++    return fieldTypeReplacement.isPresent();
++  }
++
+   /**
+    * Returns the framework class to use for the field, if different from the one implied by the
+    * binding. This implementation returns {@link Optional#empty()}.
+@@ -153,6 +179,10 @@ protected final CodeBlock getDependencyExpression(FrameworkDependency frameworkD
+         .codeBlock();
+   }
+ 
++  protected final void setFieldTypeReplacement(TypeName typeName) {
++    this.fieldTypeReplacement = Optional.of(typeName);
++  }
++
+   /** Initialization state for a factory field. */
+   private enum InitializationState {
+     /** The field is {@code null}. */
+diff --git a/java/dagger/internal/codegen/FrameworkFieldSupplier.java b/java/dagger/internal/codegen/FrameworkFieldSupplier.java
+new file mode 100644
+index 000000000..80dcf0ff7
+--- /dev/null
++++ b/java/dagger/internal/codegen/FrameworkFieldSupplier.java
+@@ -0,0 +1,31 @@
++/*
++ * Copyright (C) 2017 The Dagger Authors.
++ *
++ * Licensed under the Apache License, Version 2.0 (the "License");
++ * you may not use this file except in compliance with the License.
++ * You may obtain a copy of the License at
++ *
++ * http://www.apache.org/licenses/LICENSE-2.0
++ *
++ * Unless required by applicable law or agreed to in writing, software
++ * distributed under the License is distributed on an "AS IS" BASIS,
++ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++ * See the License for the specific language governing permissions and
++ * limitations under the License.
++ */
++
++package dagger.internal.codegen;
++
++/** An object that supplies a {@link MemberSelect} for a framework field. */
++interface FrameworkFieldSupplier {
++  /** Returns a {@link MemberSelect}, with possible side effects on the first call. */
++  MemberSelect memberSelect();
++
++  /**
++   * If true, signals that a publicly-visible concrete type was used to replace the original type
++   * of the field being initialized.
++   */
++  default boolean fieldTypeReplaced() {
++    return false;
++  }
++}
+diff --git a/java/dagger/internal/codegen/FrameworkInstanceBindingExpression.java b/java/dagger/internal/codegen/FrameworkInstanceBindingExpression.java
+index c5f9fc3d6..325054bdf 100644
+--- a/java/dagger/internal/codegen/FrameworkInstanceBindingExpression.java
++++ b/java/dagger/internal/codegen/FrameworkInstanceBindingExpression.java
+@@ -21,7 +21,6 @@
+ import com.squareup.javapoet.ClassName;
+ import com.squareup.javapoet.CodeBlock;
+ import com.squareup.javapoet.FieldSpec;
+-import dagger.internal.codegen.MemberSelect.MemberSelectSupplier;
+ import dagger.model.Key;
+ import dagger.model.RequestKind;
+ import javax.lang.model.type.DeclaredType;
+@@ -31,7 +30,7 @@
+ /** A binding expression that uses an instance of a {@link FrameworkType}. */
+ final class FrameworkInstanceBindingExpression extends BindingExpression {
+   private final ComponentBindingExpressions componentBindingExpressions;
+-  private final MemberSelectSupplier frameworkFieldSupplier;
++  private final FrameworkFieldSupplier frameworkFieldSupplier;
+   private final FrameworkType frameworkType;
+   private final DaggerTypes types;
+   private final Elements elements;
+@@ -41,7 +40,7 @@
+       RequestKind requestKind,
+       ComponentBindingExpressions componentBindingExpressions,
+       FrameworkType frameworkType,
+-      MemberSelectSupplier frameworkFieldSupplier,
++      FrameworkFieldSupplier frameworkFieldSupplier,
+       DaggerTypes types,
+       Elements elements) {
+     super(resolvedBindings, requestKind);
+@@ -65,6 +64,7 @@ Expression getDependencyExpression(ClassName requestingClass) {
+       TypeMirror expressionType =
+           isTypeAccessibleFrom(instanceType(), requestingClass.packageName())
+                   || isInlinedFactoryCreation(memberSelect)
++                  || frameworkFieldSupplier.fieldTypeReplaced()
+               ? types.wrapType(instanceType(), resolvedBindings().frameworkClass())
+               : rawFrameworkType();
+       return Expression.create(expressionType, memberSelect.getExpressionFor(requestingClass));
+diff --git a/java/dagger/internal/codegen/MemberSelect.java b/java/dagger/internal/codegen/MemberSelect.java
+index adf41d163..46294d986 100644
+--- a/java/dagger/internal/codegen/MemberSelect.java
++++ b/java/dagger/internal/codegen/MemberSelect.java
+@@ -50,12 +50,6 @@
+  */
+ abstract class MemberSelect {
+ 
+-  /** An object that supplies a {@link MemberSelect}. */
+-  interface MemberSelectSupplier {
+-    /** Returns a {@link MemberSelect}, with possible side effects on the first call. */
+-    MemberSelect memberSelect();
+-  }
+-
+   /**
+    * Returns a {@link MemberSelect} that accesses the field given by {@code fieldName} owned by
+    * {@code owningClass}.  In this context "local" refers to the fact that the field is owned by the
+diff --git a/java/dagger/internal/codegen/ProviderOrProducerFieldInitializer.java b/java/dagger/internal/codegen/ProviderOrProducerFieldInitializer.java
+index 3897b3925..50dee233e 100644
+--- a/java/dagger/internal/codegen/ProviderOrProducerFieldInitializer.java
++++ b/java/dagger/internal/codegen/ProviderOrProducerFieldInitializer.java
+@@ -192,6 +192,7 @@ private CodeBlock factoryForContributionBindingInitialization(ContributionBindin
+                           .build())
+                   .addMethod(getMethod.build())
+                   .build());
++          setFieldTypeReplacement(generatedComponentModel.name().nestedClass(factoryName));
+           return CodeBlock.of(
+               "new $L($L)",
+               factoryName,
+@@ -254,6 +255,8 @@ private CodeBlock factoryForContributionBindingInitialization(ContributionBindin
+               && binding.scope().isPresent()) {
+             factoryCreate =
+                 CodeBlock.of("($T) $L", binding.bindingType().frameworkClass(), factoryCreate);
++          } else if (!binding.scope().isPresent()) {
++            setFieldTypeReplacement(generatedClassNameForBinding(binding));
+           }
+           return decorateForScope(factoryCreate, binding.scope());
+         }
+@@ -272,6 +275,7 @@ private CodeBlock factoryForContributionBindingInitialization(ContributionBindin
+                           ComponentRequirement.forDependency(dependencyType.asType()),
+                           generatedComponentModel.name()))
+                   .build();
++          // TODO(b/70395982): Explore using a private static type instead of an anonymous class.
+           return CodeBlock.of(
+               "$L",
+               anonymousClassBuilder("")
+@@ -302,6 +306,7 @@ private CodeBlock factoryForContributionBindingInitialization(ContributionBindin
+           }
+           arguments.addAll(getBindingDependencyExpressions(binding));
+ 
++          setFieldTypeReplacement(generatedClassNameForBinding(binding));
+           return CodeBlock.of(
+               "new $T($L)",
+               generatedClassNameForBinding(binding),
+diff --git a/javatests/dagger/internal/codegen/ComponentProcessorTest.java b/javatests/dagger/internal/codegen/ComponentProcessorTest.java
+index 54e49e294..7822ab719 100644
+--- a/javatests/dagger/internal/codegen/ComponentProcessorTest.java
++++ b/javatests/dagger/internal/codegen/ComponentProcessorTest.java
+@@ -1244,7 +1244,7 @@ public void testDefaultPackage() {
+             "",
+             GENERATED_ANNOTATION,
+             "public final class DaggerBComponent implements BComponent {",
+-            "  private Provider<A> aProvider;",
++            "  private test_AComponent_a aProvider;",
+             "",
+             "  @SuppressWarnings(\"unchecked\")",
+             "  private void initialize(final Builder builder) {",
+diff --git a/javatests/dagger/internal/codegen/ElidedFactoriesTest.java b/javatests/dagger/internal/codegen/ElidedFactoriesTest.java
+index 8f3b3d791..93752837a 100644
+--- a/javatests/dagger/internal/codegen/ElidedFactoriesTest.java
++++ b/javatests/dagger/internal/codegen/ElidedFactoriesTest.java
+@@ -251,7 +251,7 @@ public void simpleComponent_injectsProviderOf_dependsOnScoped() {
+                 GENERATED_ANNOTATION,
+                 "public final class DaggerSimpleComponent implements SimpleComponent {",
+                 "  private Provider<ScopedType> scopedTypeProvider;",
+-                "  private Provider<DependsOnScoped> dependsOnScopedProvider;",
++                "  private DependsOnScoped_Factory dependsOnScopedProvider;",
+                 "  private DaggerSimpleComponent(Builder builder) {",
+                 "    initialize(builder);",
+                 "  }",
+diff --git a/javatests/dagger/internal/codegen/InjectConstructorFactoryGeneratorTest.java b/javatests/dagger/internal/codegen/InjectConstructorFactoryGeneratorTest.java
+index 9960854dc..a35fdc087 100644
+--- a/javatests/dagger/internal/codegen/InjectConstructorFactoryGeneratorTest.java
++++ b/javatests/dagger/internal/codegen/InjectConstructorFactoryGeneratorTest.java
+@@ -155,7 +155,7 @@
+             "    return new GenericClass<T>(tProvider.get());",
+             "  }",
+             "",
+-            "  public static <T> Factory<GenericClass<T>> create(Provider<T> tProvider) {",
++            "  public static <T> GenericClass_Factory<T> create(Provider<T> tProvider) {",
+             "    return new GenericClass_Factory<T>(tProvider);",
+             "  }",
+             "",
+@@ -210,7 +210,7 @@
+             "    return instance;",
+             "  }",
+             "",
+-            "  public static <A, B> Factory<GenericClass<A, B>> create(",
++            "  public static <A, B> GenericClass_Factory<A, B> create(",
+             "      Provider<A> aProvider, Provider<B> bProvider) {",
+             "    return new GenericClass_Factory<A, B>(aProvider, bProvider);",
+             "  }",
+@@ -252,9 +252,9 @@
+             "    return new GenericClass<T>();",
+             "  }",
+             "",
+-            "  @SuppressWarnings({\"rawtypes\", \"unchecked\"})",
+-            "  public static <T> Factory<GenericClass<T>> create() {",
+-            "    return (Factory) INSTANCE;",
++            "  @SuppressWarnings(\"unchecked\")",
++            "  public static <T> GenericClass_Factory<T> create() {",
++            "    return INSTANCE;",
+             "  }",
+             "",
+             "  public static <T> GenericClass<T> newGenericClass() {",
+@@ -300,7 +300,7 @@
+             "    return new GenericClass<A, B>(aProvider.get(), bProvider.get());",
+             "  }",
+             "",
+-            "  public static <A, B> Factory<GenericClass<A, B>> create(",
++            "  public static <A, B> GenericClass_Factory<A, B> create(",
+             "      Provider<A> aProvider, Provider<B> bProvider) {",
+             "    return new GenericClass_Factory<A, B>(aProvider, bProvider);",
+             "  }",
+@@ -362,7 +362,7 @@
+             "",
+             "  public static <A extends Number & Comparable<A>,",
+             "      B extends List<? extends String>,",
+-            "      C extends List<? super String>> Factory<GenericClass<A, B, C>> create(",
++            "      C extends List<? super String>> GenericClass_Factory<A, B, C> create(",
+             "          Provider<A> aProvider, Provider<B> bProvider, Provider<C> cProvider) {",
+             "    return new GenericClass_Factory<A, B, C>(aProvider, bProvider, cProvider);",
+             "  }",
+@@ -450,7 +450,7 @@
+             "      DoubleCheck.lazy(bAndB2AndPbAndLbProvider));",
+             "  }",
+             "",
+-            "  public static <A, B> Factory<GenericClass<A, B>> create(",
++            "  public static <A, B> GenericClass_Factory<A, B> create(",
+             "      Provider<A> aAndA2AndPaAndLaProvider,",
+             "      Provider<A> qaProvider,",
+             "      Provider<String> sAndS2AndPsAndLsProvider,",
+@@ -990,7 +990,7 @@
+             "    return new InjectConstructor(sProvider.get());",
+             "  }",
+             "",
+-            "  public static Factory<InjectConstructor> create(Provider<String> sProvider) {",
++            "  public static InjectConstructor_Factory create(Provider<String> sProvider) {",
+             "    return new InjectConstructor_Factory(sProvider);",
+             "  }",
+             "",
+@@ -1038,7 +1038,7 @@
+             "    return instance;",
+             "  }",
+             "",
+-            "  public static Factory<AllInjections> create(Provider<String> sProvider) {",
++            "  public static AllInjections_Factory create(Provider<String> sProvider) {",
+             "    return new AllInjections_Factory(sProvider);",
+             "  }",
+             "",
+@@ -1082,7 +1082,7 @@ public void neitherTypeNorSupertypeRequiresMemberInjection() {
+             "    return new B();",
+             "  }",
+             "",
+-            "  public static Factory<B> create() {",
++            "  public static B_Factory create() {",
+             "    return INSTANCE;",
+             "  }",
+             "",
+@@ -1131,7 +1131,7 @@ public void wildcardDependency() {
+             "    return new InjectConstructor(objectsProvider.get());",
+             "  }",
+             "",
+-            "  public static Factory<InjectConstructor> create(",
++            "  public static InjectConstructor_Factory create(",
+             "      Provider<List<?>> objectsProvider) {",
+             "    return new InjectConstructor_Factory(objectsProvider);",
+             "  }",
+@@ -1183,7 +1183,7 @@ public void basicNameCollision() {
+             "    return new InjectConstructor(factoryProvider.get());",
+             "  }",
+             "",
+-            "  public static Factory<InjectConstructor> create(",
++            "  public static InjectConstructor_Factory create(",
+             "      Provider<other.pkg.Factory> factoryProvider) {",
+             "    return new InjectConstructor_Factory(factoryProvider);",
+             "  }",
+@@ -1240,7 +1240,7 @@ public void nestedNameCollision() {
+             "    return new InjectConstructor(factoryProvider.get());",
+             "  }",
+             "",
+-            "  public static Factory<InjectConstructor> create(",
++            "  public static InjectConstructor_Factory create(",
+             "      Provider<Outer.Factory> factoryProvider) {",
+             "    return new InjectConstructor_Factory(factoryProvider);",
+             "  }",
+@@ -1303,7 +1303,7 @@ public void samePackageNameCollision() {
+             "        otherPackageProvider.get(), samePackageProvider.get());",
+             "  }",
+             "",
+-            "  public static Factory<InjectConstructor> create(",
++            "  public static InjectConstructor_Factory create(",
+             "      Provider<other.pkg.CommonName> otherPackageProvider,",
+             "      Provider<CommonName> samePackageProvider) {",
+             "    return new InjectConstructor_Factory(otherPackageProvider, samePackageProvider);",
+@@ -1347,7 +1347,7 @@ public void noDeps() {
+             "    return new SimpleType();",
+             "  }",
+             "",
+-            "  public static Factory<SimpleType> create() {",
++            "  public static SimpleType_Factory create() {",
+             "    return INSTANCE;",
+             "  }",
+             "",
+@@ -1397,7 +1397,7 @@ public void noDeps() {
+             "    return new OuterType.A();",
+             "  }",
+             "",
+-            "  public static Factory<OuterType.A> create() {",
++            "  public static OuterType_A_Factory create() {",
+             "    return INSTANCE;",
+             "  }",
+             "",
+diff --git a/javatests/dagger/internal/codegen/MapBindingComponentProcessorTest.java b/javatests/dagger/internal/codegen/MapBindingComponentProcessorTest.java
+index 1f722327b..a66e594f5 100644
+--- a/javatests/dagger/internal/codegen/MapBindingComponentProcessorTest.java
++++ b/javatests/dagger/internal/codegen/MapBindingComponentProcessorTest.java
+@@ -182,8 +182,8 @@ public void mapBindingsWithEnumKey() {
+                 "",
+                 GENERATED_ANNOTATION,
+                 "public final class DaggerTestComponent implements TestComponent {",
+-                "  private Provider<Handler> provideAdminHandlerProvider;",
+-                "  private Provider<Handler> provideLoginHandlerProvider;",
++                "  private MapModuleOne_ProvideAdminHandlerFactory provideAdminHandlerProvider;",
++                "  private MapModuleTwo_ProvideLoginHandlerFactory provideLoginHandlerProvider;",
+                 "  private Provider<Map<PathEnum, Provider<Handler>>>",
+                 "      mapOfPathEnumAndProviderOfHandlerProvider;",
+                 "",
+@@ -580,8 +580,8 @@ public void mapBindingsWithStringKey() {
+                 "",
+                 GENERATED_ANNOTATION,
+                 "public final class DaggerTestComponent implements TestComponent {",
+-                "  private Provider<Handler> provideAdminHandlerProvider;",
+-                "  private Provider<Handler> provideLoginHandlerProvider;",
++                "  private MapModuleOne_ProvideAdminHandlerFactory provideAdminHandlerProvider;",
++                "  private MapModuleTwo_ProvideLoginHandlerFactory provideLoginHandlerProvider;",
+                 "  private Provider<Map<String, Provider<Handler>>>",
+                 "      mapOfStringAndProviderOfHandlerProvider;",
+                 "",
+@@ -761,8 +761,8 @@ public void mapBindingsWithWrappedKey() {
+                 "",
+                 GENERATED_ANNOTATION,
+                 "public final class DaggerTestComponent implements TestComponent {",
+-                "  private Provider<Handler> provideAdminHandlerProvider;",
+-                "  private Provider<Handler> provideLoginHandlerProvider;",
++                "  private MapModuleOne_ProvideAdminHandlerFactory provideAdminHandlerProvider;",
++                "  private MapModuleTwo_ProvideLoginHandlerFactory provideLoginHandlerProvider;",
+                 "  private Provider<Map<WrappedClassKey, Provider<Handler>>>",
+                 "      mapOfWrappedClassKeyAndProviderOfHandlerProvider;",
+                 "",
+@@ -919,8 +919,8 @@ public void mapBindingsWithNonProviderValue() {
+                 "",
+                 GENERATED_ANNOTATION,
+                 "public final class DaggerTestComponent implements TestComponent {",
+-                "  private Provider<Handler> provideAdminHandlerProvider;",
+-                "  private Provider<Handler> provideLoginHandlerProvider;",
++                "  private MapModuleOne_ProvideAdminHandlerFactory provideAdminHandlerProvider;",
++                "  private MapModuleTwo_ProvideLoginHandlerFactory provideLoginHandlerProvider;",
+                 "  private Provider<Map<PathEnum, Handler>> mapOfPathEnumAndHandlerProvider;",
+                 "",
+                 "  @SuppressWarnings(\"unchecked\")",
+diff --git a/javatests/dagger/internal/codegen/MembersInjectionTest.java b/javatests/dagger/internal/codegen/MembersInjectionTest.java
+index f6286ac82..91e953209 100644
+--- a/javatests/dagger/internal/codegen/MembersInjectionTest.java
++++ b/javatests/dagger/internal/codegen/MembersInjectionTest.java
+@@ -1140,7 +1140,7 @@ public void injectsPrimitive() {
+             "    return instance;",
+             "  }",
+             "",
+-            "  public static Factory<InjectedType> create(",
++            "  public static InjectedType_Factory create(",
+             "      Provider<Integer> boxedIntAndPrimitiveIntProvider) {",
+             "    return new InjectedType_Factory(boxedIntAndPrimitiveIntProvider);",
+             "  }",
+diff --git a/javatests/dagger/internal/codegen/ModuleFactoryGeneratorTest.java b/javatests/dagger/internal/codegen/ModuleFactoryGeneratorTest.java
+index a4eabf95a..2677726b4 100644
+--- a/javatests/dagger/internal/codegen/ModuleFactoryGeneratorTest.java
++++ b/javatests/dagger/internal/codegen/ModuleFactoryGeneratorTest.java
+@@ -269,7 +269,7 @@ public void providesMethodReturnsProduced() {
+             "    return Preconditions.checkNotNull(module.provideString(), " + NPE_LITERAL + ");",
+             "  }",
+             "",
+-            "  public static Factory<String> create(TestModule module) {",
++            "  public static TestModule_ProvideStringFactory create(TestModule module) {",
+             "    return new TestModule_ProvideStringFactory(module);",
+             "  }",
+             "",
+@@ -316,7 +316,7 @@ public void providesMethodReturnsProduced() {
+             "    return module.provideString();",
+             "  }",
+             "",
+-            "  public static Factory<String> create(TestModule module) {",
++            "  public static TestModule_ProvideStringFactory create(TestModule module) {",
+             "    return new TestModule_ProvideStringFactory(module);",
+             "  }",
+             "",
+@@ -364,7 +364,7 @@ public void providesMethodReturnsProduced() {
+             "    return module.provideString();",
+             "  }",
+             "",
+-            "  public static Factory<String> create(TestModule module) {",
++            "  public static TestModule_ProvideStringFactory create(TestModule module) {",
+             "    return new TestModule_ProvideStringFactory(module);",
+             "  }",
+             "",
+@@ -464,7 +464,7 @@ public void providesMethodReturnsProduced() {
+             "        " + NPE_LITERAL + ");",
+             "  }",
+             "",
+-            "  public static Factory<List<Object>> create(",
++            "  public static TestModule_ProvideObjectsFactory create(",
+             "      TestModule module,",
+             "      Provider<Object> aProvider,",
+             "      Provider<Object> bProvider,",
+@@ -522,7 +522,7 @@ public void providesMethodReturnsProduced() {
+             "    return Preconditions.checkNotNull(module.provideString(), " + NPE_LITERAL + ");",
+             "  }",
+             "",
+-            "  public static Factory<String> create(TestModule module) {",
++            "  public static TestModule_ProvideStringFactory create(TestModule module) {",
+             "    return new TestModule_ProvideStringFactory(module);",
+             "  }",
+             "",
+@@ -577,7 +577,7 @@ public void providesMethodReturnsProduced() {
+             "        module.provideWildcardList(), " + NPE_LITERAL + ");",
+             "  }",
+             "",
+-            "  public static Factory<List<List<?>>> create(TestModule module) {",
++            "  public static TestModule_ProvideWildcardListFactory create(TestModule module) {",
+             "    return new TestModule_ProvideWildcardListFactory(module);",
+             "  }",
+             "",
+@@ -629,7 +629,7 @@ public void providesMethodReturnsProduced() {
+             "    return Preconditions.checkNotNull(module.provideStrings(), " + NPE_LITERAL + ");",
+             "  }",
+             "",
+-            "  public static Factory<Set<String>> create(TestModule module) {",
++            "  public static TestModule_ProvideStringsFactory create(TestModule module) {",
+             "    return new TestModule_ProvideStringsFactory(module);",
+             "  }",
+             "",
+@@ -925,7 +925,8 @@ public void genericSubclassedModule() {
+             "  }",
+             "",
+             "  public static <A extends CharSequence, B, C extends Number & Comparable<C>>",
+-            "      Factory<List<B>> create(ParentModule<A, B, C> module, Provider<B> bProvider) {",
++            "      ParentModule_ProvideListBFactory<A, B, C>  create(",
++            "          ParentModule<A, B, C> module, Provider<B> bProvider) {",
+             "    return new ParentModule_ProvideListBFactory<A, B, C>(module, bProvider);",
+             "  }",
+             "",
+@@ -964,7 +965,8 @@ public void genericSubclassedModule() {
+             "  }",
+             "",
+             "  public static <A extends CharSequence, B, C extends Number & Comparable<C>>",
+-            "      Factory<B> create(ParentModule<A, B, C> module, Provider<B> bProvider) {",
++            "      ParentModule_ProvideBElementFactory<A, B, C> create(",
++            "          ParentModule<A, B, C> module, Provider<B> bProvider) {",
+             "    return new ParentModule_ProvideBElementFactory<A, B, C>(module, bProvider);",
+             "  }",
+             "",
+@@ -1004,7 +1006,8 @@ public void genericSubclassedModule() {
+             "  }",
+             "",
+             "  public static <A extends CharSequence, B, C extends Number & Comparable<C>>",
+-            "      Factory<B> create(ParentModule<A, B, C> module, Provider<B> bProvider) {",
++            "      ParentModule_ProvideBEntryFactory<A, B, C> create(",
++            "          ParentModule<A, B, C> module, Provider<B> bProvider) {",
+             "    return new ParentModule_ProvideBEntryFactory<A, B, C>(module, bProvider);",
+             "  }",
+             "",
+@@ -1038,7 +1041,8 @@ public void genericSubclassedModule() {
+             "    return Preconditions.checkNotNull(module.provideNumber(), " + NPE_LITERAL + ");",
+             "  }",
+             "",
+-            "  public static Factory<Number> create(ChildNumberModule module) {",
++            "  public static ChildNumberModule_ProvideNumberFactory create(",
++            "      ChildNumberModule module) {",
+             "    return new ChildNumberModule_ProvideNumberFactory(module);",
+             "  }",
+             "",
+@@ -1069,7 +1073,8 @@ public void genericSubclassedModule() {
+             "    return Preconditions.checkNotNull(module.provideInteger(), " + NPE_LITERAL + ");",
+             "  }",
+             "",
+-            "  public static Factory<Integer> create(ChildIntegerModule module) {",
++            "  public static ChildIntegerModule_ProvideIntegerFactory create(",
++            "      ChildIntegerModule module) {",
+             "    return new ChildIntegerModule_ProvideIntegerFactory(module);",
+             "  }",
+             "",
+@@ -1140,7 +1145,7 @@ public void genericSubclassedModule() {
+             "        " + NPE_LITERAL + ");",
+             "  }",
+             "",
+-            "  public static Factory<Map<String, Number>> create() {",
++            "  public static ParameterizedModule_ProvideMapStringNumberFactory create() {",
+             "    return INSTANCE;",
+             "  }",
+             "",
+@@ -1171,7 +1176,7 @@ public void genericSubclassedModule() {
+             "        " + NPE_LITERAL + ");",
+             "  }",
+             "",
+-            "  public static Factory<Object> create() {",
++            "  public static ParameterizedModule_ProvideNonGenericTypeFactory create() {",
+             "    return INSTANCE;",
+             "  }",
+             "",
+@@ -1208,7 +1213,8 @@ public void genericSubclassedModule() {
+             "        " + NPE_LITERAL + ");",
+             "  }",
+             "",
+-            "  public static Factory<String> create(Provider<Object> oProvider) {",
++            "  public static ParameterizedModule_ProvideNonGenericTypeWithDepsFactory create(",
++            "      Provider<Object> oProvider) {",
+             "    return new ParameterizedModule_ProvideNonGenericTypeWithDepsFactory(oProvider);",
+             "  }",
+             "",
+diff --git a/javatests/dagger/internal/codegen/ProductionComponentProcessorTest.java b/javatests/dagger/internal/codegen/ProductionComponentProcessorTest.java
+index c1231b937..e3e3d35cc 100644
+--- a/javatests/dagger/internal/codegen/ProductionComponentProcessorTest.java
++++ b/javatests/dagger/internal/codegen/ProductionComponentProcessorTest.java
+@@ -247,7 +247,7 @@ public void simpleComponent() {
+                 "  private TestClass.BModule bModule;",
+                 "  private Provider<TestClass.SimpleComponent> simpleComponentProvider;",
+                 "  private Producer<TestClass.B> bProducer;",
+-                "  private Producer<TestClass.A> aProducer;",
++                "  private TestClass_AModule_AFactory aProducer;",
+                 "",
+                 "  private DaggerTestClass_SimpleComponent(Builder builder) {",
+                 "    initialize(builder);",
+@@ -408,13 +408,14 @@ public void simpleComponent() {
+                 GENERATED_ANNOTATION,
+                 "public final class DaggerTestClass_SimpleComponent",
+                 "    implements TestClass.SimpleComponent {",
+-                "  private Provider<Executor> executorProvider;",
++                "  private TestClass_BModule_ExecutorFactory executorProvider;",
+                 "  private Provider<Executor> executorProvider2;",
+                 "  private Provider<TestClass.SimpleComponent> simpleComponentProvider;",
+                 "  private Provider<ProductionComponentMonitor> monitorProvider;",
+-                "  private Provider<TestClass.B> bProvider;",
++                "  private TestClass_BModule_BFactory bProvider;",
+                 "  private Producer<TestClass.B> bProducer;",
+-                "  private Producer<TestClass.A> aProducer;",
++                "",
++                "  private TestClass_AModule_AFactory aProducer;",
+                 "",
+                 "  private DaggerTestClass_SimpleComponent(Builder builder) {",
+                 "    initialize(builder);",

@@ -1,0 +1,231 @@
+diff --git a/src/main/java/org/altbeacon/beacon/Beacon.java b/src/main/java/org/altbeacon/beacon/Beacon.java
+index 35cfd9ea..90095956 100644
+--- a/src/main/java/org/altbeacon/beacon/Beacon.java
++++ b/src/main/java/org/altbeacon/beacon/Beacon.java
+@@ -237,6 +237,9 @@ protected Beacon(Parcel in) {
+         }
+         mManufacturer = in.readInt();
+         mBluetoothName = in.readString();
++        // This nonsense is needed because we can't do readDouble on null values.
++        // See: http://stackoverflow.com/a/10769887/1461050
++        mRunningAverageRssi = (Double) in.readValue(Double.class.getClassLoader());
+         mParserIdentifier = in.readString();
+         mMultiFrameBeacon = in.readByte() != 0;
+     }
+@@ -279,6 +282,18 @@ public void setRunningAverageRssi(double rssi) {
+         mDistance = null; // force calculation of accuracy and proximity next time they are requested
+     }
+ 
++    /**
++     * Gets the running average rssi, if available, otherwise get the latest rssi
++     */
++    public double getRunningAverageRssi() {
++        if (mRunningAverageRssi != null) {
++            return mRunningAverageRssi;
++        }
++        else {
++            return getRssi();
++        }
++    }
++
+     /**
+      * Sets the most recently measured rssi for use in distance calculations if a running average is
+      * not available
+@@ -558,6 +573,7 @@ public void writeToParcel(Parcel out, int flags) {
+         }
+         out.writeInt(mManufacturer);
+         out.writeString(mBluetoothName);
++        out.writeValue(mRunningAverageRssi);
+         out.writeString(mParserIdentifier);
+         out.writeByte((byte) (mMultiFrameBeacon ? 1: 0));
+     }
+diff --git a/src/main/java/org/altbeacon/beacon/distance/ModelSpecificDistanceCalculator.java b/src/main/java/org/altbeacon/beacon/distance/ModelSpecificDistanceCalculator.java
+index 42f7db77..5b3ae459 100644
+--- a/src/main/java/org/altbeacon/beacon/distance/ModelSpecificDistanceCalculator.java
++++ b/src/main/java/org/altbeacon/beacon/distance/ModelSpecificDistanceCalculator.java
+@@ -54,6 +54,7 @@
+     private AndroidModel mRequestedModel;
+     private String mRemoteUpdateUrlString = null;
+     private Context mContext;
++    private static Class sCalculatorClass = CurveFittedDistanceCalculator.class;
+     private final ReentrantLock mLock = new ReentrantLock();
+ 
+     /**
+@@ -64,6 +65,14 @@ public ModelSpecificDistanceCalculator(Context context, String remoteUpdateUrlSt
+         this(context, remoteUpdateUrlString, AndroidModel.forThisDevice());
+     }
+ 
++    /**
++     * Configures the distance calculator to be used
++     * @param klass
++     */
++    public static void setDistanceCalculatorClass(Class klass) {
++        sCalculatorClass = klass;
++    }
++
+     /**
+      * Obtains the best possible <code>DistanceCalculator</code> for the Android device passed
+      * as an argument
+@@ -274,21 +283,44 @@ private void buildModelMap(String jsonString) throws JSONException {
+             if (modelObject.has("default")) {
+                 defaultFlag = modelObject.getBoolean("default");
+             }
+-            Double coefficient1 = modelObject.getDouble("coefficient1");
+-            Double coefficient2 = modelObject.getDouble("coefficient2");
+-            Double coefficient3 = modelObject.getDouble("coefficient3");
++
+             String version = modelObject.getString("version");
+             String buildNumber = modelObject.getString("build_number");
+             String model = modelObject.getString("model");
+             String manufacturer = modelObject.getString("manufacturer");
+ 
+-            CurveFittedDistanceCalculator distanceCalculator =
+-                    new CurveFittedDistanceCalculator(coefficient1,coefficient2,coefficient3);
+-
+             AndroidModel androidModel = new AndroidModel(version, buildNumber, model, manufacturer);
+-            mModelMap.put(androidModel, distanceCalculator);
+-            if (defaultFlag) {
+-                mDefaultModel = androidModel;
++
++            DistanceCalculator distanceCalculator = null;
++            if (sCalculatorClass.equals(CurveFittedDistanceCalculator.class)) {
++                Double coefficient1 = modelObject.optDouble("coefficient1");
++                Double coefficient2 = modelObject.optDouble("coefficient2");
++                Double coefficient3 = modelObject.optDouble("coefficient3");
++
++                if (!coefficient1.isNaN() && !coefficient2.isNaN() && !coefficient3.isNaN()) {
++                    distanceCalculator =
++                            new CurveFittedDistanceCalculator(coefficient1,coefficient2,coefficient3);
++                }
++            }
++            else if (sCalculatorClass.equals(PolynomialRegressionDistanceCalculator.class)) {
++                Double coefficient0 = modelObject.optDouble("c0");
++                Double coefficient1 = modelObject.optDouble("c1");
++                Double coefficient2 = modelObject.optDouble("c2");
++                if (!coefficient0.isNaN() && !coefficient1.isNaN() && !coefficient2.isNaN()) {
++                    distanceCalculator =
++                            new PolynomialRegressionDistanceCalculator(coefficient0, coefficient1, coefficient2);
++                }
++            }
++
++            if (distanceCalculator != null) {
++                mModelMap.put(androidModel, distanceCalculator);
++                if (defaultFlag) {
++                    mDefaultModel = androidModel;
++                }
++            }
++            else {
++                LogManager.w(TAG, "No distance calculator may be constructed for model "+androidModel+
++                        " because data are missing for configured calculator "+sCalculatorClass.getName());
+             }
+         }
+     }
+diff --git a/src/main/java/org/altbeacon/beacon/distance/PolynomialRegressionDistanceCalculator.java b/src/main/java/org/altbeacon/beacon/distance/PolynomialRegressionDistanceCalculator.java
+new file mode 100644
+index 00000000..d87fe73d
+--- /dev/null
++++ b/src/main/java/org/altbeacon/beacon/distance/PolynomialRegressionDistanceCalculator.java
+@@ -0,0 +1,59 @@
++package org.altbeacon.beacon.distance;
++
++import org.altbeacon.beacon.logging.LogManager;
++
++/**
++ * This class estimates the distance between the mobile device and a BLE beacon based on the measured
++ * RSSI and a txPower calibration value that represents the expected RSSI for an iPhone 5 receiving
++ * the signal when it is 1 meter away.
++ *
++ * This class uses a polynomial regression model.  The coefficients must
++ * be supplied by the caller and are specific to the Android device being used.  See the
++ * <code>ModelSpecificDistanceCalculator</code> for more information on the coefficients.
++ *
++ * Created by ppflueger on 13.02.17.
++ */
++
++public class PolynomialRegressionDistanceCalculator implements DistanceCalculator {
++
++    public static final String TAG = "PolynomialRegressionDistanceCalculator";
++    private double mCoefficient0;
++    private double mCoefficient1;
++    private double mCoefficient2;
++
++    /**
++     * Construct a calculator with coefficients specific for the device's signal vs. distance
++     *
++     * @param coefficient0
++     * @param coefficient1
++     * @param coefficient2
++     */
++    public PolynomialRegressionDistanceCalculator(double coefficient0, double coefficient1, double coefficient2) {
++        mCoefficient0 = coefficient0;
++        mCoefficient1 = coefficient1;
++        mCoefficient2 = coefficient2;
++    }
++
++    /**
++     * Calculated the estimated distance in meters to the beacon based on a reference rssi at 1m
++     * and the known actual rssi at the current location
++     *
++     * @param txPower
++     * @param rssi
++     * @return estimated distance
++     */
++    @Override
++    public double calculateDistance(int txPower, double rssi) {
++        if (rssi == 0) {
++            return -1.0; // if we cannot determine accuracy, return -1.
++        }
++
++        LogManager.d(TAG, "calculating distance based on mRssi of %s and txPower of %s", rssi, txPower);
++
++        double distance;
++        distance =  (mCoefficient0)*Math.pow(rssi,2) + mCoefficient1*rssi + mCoefficient2;
++
++        LogManager.d(TAG, "avg mRssi: %s distance: %s", rssi, distance);
++        return distance;
++    }
++}
+diff --git a/src/main/resources/model-distance-calculations.json b/src/main/resources/model-distance-calculations.json
+index 2bda2d1f..e22c7b8e 100644
+--- a/src/main/resources/model-distance-calculations.json
++++ b/src/main/resources/model-distance-calculations.json
+@@ -5,6 +5,9 @@
+       "coefficient1": 0.42093,
+       "coefficient2": 6.9476,
+       "coefficient3": 0.54992,
++      "c0": 0.00384164,
++      "c1": 0.11700683,
++      "c2": -3.789868,
+       "version":"4.4.2",
+       "build_number":"KOT49H",
+       "model":"Nexus 4",
+@@ -14,6 +17,9 @@
+       "coefficient1": 0.42093,
+       "coefficient2": 6.9476,
+       "coefficient3": 0.54992,
++      "c0": 0.00384164,
++      "c1": 0.11700683,
++      "c2": -3.789868,
+       "version":"4.4.2",
+       "build_number":"LPV79",
+       "model":"Nexus 5",
+@@ -24,6 +30,9 @@
+       "coefficient1": 0.9401940951,
+       "coefficient2": 6.170094565,
+       "coefficient3": 0.0,
++      "c0": 0.00384164,
++      "c1": 0.11700683,
++      "c2": -3.789868,
+       "version":"5.0.2",
+       "build_number":"LXG22.67-7.1",
+       "model":"Moto X Pro",
+@@ -34,6 +43,9 @@
+       "coefficient1": 0.1862616782,
+       "coefficient2": 8.235367435,
+       "coefficient3": -0.45324519,
++      "c0": 0.00384164,
++      "c1": 0.11700683,
++      "c2": -3.789868,
+       "version":"6.0",
+       "build_number":"MPE24.49-18",
+       "model":"XT1092",

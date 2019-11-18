@@ -1,0 +1,273 @@
+diff --git a/okhttp-tests/src/test/java/com/squareup/okhttp/ConnectionPoolTest.java b/okhttp-tests/src/test/java/com/squareup/okhttp/ConnectionPoolTest.java
+index 0a8753546d..4c4b1d3d54 100644
+--- a/okhttp-tests/src/test/java/com/squareup/okhttp/ConnectionPoolTest.java
++++ b/okhttp-tests/src/test/java/com/squareup/okhttp/ConnectionPoolTest.java
+@@ -16,6 +16,7 @@
+ package com.squareup.okhttp;
+ 
+ import com.squareup.okhttp.internal.RecordingOkAuthenticator;
++import com.squareup.okhttp.internal.http.StreamAllocation;
+ import com.squareup.okhttp.internal.io.RealConnection;
+ import java.net.InetSocketAddress;
+ import java.net.Proxy;
+@@ -81,7 +82,8 @@
+     pool.setCleanupRunnableForTest(emptyRunnable);
+ 
+     RealConnection c1 = newConnection(routeA1, 50L);
+-    c1.allocationCount = 1;
++    StreamAllocation streamAllocation = new StreamAllocation(pool, addressA);
++    streamAllocation.acquire(c1);
+     pool.put(c1);
+ 
+     // Running at time 50, the pool returns that nothing can be evicted until time 150.
+@@ -163,6 +165,38 @@
+     assertFalse(c3.socket.isClosed());
+   }
+ 
++  @Test public void leakedAllocation() throws Exception {
++    ConnectionPool pool = new ConnectionPool(2, 100L, TimeUnit.NANOSECONDS);
++    pool.setCleanupRunnableForTest(emptyRunnable);
++
++    RealConnection c1 = newConnection(routeA1, 0L);
++    pool.put(c1);
++    allocateAndLeakAllocation(pool, c1);
++
++    awaitGarbageCollection();
++    assertEquals(0L, pool.cleanup(100L));
++    assertEquals(Collections.emptyList(), c1.allocations);
++
++    assertTrue(c1.noNewStreams); // Can't allocate once a leak has been detected.
++  }
++
++  /** Use a helper method so there's no hidden reference remaining on the stack. */
++  private void allocateAndLeakAllocation(ConnectionPool pool, RealConnection connection) {
++    StreamAllocation leak = new StreamAllocation(pool, connection.getRoute().getAddress());
++    leak.acquire(connection);
++  }
++
++  /**
++   * See FinalizationTester for discussion on how to best trigger GC in tests.
++   * https://android.googlesource.com/platform/libcore/+/master/support/src/test/java/libcore/
++   * java/lang/ref/FinalizationTester.java
++   */
++  private void awaitGarbageCollection() throws InterruptedException {
++    Runtime.getRuntime().gc();
++    Thread.sleep(100);
++    System.runFinalization();
++  }
++
+   private RealConnection newConnection(Route route, long idleAtNanos) {
+     RealConnection connection = new RealConnection(route);
+     connection.idleAtNanos = idleAtNanos;
+diff --git a/okhttp/src/main/java/com/squareup/okhttp/ConnectionPool.java b/okhttp/src/main/java/com/squareup/okhttp/ConnectionPool.java
+index f2f56c10de..a51569d89a 100644
+--- a/okhttp/src/main/java/com/squareup/okhttp/ConnectionPool.java
++++ b/okhttp/src/main/java/com/squareup/okhttp/ConnectionPool.java
+@@ -16,9 +16,12 @@
+  */
+ package com.squareup.okhttp;
+ 
++import com.squareup.okhttp.internal.Internal;
+ import com.squareup.okhttp.internal.RouteDatabase;
+ import com.squareup.okhttp.internal.Util;
++import com.squareup.okhttp.internal.http.StreamAllocation;
+ import com.squareup.okhttp.internal.io.RealConnection;
++import java.lang.ref.Reference;
+ import java.util.ArrayDeque;
+ import java.util.ArrayList;
+ import java.util.Deque;
+@@ -129,7 +132,7 @@ public static ConnectionPool getDefault() {
+   public synchronized int getIdleConnectionCount() {
+     int total = 0;
+     for (RealConnection connection : connections) {
+-      if (connection.allocationCount == 0) total++;
++      if (connection.allocations.isEmpty()) total++;
+     }
+     return total;
+   }
+@@ -165,14 +168,14 @@ public synchronized int getHttpConnectionCount() {
+   }
+ 
+   /** Returns a recycled connection to {@code address}, or null if no such connection exists. */
+-  public synchronized Connection get(Address address) {
++  public synchronized Connection get(Address address, StreamAllocation streamAllocation) {
+     for (RealConnection connection : connections) {
+       // TODO(jwilson): this is awkward. We're already holding a lock on 'this', and
+       //     connection.allocationLimit() may also lock the FramedConnection.
+-      if (connection.allocationCount < connection.allocationLimit()
++      if (connection.allocations.size() < connection.allocationLimit()
+           && address.equals(connection.getRoute().address)
+           && !connection.noNewStreams) {
+-        connection.allocationCount++;
++        streamAllocation.acquire(connection);
+         return connection;
+       }
+     }
+@@ -208,7 +211,7 @@ public void evictAll() {
+     synchronized (this) {
+       for (Iterator<RealConnection> i = connections.iterator(); i.hasNext(); ) {
+         RealConnection connection = i.next();
+-        if (connection.allocationCount == 0) {
++        if (connection.allocations.isEmpty()) {
+           connection.noNewStreams = true;
+           evictedConnections.add(connection);
+           i.remove();
+@@ -240,7 +243,7 @@ long cleanup(long now) {
+         RealConnection connection = i.next();
+ 
+         // If the connection is in use, keep searching.
+-        if (connection.allocationCount > 0) {
++        if (pruneAndGetAllocationCount(connection, now) > 0) {
+           inUseConnectionCount++;
+           continue;
+         }
+@@ -281,6 +284,38 @@ long cleanup(long now) {
+     return 0;
+   }
+ 
++  /**
++   * Prunes any leaked allocations and then returns the number of remaining live allocations on
++   * {@code connection}. Allocations are leaked if the connection is tracking them but the
++   * application code has abandoned them. Leak detection is imprecise and relies on garbage
++   * collection.
++   */
++  private int pruneAndGetAllocationCount(RealConnection connection, long now) {
++    List<Reference<StreamAllocation>> references = connection.allocations;
++    for (int i = 0; i < references.size(); ) {
++      Reference<StreamAllocation> reference = references.get(i);
++
++      if (reference.get() != null) {
++        i++;
++        continue;
++      }
++
++      // We've discovered a leaked allocation. This is an application bug.
++      Internal.logger.warning("A connection to " + connection.getRoute().getAddress().url()
++          + " was leaked. Did you forget to close a response body?");
++      references.remove(i);
++      connection.noNewStreams = true;
++
++      // If this was the last allocation, the connection is eligible for immediate eviction.
++      if (references.isEmpty()) {
++        connection.idleAtNanos = now - keepAliveDurationNs;
++        return 0;
++      }
++    }
++
++    return references.size();
++  }
++
+   void setCleanupRunnableForTest(Runnable cleanupRunnable) {
+     this.cleanupRunnable = cleanupRunnable;
+   }
+diff --git a/okhttp/src/main/java/com/squareup/okhttp/internal/http/StreamAllocation.java b/okhttp/src/main/java/com/squareup/okhttp/internal/http/StreamAllocation.java
+index 787de7e217..7305bd7d5d 100644
+--- a/okhttp/src/main/java/com/squareup/okhttp/internal/http/StreamAllocation.java
++++ b/okhttp/src/main/java/com/squareup/okhttp/internal/http/StreamAllocation.java
+@@ -24,6 +24,8 @@
+ import com.squareup.okhttp.internal.io.RealConnection;
+ import java.io.IOException;
+ import java.io.InterruptedIOException;
++import java.lang.ref.Reference;
++import java.lang.ref.WeakReference;
+ import java.net.ProtocolException;
+ import java.net.SocketTimeoutException;
+ import java.security.cert.CertificateException;
+@@ -148,7 +150,7 @@ private RealConnection findConnection(int connectTimeout, int readTimeout, int w
+     }
+ 
+     // Attempt to get a connection from the pool.
+-    RealConnection pooledConnection = (RealConnection) connectionPool.get(address);
++    RealConnection pooledConnection = (RealConnection) connectionPool.get(address, this);
+     if (pooledConnection != null) {
+       synchronized (connectionPool) {
+         this.connection = pooledConnection;
+@@ -165,7 +167,7 @@ private RealConnection findConnection(int connectTimeout, int readTimeout, int w
+     }
+     Route route = routeSelector.next();
+     RealConnection newConnection = new RealConnection(route);
+-    newConnection.allocationCount = 1;
++    acquire(newConnection);
+ 
+     synchronized (connectionPool) {
+       connectionPool.put(newConnection);
+@@ -236,15 +238,15 @@ private void deallocate(boolean noNewStreams, boolean released, boolean streamFi
+           connection.noNewStreams = true;
+         }
+         if (this.stream == null && (this.released || connection.noNewStreams)) {
+-          connection.allocationCount--;
+-          if (connection.allocationCount == 0) {
+-            connection.idleAtNanos = System.nanoTime();
+-          }
++          release(connection);
+           if (connection.streamCount > 0) {
+             routeSelector = null;
+           }
+-          if (connection.allocationCount == 0 && connectionPool.connectionBecameIdle(connection)) {
+-            connectionToClose = connection;
++          if (connection.allocations.isEmpty()) {
++            connection.idleAtNanos = System.nanoTime();
++            if (connectionPool.connectionBecameIdle(connection)) {
++              connectionToClose = connection;
++            }
+           }
+           connection = null;
+         }
+@@ -286,6 +288,26 @@ private void connectionFailed(IOException e) {
+     deallocate(true, false, true);
+   }
+ 
++  /**
++   * Use this allocation to hold {@code connection}. Each call to this must be paired with a call to
++   * {@link #release} on the same connection.
++   */
++  public void acquire(RealConnection connection) {
++    connection.allocations.add(new WeakReference<>(this));
++  }
++
++  /** Remove this allocation from the connection's list of allocations. */
++  private void release(RealConnection connection) {
++    for (int i = 0, size = connection.allocations.size(); i < size; i++) {
++      Reference<StreamAllocation> reference = connection.allocations.get(i);
++      if (reference.get() == this) {
++        connection.allocations.remove(i);
++        return;
++      }
++    }
++    throw new IllegalStateException();
++  }
++
+   public boolean recover(RouteException e) {
+     if (connection != null) {
+       connectionFailed(e.getLastConnectException());
+diff --git a/okhttp/src/main/java/com/squareup/okhttp/internal/io/RealConnection.java b/okhttp/src/main/java/com/squareup/okhttp/internal/io/RealConnection.java
+index d051ee1f2c..4a4e9c8f41 100644
+--- a/okhttp/src/main/java/com/squareup/okhttp/internal/io/RealConnection.java
++++ b/okhttp/src/main/java/com/squareup/okhttp/internal/io/RealConnection.java
+@@ -34,14 +34,17 @@
+ import com.squareup.okhttp.internal.http.Http1xStream;
+ import com.squareup.okhttp.internal.http.OkHeaders;
+ import com.squareup.okhttp.internal.http.RouteException;
++import com.squareup.okhttp.internal.http.StreamAllocation;
+ import com.squareup.okhttp.internal.tls.OkHostnameVerifier;
+ import java.io.IOException;
++import java.lang.ref.Reference;
+ import java.net.ConnectException;
+ import java.net.Proxy;
+ import java.net.Socket;
+ import java.net.SocketTimeoutException;
+ import java.net.UnknownServiceException;
+ import java.security.cert.X509Certificate;
++import java.util.ArrayList;
+ import java.util.List;
+ import java.util.concurrent.TimeUnit;
+ import javax.net.ssl.SSLPeerUnverifiedException;
+@@ -74,7 +77,7 @@
+   public int streamCount;
+   public BufferedSource source;
+   public BufferedSink sink;
+-  public int allocationCount;
++  public final List<Reference<StreamAllocation>> allocations = new ArrayList<>();
+   public boolean noNewStreams;
+   public long idleAtNanos = Long.MAX_VALUE;
+ 

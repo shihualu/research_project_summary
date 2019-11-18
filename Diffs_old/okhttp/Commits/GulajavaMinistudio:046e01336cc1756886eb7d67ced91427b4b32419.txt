@@ -1,0 +1,203 @@
+diff --git a/okhttp/src/main/java/okhttp3/internal/connection/Transmitter.kt b/okhttp/src/main/java/okhttp3/internal/connection/Transmitter.kt
+index b58ab9cc0c..8c9083ae01 100644
+--- a/okhttp/src/main/java/okhttp3/internal/connection/Transmitter.kt
++++ b/okhttp/src/main/java/okhttp3/internal/connection/Transmitter.kt
+@@ -204,6 +204,7 @@ class Transmitter(
+ 
+   fun exchangeDoneDueToException() {
+     synchronized(connectionPool) {
++      exchange?.detachWithViolence()
+       check(!noMoreExchanges)
+       exchange = null
+     }
+diff --git a/okhttp/src/main/java/okhttp3/internal/ws/RealWebSocket.kt b/okhttp/src/main/java/okhttp3/internal/ws/RealWebSocket.kt
+index 1c5269e800..81a8f14fa6 100644
+--- a/okhttp/src/main/java/okhttp3/internal/ws/RealWebSocket.kt
++++ b/okhttp/src/main/java/okhttp3/internal/ws/RealWebSocket.kt
+@@ -531,7 +531,6 @@ class RealWebSocket(
+     val sink: BufferedSink
+   ) : Closeable
+ 
+-
+   private inner class PingTask(val delayNanos: Long) : Task("$name Ping") {
+     override fun runOnce(): Long {
+       writePingFrame()
+diff --git a/okhttp/src/test/java/okhttp3/CallKotlinTest.kt b/okhttp/src/test/java/okhttp3/CallKotlinTest.kt
+index a1c1f970da..9caa0072d4 100644
+--- a/okhttp/src/test/java/okhttp3/CallKotlinTest.kt
++++ b/okhttp/src/test/java/okhttp3/CallKotlinTest.kt
+@@ -15,14 +15,19 @@
+  */
+ package okhttp3
+ 
++import okhttp3.MediaType.Companion.toMediaType
+ import okhttp3.mockwebserver.MockResponse
+ import okhttp3.mockwebserver.MockWebServer
+ import okhttp3.testing.PlatformRule
++import okio.BufferedSink
+ import org.assertj.core.api.Assertions.assertThat
++import org.junit.Assert.assertEquals
++import org.junit.Assert.fail
+ import org.junit.Rule
+ import org.junit.Test
+ import org.junit.rules.TestRule
+ import org.junit.rules.Timeout
++import java.io.IOException
+ import java.util.concurrent.TimeUnit
+ 
+ class CallKotlinTest {
+@@ -51,4 +56,85 @@ class CallKotlinTest {
+     assertThat("abc").isEqualTo(response1.body!!.string())
+     assertThat("def").isEqualTo(response2.body!!.string())
+   }
++
++  @Test
++  fun testHeadAfterPut() {
++    class ErringRequestBody : RequestBody() {
++      override fun contentType(): MediaType {
++        return "application/xml".toMediaType()
++      }
++
++      override fun writeTo(sink: BufferedSink) {
++        sink.writeUtf8("<el")
++        sink.flush()
++        throw IOException("failed to stream the XML")
++      }
++    }
++
++    class ValidRequestBody : RequestBody() {
++      override fun contentType(): MediaType {
++        return "application/xml".toMediaType()
++      }
++
++      override fun writeTo(sink: BufferedSink) {
++        sink.writeUtf8("<element/>")
++        sink.flush()
++      }
++    }
++
++    server.enqueue(MockResponse().apply {
++      setResponseCode(201)
++    })
++    server.enqueue(MockResponse().apply {
++      setResponseCode(204)
++    })
++    server.enqueue(MockResponse().apply {
++      setResponseCode(204)
++    })
++
++    val endpointUrl = server.url("/endpoint")
++
++    var request = Request.Builder()
++        .url(endpointUrl)
++        .header("Content-Type", "application/xml")
++        .put(ValidRequestBody())
++        .build()
++    // 201
++    client.newCall(request).execute()
++
++    request = Request.Builder()
++        .url(endpointUrl)
++        .head()
++        .build()
++    // 204
++    client.newCall(request).execute()
++
++    request = Request.Builder()
++        .url(endpointUrl)
++        .header("Content-Type", "application/xml")
++        .put(ErringRequestBody())
++        .build()
++    try {
++      client.newCall(request).execute()
++      fail("test should always throw exception")
++    } catch (_: IOException) {
++      // NOTE: expected
++    }
++
++    request = Request.Builder()
++        .url(endpointUrl)
++        .head()
++        .build()
++
++    client.newCall(request).execute()
++
++    var recordedRequest = server.takeRequest()
++    assertEquals("PUT", recordedRequest.method)
++
++    recordedRequest = server.takeRequest()
++    assertEquals("HEAD", recordedRequest.method)
++
++    recordedRequest = server.takeRequest()
++    assertEquals("HEAD", recordedRequest.method)
++  }
+ }
+diff --git a/okhttp/src/test/java/okhttp3/CallTest.java b/okhttp/src/test/java/okhttp3/CallTest.java
+index a1469ae823..e6e8f0d9c2 100644
+--- a/okhttp/src/test/java/okhttp3/CallTest.java
++++ b/okhttp/src/test/java/okhttp3/CallTest.java
+@@ -26,6 +26,7 @@
+ import java.net.InetAddress;
+ import java.net.ProtocolException;
+ import java.net.Proxy;
++import java.net.SocketException;
+ import java.net.SocketTimeoutException;
+ import java.net.UnknownHostException;
+ import java.net.UnknownServiceException;
+@@ -71,6 +72,7 @@
+ import okhttp3.mockwebserver.QueueDispatcher;
+ import okhttp3.mockwebserver.RecordedRequest;
+ import okhttp3.mockwebserver.SocketPolicy;
++import okhttp3.testing.Flaky;
+ import okhttp3.testing.PlatformRule;
+ import okhttp3.tls.HandshakeCertificates;
+ import okhttp3.tls.HeldCertificate;
+@@ -956,7 +958,6 @@ private void postBodyRetransmittedAfterAuthorizationFail(String body) throws Exc
+ 
+     server.enqueue(new MockResponse()
+         .setBody("success!"));
+-
+     client = client.newBuilder()
+         .proxySelector(proxySelector)
+         .readTimeout(100, TimeUnit.MILLISECONDS)
+@@ -996,12 +997,15 @@ private void postBodyRetransmittedAfterAuthorizationFail(String body) throws Exc
+   }
+ 
+   /** https://github.com/square/okhttp/issues/4761 */
+-  @Test public void interceptorCallsProceedWithoutClosingPriorResponse() throws Exception {
++  @Test
++  public void interceptorCallsProceedWithoutClosingPriorResponse() throws Exception {
+     server.enqueue(new MockResponse()
++        .setBodyDelay(250, TimeUnit.MILLISECONDS)
+         .setBody("abc"));
+-    server.enqueue(new MockResponse());
++    server.enqueue(new MockResponse()
++        .setBody("def"));
+ 
+-    client = client.newBuilder()
++    client = clientTestRule.newClientBuilder()
+         .addInterceptor(new Interceptor() {
+           @Override public Response intercept(Chain chain) throws IOException {
+             Response response = chain.proceed(chain.request());
+@@ -1020,8 +1024,7 @@ private void postBodyRetransmittedAfterAuthorizationFail(String body) throws Exc
+         .url(server.url("/"))
+         .build();
+     executeSynchronously(request)
+-        .assertCode(200)
+-        .assertBody("abc");
++        .assertFailure(SocketException.class);
+   }
+ 
+   /**
+diff --git a/okhttp/src/test/java/okhttp3/RecordedResponse.java b/okhttp/src/test/java/okhttp3/RecordedResponse.java
+index 482d78179b..a33ec8dfb1 100644
+--- a/okhttp/src/test/java/okhttp3/RecordedResponse.java
++++ b/okhttp/src/test/java/okhttp3/RecordedResponse.java
+@@ -63,6 +63,7 @@ public RecordedResponse assertCode(int expectedCode) {
+   }
+ 
+   public RecordedResponse assertSuccessful() {
++    assertThat(failure).isNull();
+     assertThat(response.isSuccessful()).isTrue();
+     return this;
+   }

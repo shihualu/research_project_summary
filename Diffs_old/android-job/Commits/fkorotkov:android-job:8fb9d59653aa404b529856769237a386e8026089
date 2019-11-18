@@ -1,0 +1,291 @@
+diff --git a/CHANGELOG.md b/CHANGELOG.md
+index 35140ec..0d17f5e 100644
+--- a/CHANGELOG.md
++++ b/CHANGELOG.md
+@@ -2,6 +2,7 @@
+ * Add an `onCancel()` method to get notified when the job is canceled, see #359
+ * Expose the `meetsRequirements()` method to have the option to check all requirements manually, see #349
+ * Don't close the database automatically after each interaction, but give an option in the `JobConfig` class to revert this behavior, see #344
++* Add `scheduleAsync()` for scheduling jobs asynchronously to avoid IO operations on the main thread
+ 
+ ## 1.2.2 (2018-01-13)
+ * Use only the `support-compat` instead of the full `support-v4` library, see #326
+diff --git a/library/src/main/java/com/evernote/android/job/JobRequest.java b/library/src/main/java/com/evernote/android/job/JobRequest.java
+index acc24da..a8333b6 100644
+--- a/library/src/main/java/com/evernote/android/job/JobRequest.java
++++ b/library/src/main/java/com/evernote/android/job/JobRequest.java
+@@ -70,6 +70,20 @@
+      */
+     public static final NetworkType DEFAULT_NETWORK_TYPE = NetworkType.ANY;
+ 
++    /**
++     * The default callback that is used when you schedule a {@link JobRequest} asynchronously in
++     * {@link #scheduleAsync()}. This implementation only logs a message in case of a failure and
++     * doesn't crash.
++     */
++    public static final JobScheduledCallback DEFAULT_JOB_SCHEDULED_CALLBACK = new JobScheduledCallback() {
++        @Override
++        public void onJobScheduled(int jobId, @NonNull String tag, @Nullable Exception exception) {
++            if (exception != null) {
++                CAT.e(exception, "The job with tag %s couldn't be scheduled", tag);
++            }
++        }
++    };
++
+     /**
+      * The minimum interval of a periodic job. Specifying a smaller interval will result in an exception.
+      *
+@@ -405,6 +419,14 @@ public Bundle getTransientExtras() {
+     }
+ 
+     /**
++     * Schedule a request which will be executed in the future. If you want to update an existing
++     * {@link JobRequest}, call {@link JobRequest#cancelAndEdit()}, update your parameters and call
++     * this method again. Calling this method on the same request instance multiple times without
++     * cancelling is idempotent.
++     *
++     * <br>
++     * <br>
++     *
+      * Convenience method. Internally it calls {@link JobManager#schedule(JobRequest)}
+      * and {@link #getJobId()} for this request.
+      *
+@@ -415,6 +437,40 @@ public int schedule() {
+         return getJobId();
+     }
+ 
++    /**
++     * Helper method to schedule a request on a background thread. This is helpful to avoid IO operations
++     * on the main thread. The callback notifies you about the job ID or a possible failure.
++     *
++     * <br>
++     * <br>
++     *
++     * In case of a failure an error is logged, but the application doesn't crash.
++     */
++    public void scheduleAsync() {
++        scheduleAsync(DEFAULT_JOB_SCHEDULED_CALLBACK);
++    }
++
++    /**
++     * Helper method to schedule a request on a background thread. This is helpful to avoid IO operations
++     * on the main thread. The callback notifies you about the job ID or a possible failure.
++     *
++     * @param callback The callback which is invoked after the request has been scheduled.
++     */
++    public void scheduleAsync(@NonNull final JobScheduledCallback callback) {
++        JobPreconditions.checkNotNull(callback);
++        JobConfig.getExecutorService().execute(new Runnable() {
++            @Override
++            public void run() {
++                try {
++                    int jobId = schedule();
++                    callback.onJobScheduled(jobId, getTag(), null);
++                } catch (Exception e) {
++                    callback.onJobScheduled(JobScheduledCallback.JOB_ID_ERROR, getTag(), e);
++                }
++            }
++        });
++    }
++
+     /**
+      * Cancel this request if it has been scheduled. Note that if the job isn't periodic, then the
+      * time passed since the job has been scheduled is subtracted from the time frame. For example
+@@ -489,7 +545,7 @@ public Builder cancelAndEdit() {
+         return contentValues;
+     }
+ 
+-    /*package*/ static JobRequest fromCursor(Cursor cursor) throws Exception {
++    /*package*/ static JobRequest fromCursor(Cursor cursor) {
+         JobRequest request = new Builder(cursor).build();
+         request.mFailureCount = cursor.getInt(cursor.getColumnIndex(JobStorage.COLUMN_NUM_FAILURES));
+         request.mScheduledAt = cursor.getLong(cursor.getColumnIndex(JobStorage.COLUMN_SCHEDULED_AT));
+@@ -586,7 +642,7 @@ public Builder(@NonNull String tag) {
+         }
+ 
+         @SuppressWarnings("unchecked")
+-        private Builder(Cursor cursor) throws Exception {
++        private Builder(Cursor cursor) {
+             mId = cursor.getInt(cursor.getColumnIndex(JobStorage.COLUMN_ID));
+             mTag = cursor.getString(cursor.getColumnIndex(JobStorage.COLUMN_TAG));
+ 
+@@ -1165,4 +1221,23 @@ public int hashCode() {
+          */
+         METERED
+     }
++
++    /**
++     * Callback that is used when scheduling a {@link JobRequest} asynchronously on a background thread.
++     */
++    public interface JobScheduledCallback {
++        /**
++         * The job ID in case scheduling the request failed.
++         */
++        int JOB_ID_ERROR = -1;
++
++        /**
++         * Called after your request was scheduled.
++         *
++         * @param jobId The unique ID of your new scheduled {@link JobRequest}. Or {@link #JOB_ID_ERROR} in case of a failure.
++         * @param tag The tag of the scheduled request.
++         * @param exception If scheduling the request failed, then the exception won't be {@code null}.
++         */
++        void onJobScheduled(int jobId, @NonNull String tag, @Nullable Exception exception);
++    }
+ }
+diff --git a/library/src/test/java/com/evernote/android/job/AsyncScheduleTest.java b/library/src/test/java/com/evernote/android/job/AsyncScheduleTest.java
+new file mode 100644
+index 0000000..bef5a3b
+--- /dev/null
++++ b/library/src/test/java/com/evernote/android/job/AsyncScheduleTest.java
+@@ -0,0 +1,121 @@
++package com.evernote.android.job;
++
++import android.app.job.JobInfo;
++import android.app.job.JobScheduler;
++import android.content.Context;
++import android.support.annotation.NonNull;
++import android.support.annotation.Nullable;
++
++import com.evernote.android.job.test.DummyJobs;
++import com.evernote.android.job.test.JobRobolectricTestRunner;
++import com.evernote.android.job.util.JobLogger;
++
++import org.junit.Before;
++import org.junit.FixMethodOrder;
++import org.junit.Test;
++import org.junit.runner.RunWith;
++import org.junit.runners.MethodSorters;
++
++import java.util.concurrent.CountDownLatch;
++import java.util.concurrent.Executors;
++import java.util.concurrent.TimeUnit;
++import java.util.concurrent.atomic.AtomicInteger;
++import java.util.concurrent.atomic.AtomicReference;
++
++import static org.assertj.core.api.Java6Assertions.assertThat;
++import static org.mockito.ArgumentMatchers.any;
++import static org.mockito.Mockito.mock;
++import static org.mockito.Mockito.when;
++
++/**
++ * @author rwondratschek
++ */
++@RunWith(JobRobolectricTestRunner.class)
++@FixMethodOrder(MethodSorters.JVM)
++public class AsyncScheduleTest extends BaseJobManagerTest {
++
++    @Before
++    public void prepare() {
++        JobConfig.setExecutorService(Executors.newSingleThreadExecutor());
++    }
++
++    @Test
++    public void verifyScheduleAsync() throws Exception {
++        DummyJobs.createBuilder(DummyJobs.SuccessJob.class).setExecutionWindow(300_000, 400_000).build().scheduleAsync();
++        waitUntilScheduled();
++        assertThat(manager().getAllJobRequests()).hasSize(1);
++    }
++
++    @Test
++    public void verifyJobIdAsync() throws Exception {
++        final AtomicInteger jobId = new AtomicInteger(-2);
++        DummyJobs.createBuilder(DummyJobs.SuccessJob.class).setExecutionWindow(300_000, 400_000).build()
++                .scheduleAsync(new JobRequest.JobScheduledCallback() {
++                    @Override
++                    public void onJobScheduled(int id, @NonNull String tag, @Nullable Exception exception) {
++                        jobId.set(id);
++                    }
++                });
++
++        waitUntilScheduled();
++        assertThat(manager().getJobRequest(jobId.get())).isNotNull();
++    }
++
++    @Test
++    public void verifyErrorAsync() throws Exception {
++        JobScheduler jobScheduler = mock(JobScheduler.class);
++        when(jobScheduler.schedule(any(JobInfo.class))).thenThrow(new RuntimeException("test"));
++        when(context().getSystemService(Context.JOB_SCHEDULER_SERVICE)).thenReturn(jobScheduler);
++
++        final AtomicReference<Exception> reference = new AtomicReference<>();
++
++        new JobRequest.Builder("tag")
++                .setExecutionWindow(200_000, 300_000)
++                .build()
++                .scheduleAsync(new JobRequest.JobScheduledCallback() {
++                    @Override
++                    public void onJobScheduled(int jobId, @NonNull String tag, @Nullable Exception exception) {
++                        assertThat(jobId).isEqualTo(JOB_ID_ERROR);
++                        reference.set(exception);
++                    }
++                });
++
++        waitUntilScheduled();
++        assertThat(reference.get()).isInstanceOf(RuntimeException.class);
++    }
++
++    @Test
++    public void verifyErrorIsLoggedInDefaultHandler() throws Exception {
++        final String errorMessage = "test ABC";
++
++        JobScheduler jobScheduler = mock(JobScheduler.class);
++        when(jobScheduler.schedule(any(JobInfo.class))).thenThrow(new RuntimeException(errorMessage));
++        when(context().getSystemService(Context.JOB_SCHEDULER_SERVICE)).thenReturn(jobScheduler);
++
++        final AtomicInteger specificError = new AtomicInteger(0);
++        JobConfig.addLogger(new JobLogger() {
++            @Override
++            public void log(int priority, @NonNull String tag, @NonNull String message, @Nullable Throwable t) {
++                if (t != null && t.getMessage().equals(errorMessage)) {
++                    specificError.incrementAndGet();
++                }
++            }
++        });
++
++        new JobRequest.Builder("tag").setExecutionWindow(200_000, 300_000).build().scheduleAsync();
++        waitUntilScheduled();
++
++        assertThat(specificError.get()).isEqualTo(1);
++    }
++
++    private void waitUntilScheduled() throws Exception {
++        final CountDownLatch latch = new CountDownLatch(1);
++        JobConfig.getExecutorService().execute(new Runnable() {
++            @Override
++            public void run() {
++                latch.countDown();
++            }
++        });
++        latch.await(50, TimeUnit.SECONDS);
++    }
++}
+diff --git a/library/src/test/java/com/evernote/android/job/JobManagerTest.java b/library/src/test/java/com/evernote/android/job/JobManagerTest.java
+index d4f511c..5c94c3d 100644
+--- a/library/src/test/java/com/evernote/android/job/JobManagerTest.java
++++ b/library/src/test/java/com/evernote/android/job/JobManagerTest.java
+@@ -104,6 +104,24 @@ public void testScheduleIsIdempotent() throws Exception {
+         assertThat(request.getScheduledAt()).isEqualTo(scheduledAt);
+     }
+ 
++    @Test
++    public void testScheduleIsNotIdempotentWithNewRequest() throws Exception {
++        JobRequest.Builder builder = DummyJobs.createBuilder(DummyJobs.SuccessJob.class).setExecutionWindow(300_000, 400_000);
++        JobRequest request1 = builder.build();
++        int jobId = request1.schedule();
++
++        long scheduledAt = request1.getScheduledAt();
++        assertThat(scheduledAt).isGreaterThan(0L);
++
++        Thread.sleep(10);
++
++        JobRequest request2 = builder.build();
++        int newJobId = request2.schedule();
++
++        assertThat(newJobId).isGreaterThan(jobId);
++        assertThat(request2.getScheduledAt()).isGreaterThan(scheduledAt);
++    }
++
+     @Test
+     public void testSimultaneousCancel() throws Exception {
+         final int threadCount = 5;

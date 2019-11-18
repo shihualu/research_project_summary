@@ -1,0 +1,162 @@
+diff --git a/CHANGELOG.md b/CHANGELOG.md
+index 1418b73..9ef68e8 100644
+--- a/CHANGELOG.md
++++ b/CHANGELOG.md
+@@ -2,6 +2,7 @@
+ * Add option to override the default background executor, see #292
+ * Don't keep a strong reference to finished jobs to allow freeing memory, see #299
+ * Allow running a daily job immediately once, this is helpful for testing purposes, see #317
++* Allow enforcing requirements for daily jobs, see #313
+ 
+ ## 1.2.0 (2017-10-05)
+ 
+diff --git a/library/src/main/java/com/evernote/android/job/DailyJob.java b/library/src/main/java/com/evernote/android/job/DailyJob.java
+index 4f4d473..1d6e800 100644
+--- a/library/src/main/java/com/evernote/android/job/DailyJob.java
++++ b/library/src/main/java/com/evernote/android/job/DailyJob.java
+@@ -21,7 +21,7 @@
+  *
+  * @author rwondratschek
+  */
+-@SuppressWarnings("unused")
++@SuppressWarnings({"unused", "WeakerAccess"})
+ public abstract class DailyJob extends Job {
+ 
+     private static final CatLog CAT = new JobCat("DailyJob");
+@@ -31,15 +31,15 @@
+     @VisibleForTesting
+     /*package*/ static final String EXTRA_END_MS = "EXTRA_END_MS";
+     @VisibleForTesting
+-    /*package*/ static final String EXTRA_ONCE = "EXTRA_ONCE";
++    private static final String EXTRA_ONCE = "EXTRA_ONCE";
+ 
+     private static final long DAY = TimeUnit.DAYS.toMillis(1);
+ 
+     /**
+      * Schedules your daily job. A builder is required for this method call. Within the builder, you may specify
+      * additional requirements and/or extras for the job. However, a daily job may not be exact,
+-     * periodic or transient. Since the rescheduling of a daily job when requirements aren't met
+-     * (e.g. low internet connectivity) isn't useful, the enforcing of such requirements isn't supported either.
++     * periodic or transient. If the requirements are enforced but are not met when the job runs, then the
++     * daily job will only be rescheduled for the next day. The back-off criteria is ignored in this case.
+      * <br>
+      * <br>
+      * Daily jobs should use a unique tag and their classes shouldn't be reused for other jobs.
+@@ -140,9 +140,6 @@ private static int schedule(@NonNull JobRequest.Builder builder, boolean newJob,
+         if (newJob && (request.isExact() || request.isPeriodic() || request.isTransient())) {
+             throw new IllegalArgumentException("Daily jobs cannot be exact, periodic or transient");
+         }
+-        if (newJob && (request.requirementsEnforced())) {
+-            throw new IllegalArgumentException("Daily jobs cannot enforce requirements");
+-        }
+ 
+         return request.schedule();
+     }
+@@ -161,7 +158,13 @@ protected final Result onRunJob(Params params) {
+         DailyJobResult result = null;
+ 
+         try {
+-            result = onRunDailyJob(params);
++            if (meetsRequirements()) {
++                result = onRunDailyJob(params);
++            } else {
++                result = DailyJobResult.SUCCESS; // reschedule
++                CAT.i("Daily job requirements not met, reschedule for the next day");
++            }
++
+         } finally {
+             if (result == null) {
+                 // shouldn't happen if the job follows the contract
+diff --git a/library/src/main/java/com/evernote/android/job/Job.java b/library/src/main/java/com/evernote/android/job/Job.java
+index cbbd534..db06f43 100644
+--- a/library/src/main/java/com/evernote/android/job/Job.java
++++ b/library/src/main/java/com/evernote/android/job/Job.java
+@@ -117,7 +117,8 @@
+ 
+     /*package*/ final Result runJob() {
+         try {
+-            if (meetsRequirements()) {
++            // daily jobs check the requirements manually
++            if (this instanceof DailyJob || meetsRequirements()) {
+                 mResult = onRunJob(getParams());
+             } else {
+                 mResult = getParams().isPeriodic() ? Result.FAILURE : Result.RESCHEDULE;
+@@ -143,7 +144,7 @@ protected void onReschedule(int newJobId) {
+         // override me
+     }
+ 
+-    private boolean meetsRequirements() {
++    /*package*/ boolean meetsRequirements() {
+         if (!getParams().getRequest().requirementsEnforced()) {
+             return true;
+         }
+diff --git a/library/src/test/java/com/evernote/android/job/DailyJobTest.java b/library/src/test/java/com/evernote/android/job/DailyJobTest.java
+index e3eea3b..ed3414a 100644
+--- a/library/src/test/java/com/evernote/android/job/DailyJobTest.java
++++ b/library/src/test/java/com/evernote/android/job/DailyJobTest.java
+@@ -1,5 +1,7 @@
+ package com.evernote.android.job;
+ 
++import android.support.annotation.NonNull;
++
+ import com.evernote.android.job.test.DummyJobs;
+ import com.evernote.android.job.test.JobRobolectricTestRunner;
+ import com.evernote.android.job.test.TestClock;
+@@ -14,6 +16,7 @@
+ import java.util.Calendar;
+ import java.util.Set;
+ import java.util.concurrent.TimeUnit;
++import java.util.concurrent.atomic.AtomicBoolean;
+ 
+ import static org.assertj.core.api.Java6Assertions.assertThat;
+ 
+@@ -250,10 +253,48 @@ public void verifyImmediateExecution() {
+         int normalJobId = DailyJob.schedule(DummyJobs.createBuilder(DummyJobs.SuccessJob.class), time, time);
+         assertThat(manager().getAllJobRequests()).hasSize(2);
+ 
+-        assertThat(nowJobId).isEqualTo(1);
+         executeJob(nowJobId, Job.Result.SUCCESS);
+ 
+         assertThat(manager().getAllJobRequests()).hasSize(1);
+         assertThat(manager().getJobRequest(normalJobId)).isNotNull();
+     }
++
++    @Test
++    public void verifyRequirementsEnforcedSkipsJob() {
++        long time = 1L;
++
++        final AtomicBoolean atomicBoolean = new AtomicBoolean(true);
++
++        manager().addJobCreator(new JobCreator() {
++            @Override
++            public Job create(@NonNull String tag) {
++                return new DailyJob() {
++                    @NonNull
++                    @Override
++                    protected DailyJobResult onRunDailyJob(Params params) {
++                        atomicBoolean.set(false);
++                        return DailyJobResult.SUCCESS;
++                    }
++                };
++            }
++        });
++
++        int jobId = DailyJob.schedule(new JobRequest.Builder("any").setRequiresCharging(true).setRequirementsEnforced(true), time, time);
++        assertThat(manager().getAllJobRequests()).hasSize(1);
++
++        executeJob(jobId, Job.Result.SUCCESS);
++
++        assertThat(manager().getAllJobRequests()).hasSize(1);
++        assertThat(atomicBoolean.get()).isTrue();
++
++        // now verify that the job is called without the requirement
++        manager().cancelAll();
++        jobId = DailyJob.schedule(new JobRequest.Builder("any").setRequiresCharging(false).setRequirementsEnforced(true), time, time);
++        assertThat(manager().getAllJobRequests()).hasSize(1);
++
++        executeJob(jobId, Job.Result.SUCCESS);
++
++        assertThat(manager().getAllJobRequests()).hasSize(1);
++        assertThat(atomicBoolean.get()).isFalse();
++    }
+ }

@@ -1,0 +1,255 @@
+diff --git a/library/core/src/main/java/com/google/android/exoplayer2/offline/QueuedDownload.java b/library/core/src/main/java/com/google/android/exoplayer2/offline/QueuedDownload.java
+index 61b388f85f..2a438ed2ee 100644
+--- a/library/core/src/main/java/com/google/android/exoplayer2/offline/QueuedDownload.java
++++ b/library/core/src/main/java/com/google/android/exoplayer2/offline/QueuedDownload.java
+@@ -1,80 +1,121 @@
+ package com.google.android.exoplayer2.offline;
+ 
+-import android.os.SystemClock;
+-
++import com.google.android.exoplayer2.util.Log;
+ import java.io.IOException;
+-import java.util.HashMap;
++import java.util.ArrayList;
+ import java.util.List;
++import java.util.Locale;
+ 
+-public class QueuedDownload<T> {
++public class QueuedDownload<T extends SegmentDownloader.Segment> {
+ 
+     public static int SIZE = 3;
+ 
+     interface Callback<T> {
+-        void download(T item) throws InterruptedException, IOException;
++
++        void download(T item, int type) throws InterruptedException, IOException;
+     }
+ 
+     private final List<T> itemsToDownload;
+-//    private final int maxParallelSize;
+     private final Callback<T> callback;
+-    private final Object Q_LOCK = new Object();
++    private final Object threadLock = new Object();
++
++    private ArrayList<ArrayList<T>> parallelQueueList = new ArrayList<>();
++    private int maxQueueSize;
+ 
+-    private int currentParallelCount = 0;
+-    private InterruptedException interruptedExceptionHolder = null;
+-    private IOException ioExceptionHolder = null;
++    private volatile InterruptedException interruptedExceptionHolder = null;
++    private volatile IOException ioExceptionHolder = null;
+ 
+ 
+-    private QueuedDownload(List<T> itemsToDownload, int maxParallelSize, Callback<T> callback) {
++    public QueuedDownload(List<T> itemsToDownload, int size, Callback<T> callback) {
+         this.itemsToDownload = itemsToDownload;
+-//        this.maxParallelSize = maxParallelSize;
+         this.callback = callback;
++        this.maxQueueSize = size;
+     }
+ 
+-    QueuedDownload(List<T> itemsToDownload, Callback<T> callback) {
+-        this(itemsToDownload, 0, callback);
+-    }
+ 
+-    void initDownload() throws IOException, InterruptedException {
++    void download() throws IOException, InterruptedException {
+ 
+-        while (itemsToDownload.size() > 0) {
++        int size = itemsToDownload.size();
+ 
+-            while (currentParallelCount >= SIZE) {
+-                SystemClock.sleep(100);
+-            }
++        for (int i = 0; i < size; i++) {
+ 
+-            if(interruptedExceptionHolder != null) {
+-                throw interruptedExceptionHolder;
++            int pos = i % maxQueueSize;
++
++            ArrayList<T> targetQueue;
++
++            if (pos >= parallelQueueList.size()) {
++                targetQueue = new ArrayList<>();
++                parallelQueueList.add(targetQueue);
++            } else {
++                targetQueue = parallelQueueList.get(pos);
+             }
+ 
+-            if(ioExceptionHolder != null) {
+-                throw ioExceptionHolder;
++            targetQueue.add(itemsToDownload.get(i));
++        }
++
++        for (int i = 0; i < parallelQueueList.size(); i++) {
++            executeAsync(parallelQueueList.get(i), i);
++        }
++
++        synchronized (threadLock) {
++            if(! isAllQueueEmpty()) {
++                threadLock.wait();
+             }
++        }
+ 
+-            T item = itemsToDownload.remove(0);
+-            downloadAsync(item);
++        if (interruptedExceptionHolder != null) {
++            throw interruptedExceptionHolder;
++        }
+ 
++        if (ioExceptionHolder != null) {
++            throw ioExceptionHolder;
+         }
++
+     }
+ 
+-    private void downloadAsync(T item) {
++    private boolean isAllQueueEmpty() {
++
++        for (int i = 0; i < parallelQueueList.size(); i++) {
+ 
+-        synchronized (Q_LOCK) {
+-            currentParallelCount++;
++            if (!parallelQueueList.get(i).isEmpty()) {
++                return false;
++            }
+         }
+ 
++        return true;
++    }
++
++    private void executeAsync(ArrayList<T> queue, int type) {
++
+         new Thread(() -> {
+             try {
+-                callback.download(item);
++                execute(queue, type);
++            } catch (IOException e) {
++                ioExceptionHolder = e;
+             } catch (InterruptedException e) {
+                 interruptedExceptionHolder = e;
+             }
+-            catch (IOException e) {
+-                ioExceptionHolder = e;
+-            }
+-            synchronized (Q_LOCK) {
+-                currentParallelCount--;
+-            }
+         }).start();
+ 
+     }
++
++    private void execute(ArrayList<T> queue, int type) throws IOException, InterruptedException {
++
++        while (!queue.isEmpty()) {
++
++            if(ioExceptionHolder != null || interruptedExceptionHolder != null) {
++                return;
++            }
++            T item = queue.remove(0);
++            Log.d("VideoDownload", String.format(Locale.getDefault(), "Q(%d) -S:%d : U:%s", type, queue.size(), item.dataSpec.uri.toString()));
++            callback.download(item, type);
++
++        }
++
++        synchronized (threadLock) {
++            if (isAllQueueEmpty()) {
++                threadLock.notify();
++            }
++        }
++    }
+ }
+diff --git a/library/core/src/main/java/com/google/android/exoplayer2/offline/SegmentDownloader.java b/library/core/src/main/java/com/google/android/exoplayer2/offline/SegmentDownloader.java
+index 47a2fcc54b..58dab0c21e 100644
+--- a/library/core/src/main/java/com/google/android/exoplayer2/offline/SegmentDownloader.java
++++ b/library/core/src/main/java/com/google/android/exoplayer2/offline/SegmentDownloader.java
+@@ -64,7 +64,8 @@ public int compareTo(@NonNull Segment other) {
+   private final Uri manifestUri;
+   private final PriorityTaskManager priorityTaskManager;
+   private final Cache cache;
+-  private final CacheDataSource dataSource;
++//  private final CacheDataSource dataSource;
++  private final ArrayList<CacheDataSource> dataSources;
+   private final CacheDataSource offlineDataSource;
+   private final ArrayList<StreamKey> streamKeys;
+   private final AtomicBoolean isCanceled;
+@@ -86,7 +87,13 @@ public SegmentDownloader(
+     this.manifestUri = manifestUri;
+     this.streamKeys = new ArrayList<>(streamKeys);
+     this.cache = constructorHelper.getCache();
+-    this.dataSource = constructorHelper.buildCacheDataSource(false);
++
++    dataSources = new ArrayList<>();
++
++    for (int i = 0; i < QueuedDownload.SIZE; i++) {
++      dataSources.add(constructorHelper.buildCacheDataSource(false));
++    }
++
+     this.offlineDataSource = constructorHelper.buildCacheDataSource(true);
+     this.priorityTaskManager = constructorHelper.getPriorityTaskManager();
+     totalSegments = C.LENGTH_UNSET;
+@@ -112,28 +119,27 @@ public final void download() throws IOException, InterruptedException {
+       Collections.sort(segments);
+       byte[] buffer = new byte[BUFFER_SIZE_BYTES];
+       CachingCounters cachingCounters = new CachingCounters();
+-      QueuedDownload<Segment> queuedDownload = new QueuedDownload<>(segments, segment -> {
+-
+-        try {
+-          CacheUtil.cache(
+-              segment.dataSpec,
+-              cache,
+-              dataSource,
+-              buffer,
+-              priorityTaskManager,
+-              C.PRIORITY_DOWNLOAD,
+-              cachingCounters,
+-              isCanceled,
+-              true);
+-          downloadedSegments++;
+-        } finally {
+-          synchronized (lock) {
+-            downloadedBytes += cachingCounters.newlyCachedBytes;
+-          }
+-        }
+-      });
+-
+-      queuedDownload.initDownload();
++      QueuedDownload<Segment> queuedDownload = new QueuedDownload<>(segments, QueuedDownload.SIZE,
++          (segment, type) -> {
++
++            try {
++              CacheUtil.cache(
++                  segment.dataSpec,
++                  cache,
++                  dataSources.get(type),
++                  buffer,
++                  priorityTaskManager,
++                  C.PRIORITY_DOWNLOAD,
++                  cachingCounters,
++                  isCanceled,
++                  true);
++              downloadedSegments++;
++            } finally {
++              downloadedBytes += cachingCounters.newlyCachedBytes;
++            }
++          });
++
++      queuedDownload.download();
+     } finally {
+       priorityTaskManager.remove(C.PRIORITY_DOWNLOAD);
+     }
+@@ -209,11 +215,11 @@ public final void remove() throws InterruptedException {
+   // Writes to downloadedSegments and downloadedBytes are safe. See the comment on download().
+   @SuppressWarnings("NonAtomicVolatileUpdate")
+   private List<Segment> initDownload() throws IOException, InterruptedException {
+-    M manifest = getManifest(dataSource, manifestUri);
++    M manifest = getManifest(dataSources.get(0), manifestUri);
+     if (!streamKeys.isEmpty()) {
+       manifest = manifest.copy(streamKeys);
+     }
+-    List<Segment> segments = getSegments(dataSource, manifest, /* allowIncompleteList= */ false);
++    List<Segment> segments = getSegments(dataSources.get(0), manifest, /* allowIncompleteList= */ false);
+     CachingCounters cachingCounters = new CachingCounters();
+     totalSegments = segments.size();
+     downloadedSegments = 0;

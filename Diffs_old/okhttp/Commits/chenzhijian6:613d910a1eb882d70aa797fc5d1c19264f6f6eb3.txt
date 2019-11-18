@@ -1,0 +1,959 @@
+diff --git a/okhttp-tests/src/test/java/com/squareup/okhttp/CallTest.java b/okhttp-tests/src/test/java/com/squareup/okhttp/CallTest.java
+index 68ba1dd4c6..85ad0444af 100644
+--- a/okhttp-tests/src/test/java/com/squareup/okhttp/CallTest.java
++++ b/okhttp-tests/src/test/java/com/squareup/okhttp/CallTest.java
+@@ -21,6 +21,7 @@
+ import com.squareup.okhttp.mockwebserver.Dispatcher;
+ import com.squareup.okhttp.mockwebserver.MockResponse;
+ import com.squareup.okhttp.mockwebserver.MockWebServer;
++import com.squareup.okhttp.mockwebserver.PushPromise;
+ import com.squareup.okhttp.mockwebserver.RecordedRequest;
+ import com.squareup.okhttp.mockwebserver.SocketPolicy;
+ import java.io.File;
+@@ -292,6 +293,37 @@
+     patch();
+   }
+ 
++  @Test public void push_SPDY_3() throws Exception {
++    enableProtocol(Protocol.SPDY_3);
++    server.enqueue(new MockResponse()
++        .withPush(new PushPromise("GET", "/pushed", Arrays.asList("foo: bar"),
++             new MockResponse().setBody("push data")))
++        .setBody("abc"));
++    server.play();
++
++    TestPushObserver pushObserver = new TestPushObserver();
++    Request request = new Request.Builder()
++        .url(server.getUrl("/"))
++        .build();
++
++    executeSynchronously(request, pushObserver)
++        .assertCode(200)
++        .assertBody("abc");
++
++    RecordedRequest recordedRequest = server.takeRequest();
++    assertEquals("GET", recordedRequest.getMethod());
++    assertEquals(0, recordedRequest.getBody().length);
++
++    synchronized (pushObserver) {
++      if (!pushObserver.gotRequest()) {
++        pushObserver.wait();
++      }
++      assertNull(pushObserver.exception());
++      assertEquals("/pushed", pushObserver.response().header("path"));
++      assertEquals("push data", new String(pushObserver.response().body().bytes()));
++    }
++  }
++
+   @Test public void illegalToExecuteTwice() throws Exception {
+     server.enqueue(new MockResponse()
+         .setBody("abc")
+@@ -1204,9 +1236,17 @@
+         .assertRequestHeader("Accept-Encoding", "gzip");
+   }
+ 
++  private RecordedResponse executeSynchronously(Request request, PushObserver pushObserver) throws IOException {
++      Call call = client.newCall(request);
++      if(pushObserver != null) {
++          call = call.pushObserver(pushObserver);
++      }
++      Response response = call.execute();
++      return new RecordedResponse(request, response, response.body().string(), null);
++  }
++
+   private RecordedResponse executeSynchronously(Request request) throws IOException {
+-    Response response = client.newCall(request).execute();
+-    return new RecordedResponse(request, response, response.body().string(), null);
++      return executeSynchronously(request, null);
+   }
+ 
+   /**
+@@ -1243,4 +1283,33 @@ private void assertContainsNoneMatching(List<String> headers, String pattern) {
+       }
+     }
+   }
++  private class TestPushObserver implements PushObserver {
++    private boolean gotRequest = false;
++    private IOException exception = null;
++    private Response response = null;
++    private String data = null;
++
++    public boolean gotRequest() {
++      return gotRequest;
++    }
++
++    public IOException exception() {
++      return exception;
++    }
++
++    public Response response() {
++      return response;
++    }
++
++
++    @Override public synchronized boolean onPush(Response response) {
++      try {
++          this.response = response;
++        return false;
++      } finally {
++        gotRequest = true;
++        notifyAll();
++      }
++    }
++  };
+ }
+diff --git a/okhttp-tests/src/test/java/com/squareup/okhttp/internal/spdy/SpdyConnectionTest.java b/okhttp-tests/src/test/java/com/squareup/okhttp/internal/spdy/SpdyConnectionTest.java
+index 05072897ed..89aa6bfc38 100644
+--- a/okhttp-tests/src/test/java/com/squareup/okhttp/internal/spdy/SpdyConnectionTest.java
++++ b/okhttp-tests/src/test/java/com/squareup/okhttp/internal/spdy/SpdyConnectionTest.java
+@@ -1530,6 +1530,37 @@ private void headerBlockHasTrailingCompressedBytes(String frame, int length) thr
+     assertEquals(expectedResponseHeaders, observer.takeEvent());
+   }
+ 
++  @Test public void pushStream() throws Exception {
++    peer.setVariantAndClient(SPDY3, false);
++
++    // write the mocking script
++    peer.acceptFrame(); // SYN_STREAM
++    peer.sendFrame().synReply(false, 3, headerEntries("a", "android"));
++    final List<Header> expectedPushHeaders = Arrays.asList(
++        new Header(Header.TARGET_SCHEME, "https"),
++        new Header(Header.TARGET_AUTHORITY, "squareup.com"),
++        new Header(Header.TARGET_PATH, "/cached")
++    );
++    peer.sendFrame().synStream(false, true, 2, 3, expectedPushHeaders);
++    peer.sendFrame().data(true, 3, data(0));
++    peer.sendFrame().data(true, 2, new Buffer().writeUtf8("robot"));
++    peer.play();
++
++    RecordingPushObserver observer = new RecordingPushObserver();
++
++    // play it back
++    SpdyConnection connection = connectionBuilder(peer, SPDY3)
++        .pushObserver(observer).build();
++    SpdyStream client = connection.newStream(headerEntries("b", "banana"), false, true);
++    assertEquals(-1, client.getSource().read(new Buffer(), 1));
++
++    // verify the peer received what was expected
++    assertEquals(TYPE_HEADERS, peer.takeFrame().type);
++
++    assertEquals(expectedPushHeaders, observer.takeEvent());
++    assertEquals("robot", observer.takeEvent());
++  }
++
+   @Test public void doublePushPromise() throws Exception {
+     peer.setVariantAndClient(HTTP_2, false);
+ 
+@@ -1567,7 +1598,7 @@ private void headerBlockHasTrailingCompressedBytes(String frame, int length) thr
+ 
+     // play it back
+     connectionBuilder(peer, HTTP_2)
+-        .pushObserver(PushObserver.CANCEL).build();
++        .pushObserver(SpdyPushObserver.CANCEL).build();
+ 
+     // verify the peer received what was expected
+     MockSpdyPeer.InFrame rstStream = peer.takeFrame();
+@@ -1642,27 +1673,18 @@ static int roundUp(int num, int divisor) {
+     return (num + divisor - 1) / divisor;
+   }
+ 
+-  static final PushObserver IGNORE = new PushObserver() {
+-
+-    @Override public boolean onRequest(int streamId, List<Header> requestHeaders) {
+-      return false;
+-    }
++  static final SpdyPushObserver IGNORE = new SpdyPushObserver() {
+ 
+-    @Override public boolean onHeaders(int streamId, List<Header> responseHeaders, boolean last) {
++    @Override public synchronized boolean onPromise(int streamId, List<Header> requestHeaders) {
+       return false;
+     }
+ 
+-    @Override public boolean onData(int streamId, BufferedSource source, int byteCount,
+-        boolean last) throws IOException {
+-      source.skip(byteCount);
++    @Override public synchronized boolean onPush(SpdyStream associated, SpdyStream push) {
+       return false;
+     }
+-
+-    @Override public void onReset(int streamId, ErrorCode errorCode) {
+-    }
+   };
+ 
+-  private static class RecordingPushObserver implements PushObserver {
++  private static class RecordingPushObserver implements SpdyPushObserver {
+     final List<Object> events = new ArrayList<Object>();
+ 
+     public synchronized Object takeEvent() throws InterruptedException {
+@@ -1672,32 +1694,26 @@ public synchronized Object takeEvent() throws InterruptedException {
+       return events.remove(0);
+     }
+ 
+-    @Override public synchronized boolean onRequest(int streamId, List<Header> requestHeaders) {
++    @Override public synchronized boolean onPromise(int streamId, List<Header> requestHeaders) {
+       assertEquals(2, streamId);
+       events.add(requestHeaders);
+       notifyAll();
+       return false;
+     }
+ 
+-    @Override public synchronized boolean onHeaders(
+-        int streamId, List<Header> responseHeaders, boolean last) {
+-      assertEquals(2, streamId);
+-      assertTrue(last);
+-      events.add(responseHeaders);
+-      notifyAll();
+-      return false;
+-    }
+-
+-    @Override public synchronized boolean onData(
+-        int streamId, BufferedSource source, int byteCount, boolean last) {
+-      events.add(new AssertionError("onData"));
+-      notifyAll();
++    @Override public synchronized boolean onPush(SpdyStream associated, SpdyStream push) {
++      assertEquals(2, push.getId());
++      events.add(push.getRequestHeaders());
++      Source in = push.getSource();
++      try {
++        String data = Okio.buffer(in).readByteString(5).utf8();
++
++        events.add(data);
++        notifyAll();
++      } catch (IOException expected) {
++        // Just don't push anything to events
++      }
+       return false;
+     }
+-
+-    @Override public synchronized void onReset(int streamId, ErrorCode errorCode) {
+-      events.add(new AssertionError("onReset"));
+-      notifyAll();
+-    }
+   }
+ }
+diff --git a/okhttp/src/main/java/com/squareup/okhttp/Call.java b/okhttp/src/main/java/com/squareup/okhttp/Call.java
+index 32edc4fe57..a37e13e410 100644
+--- a/okhttp/src/main/java/com/squareup/okhttp/Call.java
++++ b/okhttp/src/main/java/com/squareup/okhttp/Call.java
+@@ -16,6 +16,7 @@
+ package com.squareup.okhttp;
+ 
+ import com.squareup.okhttp.internal.NamedRunnable;
++import com.squareup.okhttp.internal.PushCallback;
+ import com.squareup.okhttp.internal.Util;
+ import com.squareup.okhttp.internal.http.HttpEngine;
+ import com.squareup.okhttp.internal.http.HttpMethod;
+@@ -45,6 +46,7 @@
+   /** The request; possibly a consequence of redirects or auth headers. */
+   private Request request;
+   HttpEngine engine;
++  PushObserver pushObserver;
+ 
+   Call(OkHttpClient client, Dispatcher dispatcher, Request request) {
+     this.client = client;
+@@ -73,6 +75,7 @@
+    * @throws IllegalStateException when the call has already been executed.
+    */
+   public Response execute() throws IOException {
++    setPushCallback();
+     synchronized (this) {
+       if (executed) throw new IllegalStateException("Already Executed");
+       executed = true;
+@@ -97,6 +100,7 @@ public Response execute() throws IOException {
+    * @throws IllegalStateException when the call has already been executed.
+    */
+   public void enqueue(Callback responseCallback) {
++    setPushCallback();
+     synchronized (this) {
+       if (executed) throw new IllegalStateException("Already Executed");
+       executed = true;
+@@ -239,6 +243,25 @@ private Response getResponse() throws IOException {
+     }
+   }
+ 
++  private void setPushCallback() {
++      if(pushObserver != null) {
++          request = request.newBuilder().pushCallback(new PushCallback() {
++              @Override
++              public boolean onPush(Response partialResponse, BufferedSource buffer) {
++                  Response response = partialResponse.newBuilder()
++                          .body(new RealResponseBody(partialResponse, buffer))
++                          .build();
++                  return pushObserver.onPush(response);
++              }
++          }).build();
++      }
++  }
++
++  public Call pushObserver(PushObserver pushObserver) {
++      this.pushObserver = pushObserver;
++      return this;
++  }
++
+   private static class RealResponseBody extends ResponseBody {
+     private final Response response;
+     private final BufferedSource source;
+diff --git a/okhttp/src/main/java/com/squareup/okhttp/PushObserver.java b/okhttp/src/main/java/com/squareup/okhttp/PushObserver.java
+new file mode 100644
+index 0000000000..8b25707465
+--- /dev/null
++++ b/okhttp/src/main/java/com/squareup/okhttp/PushObserver.java
+@@ -0,0 +1,49 @@
++/*
++ * Copyright (C) 2014 Square, Inc.
++ *
++ * Licensed under the Apache License, Version 2.0 (the "License");
++ * you may not use this file except in compliance with the License.
++ * You may obtain a copy of the License at
++ *
++ *      http://www.apache.org/licenses/LICENSE-2.0
++ *
++ * Unless required by applicable law or agreed to in writing, software
++ * distributed under the License is distributed on an "AS IS" BASIS,
++ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++ * See the License for the specific language governing permissions and
++ * limitations under the License.
++ */
++package com.squareup.okhttp;
++
++import okio.BufferedSource;
++
++/**
++ * {@link com.squareup.okhttp.Protocol#HTTP_2 HTTP/2} only.
++ * Processes server-initiated HTTP requests on the client. Implementations must
++ * quickly dispatch callbacks to avoid creating a bottleneck.
++ *
++ * <p>While {@link #onReset} may occur at any time, the following callbacks are
++ * expected in order, correlated by stream ID.
++ * <ul>
++ *   <li>{@link #onRequest}</li>
++ *   <li>{@link #onHeaders} (unless canceled)</li>
++ *   <li>{@link #onData} (optional sequence of data frames)</li>
++ * </ul>
++ *
++ * <p>As a stream ID is scoped to a single HTTP/2 connection, implementations
++ * which target multiple connections should expect repetition of stream IDs.
++ *
++ * <p>Return true to request cancellation of a pushed stream.  Note that this
++ * does not guarantee future frames won't arrive on the stream ID.
++ */
++public interface PushObserver {
++  /**
++   * The response headers corresponding to a pushed request.  When {@code last}
++   * is true, there are no data frames to follow.
++   *
++   * @param streamId server-initiated stream ID: an even number.
++   * @param responseHeaders minimally includes {@code :status}.
++   * @param last when true, there is no response data.
++   */
++  boolean onPush(Response response);
++}
+diff --git a/okhttp/src/main/java/com/squareup/okhttp/Request.java b/okhttp/src/main/java/com/squareup/okhttp/Request.java
+index 5d1ec86482..657a42bde7 100644
+--- a/okhttp/src/main/java/com/squareup/okhttp/Request.java
++++ b/okhttp/src/main/java/com/squareup/okhttp/Request.java
+@@ -16,6 +16,8 @@
+ package com.squareup.okhttp;
+ 
+ import com.squareup.okhttp.internal.Platform;
++import com.squareup.okhttp.internal.PushCallback;
++
+ import java.io.IOException;
+ import java.net.MalformedURLException;
+ import java.net.URI;
+@@ -33,6 +35,7 @@
+   private final Headers headers;
+   private final RequestBody body;
+   private final Object tag;
++  private final PushCallback pushCallback;
+ 
+   private volatile URI uri; // Lazily initialized.
+   private volatile CacheControl cacheControl; // Lazily initialized.
+@@ -43,6 +46,7 @@ private Request(Builder builder) {
+     this.headers = builder.headers.build();
+     this.body = builder.body;
+     this.tag = builder.tag != null ? builder.tag : this;
++    this.pushCallback = builder.pushCallback;
+   }
+ 
+   public URL url() {
+@@ -86,6 +90,10 @@ public Object tag() {
+     return tag;
+   }
+ 
++  public PushCallback pushCallback() {
++    return pushCallback;
++  }
++
+   public Builder newBuilder() {
+     return new Builder(this);
+   }
+@@ -119,6 +127,7 @@ public boolean isHttps() {
+     private Headers.Builder headers;
+     private RequestBody body;
+     private Object tag;
++    private PushCallback pushCallback = null;
+ 
+     public Builder() {
+       this.method = "GET";
+@@ -131,6 +140,7 @@ private Builder(Request request) {
+       this.body = request.body;
+       this.tag = request.tag;
+       this.headers = request.headers.newBuilder();
++      this.pushCallback = request.pushCallback;
+     }
+ 
+     public Builder url(String url) {
+@@ -209,6 +219,11 @@ public Builder method(String method, RequestBody body) {
+       return this;
+     }
+ 
++    Builder pushCallback(PushCallback pushCallback) {
++      this.pushCallback = pushCallback;
++      return this;
++    }
++
+     /**
+      * Attaches {@code tag} to the request. It can be used later to cancel the
+      * request. If the tag is unspecified or null, the request is canceled by
+diff --git a/okhttp/src/main/java/com/squareup/okhttp/internal/PushCallback.java b/okhttp/src/main/java/com/squareup/okhttp/internal/PushCallback.java
+new file mode 100644
+index 0000000000..8ae81c6426
+--- /dev/null
++++ b/okhttp/src/main/java/com/squareup/okhttp/internal/PushCallback.java
+@@ -0,0 +1,12 @@
++package com.squareup.okhttp.internal;
++
++import com.squareup.okhttp.Response;
++import okio.BufferedSource;
++
++/**
++ * Created by drapp on 5/22/14.
++ */
++public interface PushCallback {
++
++    boolean onPush(Response partialResponse, BufferedSource buffer);
++}
+diff --git a/okhttp/src/main/java/com/squareup/okhttp/internal/http/HttpEngine.java b/okhttp/src/main/java/com/squareup/okhttp/internal/http/HttpEngine.java
+index 675d3a90d1..f9609e9808 100644
+--- a/okhttp/src/main/java/com/squareup/okhttp/internal/http/HttpEngine.java
++++ b/okhttp/src/main/java/com/squareup/okhttp/internal/http/HttpEngine.java
+@@ -639,6 +639,10 @@ private Request networkRequest(Request request) throws IOException {
+     return result.build();
+   }
+ 
++  public boolean isTransparentGzip() {
++    return transparentGzip;
++  }
++
+   public static String getDefaultUserAgent() {
+     String agent = System.getProperty("http.agent");
+     return agent != null ? agent : ("Java" + System.getProperty("java.version"));
+diff --git a/okhttp/src/main/java/com/squareup/okhttp/internal/http/SpdyTransport.java b/okhttp/src/main/java/com/squareup/okhttp/internal/http/SpdyTransport.java
+index 07713ec472..e4d55e800d 100644
+--- a/okhttp/src/main/java/com/squareup/okhttp/internal/http/SpdyTransport.java
++++ b/okhttp/src/main/java/com/squareup/okhttp/internal/http/SpdyTransport.java
+@@ -16,15 +16,14 @@
+ 
+ package com.squareup.okhttp.internal.http;
+ 
+-import com.squareup.okhttp.Headers;
+-import com.squareup.okhttp.Protocol;
+-import com.squareup.okhttp.Request;
+-import com.squareup.okhttp.Response;
++import com.squareup.okhttp.*;
++import com.squareup.okhttp.internal.PushCallback;
+ import com.squareup.okhttp.internal.Util;
+ import com.squareup.okhttp.internal.spdy.ErrorCode;
+ import com.squareup.okhttp.internal.spdy.Header;
+ import com.squareup.okhttp.internal.spdy.SpdyConnection;
+ import com.squareup.okhttp.internal.spdy.SpdyStream;
++import com.squareup.okhttp.internal.spdy.SpdyPushObserver;
+ import java.io.IOException;
+ import java.io.OutputStream;
+ import java.net.CacheRequest;
+@@ -36,7 +35,10 @@
+ import java.util.Set;
+ import java.util.concurrent.TimeUnit;
+ import okio.Buffer;
++import okio.BufferedSource;
++import okio.GzipSource;
+ import okio.ByteString;
++import okio.Okio;
+ import okio.Sink;
+ import okio.Source;
+ import okio.Timeout;
+@@ -84,7 +86,7 @@ public SpdyTransport(HttpEngine httpEngine, SpdyConnection spdyConnection) {
+     return stream.getSink();
+   }
+ 
+-  @Override public void writeRequestHeaders(Request request) throws IOException {
++  @Override public void writeRequestHeaders(final Request request) throws IOException {
+     if (stream != null) return;
+ 
+     httpEngine.writingRequestHeaders();
+@@ -95,6 +97,36 @@ public SpdyTransport(HttpEngine httpEngine, SpdyConnection spdyConnection) {
+         writeNameValueBlock(request, spdyConnection.getProtocol(), version), hasRequestBody,
+         hasResponseBody);
+     stream.readTimeout().timeout(httpEngine.client.getReadTimeout(), TimeUnit.MILLISECONDS);
++
++    final PushCallback pushCallback = request.pushCallback();
++    if (pushCallback != null) {
++      stream.pushObserver = new SpdyPushObserver() {
++        @Override public synchronized boolean onPromise(int streamId, List<Header> requestHeaders) {
++          return true;
++        }
++
++        @Override public synchronized boolean onPush(SpdyStream associated, SpdyStream push) {
++          try {
++            Response pushReq = parsePushResponse(
++                    request,
++                    push.getRequestHeaders(),
++                    spdyConnection.getProtocol()).build();
++
++            SpdySource source = new SpdySource(push, null);
++            BufferedSource buffer;
++            if (httpEngine.isTransparentGzip()
++                    && "gzip".equalsIgnoreCase(pushReq.headers().get("Content-Encoding"))) {
++              buffer = Okio.buffer(new GzipSource(source));
++            } else {
++              buffer = Okio.buffer(source);
++            }
++            return pushCallback.onPush(pushReq, buffer);
++          } catch (IOException ignored) {
++            return true;
++          }
++        }
++      };
++    }
+   }
+ 
+   @Override public void writeRequestBody(RetryableSink requestBody) throws IOException {
+@@ -211,6 +243,51 @@ private static String joinOnNull(String first, String second) {
+         .headers(headersBuilder.build());
+   }
+ 
++  /** Returns headers for a name value block containing a SPDY response. */
++  public static Response.Builder parsePushResponse(Request request, List<Header> headerBlock,
++                                                  Protocol protocol) throws IOException {
++    String path = null;
++    String host = null;
++    String scheme = null;
++
++    Headers.Builder headersBuilder = new Headers.Builder();
++    headersBuilder.set(OkHeaders.SELECTED_PROTOCOL, protocol.toString());
++    for (Header header : headerBlock) {
++      ByteString name = header.name;
++      String values = header.value.utf8();
++      for (int start = 0; start < values.length(); ) {
++        int end = values.indexOf('\0', start);
++        if (end == -1) {
++          end = values.length();
++        }
++        String value = values.substring(start, end);
++        if (name.equals(TARGET_PATH)) {
++          path = value;
++          // Add :path header to enable transparent decompression
++          headersBuilder.add(name.utf8(), value);
++        } else if (name.equals(TARGET_HOST)) {
++          host = value;
++        } else if (name.equals(TARGET_SCHEME)) {
++          scheme = value;
++        } else if (!isProhibitedHeader(protocol, name)) { // Don't write forbidden headers!
++          headersBuilder.add(name.utf8(), value);
++        }
++        start = end + 1;
++      }
++    }
++    if (path == null || host == null || scheme == null) {
++      throw new ProtocolException("Expected ':path',':host', ':scheme' headers are not set");
++    }
++
++    return new Response.Builder()
++            .code(200)
++            .message("OK")
++            .request(request)
++            .protocol(protocol)
++            .headers(headersBuilder.build());
++  }
++
++
+   @Override public void emptyTransferStream() {
+     // Do nothing.
+   }
+diff --git a/okhttp/src/main/java/com/squareup/okhttp/internal/spdy/SpdyConnection.java b/okhttp/src/main/java/com/squareup/okhttp/internal/spdy/SpdyConnection.java
+index 520a28bebf..3a65015aed 100644
+--- a/okhttp/src/main/java/com/squareup/okhttp/internal/spdy/SpdyConnection.java
++++ b/okhttp/src/main/java/com/squareup/okhttp/internal/spdy/SpdyConnection.java
+@@ -25,10 +25,8 @@
+ import java.net.Socket;
+ import java.util.HashMap;
+ import java.util.Iterator;
+-import java.util.LinkedHashSet;
+ import java.util.List;
+ import java.util.Map;
+-import java.util.Set;
+ import java.util.concurrent.ExecutorService;
+ import java.util.concurrent.LinkedBlockingQueue;
+ import java.util.concurrent.SynchronousQueue;
+@@ -92,7 +90,7 @@
+   /** Lazily-created map of in-flight pings awaiting a response. Guarded by this. */
+   private Map<Integer, Ping> pings;
+   /** User code to run in response to push promise events. */
+-  private final PushObserver pushObserver;
++  private final SpdyPushObserver pushObserver;
+   private int nextPingId;
+ 
+   /**
+@@ -129,7 +127,6 @@
+ 
+   private SpdyConnection(Builder builder) throws IOException {
+     protocol = builder.protocol;
+-    pushObserver = builder.pushObserver;
+     client = builder.client;
+     handler = builder.handler;
+     // http://tools.ietf.org/html/draft-ietf-httpbis-http2-12#section-5.1.1
+@@ -148,21 +145,22 @@ private SpdyConnection(Builder builder) throws IOException {
+ 
+     if (protocol == Protocol.HTTP_2) {
+       variant = new Http20Draft12();
+-      // Like newSingleThreadExecutor, except lazy creates the thread.
+-      pushExecutor = new ThreadPoolExecutor(0, 1,
+-          0L, TimeUnit.MILLISECONDS,
+-          new LinkedBlockingQueue<Runnable>(),
+-          Util.threadFactory(String.format("OkHttp %s Push Observer", hostName), true));
+     } else if (protocol == Protocol.SPDY_3) {
+       variant = new Spdy3();
+-      pushExecutor = null;
+     } else {
+       throw new AssertionError(protocol);
+     }
++    // Like newSingleThreadExecutor, except lazy creates the thread.
++    pushExecutor = new ThreadPoolExecutor(0, 1,
++        0L, TimeUnit.MILLISECONDS,
++        new LinkedBlockingQueue<Runnable>(),
++        Util.threadFactory(String.format("OkHttp %s Push Observer", hostName), true));
++
+     bytesLeftInWriteWindow = peerSettings.getInitialWindowSize(DEFAULT_INITIAL_WINDOW_SIZE);
+     socket = builder.socket;
+     frameWriter = variant.newWriter(Okio.buffer(Okio.sink(builder.socket)), client);
+     maxFrameSize = variant.maxFrameSize();
++    pushObserver = builder.pushObserver;
+ 
+     readerRunnable = new Reader();
+     new Thread(readerRunnable).start(); // Not a daemon thread.
+@@ -221,7 +219,6 @@ public synchronized long getIdleStartTimeNs() {
+   public SpdyStream pushStream(int associatedStreamId, List<Header> requestHeaders, boolean out)
+       throws IOException {
+     if (client) throw new IllegalStateException("Client cannot push requests.");
+-    if (protocol != Protocol.HTTP_2) throw new IllegalStateException("protocol != HTTP_2");
+     return newStream(associatedStreamId, requestHeaders, out, false);
+   }
+ 
+@@ -258,7 +255,7 @@ private SpdyStream newStream(int associatedStreamId, List<Header> requestHeaders
+           setIdle(false);
+         }
+       }
+-      if (associatedStreamId == 0) {
++      if (associatedStreamId == 0 || protocol == Protocol.SPDY_3) {
+         frameWriter.synStream(outFinished, inFinished, streamId, associatedStreamId,
+             requestHeaders);
+       } else if (client) {
+@@ -506,7 +503,7 @@ public void sendConnectionPreface() throws IOException {
+     private Socket socket;
+     private IncomingStreamHandler handler = IncomingStreamHandler.REFUSE_INCOMING_STREAMS;
+     private Protocol protocol = Protocol.SPDY_3;
+-    private PushObserver pushObserver = PushObserver.CANCEL;
++    private SpdyPushObserver pushObserver = SpdyPushObserver.CANCEL;
+     private boolean client;
+ 
+     public Builder(boolean client, Socket socket) throws IOException {
+@@ -533,7 +530,7 @@ public Builder protocol(Protocol protocol) {
+       return this;
+     }
+ 
+-    public Builder pushObserver(PushObserver pushObserver) {
++    public Builder pushObserver(SpdyPushObserver pushObserver) {
+       this.pushObserver = pushObserver;
+       return this;
+     }
+@@ -580,10 +577,6 @@ private Reader() {
+ 
+     @Override public void data(boolean inFinished, int streamId, BufferedSource source, int length)
+         throws IOException {
+-      if (pushedStream(streamId)) {
+-        pushDataLater(streamId, source, length, inFinished);
+-        return;
+-      }
+       SpdyStream dataStream = getStream(streamId);
+       if (dataStream == null) {
+         writeSynResetLater(streamId, ErrorCode.INVALID_STREAM);
+@@ -598,17 +591,24 @@ private Reader() {
+ 
+     @Override public void headers(boolean outFinished, boolean inFinished, int streamId,
+         int associatedStreamId, List<Header> headerBlock, HeadersMode headersMode) {
+-      if (pushedStream(streamId)) {
+-        pushHeadersLater(streamId, headerBlock, inFinished);
+-        return;
+-      }
+       SpdyStream stream;
++      SpdyStream associated = null;
+       synchronized (SpdyConnection.this) {
+         // If we're shutdown, don't bother with this stream.
+         if (shutdown) return;
+ 
+         stream = getStream(streamId);
+ 
++        // Fetch associated stream
++        if (pushedStream(streamId)) {
++          associated = getStream(associatedStreamId);
++
++          if (associated == null) {
++            writeSynResetLater(streamId, ErrorCode.INVALID_STREAM);
++            return;
++          }
++        }
++
+         if (stream == null) {
+           // The headers claim to be for an existing stream, but we don't have one.
+           if (headersMode.failIfStreamAbsent()) {
+@@ -627,6 +627,14 @@ private Reader() {
+               inFinished, headerBlock);
+           lastGoodStreamId = streamId;
+           streams.put(streamId, newStream);
++
++          // Handle PUSH streams
++          if (pushedStream(streamId)) {
++            pushStreamLater(associated, newStream);
++            return;
++          }
++
++          // Handle server incoming requests
+           executor.submit(new NamedRunnable("OkHttp %s stream %d", hostName, streamId) {
+             @Override public void execute() {
+               try {
+@@ -653,10 +661,6 @@ private Reader() {
+     }
+ 
+     @Override public void rstStream(int streamId, ErrorCode errorCode) {
+-      if (pushedStream(streamId)) {
+-        pushResetLater(streamId, errorCode);
+-        return;
+-      }
+       SpdyStream rstStream = removeStream(streamId);
+       if (rstStream != null) {
+         rstStream.receiveRstStream(errorCode);
+@@ -763,7 +767,7 @@ private void ackSettingsLater() {
+ 
+     @Override
+     public void pushPromise(int streamId, int promisedStreamId, List<Header> requestHeaders) {
+-      pushRequestLater(promisedStreamId, requestHeaders);
++      pushPromiseLater(promisedStreamId, requestHeaders);
+     }
+ 
+     @Override public void alternateService(int streamId, String origin, ByteString protocol,
+@@ -772,31 +776,18 @@ public void pushPromise(int streamId, int promisedStreamId, List<Header> request
+     }
+   }
+ 
+-  /** Even, positive numbered streams are pushed streams in HTTP/2. */
++  /** Even, positive numbered streams are pushed streams in HTTP/2 and SPDY/3. */
+   private boolean pushedStream(int streamId) {
+-    return protocol == Protocol.HTTP_2 && streamId != 0 && (streamId & 1) == 0;
++    return (protocol == Protocol.HTTP_2 || client) && streamId != 0 && (streamId & 1) == 0;
+   }
+ 
+-  // Guarded by this.
+-  private final Set<Integer> currentPushRequests = new LinkedHashSet<Integer>();
+-
+-  private void pushRequestLater(final int streamId, final List<Header> requestHeaders) {
+-    synchronized (this) {
+-      if (currentPushRequests.contains(streamId)) {
+-        writeSynResetLater(streamId, ErrorCode.PROTOCOL_ERROR);
+-        return;
+-      }
+-      currentPushRequests.add(streamId);
+-    }
++  private void pushPromiseLater(final int streamId, final List<Header> requestHeaders) {
+     pushExecutor.submit(new NamedRunnable("OkHttp %s Push Request[%s]", hostName, streamId) {
+       @Override public void execute() {
+-        boolean cancel = pushObserver.onRequest(streamId, requestHeaders);
++        boolean cancel = pushObserver.onPromise(streamId, requestHeaders);
+         try {
+           if (cancel) {
+             frameWriter.rstStream(streamId, ErrorCode.CANCEL);
+-            synchronized (SpdyConnection.this) {
+-              currentPushRequests.remove(streamId);
+-            }
+           }
+         } catch (IOException ignored) {
+         }
+@@ -804,43 +795,26 @@ private void pushRequestLater(final int streamId, final List<Header> requestHead
+     });
+   }
+ 
+-  private void pushHeadersLater(final int streamId, final List<Header> requestHeaders,
+-      final boolean inFinished) {
+-    pushExecutor.submit(new NamedRunnable("OkHttp %s Push Headers[%s]", hostName, streamId) {
++  private void pushStreamLater(final SpdyStream associated, final SpdyStream push) {
++    pushExecutor.submit(new NamedRunnable("OkHttp %s Push Request[%s]", hostName, push.getId()) {
+       @Override public void execute() {
+-        boolean cancel = pushObserver.onHeaders(streamId, requestHeaders, inFinished);
+-        try {
+-          if (cancel) frameWriter.rstStream(streamId, ErrorCode.CANCEL);
+-          if (cancel || inFinished) {
+-            synchronized (SpdyConnection.this) {
+-              currentPushRequests.remove(streamId);
+-            }
++        SpdyPushObserver streamPushObserver;
++        boolean cancel;
++        int pushId;
++        synchronized (associated) {
++          if (associated.pushObserver != null) {
++            streamPushObserver = associated.pushObserver;
++          } else {
++            streamPushObserver = pushObserver;
++          }
++          synchronized (push) {
++            pushId = push.getId();
++            cancel = streamPushObserver.onPush(associated, push);
+           }
+-        } catch (IOException ignored) {
+         }
+-      }
+-    });
+-  }
+-
+-  /**
+-   * Eagerly reads {@code byteCount} bytes from the source before launching a background task to
+-   * process the data.  This avoids corrupting the stream.
+-   */
+-  private void pushDataLater(final int streamId, final BufferedSource source, final int byteCount,
+-      final boolean inFinished) throws IOException {
+-    final Buffer buffer = new Buffer();
+-    source.require(byteCount); // Eagerly read the frame before firing client thread.
+-    source.read(buffer, byteCount);
+-    if (buffer.size() != byteCount) throw new IOException(buffer.size() + " != " + byteCount);
+-    pushExecutor.submit(new NamedRunnable("OkHttp %s Push Data[%s]", hostName, streamId) {
+-      @Override public void execute() {
+         try {
+-          boolean cancel = pushObserver.onData(streamId, buffer, byteCount, inFinished);
+-          if (cancel) frameWriter.rstStream(streamId, ErrorCode.CANCEL);
+-          if (cancel || inFinished) {
+-            synchronized (SpdyConnection.this) {
+-              currentPushRequests.remove(streamId);
+-            }
++          if (cancel) {
++            frameWriter.rstStream(pushId, ErrorCode.CANCEL);
+           }
+         } catch (IOException ignored) {
+         }
+@@ -848,14 +822,7 @@ private void pushDataLater(final int streamId, final BufferedSource source, fina
+     });
+   }
+ 
+-  private void pushResetLater(final int streamId, final ErrorCode errorCode) {
+-    pushExecutor.submit(new NamedRunnable("OkHttp %s Push Reset[%s]", hostName, streamId) {
+-      @Override public void execute() {
+-        pushObserver.onReset(streamId, errorCode);
+-        synchronized (SpdyConnection.this) {
+-          currentPushRequests.remove(streamId);
+-        }
+-      }
+-    });
++  private void pushRequestLater(final int streamId, final List<Header> requestHeaders) {
++    // WTF Should I do with this?
+   }
+ }
+diff --git a/okhttp/src/main/java/com/squareup/okhttp/internal/spdy/PushObserver.java b/okhttp/src/main/java/com/squareup/okhttp/internal/spdy/SpdyPushObserver.java
+similarity index 62%
+rename from okhttp/src/main/java/com/squareup/okhttp/internal/spdy/PushObserver.java
+rename to okhttp/src/main/java/com/squareup/okhttp/internal/spdy/SpdyPushObserver.java
+index cdb51f65a5..dda77a5180 100644
+--- a/okhttp/src/main/java/com/squareup/okhttp/internal/spdy/PushObserver.java
++++ b/okhttp/src/main/java/com/squareup/okhttp/internal/spdy/SpdyPushObserver.java
+@@ -15,9 +15,7 @@
+  */
+ package com.squareup.okhttp.internal.spdy;
+ 
+-import java.io.IOException;
+ import java.util.List;
+-import okio.BufferedSource;
+ 
+ /**
+  * {@link com.squareup.okhttp.Protocol#HTTP_2 HTTP/2} only.
+@@ -38,7 +36,7 @@
+  * <p>Return true to request cancellation of a pushed stream.  Note that this
+  * does not guarantee future frames won't arrive on the stream ID.
+  */
+-public interface PushObserver {
++public interface SpdyPushObserver {
+   /**
+    * Describes the request that the server intends to push a response for.
+    *
+@@ -46,7 +44,7 @@
+    * @param requestHeaders minimally includes {@code :method}, {@code :scheme},
+    * {@code :authority}, and (@code :path}.
+    */
+-  boolean onRequest(int streamId, List<Header> requestHeaders);
++  boolean onPromise(int streamId, List<Header> requestHeaders);
+ 
+   /**
+    * The response headers corresponding to a pushed request.  When {@code last}
+@@ -56,40 +54,16 @@
+    * @param responseHeaders minimally includes {@code :status}.
+    * @param last when true, there is no response data.
+    */
+-  boolean onHeaders(int streamId, List<Header> responseHeaders, boolean last);
++  boolean onPush(SpdyStream associated, SpdyStream push);
+ 
+-  /**
+-   * A chunk of response data corresponding to a pushed request.  This data
+-   * must either be read or skipped.
+-   *
+-   * @param streamId server-initiated stream ID: an even number.
+-   * @param source location of data corresponding with this stream ID.
+-   * @param byteCount number of bytes to read or skip from the source.
+-   * @param last when true, there are no data frames to follow.
+-   */
+-  boolean onData(int streamId, BufferedSource source, int byteCount, boolean last)
+-      throws IOException;
+-
+-  /** Indicates the reason why this stream was canceled. */
+-  void onReset(int streamId, ErrorCode errorCode);
+-
+-  PushObserver CANCEL = new PushObserver() {
++  SpdyPushObserver CANCEL = new SpdyPushObserver() {
+ 
+-    @Override public boolean onRequest(int streamId, List<Header> requestHeaders) {
++    @Override public boolean onPromise(int streamId, List<Header> requestHeaders) {
+       return true;
+     }
+ 
+-    @Override public boolean onHeaders(int streamId, List<Header> responseHeaders, boolean last) {
++    @Override public boolean onPush(SpdyStream associated, SpdyStream push) {
+       return true;
+     }
+-
+-    @Override public boolean onData(int streamId, BufferedSource source, int byteCount,
+-        boolean last) throws IOException {
+-      source.skip(byteCount);
+-      return true;
+-    }
+-
+-    @Override public void onReset(int streamId, ErrorCode errorCode) {
+-    }
+   };
+ }
+diff --git a/okhttp/src/main/java/com/squareup/okhttp/internal/spdy/SpdyStream.java b/okhttp/src/main/java/com/squareup/okhttp/internal/spdy/SpdyStream.java
+index 30e2ccb3b7..fdb22c4cee 100644
+--- a/okhttp/src/main/java/com/squareup/okhttp/internal/spdy/SpdyStream.java
++++ b/okhttp/src/main/java/com/squareup/okhttp/internal/spdy/SpdyStream.java
+@@ -65,6 +65,7 @@
+   final SpdyDataSink sink;
+   private final SpdyTimeout readTimeout = new SpdyTimeout();
+   private final SpdyTimeout writeTimeout = new SpdyTimeout();
++  public SpdyPushObserver pushObserver = null;
+ 
+   /**
+    * The reason why this stream was abnormally closed. If there are multiple

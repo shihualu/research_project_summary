@@ -1,0 +1,1130 @@
+diff --git a/config-example.properties b/config-example.properties
+index e8e9dbc509..6b4b82796b 100644
+--- a/config-example.properties
++++ b/config-example.properties
+@@ -1,3 +1,4 @@
++
+ ##### Vehicles #####
+ 
+ 
+@@ -88,11 +89,6 @@ prepare.min_one_way_network_size=200
+ routing.non_ch.max_waypoint_distance = 1000000
+ 
+ 
+-# You can permanently block certain areas from routing
+-# e.g. you can block certain areas with 
+-# block_area=lat1,lon1,lat2,lon2
+-
+-
+ 
+ ##### Web #####
+ 
+diff --git a/core/src/main/java/com/graphhopper/GraphHopper.java b/core/src/main/java/com/graphhopper/GraphHopper.java
+index 2df7c244b9..d3d8bdff13 100644
+--- a/core/src/main/java/com/graphhopper/GraphHopper.java
++++ b/core/src/main/java/com/graphhopper/GraphHopper.java
+@@ -89,7 +89,6 @@
+     private boolean simplifyResponse = true;
+     private TraversalMode traversalMode = TraversalMode.NODE_BASED;
+     private int maxVisitedNodes = Integer.MAX_VALUE;
+-    private String blockedRectangularAreas = "";
+ 
+     private int nonChMaxWaypointDistance = Integer.MAX_VALUE;
+     // for index
+@@ -599,7 +598,6 @@ public GraphHopper init(CmdArgs args) {
+         maxVisitedNodes = args.getInt(Routing.INIT_MAX_VISITED_NODES, Integer.MAX_VALUE);
+         maxRoundTripRetries = args.getInt(RoundTrip.INIT_MAX_RETRIES, maxRoundTripRetries);
+         nonChMaxWaypointDistance = args.getInt(Parameters.NON_CH.MAX_NON_CH_POINT_DISTANCE, Integer.MAX_VALUE);
+-        blockedRectangularAreas = args.get(Routing.BLOCK_AREA, "");
+ 
+         return this;
+     }
+@@ -796,6 +794,7 @@ private void initCHAlgoFactoryDecorator() {
+         if (!chFactoryDecorator.hasWeightings()) {
+             for (FlagEncoder encoder : encodingManager.fetchEdgeEncoders()) {
+                 for (String chWeightingStr : chFactoryDecorator.getWeightingsAsStrings()) {
++                    // ghStorage is null at this point
+                     Weighting weighting = createWeighting(new HintsMap(chWeightingStr), encoder, null);
+                     chFactoryDecorator.addWeighting(weighting);
+                 }
+@@ -885,41 +884,37 @@ private void interpolateBridgesAndOrTunnels() {
+      * @see HintsMap
+      */
+     public Weighting createWeighting(HintsMap hintsMap, FlagEncoder encoder, Graph graph) {
+-        String weighting = hintsMap.getWeighting().toLowerCase();
++        String weightingStr = hintsMap.getWeighting().toLowerCase();
++        Weighting weighting = null;
+ 
+         if (encoder.supports(GenericWeighting.class)) {
+-            DataFlagEncoder dataEncoder = (DataFlagEncoder) encoder;
+-            ConfigMap cMap = dataEncoder.readStringMap(hintsMap);
+-
+-            // add default blocked rectangular areas from config properties
+-            if (!this.blockedRectangularAreas.isEmpty()) {
+-                String val = this.blockedRectangularAreas;
+-                String blockedAreasFromRequest = hintsMap.get(Parameters.Routing.BLOCK_AREA, "");
+-                if (!blockedAreasFromRequest.isEmpty())
+-                    val += ";" + blockedAreasFromRequest;
+-                hintsMap.put(Parameters.Routing.BLOCK_AREA, val);
+-            }
+-
+-            cMap = new GraphEdgeIdFinder(graph, locationIndex).parseStringHints(cMap, hintsMap, new DefaultEdgeFilter(encoder));
+-            GenericWeighting genericWeighting = new GenericWeighting(dataEncoder, cMap);
+-            genericWeighting.setGraph(graph);
+-            return genericWeighting;
+-        } else if ("shortest".equalsIgnoreCase(weighting)) {
+-            return new ShortestWeighting(encoder);
+-        } else if ("fastest".equalsIgnoreCase(weighting) || weighting.isEmpty()) {
++            weighting = new GenericWeighting((DataFlagEncoder) encoder, hintsMap);
++        } else if ("shortest".equalsIgnoreCase(weightingStr)) {
++            weighting = new ShortestWeighting(encoder);
++        } else if ("fastest".equalsIgnoreCase(weightingStr) || weightingStr.isEmpty()) {
+             if (encoder.supports(PriorityWeighting.class))
+-                return new PriorityWeighting(encoder, hintsMap);
++                weighting = new PriorityWeighting(encoder, hintsMap);
+             else
+-                return new FastestWeighting(encoder, hintsMap);
+-        } else if ("curvature".equalsIgnoreCase(weighting)) {
++                weighting = new FastestWeighting(encoder, hintsMap);
++        } else if ("curvature".equalsIgnoreCase(weightingStr)) {
+             if (encoder.supports(CurvatureWeighting.class))
+-                return new CurvatureWeighting(encoder, hintsMap);
++                weighting = new CurvatureWeighting(encoder, hintsMap);
++
++        } else if ("short_fastest".equalsIgnoreCase(weightingStr)) {
++            weighting = new ShortFastestWeighting(encoder, hintsMap);
++        }
++
++        if (weighting == null)
++            throw new IllegalArgumentException("weighting " + weighting + " not supported");
+ 
+-        } else if ("short_fastest".equalsIgnoreCase(weighting)) {
+-            return new ShortFastestWeighting(encoder, hintsMap);
++        if (hintsMap.has(Routing.BLOCK_AREA)) {
++            String blockAreaStr = hintsMap.get(Parameters.Routing.BLOCK_AREA, "");
++            GraphEdgeIdFinder.BlockArea blockArea = new GraphEdgeIdFinder(graph, locationIndex).
++                    parseBlockArea(blockAreaStr, new DefaultEdgeFilter(encoder));
++            return new BlockAreaWeighting(weighting, blockArea);
+         }
+ 
+-        throw new IllegalArgumentException("weighting " + weighting + " not supported");
++        return weighting;
+     }
+ 
+     /**
+diff --git a/core/src/main/java/com/graphhopper/routing/ch/CHAlgoFactoryDecorator.java b/core/src/main/java/com/graphhopper/routing/ch/CHAlgoFactoryDecorator.java
+index 90cef22bc0..996b464a39 100644
+--- a/core/src/main/java/com/graphhopper/routing/ch/CHAlgoFactoryDecorator.java
++++ b/core/src/main/java/com/graphhopper/routing/ch/CHAlgoFactoryDecorator.java
+@@ -22,6 +22,7 @@
+ import com.graphhopper.routing.util.HintsMap;
+ import com.graphhopper.routing.util.TraversalMode;
+ import com.graphhopper.routing.weighting.AbstractWeighting;
++import com.graphhopper.routing.weighting.BlockAreaWeighting;
+ import com.graphhopper.routing.weighting.GenericWeighting;
+ import com.graphhopper.routing.weighting.Weighting;
+ import com.graphhopper.storage.*;
+@@ -316,9 +317,6 @@ public void createPreparations(GraphHopperStorage ghStorage, TraversalMode trave
+         traversalMode = getNodeBase();
+ 
+         for (Weighting weighting : getWeightings()) {
+-            if (weighting instanceof GenericWeighting) {
+-                ((GenericWeighting) weighting).setGraph(ghStorage);
+-            }
+             PrepareContractionHierarchies tmpPrepareCH = new PrepareContractionHierarchies(
+                     new GHDirectory("", DAType.RAM_INT), ghStorage, ghStorage.getGraph(CHGraph.class, weighting),
+                     weighting, traversalMode);
+diff --git a/core/src/main/java/com/graphhopper/routing/util/DataFlagEncoder.java b/core/src/main/java/com/graphhopper/routing/util/DataFlagEncoder.java
+index e42a356e1c..917d037475 100644
+--- a/core/src/main/java/com/graphhopper/routing/util/DataFlagEncoder.java
++++ b/core/src/main/java/com/graphhopper/routing/util/DataFlagEncoder.java
+@@ -211,7 +211,7 @@ public int defineWayBits(int index, int shift) {
+         accessEncoder = new EncodedValue("access car", shift, 3, 1, 1, 4, true);
+         shift += accessEncoder.getBits();
+ 
+-        int tmpMax = spatialRuleLookup.size()-1;
++        int tmpMax = spatialRuleLookup.size() - 1;
+         int bits = 32 - Integer.numberOfLeadingZeros(tmpMax);
+         spatialEncoder = new EncodedValue("spatial_location", shift, bits, 1, 0, tmpMax, true);
+         shift += spatialEncoder.getBits();
+@@ -566,7 +566,7 @@ public String getHighwayAsString(EdgeIteratorState edge) {
+         return null;
+     }
+ 
+-    public double[] getHighwaySpeedMap(Map<String, Double> map) {
++    double[] getHighwaySpeedMap(Map<String, Double> map) {
+         if (map == null)
+             throw new IllegalArgumentException("Map cannot be null when calling getHighwaySpeedMap");
+ 
+@@ -847,24 +847,39 @@ public String toString() {
+      * This method creates a Config map out of the PMap. Later on this conversion should not be
+      * necessary when we read JSON.
+      */
+-    public ConfigMap readStringMap(PMap weightingMap) {
+-        Map<String, Double> map = new HashMap<>();
++    public WeightingConfig createWeightingConfig(PMap pMap) {
++        HashMap<String, Double> map = new HashMap<>(DEFAULT_SPEEDS.size());
+         for (Entry<String, Double> e : DEFAULT_SPEEDS.entrySet()) {
+-            map.put(e.getKey(), weightingMap.getDouble("highways." + e.getKey(), e.getValue()));
++            map.put(e.getKey(), pMap.getDouble(e.getKey(), e.getValue()));
+         }
+ 
+-        ConfigMap cMap = new ConfigMap();
+-        cMap.put("highways", map);
++        return new WeightingConfig(getHighwaySpeedMap(map));
++    }
+ 
+-        cloneDoubleAttribute(weightingMap, cMap, GenericWeighting.HEIGHT_LIMIT, 0d);
+-        cloneDoubleAttribute(weightingMap, cMap, GenericWeighting.WEIGHT_LIMIT, 0d);
+-        cloneDoubleAttribute(weightingMap, cMap, GenericWeighting.WIDTH_LIMIT, 0d);
++    public class WeightingConfig {
++        private final double[] speedArray;
+ 
+-        return cMap;
+-    }
++        public WeightingConfig(double[] speedArray) {
++            this.speedArray = speedArray;
++        }
+ 
+-    private void cloneDoubleAttribute(PMap weightingMap, ConfigMap cMap, String key, double _default) {
+-        if (weightingMap.has(key))
+-            cMap.put(key, weightingMap.getDouble(key, _default));
++        public double getSpeed(EdgeIteratorState edgeState) {
++            int highwayKey = getHighway(edgeState);
++            // ensure before (in createResult) that all highways that were specified in the request are known
++            double speed = speedArray[highwayKey];
++            if (speed < 0)
++                throw new IllegalStateException("speed was negative? " + edgeState.getEdge()
++                        + ", highway:" + highwayKey);
++            return speed;
++        }
++
++        public double getMaxSpecifiedSpeed() {
++            double tmpSpeed = 0;
++            for (double speed : speedArray) {
++                if (speed > tmpSpeed)
++                    tmpSpeed = speed;
++            }
++            return tmpSpeed;
++        }
+     }
+ }
+diff --git a/core/src/main/java/com/graphhopper/routing/util/HintsMap.java b/core/src/main/java/com/graphhopper/routing/util/HintsMap.java
+index 470726e5ad..314af30c60 100644
+--- a/core/src/main/java/com/graphhopper/routing/util/HintsMap.java
++++ b/core/src/main/java/com/graphhopper/routing/util/HintsMap.java
+@@ -26,6 +26,10 @@
+     public HintsMap() {
+     }
+ 
++    public HintsMap(int capacity) {
++        super(capacity);
++    }
++
+     /**
+      * Convenient constructor if only one parameter is provided
+      */
+diff --git a/core/src/main/java/com/graphhopper/routing/weighting/AbstractWeighting.java b/core/src/main/java/com/graphhopper/routing/weighting/AbstractWeighting.java
+index f703c0e991..e5572cf992 100644
+--- a/core/src/main/java/com/graphhopper/routing/weighting/AbstractWeighting.java
++++ b/core/src/main/java/com/graphhopper/routing/weighting/AbstractWeighting.java
+@@ -27,7 +27,7 @@
+ public abstract class AbstractWeighting implements Weighting {
+     protected final FlagEncoder flagEncoder;
+ 
+-    public AbstractWeighting(FlagEncoder encoder) {
++    protected AbstractWeighting(FlagEncoder encoder) {
+         this.flagEncoder = encoder;
+         if (!flagEncoder.isRegistered())
+             throw new IllegalStateException("Make sure you add the FlagEncoder " + flagEncoder + " to an EncodingManager before using it elsewhere");
+diff --git a/core/src/main/java/com/graphhopper/routing/weighting/BlockAreaWeighting.java b/core/src/main/java/com/graphhopper/routing/weighting/BlockAreaWeighting.java
+new file mode 100644
+index 0000000000..b1ad04378b
+--- /dev/null
++++ b/core/src/main/java/com/graphhopper/routing/weighting/BlockAreaWeighting.java
+@@ -0,0 +1,35 @@
++package com.graphhopper.routing.weighting;
++
++import com.graphhopper.storage.GraphEdgeIdFinder;
++import com.graphhopper.util.EdgeIteratorState;
++
++/**
++ * This weighting is a wrapper for every weighting to support block_area
++ */
++public class BlockAreaWeighting extends AbstractAdjustedWeighting {
++
++    private GraphEdgeIdFinder.BlockArea blockArea;
++
++    public BlockAreaWeighting(Weighting superWeighting, GraphEdgeIdFinder.BlockArea blockArea) {
++        super(superWeighting);
++        this.blockArea = blockArea;
++    }
++
++    @Override
++    public double getMinWeight(double distance) {
++        return superWeighting.getMinWeight(distance);
++    }
++
++    @Override
++    public double calcWeight(EdgeIteratorState edgeState, boolean reverse, int prevOrNextEdgeId) {
++        if (blockArea.contains(edgeState))
++            return Double.POSITIVE_INFINITY;
++
++        return superWeighting.calcWeight(edgeState, reverse, prevOrNextEdgeId);
++    }
++
++    @Override
++    public String getName() {
++        return "block_area";
++    }
++}
+diff --git a/core/src/main/java/com/graphhopper/routing/weighting/FastestWeighting.java b/core/src/main/java/com/graphhopper/routing/weighting/FastestWeighting.java
+index 98d4a7183b..cffbc5867b 100644
+--- a/core/src/main/java/com/graphhopper/routing/weighting/FastestWeighting.java
++++ b/core/src/main/java/com/graphhopper/routing/weighting/FastestWeighting.java
+@@ -18,6 +18,7 @@
+ package com.graphhopper.routing.weighting;
+ 
+ import com.graphhopper.routing.util.FlagEncoder;
++import com.graphhopper.routing.util.HintsMap;
+ import com.graphhopper.util.EdgeIteratorState;
+ import com.graphhopper.util.PMap;
+ import com.graphhopper.util.Parameters.Routing;
+@@ -39,15 +40,15 @@
+     private final long headingPenaltyMillis;
+     private final double maxSpeed;
+ 
+-    public FastestWeighting(FlagEncoder encoder, PMap pMap) {
++    public FastestWeighting(FlagEncoder encoder, PMap map) {
+         super(encoder);
+-        headingPenalty = pMap.getDouble(Routing.HEADING_PENALTY, Routing.DEFAULT_HEADING_PENALTY);
++        headingPenalty = map.getDouble(Routing.HEADING_PENALTY, Routing.DEFAULT_HEADING_PENALTY);
+         headingPenaltyMillis = Math.round(headingPenalty * 1000);
+         maxSpeed = encoder.getMaxSpeed() / SPEED_CONV;
+     }
+ 
+     public FastestWeighting(FlagEncoder encoder) {
+-        this(encoder, new PMap(0));
++        this(encoder, new HintsMap(0));
+     }
+ 
+     @Override
+diff --git a/core/src/main/java/com/graphhopper/routing/weighting/GenericWeighting.java b/core/src/main/java/com/graphhopper/routing/weighting/GenericWeighting.java
+index 6eb9655e75..b23e88938d 100644
+--- a/core/src/main/java/com/graphhopper/routing/weighting/GenericWeighting.java
++++ b/core/src/main/java/com/graphhopper/routing/weighting/GenericWeighting.java
+@@ -17,18 +17,10 @@
+  */
+ package com.graphhopper.routing.weighting;
+ 
+-import com.graphhopper.coll.GHIntHashSet;
+ import com.graphhopper.routing.util.DataFlagEncoder;
+-import com.graphhopper.storage.Graph;
+-import com.graphhopper.storage.GraphEdgeIdFinder;
+-import com.graphhopper.storage.NodeAccess;
+-import com.graphhopper.util.ConfigMap;
+ import com.graphhopper.util.EdgeIteratorState;
++import com.graphhopper.util.PMap;
+ import com.graphhopper.util.Parameters.Routing;
+-import com.graphhopper.util.shapes.Shape;
+-
+-import java.util.Collections;
+-import java.util.List;
+ 
+ /**
+  * Calculates the best route according to a configurable weighting.
+@@ -48,40 +40,30 @@
+     protected final long headingPenaltyMillis;
+     protected final double maxSpeed;
+     protected final DataFlagEncoder gEncoder;
+-    protected final double[] speedArray;
++    protected final DataFlagEncoder.WeightingConfig weightingConfig;
+     protected final int accessType;
+-    protected final int eventuallAccessiblePenalty = 10;
++    protected final int uncertainAccessiblePenalty = 10;
+ 
+     protected final double height;
+     protected final double weight;
+     protected final double width;
+ 
+-    private final GHIntHashSet blockedEdges;
+-    private final List<Shape> blockedShapes;
+-    private NodeAccess na;
+-
+-    public GenericWeighting(DataFlagEncoder encoder, ConfigMap cMap) {
++    public GenericWeighting(DataFlagEncoder encoder, PMap hintsMap) {
+         super(encoder);
+         gEncoder = encoder;
+-        headingPenalty = cMap.getDouble(Routing.HEADING_PENALTY, Routing.DEFAULT_HEADING_PENALTY);
++        headingPenalty = hintsMap.getDouble(Routing.HEADING_PENALTY, Routing.DEFAULT_HEADING_PENALTY);
+         headingPenaltyMillis = Math.round(headingPenalty * 1000);
+ 
+-        speedArray = gEncoder.getHighwaySpeedMap(cMap.getMap("highways", Double.class));
+-        double tmpSpeed = 0;
+-        for (double speed : speedArray) {
+-            if (speed > tmpSpeed)
+-                tmpSpeed = speed;
+-        }
+-        if (tmpSpeed > encoder.getMaxPossibleSpeed())
+-            throw new IllegalArgumentException("Speed bigger than maximum speed: " + tmpSpeed + " > " + encoder.getMaxPossibleSpeed());
++        weightingConfig = encoder.createWeightingConfig(hintsMap);
++        double maxSpecifiedSpeed = weightingConfig.getMaxSpecifiedSpeed();
++        if (maxSpecifiedSpeed > encoder.getMaxPossibleSpeed())
++            throw new IllegalArgumentException("Some specified speed value bigger than maximum possible speed: " + maxSpecifiedSpeed + " > " + encoder.getMaxPossibleSpeed());
+ 
+-        maxSpeed = tmpSpeed / SPEED_CONV;
++        this.maxSpeed = maxSpecifiedSpeed / SPEED_CONV;
+         accessType = gEncoder.getAccessType("motor_vehicle");
+-        blockedEdges = cMap.get(GraphEdgeIdFinder.BLOCKED_EDGES, new GHIntHashSet(0));
+-        blockedShapes = cMap.get(GraphEdgeIdFinder.BLOCKED_SHAPES, Collections.EMPTY_LIST);
+-        height = cMap.getDouble(HEIGHT_LIMIT, 0d);
+-        weight = cMap.getDouble(WEIGHT_LIMIT, 0d);
+-        width = cMap.getDouble(WIDTH_LIMIT, 0d);
++        height = hintsMap.getDouble(HEIGHT_LIMIT, 0d);
++        weight = hintsMap.getDouble(WEIGHT_LIMIT, 0d);
++        width = hintsMap.getDouble(WIDTH_LIMIT, 0d);
+     }
+ 
+     @Override
+@@ -95,25 +77,14 @@ public double calcWeight(EdgeIteratorState edgeState, boolean reverse, int prevO
+         if (reverse) {
+             if (!gEncoder.isBackward(edgeState, accessType))
+                 return Double.POSITIVE_INFINITY;
+-        } else if (!gEncoder.isForward(edgeState, accessType))
+-            return Double.POSITIVE_INFINITY;
+-
+-        if ((gEncoder.isStoreHeight() && overLimit(height, gEncoder.getHeight(edgeState))) ||
+-                (gEncoder.isStoreWeight() && overLimit(weight, gEncoder.getWeight(edgeState))) ||
+-                (gEncoder.isStoreWidth() && overLimit(width, gEncoder.getWidth(edgeState))))
+-            return Double.POSITIVE_INFINITY;
+-
+-        if (!blockedEdges.isEmpty() && blockedEdges.contains(edgeState.getEdge())) {
++        } else if (!gEncoder.isForward(edgeState, accessType)) {
+             return Double.POSITIVE_INFINITY;
+         }
+ 
+-        if (!blockedShapes.isEmpty() && na != null) {
+-            for (Shape shape : blockedShapes) {
+-                if (shape.contains(na.getLatitude(edgeState.getAdjNode()), na.getLongitude(edgeState.getAdjNode()))) {
+-                    return Double.POSITIVE_INFINITY;
+-                }
+-            }
+-        }
++        if (gEncoder.isStoreHeight() && overLimit(height, gEncoder.getHeight(edgeState))
++                || gEncoder.isStoreWeight() && overLimit(weight, gEncoder.getWeight(edgeState))
++                || gEncoder.isStoreWidth() && overLimit(width, gEncoder.getWidth(edgeState)))
++            return Double.POSITIVE_INFINITY;
+ 
+         long time = calcMillis(edgeState, reverse, prevOrNextEdgeId);
+         if (time == Long.MAX_VALUE)
+@@ -123,14 +94,14 @@ public double calcWeight(EdgeIteratorState edgeState, boolean reverse, int prevO
+             case NOT_ACCESSIBLE:
+                 return Double.POSITIVE_INFINITY;
+             case EVENTUALLY_ACCESSIBLE:
+-                time = time * eventuallAccessiblePenalty;
++                time = time * uncertainAccessiblePenalty;
+         }
+ 
+         return time;
+     }
+ 
+-    private boolean overLimit(double height, double heightLimit) {
+-        return height > 0 && heightLimit > 0 && height >= heightLimit;
++    private boolean overLimit(double value, double valueMax) {
++        return value > 0 && valueMax > 0 && value >= valueMax;
+     }
+ 
+     @Override
+@@ -138,11 +109,7 @@ public long calcMillis(EdgeIteratorState edgeState, boolean reverse, int prevOrN
+         // TODO to avoid expensive reverse flags include oneway accessibility
+         // but how to include e.g. maxspeed as it depends on direction? Does highway depend on direction?
+         // reverse = edge.isReverse()? !reverse : reverse;
+-        int highwayVal = gEncoder.getHighway(edgeState);
+-        double speed = speedArray[highwayVal];
+-        if (speed < 0)
+-            throw new IllegalStateException("speed was negative? " + edgeState.getEdge()
+-                    + ", highway:" + highwayVal + ", reverse:" + reverse);
++        double speed = weightingConfig.getSpeed(edgeState);
+         if (speed == 0)
+             return Long.MAX_VALUE;
+ 
+@@ -176,12 +143,4 @@ public long calcMillis(EdgeIteratorState edgeState, boolean reverse, int prevOrN
+     public String getName() {
+         return "generic";
+     }
+-
+-    /**
+-     * Use this method to associate a graph with this weighting to calculate e.g. node locations too.
+-     */
+-    public void setGraph(Graph graph) {
+-        if (graph != null)
+-            this.na = graph.getNodeAccess();
+-    }
+ }
+diff --git a/core/src/main/java/com/graphhopper/routing/weighting/ShortFastestWeighting.java b/core/src/main/java/com/graphhopper/routing/weighting/ShortFastestWeighting.java
+index f70852e5ed..d324c6661c 100644
+--- a/core/src/main/java/com/graphhopper/routing/weighting/ShortFastestWeighting.java
++++ b/core/src/main/java/com/graphhopper/routing/weighting/ShortFastestWeighting.java
+@@ -35,13 +35,13 @@
+     private final double distanceFactor;
+     private final double timeFactor;
+ 
+-    public ShortFastestWeighting(FlagEncoder encoder, PMap pMap) {
++    public ShortFastestWeighting(FlagEncoder encoder, PMap map) {
+         super(encoder);
+-        timeFactor = checkBounds(TIME_FACTOR, pMap.getDouble(TIME_FACTOR, 1));
++        timeFactor = checkBounds(TIME_FACTOR, map.getDouble(TIME_FACTOR, 1));
+ 
+         // is it faster to include timeFactor via distanceFactor = tmp / timeFactor?
+         // default value derived from the cost for time e.g. 25€/hour and for distance 0.5€/km
+-        distanceFactor = checkBounds(DISTANCE_FACTOR, pMap.getDouble(DISTANCE_FACTOR, 0.07));
++        distanceFactor = checkBounds(DISTANCE_FACTOR, map.getDouble(DISTANCE_FACTOR, 0.07));
+ 
+         if (timeFactor < 1e-5 && distanceFactor < 1e-5)
+             throw new IllegalArgumentException("[" + NAME + "] one of distance_factor or time_factor has to be non-zero");
+diff --git a/core/src/main/java/com/graphhopper/storage/GraphEdgeIdFinder.java b/core/src/main/java/com/graphhopper/storage/GraphEdgeIdFinder.java
+index b1c2ef20d2..b4819accfe 100644
+--- a/core/src/main/java/com/graphhopper/storage/GraphEdgeIdFinder.java
++++ b/core/src/main/java/com/graphhopper/storage/GraphEdgeIdFinder.java
+@@ -19,15 +19,10 @@
+ 
+ import com.graphhopper.coll.GHIntHashSet;
+ import com.graphhopper.routing.util.EdgeFilter;
+-import com.graphhopper.routing.util.HintsMap;
+ import com.graphhopper.storage.index.LocationIndex;
+ import com.graphhopper.storage.index.QueryResult;
+ import com.graphhopper.util.BreadthFirstSearch;
+-import com.graphhopper.util.ConfigMap;
+ import com.graphhopper.util.EdgeIteratorState;
+-
+-import static com.graphhopper.util.Parameters.Routing.*;
+-
+ import com.graphhopper.util.PointList;
+ import com.graphhopper.util.shapes.BBox;
+ import com.graphhopper.util.shapes.Circle;
+@@ -45,9 +40,6 @@
+  */
+ public class GraphEdgeIdFinder {
+ 
+-    // internal properties
+-    public static final String BLOCKED_EDGES = "graph_finder.blocked_edges";
+-    public static final String BLOCKED_SHAPES = "graph_finder.blocked_shapes";
+     private final Graph graph;
+     private final LocationIndex locationIndex;
+ 
+@@ -130,54 +122,85 @@ public void fillEdgeIDs(GHIntHashSet edgeIds, Geometry geometry, EdgeFilter filt
+     }
+ 
+     /**
+-     * This method reads string values from the hints about blocked areas and fills the configMap with either the
+-     * created shapes or the found edges if area is small enough.
++     * This method reads the blockAreaString and creates a Collection of Shapes or a set of found edges if area is small enough.
+      */
+-    public ConfigMap parseStringHints(ConfigMap configMap, HintsMap hints, EdgeFilter filter) {
++    public BlockArea parseBlockArea(String blockAreaString, EdgeFilter filter) {
+         final String objectSeparator = ";";
+         final String innerObjSep = ",";
+         // use shapes if bigger than 1km^2
+         final double shapeArea = 1000 * 1000;
+-
+-        final GHIntHashSet blockedEdges = new GHIntHashSet();
+-        final List<Shape> blockedShapes = new ArrayList<>();
++        BlockArea blockArea = new BlockArea(graph);
+ 
+         // Add blocked circular areas or points
+-        String blockedCircularAreasStr = hints.get(BLOCK_AREA, "");
+-        if (!blockedCircularAreasStr.isEmpty()) {
+-            String[] blockedCircularAreasArr = blockedCircularAreasStr.split(objectSeparator);
++        if (!blockAreaString.isEmpty()) {
++            String[] blockedCircularAreasArr = blockAreaString.split(objectSeparator);
+             for (int i = 0; i < blockedCircularAreasArr.length; i++) {
+                 String objectAsString = blockedCircularAreasArr[i];
+                 String[] splittedObject = objectAsString.split(innerObjSep);
+                 if (splittedObject.length == 4) {
+                     final BBox bbox = BBox.parseTwoPoints(objectAsString);
+                     if (bbox.calculateArea() > shapeArea)
+-                        blockedShapes.add(bbox);
++                        blockArea.add(bbox);
+                     else
+-                        findEdgesInShape(blockedEdges, bbox, filter);
++                        findEdgesInShape(blockArea.blockedEdges, bbox, filter);
+                 } else if (splittedObject.length == 3) {
+                     double lat = Double.parseDouble(splittedObject[0]);
+                     double lon = Double.parseDouble(splittedObject[1]);
+                     int radius = Integer.parseInt(splittedObject[2]);
+                     Circle circle = new Circle(lat, lon, radius);
+                     if (circle.calculateArea() > shapeArea) {
+-                        blockedShapes.add(circle);
++                        blockArea.add(circle);
+                     } else {
+-                        findEdgesInShape(blockedEdges, circle, filter);
++                        findEdgesInShape(blockArea.blockedEdges, circle, filter);
+                     }
+                 } else if (splittedObject.length == 2) {
+                     double lat = Double.parseDouble(splittedObject[0]);
+                     double lon = Double.parseDouble(splittedObject[1]);
+-                    findClosestEdge(blockedEdges, lat, lon, filter);
++                    findClosestEdge(blockArea.blockedEdges, lat, lon, filter);
+                 } else {
+                     throw new IllegalArgumentException(objectAsString + " at index " + i + " need to be defined as lat,lon "
+                             + "or as a circle lat,lon,radius or rectangular lat1,lon1,lat2,lon2");
+                 }
+             }
+         }
++        return blockArea;
++    }
++
++    /**
++     * This class handles edges and areas where access should be blocked.
++     */
++    public static class BlockArea {
++        final GHIntHashSet blockedEdges = new GHIntHashSet();
++        final List<Shape> blockedShapes = new ArrayList<>();
++        private final NodeAccess na;
++
++        public BlockArea(Graph g) {
++            na = g.getNodeAccess();
++        }
++
++        public void add(int edgeId) {
++            blockedEdges.addAll(edgeId);
++        }
++
++        public void add(Shape shape) {
++            blockedShapes.add(shape);
++        }
+ 
+-        configMap.put(BLOCKED_EDGES, blockedEdges);
+-        configMap.put(BLOCKED_SHAPES, blockedShapes);
+-        return configMap;
++        /**
++         * @return true if the specified edgeState is part of this BlockArea
++         */
++        public final boolean contains(EdgeIteratorState edgeState) {
++            if (!blockedEdges.isEmpty() && blockedEdges.contains(edgeState.getEdge())) {
++                return true;
++            }
++
++            if (!blockedShapes.isEmpty() && na != null) {
++                for (Shape shape : blockedShapes) {
++                    if (shape.contains(na.getLatitude(edgeState.getAdjNode()), na.getLongitude(edgeState.getAdjNode())))
++                        return true;
++                }
++            }
++            return false;
++        }
+     }
+-}
++}
+\ No newline at end of file
+diff --git a/core/src/main/java/com/graphhopper/util/ConfigMap.java b/core/src/main/java/com/graphhopper/util/ConfigMap.java
+deleted file mode 100644
+index 74c4c93b3c..0000000000
+--- a/core/src/main/java/com/graphhopper/util/ConfigMap.java
++++ /dev/null
+@@ -1,129 +0,0 @@
+-/*
+- *  Licensed to GraphHopper GmbH under one or more contributor
+- *  license agreements. See the NOTICE file distributed with this work for 
+- *  additional information regarding copyright ownership.
+- * 
+- *  GraphHopper GmbH licenses this file to you under the Apache License, 
+- *  Version 2.0 (the "License"); you may not use this file except in 
+- *  compliance with the License. You may obtain a copy of the License at
+- * 
+- *       http://www.apache.org/licenses/LICENSE-2.0
+- * 
+- *  Unless required by applicable law or agreed to in writing, software
+- *  distributed under the License is distributed on an "AS IS" BASIS,
+- *  WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+- *  See the License for the specific language governing permissions and
+- *  limitations under the License.
+- */
+-package com.graphhopper.util;
+-
+-import java.util.HashMap;
+-import java.util.List;
+-import java.util.Map;
+-
+-/**
+- * A properties map (String to Object) with convenient accessors
+- * <p>
+- *
+- * @author Peter Karich
+- * @see PMap
+- */
+-public class ConfigMap {
+-    private final Map<String, Object> map;
+-
+-    public ConfigMap() {
+-        this(5);
+-    }
+-
+-    public ConfigMap(int capacity) {
+-        this(new HashMap<String, Object>(capacity));
+-    }
+-
+-    public ConfigMap(Map<String, Object> map) {
+-        this.map = map;
+-    }
+-
+-    public ConfigMap put(ConfigMap map) {
+-        this.map.putAll(map.map);
+-        return this;
+-    }
+-
+-    String checkKey(String key) {
+-        if (!key.toLowerCase().equals(key))
+-            throw new NullPointerException("keys have to be lower case but wasn't: " + key);
+-        return key;
+-    }
+-
+-    public ConfigMap put(String key, Object obj) {
+-        if (obj == null)
+-            throw new NullPointerException("Value cannot be null for key " + key + ". Use remove instead.");
+-
+-        map.put(checkKey(key), obj);
+-        return this;
+-    }
+-
+-    public ConfigMap remove(String key) {
+-        map.remove(checkKey(key));
+-        return this;
+-    }
+-
+-    public boolean has(String key) {
+-        return map.containsKey(checkKey(key));
+-    }
+-
+-    public long getLong(String key, long _default) {
+-        Long t = (Long) map.get(checkKey(key));
+-        if (t == null)
+-            return _default;
+-        return t;
+-    }
+-
+-    public int getInt(String key, int _default) {
+-        Integer t = (Integer) map.get(checkKey(key));
+-        if (t == null)
+-            return _default;
+-        return t;
+-    }
+-
+-    public boolean getBool(String key, boolean _default) {
+-        Boolean t = (Boolean) map.get(checkKey(key));
+-        if (t == null)
+-            return _default;
+-        return t;
+-    }
+-
+-    public double getDouble(String key, double _default) {
+-        Double t = (Double) map.get(checkKey(key));
+-        if (t == null)
+-            return _default;
+-        return t;
+-    }
+-
+-    public <T> T get(String key, T _default) {
+-        T t = (T) map.get(checkKey(key));
+-        if (t == null)
+-            return _default;
+-        return t;
+-    }
+-
+-    public <T> Map<String, T> getMap(String key, Class<T> embed) {
+-        return (Map<String, T>) map.get(checkKey(key));
+-    }
+-
+-    public Map<String, Object> getMap(String key) {
+-        return (Map<String, Object>) map.get(checkKey(key));
+-    }
+-
+-    public List getList(String key) {
+-        return (List) map.get(checkKey(key));
+-    }
+-
+-    public <T> List<T> getList(String key, Class<T> embed) {
+-        return (List<T>) map.get(checkKey(key));
+-    }
+-
+-    @Override
+-    public String toString() {
+-        return map.toString();
+-    }
+-}
+diff --git a/core/src/main/java/com/graphhopper/util/PMap.java b/core/src/main/java/com/graphhopper/util/PMap.java
+index 5605cf9332..cf8520a732 100644
+--- a/core/src/main/java/com/graphhopper/util/PMap.java
++++ b/core/src/main/java/com/graphhopper/util/PMap.java
+@@ -25,7 +25,6 @@
+  * <p>
+  *
+  * @author Peter Karich
+- * @see ConfigMap
+  */
+ public class PMap {
+     private final Map<String, String> map;
+diff --git a/core/src/test/java/com/graphhopper/routing/PathTest.java b/core/src/test/java/com/graphhopper/routing/PathTest.java
+index 06932b1f6e..399ff588a6 100644
+--- a/core/src/test/java/com/graphhopper/routing/PathTest.java
++++ b/core/src/test/java/com/graphhopper/routing/PathTest.java
+@@ -533,8 +533,7 @@ public void testCalcInstructionsForDataFlagEncoder() {
+         g.edge(2, 4, 5, true).setFlags(dataFlagEncoder.handleWayTags(w,1,0));
+         g.edge(2, 3, 5, true).setFlags(dataFlagEncoder.handleWayTags(w,1,0));
+ 
+-        ConfigMap cMap = dataFlagEncoder.readStringMap(new PMap());
+-        Path p = new Dijkstra(g, new GenericWeighting(dataFlagEncoder, cMap), TraversalMode.NODE_BASED).calcPath(1, 3);
++        Path p = new Dijkstra(g, new GenericWeighting(dataFlagEncoder, new HintsMap()), TraversalMode.NODE_BASED).calcPath(1, 3);
+         assertTrue(p.isFound());
+         InstructionList wayList = p.calcInstructions(tr);
+         assertEquals(3, wayList.size());
+diff --git a/core/src/test/java/com/graphhopper/routing/weighting/BlockAreaWeightingTest.java b/core/src/test/java/com/graphhopper/routing/weighting/BlockAreaWeightingTest.java
+new file mode 100644
+index 0000000000..856a8a4b05
+--- /dev/null
++++ b/core/src/test/java/com/graphhopper/routing/weighting/BlockAreaWeightingTest.java
+@@ -0,0 +1,72 @@
++package com.graphhopper.routing.weighting;
++
++import com.graphhopper.routing.AbstractRoutingAlgorithmTester;
++import com.graphhopper.routing.util.CarFlagEncoder;
++import com.graphhopper.routing.util.EncodingManager;
++import com.graphhopper.routing.util.FlagEncoder;
++import com.graphhopper.storage.Graph;
++import com.graphhopper.storage.GraphBuilder;
++import com.graphhopper.storage.GraphEdgeIdFinder;
++import com.graphhopper.util.EdgeIterator;
++import com.graphhopper.util.EdgeIteratorState;
++import com.graphhopper.util.shapes.Circle;
++import org.junit.Before;
++import org.junit.Test;
++
++import java.util.Arrays;
++
++import static org.junit.Assert.assertEquals;
++
++public class BlockAreaWeightingTest {
++
++    private FlagEncoder encoder = new CarFlagEncoder();
++    private EncodingManager em;
++    private Graph graph;
++
++    @Before
++    public void setUp() {
++        encoder = new CarFlagEncoder();
++        em = new EncodingManager(Arrays.asList(encoder), 8);
++        graph = new GraphBuilder(em).create();
++        // 0-1
++        graph.edge(0, 1, 1, true);
++        AbstractRoutingAlgorithmTester.updateDistancesFor(graph, 0, 0.00, 0.00);
++        AbstractRoutingAlgorithmTester.updateDistancesFor(graph, 1, 0.01, 0.01);
++    }
++
++    @Test
++    public void testBlockedById() {
++        GraphEdgeIdFinder.BlockArea bArea = new GraphEdgeIdFinder.BlockArea(graph);
++        EdgeIteratorState edge = graph.getEdgeIteratorState(0, 1);
++        BlockAreaWeighting instance = new BlockAreaWeighting(new FastestWeighting(encoder), bArea);
++        assertEquals(94.35, instance.calcWeight(edge, false, EdgeIterator.NO_EDGE), .01);
++
++        bArea.add(0);
++        instance = new BlockAreaWeighting(new FastestWeighting(encoder), bArea);
++        assertEquals(Double.POSITIVE_INFINITY, instance.calcWeight(edge, false, EdgeIterator.NO_EDGE), .01);
++    }
++
++    @Test
++    public void testBlockedByShape() {
++        EdgeIteratorState edge = graph.getEdgeIteratorState(0, 1);
++        GraphEdgeIdFinder.BlockArea bArea = new GraphEdgeIdFinder.BlockArea(graph);
++        BlockAreaWeighting instance = new BlockAreaWeighting(new FastestWeighting(encoder), bArea);
++        assertEquals(94.35, instance.calcWeight(edge, false, EdgeIterator.NO_EDGE), 0.01);
++
++        bArea.add(new Circle(0.01, 0.01, 100));
++        assertEquals(Double.POSITIVE_INFINITY, instance.calcWeight(edge, false, EdgeIterator.NO_EDGE), .01);
++
++        bArea = new GraphEdgeIdFinder.BlockArea(graph);
++        instance = new BlockAreaWeighting(new FastestWeighting(encoder), bArea);
++        // Do not match 1,1 of edge
++        bArea.add(new Circle(0.1, 0.1, 100));
++        assertEquals(94.35, instance.calcWeight(edge, false, EdgeIterator.NO_EDGE), .01);
++    }
++
++
++    @Test
++    public void testNullGraph() {
++        // TODO is there an equivalent to check?
++        // BlockAreaWeighting weighting = new BlockAreaWeighting(new FastestWeighting(encoder));
++    }
++}
+\ No newline at end of file
+diff --git a/core/src/test/java/com/graphhopper/routing/weighting/GenericWeightingTest.java b/core/src/test/java/com/graphhopper/routing/weighting/GenericWeightingTest.java
+index c8cac07dd4..ade59cef2e 100644
+--- a/core/src/test/java/com/graphhopper/routing/weighting/GenericWeightingTest.java
++++ b/core/src/test/java/com/graphhopper/routing/weighting/GenericWeightingTest.java
+@@ -17,22 +17,20 @@
+  */
+ package com.graphhopper.routing.weighting;
+ 
+-import com.graphhopper.coll.GHIntHashSet;
+ import com.graphhopper.reader.ReaderWay;
+ import com.graphhopper.routing.AbstractRoutingAlgorithmTester;
+-import com.graphhopper.routing.util.*;
+-import com.graphhopper.storage.*;
+-
+-import static com.graphhopper.storage.GraphEdgeIdFinder.BLOCKED_EDGES;
+-import static com.graphhopper.storage.GraphEdgeIdFinder.BLOCKED_SHAPES;
+-
+-import com.graphhopper.util.*;
+-import com.graphhopper.util.shapes.Circle;
+-import com.graphhopper.util.shapes.Shape;
++import com.graphhopper.routing.util.DataFlagEncoder;
++import com.graphhopper.routing.util.EncodingManager;
++import com.graphhopper.routing.util.HintsMap;
++import com.graphhopper.storage.Graph;
++import com.graphhopper.storage.GraphBuilder;
++import com.graphhopper.util.EdgeIterator;
++import com.graphhopper.util.EdgeIteratorState;
++import com.graphhopper.util.PMap;
+ import org.junit.Before;
+ import org.junit.Test;
+ 
+-import java.util.*;
++import java.util.Arrays;
+ 
+ import static org.junit.Assert.assertEquals;
+ 
+@@ -71,68 +69,20 @@ public void setUp() {
+         graph.getEdgeIteratorState(0, 1).setFlags(encoder.handleWayTags(way, 1, 0));
+     }
+ 
+-    @Test
+-    public void testBlockedById() {
+-        EdgeIteratorState edge = graph.getEdgeIteratorState(0, 1);
+-        ConfigMap cMap = encoder.readStringMap(new PMap());
+-        Weighting instance = new GenericWeighting(encoder, cMap);
+-        assertEquals(edgeWeight, instance.calcWeight(edge, false, EdgeIterator.NO_EDGE), 1e-8);
+-
+-        GHIntHashSet blockedEdges = new GHIntHashSet(1);
+-        cMap.put(BLOCKED_EDGES, blockedEdges);
+-        blockedEdges.add(0);
+-        instance = new GenericWeighting(encoder, cMap);
+-        assertEquals(Double.POSITIVE_INFINITY, instance.calcWeight(edge, false, EdgeIterator.NO_EDGE), 1e-8);
+-    }
+-
+-    @Test
+-    public void testBlockedByShape() {
+-        EdgeIteratorState edge = graph.getEdgeIteratorState(0, 1);
+-        ConfigMap cMap = encoder.readStringMap(new PMap());
+-        GenericWeighting instance = new GenericWeighting(encoder, cMap);
+-        assertEquals(edgeWeight, instance.calcWeight(edge, false, EdgeIterator.NO_EDGE), 1e-8);
+-
+-        List<Shape> shapes = new ArrayList<>(1);
+-        shapes.add(new Circle(0.01, 0.01, 100));
+-        cMap.put(BLOCKED_SHAPES, shapes);
+-        instance = new GenericWeighting(encoder, cMap);
+-        instance.setGraph(graph);
+-        assertEquals(Double.POSITIVE_INFINITY, instance.calcWeight(edge, false, EdgeIterator.NO_EDGE), 1e-8);
+-
+-        shapes.clear();
+-        // Do not match 1,1 of edge
+-        shapes.add(new Circle(0.1, 0.1, 100));
+-        cMap.put(BLOCKED_SHAPES, shapes);
+-        instance = new GenericWeighting(encoder, cMap);
+-        instance.setGraph(graph);
+-        assertEquals(edgeWeight, instance.calcWeight(edge, false, EdgeIterator.NO_EDGE), 1e-8);
+-    }
+-
+     @Test
+     public void testCalcTime() {
+-        ConfigMap cMap = encoder.readStringMap(new PMap());
+-        GenericWeighting weighting = new GenericWeighting(encoder, cMap);
++        GenericWeighting weighting = new GenericWeighting(encoder, new HintsMap());
+         EdgeIteratorState edge = graph.getEdgeIteratorState(0, 1);
+         assertEquals(edgeWeight, weighting.calcMillis(edge, false, EdgeIterator.NO_EDGE), .1);
+     }
+ 
+-    @Test
+-    public void testNullGraph() {
+-        ConfigMap cMap = encoder.readStringMap(new PMap());
+-        GenericWeighting weighting = new GenericWeighting(encoder, cMap);
+-        weighting.setGraph(null);
+-    }
+-
+     @Test
+     public void testRoadAttributeRestriction() {
+         EdgeIteratorState edge = graph.getEdgeIteratorState(0, 1);
+-        ConfigMap cMap = encoder.readStringMap(new PMap());
+-        cMap.put(GenericWeighting.HEIGHT_LIMIT, 4.0);
+-        Weighting instance = new GenericWeighting(encoder, cMap);
++        Weighting instance = new GenericWeighting(encoder, new HintsMap().put(GenericWeighting.HEIGHT_LIMIT, 4.0));
+         assertEquals(edgeWeight, instance.calcWeight(edge, false, EdgeIterator.NO_EDGE), 1e-8);
+ 
+-        cMap.put(GenericWeighting.HEIGHT_LIMIT, 5.0);
+-        instance = new GenericWeighting(encoder, cMap);
++        instance = new GenericWeighting(encoder, new HintsMap().put(GenericWeighting.HEIGHT_LIMIT, 5.0));
+         assertEquals(Double.POSITIVE_INFINITY, instance.calcWeight(edge, false, EdgeIterator.NO_EDGE), 1e-8);
+     }
+ 
+@@ -153,11 +103,8 @@ public void testDisabledRoadAttributes() {
+         AbstractRoutingAlgorithmTester.updateDistancesFor(simpleGraph, 1, 0.01, 0.01);
+         simpleGraph.getEdgeIteratorState(0, 1).setFlags(simpleEncoder.handleWayTags(way, 1, 0));
+ 
++        Weighting instance = new GenericWeighting(simpleEncoder, new HintsMap().put(GenericWeighting.HEIGHT_LIMIT, 5.0));
+         EdgeIteratorState edge = simpleGraph.getEdgeIteratorState(0, 1);
+-        ConfigMap cMap = simpleEncoder.readStringMap(new PMap());
+-        cMap.put(GenericWeighting.HEIGHT_LIMIT, 5.0);
+-        Weighting instance = new GenericWeighting(simpleEncoder, cMap);
+-
+         assertEquals(edgeWeight, instance.calcWeight(edge, false, EdgeIterator.NO_EDGE), 1e-8);
+     }
+ }
+diff --git a/core/src/test/java/com/graphhopper/storage/GraphEdgeIdFinderTest.java b/core/src/test/java/com/graphhopper/storage/GraphEdgeIdFinderTest.java
+index 2c372647c4..ca84b73727 100644
+--- a/core/src/test/java/com/graphhopper/storage/GraphEdgeIdFinderTest.java
++++ b/core/src/test/java/com/graphhopper/storage/GraphEdgeIdFinderTest.java
+@@ -23,24 +23,16 @@
+ import com.graphhopper.routing.util.DefaultEdgeFilter;
+ import com.graphhopper.routing.util.EncodingManager;
+ import com.graphhopper.routing.util.FlagEncoder;
+-import com.graphhopper.routing.util.HintsMap;
+-
+-import static com.graphhopper.storage.GraphEdgeIdFinder.BLOCKED_EDGES;
+-import static com.graphhopper.storage.GraphEdgeIdFinder.BLOCKED_SHAPES;
+-
+ import com.graphhopper.storage.index.LocationIndex;
+ import com.graphhopper.storage.index.LocationIndexTree;
+-import com.graphhopper.util.ConfigMap;
+-import com.graphhopper.util.Parameters;
+ import com.graphhopper.util.shapes.Circle;
+ import com.graphhopper.util.shapes.Shape;
++import org.junit.Test;
+ 
+ import java.util.ArrayList;
+ import java.util.List;
+ 
+-import org.junit.Test;
+-
+-import static org.junit.Assert.*;
++import static org.junit.Assert.assertEquals;
+ 
+ /**
+  * @author Peter Karich
+@@ -69,25 +61,21 @@ public void testParseStringHints() {
+         LocationIndex locationIndex = new LocationIndexTree(graph, new RAMDirectory())
+                 .prepareIndex();
+ 
+-        HintsMap hints = new HintsMap();
+-        hints.put(Parameters.Routing.BLOCK_AREA, "0.01,0.005,1");
+-
+-        ConfigMap cMap = new ConfigMap();
+         GraphEdgeIdFinder graphFinder = new GraphEdgeIdFinder(graph, locationIndex);
+-        ConfigMap result = graphFinder.parseStringHints(cMap, hints, new DefaultEdgeFilter(encoder));
++        GraphEdgeIdFinder.BlockArea blockArea = graphFinder.parseBlockArea("0.01,0.005,1", new DefaultEdgeFilter(encoder));
+ 
+         GHIntHashSet blockedEdges = new GHIntHashSet();
+         blockedEdges.add(0);
+-        assertEquals(blockedEdges, result.get(BLOCKED_EDGES, new GHIntHashSet()));
++        assertEquals(blockedEdges, blockArea.blockedEdges);
+         List<Shape> blockedShapes = new ArrayList<>();
+-        assertEquals(blockedShapes, result.get(BLOCKED_SHAPES, new ArrayList<>()));
++        assertEquals(blockedShapes, blockArea.blockedShapes);
+ 
+         // big area converts into shapes
+-        hints.put(Parameters.Routing.BLOCK_AREA, "0,0,1000");
+-        result = graphFinder.parseStringHints(cMap, hints, new DefaultEdgeFilter(encoder));
++        graphFinder = new GraphEdgeIdFinder(graph, locationIndex);
++        blockArea = graphFinder.parseBlockArea("0,0,1000", new DefaultEdgeFilter(encoder));
+         blockedEdges.clear();
+-        assertEquals(blockedEdges, result.get(BLOCKED_EDGES, new GHIntHashSet()));
++        assertEquals(blockedEdges, blockArea.blockedEdges);
+         blockedShapes.add(new Circle(0, 0, 1000));
+-        assertEquals(blockedShapes, result.get(BLOCKED_SHAPES, new ArrayList<>()));
++        assertEquals(blockedShapes, blockArea.blockedShapes);
+     }
+ }
+diff --git a/core/src/test/java/com/graphhopper/util/ConfigMapTest.java b/core/src/test/java/com/graphhopper/util/ConfigMapTest.java
+deleted file mode 100644
+index 4307fc92b1..0000000000
+--- a/core/src/test/java/com/graphhopper/util/ConfigMapTest.java
++++ /dev/null
+@@ -1,38 +0,0 @@
+-/*
+- *  Licensed to GraphHopper GmbH under one or more contributor
+- *  license agreements. See the NOTICE file distributed with this work for 
+- *  additional information regarding copyright ownership.
+- * 
+- *  GraphHopper GmbH licenses this file to you under the Apache License, 
+- *  Version 2.0 (the "License"); you may not use this file except in 
+- *  compliance with the License. You may obtain a copy of the License at
+- * 
+- *       http://www.apache.org/licenses/LICENSE-2.0
+- * 
+- *  Unless required by applicable law or agreed to in writing, software
+- *  distributed under the License is distributed on an "AS IS" BASIS,
+- *  WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+- *  See the License for the specific language governing permissions and
+- *  limitations under the License.
+- */
+-package com.graphhopper.util;
+-
+-import org.junit.Test;
+-
+-import static org.junit.Assert.*;
+-
+-/**
+- * @author Peter Karich
+- */
+-public class ConfigMapTest {
+-    @Test
+-    public void testPut() {
+-        ConfigMap instance = new ConfigMap();
+-        instance.put("int_val", 1);
+-        instance.put("test_pest", true);
+-
+-        assertTrue(instance.get("test_pest", false));
+-        assertFalse(instance.get("test_pest_", false));
+-        assertEquals(1L, instance.getInt("int_val", 0));
+-    }
+-}
+diff --git a/reader-osm/src/test/java/com/graphhopper/GraphHopperIT.java b/reader-osm/src/test/java/com/graphhopper/GraphHopperIT.java
+index 67af7da76a..3c8db99b3d 100644
+--- a/reader-osm/src/test/java/com/graphhopper/GraphHopperIT.java
++++ b/reader-osm/src/test/java/com/graphhopper/GraphHopperIT.java
+@@ -254,7 +254,7 @@ public void testNorthBayreuthBlockeEdges() {
+                 setOSMFile(DIR + "/north-bayreuth.osm.gz").
+                 setCHEnabled(false).
+                 setGraphHopperLocation(tmpGraphFile).
+-                setEncodingManager(new EncodingManager("generic", 8));
++                setEncodingManager(new EncodingManager("generic,car", 8));
+         tmpHopper.importOrLoad();
+ 
+         GHRequest req = new GHRequest(49.985272, 11.506151, 49.986107, 11.507202).
+@@ -275,7 +275,7 @@ public void testNorthBayreuthBlockeEdges() {
+ 
+         rsp = tmpHopper.route(req);
+         assertFalse(rsp.getErrors().toString(), rsp.hasErrors());
+-        assertEquals(6684, rsp.getBest().getDistance(), 1);
++        assertEquals(6685, rsp.getBest().getDistance(), 1);
+ 
+         // block by area
+         String someArea = "49.97986,11.472902,50.003946,11.534357";
+@@ -301,6 +301,19 @@ public void testNorthBayreuthBlockeEdges() {
+         rsp = tmpHopper.route(req);
+         assertFalse(rsp.getErrors().toString(), rsp.hasErrors());
+         assertEquals(6879, rsp.getBest().getDistance(), 1);
++
++        // blocking works for all weightings
++        req = new GHRequest(50.009504, 11.490669, 50.024726, 11.496162).
++                setVehicle("car").setWeighting("fastest");
++        rsp = tmpHopper.route(req);
++        assertFalse(rsp.getErrors().toString(), rsp.hasErrors());
++        assertEquals(1807, rsp.getBest().getDistance(), 1);
++
++        // block point 49.985759,11.50687
++        req.getHints().put(Routing.BLOCK_AREA, "50.018274,11.492558");
++        rsp = tmpHopper.route(req);
++        assertFalse(rsp.getErrors().toString(), rsp.hasErrors());
++        assertEquals(3363, rsp.getBest().getDistance(), 1);
+     }
+ 
+     @Test

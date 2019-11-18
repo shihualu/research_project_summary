@@ -1,0 +1,782 @@
+diff --git a/java/dagger/internal/codegen/ProducerFactoryGenerator.java b/java/dagger/internal/codegen/ProducerFactoryGenerator.java
+index 16e5cd923..1eb2c62e4 100644
+--- a/java/dagger/internal/codegen/ProducerFactoryGenerator.java
++++ b/java/dagger/internal/codegen/ProducerFactoryGenerator.java
+@@ -29,14 +29,10 @@
+ import static dagger.internal.codegen.SourceFiles.frameworkTypeUsageStatement;
+ import static dagger.internal.codegen.SourceFiles.generateBindingFieldsForDependencies;
+ import static dagger.internal.codegen.SourceFiles.generatedClassNameForBinding;
+-import static dagger.internal.codegen.TypeNames.ASYNC_FUNCTION;
+-import static dagger.internal.codegen.TypeNames.EXECUTOR;
+ import static dagger.internal.codegen.TypeNames.FUTURES;
+ import static dagger.internal.codegen.TypeNames.PRODUCERS;
+ import static dagger.internal.codegen.TypeNames.PRODUCER_TOKEN;
+-import static dagger.internal.codegen.TypeNames.RUNNABLE;
+ import static dagger.internal.codegen.TypeNames.VOID_CLASS;
+-import static dagger.internal.codegen.TypeNames.abstractProducerOf;
+ import static dagger.internal.codegen.TypeNames.listOf;
+ import static dagger.internal.codegen.TypeNames.listenableFutureOf;
+ import static dagger.internal.codegen.TypeNames.producedOf;
+@@ -46,7 +42,6 @@
+ import static javax.lang.model.element.Modifier.PROTECTED;
+ import static javax.lang.model.element.Modifier.PUBLIC;
+ 
+-import com.google.common.base.Joiner;
+ import com.google.common.collect.FluentIterable;
+ import com.google.common.collect.ImmutableList;
+ import com.google.common.collect.ImmutableMap;
+@@ -63,6 +58,7 @@
+ import dagger.model.Key;
+ import dagger.model.RequestKind;
+ import dagger.producers.Producer;
++import dagger.producers.internal.AbstractProducesMethodProducer;
+ import java.util.Map;
+ import java.util.Optional;
+ import javax.annotation.processing.Filer;
+@@ -119,7 +115,6 @@ ClassName nameGeneratedType(ProductionBinding binding) {
+                     .addMember("value", "$S", "FutureReturnValueIgnored")
+                     .build())
+             .addModifiers(PUBLIC, FINAL)
+-            .superclass(abstractProducerOf(providedTypeName))
+             .addTypeVariables(bindingTypeElementTypeVariableNames(binding));
+ 
+     UniqueNameSet uniqueFieldNames = new UniqueNameSet();
+@@ -137,32 +132,34 @@ ClassName nameGeneratedType(ProductionBinding binding) {
+                     TypeName.get(binding.bindingTypeElement().get().asType())))
+             : Optional.empty();
+ 
++    String executorParameterName = null;
+     String monitorParameterName = null;
+     for (Map.Entry<Key, FrameworkField> entry :
+         generateBindingFieldsForDependencies(binding).entrySet()) {
+       Key key = entry.getKey();
+       FrameworkField bindingField = entry.getValue();
+       String fieldName = uniqueFieldNames.getUniqueName(bindingField.name());
+-      if (key.equals(keyFactory.forProductionComponentMonitor())) {
++      if (key.equals(keyFactory.forProductionImplementationExecutor())) {
++        executorParameterName = fieldName;
++        constructorBuilder.addParameter(bindingField.type(), executorParameterName);
++        continue;
++      } else if (key.equals(keyFactory.forProductionComponentMonitor())) {
+         monitorParameterName = fieldName;
+         constructorBuilder.addParameter(bindingField.type(), monitorParameterName);
+         continue;
+       }
+-
+       FieldSpec field =
+           addFieldAndConstructorParameter(
+-              factoryBuilder,
+-              constructorBuilder,
+-              fieldName,
+-              bindingField.type());
++              factoryBuilder, constructorBuilder, fieldName, bindingField.type());
+       fieldsBuilder.put(key, field);
+     }
+     ImmutableMap<Key, FieldSpec> fields = fieldsBuilder.build();
+ 
+     constructorBuilder.addStatement(
+-        "super($N, $L)",
++        "super($N, $L, $N)",
+         verifyNotNull(monitorParameterName),
+-        producerTokenConstruction(generatedTypeName, binding));
++        producerTokenConstruction(generatedTypeName, binding),
++        verifyNotNull(executorParameterName));
+ 
+     if (binding.requiresModuleInstance()) {
+       assignField(constructorBuilder, moduleField.get());
+@@ -172,9 +169,8 @@ ClassName nameGeneratedType(ProductionBinding binding) {
+       assignField(constructorBuilder, field);
+     }
+ 
+-    MethodSpec.Builder computeMethodBuilder =
+-        methodBuilder("compute")
+-            .returns(futureTypeName)
++    MethodSpec.Builder collectDependenciesBuilder =
++        methodBuilder("collectDependencies")
+             .addAnnotation(Override.class)
+             .addModifiers(PROTECTED);
+ 
+@@ -182,7 +178,7 @@ ClassName nameGeneratedType(ProductionBinding binding) {
+     for (DependencyRequest dependency : asyncDependencies) {
+       TypeName futureType = listenableFutureOf(asyncDependencyType(dependency));
+       CodeBlock futureAccess = CodeBlock.of("$N.get()", fields.get(dependency.key()));
+-      computeMethodBuilder.addStatement(
++      collectDependenciesBuilder.addStatement(
+           "$T $L = $L",
+           futureType,
+           dependencyFutureName(dependency),
+@@ -192,22 +188,13 @@ ClassName nameGeneratedType(ProductionBinding binding) {
+     }
+     FutureTransform futureTransform = FutureTransform.create(fields, binding, asyncDependencies);
+ 
+-    computeMethodBuilder.addStatement(
+-        "return $T.transformAsync($L, this, this)",
+-        FUTURES,
+-        futureTransform.futureCodeBlock());
++    collectDependenciesBuilder
++        .returns(listenableFutureOf(futureTransform.applyArgType()))
++        .addStatement("return $L", futureTransform.futureCodeBlock());
+ 
+-    factoryBuilder
+-        .addSuperinterface(
+-            ParameterizedTypeName.get(
+-                ASYNC_FUNCTION, futureTransform.applyArgType(), providedTypeName))
+-        .addSuperinterface(EXECUTOR);
+-
+-    MethodSpec.Builder applyMethodBuilder =
+-        methodBuilder("apply")
++    MethodSpec.Builder callProducesMethod =
++        methodBuilder("callProducesMethod")
+             .returns(futureTypeName)
+-            .addJavadoc("@deprecated this may only be called from the internal {@link #compute()}")
+-            .addAnnotation(Deprecated.class)
+             .addAnnotation(Override.class)
+             .addModifiers(PUBLIC)
+             .addParameter(futureTransform.applyArgType(), futureTransform.applyArgName())
+@@ -216,23 +203,18 @@ ClassName nameGeneratedType(ProductionBinding binding) {
+                 getInvocationCodeBlock(
+                     binding, providedTypeName, futureTransform.parameterCodeBlocks()));
+     if (futureTransform.hasUncheckedCast()) {
+-      applyMethodBuilder.addAnnotation(AnnotationSpecs.suppressWarnings(UNCHECKED));
++      callProducesMethod.addAnnotation(AnnotationSpecs.suppressWarnings(UNCHECKED));
+     }
+ 
+-    MethodSpec.Builder executeMethodBuilder =
+-        methodBuilder("execute")
+-            .addModifiers(PUBLIC)
+-            .addJavadoc("@deprecated this may only be called from the internal {@link #compute()}")
+-            .addAnnotation(Deprecated.class)
+-            .addAnnotation(Override.class)
+-            .addParameter(RUNNABLE, "runnable")
+-            .addStatement("monitor.ready()")
+-            .addStatement("executorProvider.get().execute(runnable)");
+-
+-    factoryBuilder.addMethod(constructorBuilder.build());
+-    factoryBuilder.addMethod(computeMethodBuilder.build());
+-    factoryBuilder.addMethod(applyMethodBuilder.build());
+-    factoryBuilder.addMethod(executeMethodBuilder.build());
++    factoryBuilder
++        .superclass(
++            ParameterizedTypeName.get(
++                ClassName.get(AbstractProducesMethodProducer.class),
++                futureTransform.applyArgType(),
++                providedTypeName))
++        .addMethod(constructorBuilder.build())
++        .addMethod(collectDependenciesBuilder.build())
++        .addMethod(callProducesMethod.build());
+ 
+     gwtIncompatibleAnnotation(binding).ifPresent(factoryBuilder::addAnnotation);
+ 
+@@ -519,12 +501,6 @@ private CodeBlock getInvocationCodeBlock(
+             binding.bindingElement().get().getSimpleName(),
+             makeParametersCodeBlock(parameterCodeBlocks));
+ 
+-    // NOTE(beder): We don't worry about catching exceptions from the monitor methods themselves
+-    // because we'll wrap all monitoring in non-throwing monitors before we pass them to the
+-    // factories.
+-    ImmutableList.Builder<CodeBlock> codeBlocks = ImmutableList.builder();
+-    codeBlocks.add(CodeBlock.of("monitor.methodStarting();"));
+-
+     final CodeBlock returnCodeBlock;
+     switch (binding.productionKind().get()) {
+       case IMMEDIATE:
+@@ -540,16 +516,7 @@ private CodeBlock getInvocationCodeBlock(
+       default:
+         throw new AssertionError();
+     }
+-    return CodeBlock.of(
+-        Joiner.on('\n')
+-            .join(
+-                "monitor.methodStarting();",
+-                "try {",
+-                "  return $L;",
+-                "} finally {",
+-                "  monitor.methodFinished();",
+-                "}"),
+-        returnCodeBlock);
++    return CodeBlock.of("return $L;", returnCodeBlock);
+   }
+ 
+   /**
+diff --git a/java/dagger/producers/internal/AbstractProducer.java b/java/dagger/producers/internal/AbstractProducer.java
+index 39abe991e..2af9470c1 100644
+--- a/java/dagger/producers/internal/AbstractProducer.java
++++ b/java/dagger/producers/internal/AbstractProducer.java
+@@ -16,40 +16,18 @@
+ 
+ package dagger.producers.internal;
+ 
+-import static com.google.common.base.Preconditions.checkNotNull;
+-
+ import com.google.common.util.concurrent.ListenableFuture;
+ import dagger.producers.Producer;
+-import dagger.producers.monitoring.ProducerMonitor;
+-import dagger.producers.monitoring.ProducerToken;
+-import dagger.producers.monitoring.ProductionComponentMonitor;
+-import dagger.producers.monitoring.internal.Monitors;
+-import javax.inject.Provider;
+-import org.checkerframework.checker.nullness.compatqual.NullableDecl;
+ 
+ /**
+  * An abstract {@link Producer} implementation that memoizes the result of its compute method.
+  */
+ public abstract class AbstractProducer<T> implements Producer<T> {
+-  private final Provider<ProductionComponentMonitor> monitorProvider;
+-  @NullableDecl private final ProducerToken token;
+   private volatile ListenableFuture<T> instance = null;
+-  protected volatile ProducerMonitor monitor = null;
+-
+-  protected AbstractProducer() {
+-    this(Monitors.noOpProductionComponentMonitorProvider(), null);
+-  }
+ 
+-  protected AbstractProducer(
+-      Provider<ProductionComponentMonitor> monitorProvider, @NullableDecl ProducerToken token) {
+-    this.monitorProvider = checkNotNull(monitorProvider);
+-    this.token = token;
+-  }
++  protected AbstractProducer() {}
+ 
+-  /**
+-   * Computes this producer's future, which is then cached in {@link #get}. The {@link #monitor}
+-   * will be non-null from the point of this call forward.
+-   */
++  /** Computes this producer's future, which is then cached in {@link #get}. */
+   protected abstract ListenableFuture<T> compute();
+ 
+   @Override
+@@ -60,13 +38,10 @@ protected AbstractProducer(
+       synchronized (this) {
+         result = instance;
+         if (result == null) {
+-          monitor = monitorProvider.get().producerMonitorFor(token);
+-          monitor.requested();
+           instance = result = compute();
+           if (result == null) {
+             throw new NullPointerException("compute returned null");
+           }
+-          monitor.addCallbackTo(result);
+         }
+       }
+     }
+diff --git a/java/dagger/producers/internal/AbstractProducesMethodProducer.java b/java/dagger/producers/internal/AbstractProducesMethodProducer.java
+new file mode 100644
+index 000000000..0cf36ca53
+--- /dev/null
++++ b/java/dagger/producers/internal/AbstractProducesMethodProducer.java
+@@ -0,0 +1,100 @@
++/*
++ * Copyright (C) 2018 The Dagger Authors.
++ *
++ * Licensed under the Apache License, Version 2.0 (the "License");
++ * you may not use this file except in compliance with the License.
++ * You may obtain a copy of the License at
++ *
++ * http://www.apache.org/licenses/LICENSE-2.0
++ *
++ * Unless required by applicable law or agreed to in writing, software
++ * distributed under the License is distributed on an "AS IS" BASIS,
++ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++ * See the License for the specific language governing permissions and
++ * limitations under the License.
++ */
++
++package dagger.producers.internal;
++
++import static dagger.internal.Preconditions.checkNotNull;
++
++import com.google.common.util.concurrent.AsyncFunction;
++import com.google.common.util.concurrent.Futures;
++import com.google.common.util.concurrent.ListenableFuture;
++import dagger.producers.monitoring.ProducerMonitor;
++import dagger.producers.monitoring.ProducerToken;
++import dagger.producers.monitoring.ProductionComponentMonitor;
++import java.util.concurrent.Executor;
++import javax.inject.Provider;
++import org.checkerframework.checker.nullness.compatqual.NullableDecl;
++
++/**
++ * An {@link AbstractProducer} for all {@link dagger.producers.Produces} methods.
++ *
++ * @param <D> the type of asynchronous dependencies. These will be collected in {@link
++ *     #collectDependencies()} and then made available to the {@code @Produces method in} {@link
++ *     #callProducesMethod(Object)}. If there is only one asynchronous dependency, {@code D} can be
++ *     the key for that dependency. If there are multiple, they should be wrapped in a list and
++ *     unwrapped in {@link #callProducesMethod(Object)}.
++ * @param <T> the produced type
++ */
++public abstract class AbstractProducesMethodProducer<D, T> extends AbstractProducer<T>
++    implements AsyncFunction<D, T>, Executor {
++  private final Provider<ProductionComponentMonitor> monitorProvider;
++  @NullableDecl private final ProducerToken token;
++  private final Provider<Executor> executorProvider;
++  private volatile ProducerMonitor monitor = null;
++
++  protected AbstractProducesMethodProducer(
++      Provider<ProductionComponentMonitor> monitorProvider,
++      @NullableDecl ProducerToken token,
++      Provider<Executor> executorProvider) {
++    this.monitorProvider = checkNotNull(monitorProvider);
++    this.token = token;
++    this.executorProvider = checkNotNull(executorProvider);
++  }
++
++  @Override
++  protected final ListenableFuture<T> compute() {
++    monitor = monitorProvider.get().producerMonitorFor(token);
++    monitor.requested();
++    ListenableFuture<T> result = Futures.transformAsync(collectDependencies(), this, this);
++    monitor.addCallbackTo(result);
++    return result;
++  }
++
++  /**
++   * Collects the asynchronous dependencies to be passed to {@link
++   * Futures#transformAsync(ListenableFuture, AsyncFunction, Executor)}.
++   */
++  protected abstract ListenableFuture<D> collectDependencies();
++
++  /** @deprecated this may only be called from the internal {@link #compute()} */
++  @Deprecated
++  @Override
++  public final ListenableFuture<T> apply(D asyncDependencies) throws Exception {
++    // NOTE(beder): We don't worry about catching exceptions from the monitor methods themselves
++    // because we'll wrap all monitoring in non-throwing monitors before we pass them to the
++    // factories.
++    monitor.methodStarting();
++    try {
++      return callProducesMethod(asyncDependencies);
++    } finally {
++      monitor.methodFinished();
++    }
++  }
++
++  /**
++   * Calls the {@link dagger.producers.Produces} method. This will always be called on the {@link
++   * Executor} provided to this producer.
++   */
++  protected abstract ListenableFuture<T> callProducesMethod(D asyncDependencies) throws Exception;
++
++  /** @deprecated this may only be called from the internal {@link #compute()} */
++  @Deprecated
++  @Override
++  public final void execute(Runnable runnable) {
++    monitor.ready();
++    executorProvider.get().execute(runnable);
++  }
++}
+diff --git a/javatests/dagger/internal/codegen/ProducerModuleFactoryGeneratorTest.java b/javatests/dagger/internal/codegen/ProducerModuleFactoryGeneratorTest.java
+index eec32f72d..5169ced35 100644
+--- a/javatests/dagger/internal/codegen/ProducerModuleFactoryGeneratorTest.java
++++ b/javatests/dagger/internal/codegen/ProducerModuleFactoryGeneratorTest.java
+@@ -358,10 +358,9 @@ public void publicModuleNonPublicIncludes() {
+             "TestModule_ProduceStringFactory",
+             "package test;",
+             "",
+-            "import com.google.common.util.concurrent.AsyncFunction;",
+             "import com.google.common.util.concurrent.Futures;",
+             "import com.google.common.util.concurrent.ListenableFuture;",
+-            "import dagger.producers.internal.AbstractProducer;",
++            "import dagger.producers.internal.AbstractProducesMethodProducer;",
+             "import dagger.producers.monitoring.ProducerToken;",
+             "import dagger.producers.monitoring.ProductionComponentMonitor;",
+             "import java.util.concurrent.Executor;",
+@@ -371,10 +370,8 @@ public void publicModuleNonPublicIncludes() {
+             "@SuppressWarnings(\"FutureReturnValueIgnored\")",
+             GENERATED_ANNOTATION,
+             "public final class TestModule_ProduceStringFactory",
+-            "    extends AbstractProducer<String>",
+-            "    implements AsyncFunction<Void, String>, Executor {",
++            "    extends AbstractProducesMethodProducer<Void, String> {",
+             "  private final TestModule module;",
+-            "  private final Provider<Executor> executorProvider;",
+             "",
+             "  public TestModule_ProduceStringFactory(",
+             "      TestModule module,",
+@@ -382,30 +379,17 @@ public void publicModuleNonPublicIncludes() {
+             "      Provider<ProductionComponentMonitor> productionComponentMonitorProvider) {",
+             "    super(",
+             "        productionComponentMonitorProvider,",
+-            "        ProducerToken.create(TestModule_ProduceStringFactory.class));",
++            "        ProducerToken.create(TestModule_ProduceStringFactory.class),",
++            "        executorProvider);",
+             "    this.module = module;",
+-            "    this.executorProvider = executorProvider;",
+             "  }",
+             "",
+-            "  @Override protected ListenableFuture<String> compute() {",
+-            "    return Futures.transformAsync(",
+-            "        Futures.<Void>immediateFuture(null), this, this);",
++            "  @Override protected ListenableFuture<Void> collectDependencies() {",
++            "    return Futures.<Void>immediateFuture(null);",
+             "  }",
+             "",
+-            "  @Deprecated",
+-            "  @Override public ListenableFuture<String> apply(Void ignoredVoidArg) {",
+-            "    monitor.methodStarting();",
+-            "    try {",
+-            "      return module.produceString();",
+-            "    } finally {",
+-            "      monitor.methodFinished();",
+-            "    }",
+-            "  }",
+-            "",
+-            "  @Deprecated",
+-            "  @Override public void execute(Runnable runnable) {",
+-            "    monitor.ready();",
+-            "    executorProvider.get().execute(runnable);",
++            "  @Override public ListenableFuture<String> callProducesMethod(Void ignoredVoidArg) {",
++            "    return module.produceString();",
+             "  }",
+             "}");
+     assertAbout(javaSource())
+@@ -439,10 +423,9 @@ public void singleProducesMethodNoArgsFutureWithProducerName() {
+             "TestModule_ProduceStringFactory",
+             "package test;",
+             "",
+-            "import com.google.common.util.concurrent.AsyncFunction;",
+             "import com.google.common.util.concurrent.Futures;",
+             "import com.google.common.util.concurrent.ListenableFuture;",
+-            "import dagger.producers.internal.AbstractProducer;",
++            "import dagger.producers.internal.AbstractProducesMethodProducer;",
+             "import dagger.producers.monitoring.ProducerToken;",
+             "import dagger.producers.monitoring.ProductionComponentMonitor;",
+             "import java.util.concurrent.Executor;",
+@@ -452,10 +435,8 @@ public void singleProducesMethodNoArgsFutureWithProducerName() {
+             "@SuppressWarnings(\"FutureReturnValueIgnored\")",
+             GENERATED_ANNOTATION,
+             "public final class TestModule_ProduceStringFactory",
+-            "    extends AbstractProducer<String>",
+-            "    implements AsyncFunction<Void, String>, Executor {",
++            "    extends AbstractProducesMethodProducer<Void, String> {",
+             "  private final TestModule module;",
+-            "  private final Provider<Executor> executorProvider;",
+             "",
+             "  public TestModule_ProduceStringFactory(",
+             "      TestModule module,",
+@@ -463,30 +444,17 @@ public void singleProducesMethodNoArgsFutureWithProducerName() {
+             "      Provider<ProductionComponentMonitor> productionComponentMonitorProvider) {",
+             "    super(",
+             "        productionComponentMonitorProvider,",
+-            "        ProducerToken.create(\"test.TestModule#produceString\"));",
++            "        ProducerToken.create(\"test.TestModule#produceString\"),",
++            "        executorProvider);",
+             "    this.module = module;",
+-            "    this.executorProvider = executorProvider;",
+-            "  }",
+-            "",
+-            "  @Override protected ListenableFuture<String> compute() {",
+-            "    return Futures.transformAsync(",
+-            "      Futures.<Void>immediateFuture(null), this, this);",
+             "  }",
+             "",
+-            "  @Deprecated",
+-            "  @Override public ListenableFuture<String> apply(Void ignoredVoidArg) {",
+-            "    monitor.methodStarting();",
+-            "    try {",
+-            "      return module.produceString();",
+-            "    } finally {",
+-            "      monitor.methodFinished();",
+-            "    }",
++            "  @Override protected ListenableFuture<Void> collectDependencies() {",
++            "    return Futures.<Void>immediateFuture(null);",
+             "  }",
+             "",
+-            "  @Deprecated",
+-            "  @Override public void execute(Runnable runnable) {",
+-            "    monitor.ready();",
+-            "    executorProvider.get().execute(runnable);",
++            "  @Override public ListenableFuture<String> callProducesMethod(Void ignoredVoidArg) {",
++            "    return module.produceString();",
+             "  }",
+             "}");
+     assertAbout(javaSource())
+diff --git a/javatests/dagger/producers/internal/AbstractProducerTest.java b/javatests/dagger/producers/internal/AbstractProducerTest.java
+index 0e2fca495..da2412513 100644
+--- a/javatests/dagger/producers/internal/AbstractProducerTest.java
++++ b/javatests/dagger/producers/internal/AbstractProducerTest.java
+@@ -18,55 +18,23 @@
+ 
+ import static com.google.common.truth.Truth.assertThat;
+ import static org.junit.Assert.fail;
+-import static org.mockito.Matchers.any;
+-import static org.mockito.Mockito.verify;
+-import static org.mockito.Mockito.verifyNoMoreInteractions;
+-import static org.mockito.Mockito.when;
+ 
+ import com.google.common.util.concurrent.Futures;
+ import com.google.common.util.concurrent.ListenableFuture;
+-import com.google.common.util.concurrent.SettableFuture;
+ import dagger.producers.Producer;
+-import dagger.producers.monitoring.ProducerMonitor;
+-import dagger.producers.monitoring.ProducerToken;
+-import dagger.producers.monitoring.ProductionComponentMonitor;
+-import java.util.concurrent.ExecutionException;
+-import javax.inject.Provider;
+-import org.junit.Before;
+ import org.junit.Test;
+ import org.junit.runner.RunWith;
+ import org.junit.runners.JUnit4;
+-import org.mockito.Mock;
+-import org.mockito.Mockito;
+-import org.mockito.MockitoAnnotations;
+ 
+ /**
+  * Tests {@link AbstractProducer}.
+  */
+ @RunWith(JUnit4.class)
+ public class AbstractProducerTest {
+-  @Mock private ProductionComponentMonitor componentMonitor;
+-  private ProducerMonitor monitor;
+-  private Provider<ProductionComponentMonitor> componentMonitorProvider;
+-
+-  @Before
+-  public void initMocks() {
+-    MockitoAnnotations.initMocks(this);
+-    monitor = Mockito.mock(ProducerMonitor.class, Mockito.CALLS_REAL_METHODS);
+-    when(componentMonitor.producerMonitorFor(any(ProducerToken.class))).thenReturn(monitor);
+-    componentMonitorProvider =
+-        new Provider<ProductionComponentMonitor>() {
+-          @Override
+-          public ProductionComponentMonitor get() {
+-            return componentMonitor;
+-          }
+-        };
+-  }
+-
+   @Test
+   @SuppressWarnings("CheckReturnValue")
+   public void get_nullPointerException() {
+-    Producer<Object> producer = new DelegateProducer<>(componentMonitorProvider, null);
++    Producer<Object> producer = new DelegateProducer<>(null);
+     try {
+       producer.get();
+       fail();
+@@ -76,7 +44,7 @@ public void get_nullPointerException() {
+ 
+   @Test public void get() throws Exception {
+     Producer<Integer> producer =
+-        new AbstractProducer<Integer>(componentMonitorProvider, null) {
++        new AbstractProducer<Integer>() {
+           int i = 0;
+ 
+           @Override
+@@ -89,64 +57,15 @@ public void get_nullPointerException() {
+     assertThat(producer.get().get()).isEqualTo(0);
+   }
+ 
+-  @Test
+-  public void monitor_success() throws Exception {
+-    SettableFuture<Integer> delegateFuture = SettableFuture.create();
+-    Producer<Integer> producer = new DelegateProducer<>(componentMonitorProvider, delegateFuture);
+-
+-    ListenableFuture<Integer> future = producer.get();
+-    assertThat(future.isDone()).isFalse();
+-    verify(monitor).requested();
+-    verify(monitor).addCallbackTo(anyListenableFuture());
+-    delegateFuture.set(-42);
+-    assertThat(future.get()).isEqualTo(-42);
+-    verify(monitor).succeeded(-42);
+-    verifyNoMoreInteractions(monitor);
+-  }
+-
+-  @Test
+-  public void monitor_failure() throws Exception {
+-    SettableFuture<Integer> delegateFuture = SettableFuture.create();
+-    Producer<Integer> producer = new DelegateProducer<>(componentMonitorProvider, delegateFuture);
+-
+-    ListenableFuture<Integer> future = producer.get();
+-    assertThat(future.isDone()).isFalse();
+-    verify(monitor).requested();
+-    verify(monitor).addCallbackTo(anyListenableFuture());
+-    Throwable t = new RuntimeException("monkey");
+-    delegateFuture.setException(t);
+-    try {
+-      future.get();
+-      fail();
+-    } catch (ExecutionException e) {
+-      assertThat(e.getCause()).isSameAs(t);
+-    }
+-    verify(monitor).failed(t);
+-    verifyNoMoreInteractions(monitor);
+-  }
+-
+-  private ListenableFuture<?> anyListenableFuture() {
+-    return any(ListenableFuture.class);
+-  }
+-
+-  @Test(expected = NullPointerException.class)
+-  public void monitor_null() throws Exception {
+-    new DelegateProducer<>(null, Futures.immediateFuture(42));
+-  }
+-
+   static final class DelegateProducer<T> extends AbstractProducer<T> {
+     private final ListenableFuture<T> delegate;
+ 
+-    DelegateProducer(
+-        Provider<ProductionComponentMonitor> componentMonitorProvider,
+-        ListenableFuture<T> delegate) {
+-      super(componentMonitorProvider, null);
++    DelegateProducer(ListenableFuture<T> delegate) {
+       this.delegate = delegate;
+     }
+ 
+     @Override
+     public ListenableFuture<T> compute() {
+-      assertThat(monitor).isNotNull();
+       return delegate;
+     }
+   }
+diff --git a/javatests/dagger/producers/internal/AbstractProducesMethodProducerTest.java b/javatests/dagger/producers/internal/AbstractProducesMethodProducerTest.java
+new file mode 100644
+index 000000000..82258956d
+--- /dev/null
++++ b/javatests/dagger/producers/internal/AbstractProducesMethodProducerTest.java
+@@ -0,0 +1,147 @@
++/*
++ * Copyright (C) 2014 The Dagger Authors.
++ *
++ * Licensed under the Apache License, Version 2.0 (the "License");
++ * you may not use this file except in compliance with the License.
++ * You may obtain a copy of the License at
++ *
++ * http://www.apache.org/licenses/LICENSE-2.0
++ *
++ * Unless required by applicable law or agreed to in writing, software
++ * distributed under the License is distributed on an "AS IS" BASIS,
++ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++ * See the License for the specific language governing permissions and
++ * limitations under the License.
++ */
++
++package dagger.producers.internal;
++
++import static com.google.common.truth.Truth.assertThat;
++import static org.junit.Assert.fail;
++import static org.mockito.Matchers.any;
++import static org.mockito.Mockito.verify;
++import static org.mockito.Mockito.verifyNoMoreInteractions;
++import static org.mockito.Mockito.when;
++
++import com.google.common.util.concurrent.Futures;
++import com.google.common.util.concurrent.ListenableFuture;
++import com.google.common.util.concurrent.MoreExecutors;
++import com.google.common.util.concurrent.SettableFuture;
++import dagger.producers.Producer;
++import dagger.producers.monitoring.ProducerMonitor;
++import dagger.producers.monitoring.ProducerToken;
++import dagger.producers.monitoring.ProductionComponentMonitor;
++import java.util.concurrent.ExecutionException;
++import java.util.concurrent.Executor;
++import javax.inject.Provider;
++import org.junit.Before;
++import org.junit.Test;
++import org.junit.runner.RunWith;
++import org.junit.runners.JUnit4;
++import org.mockito.Mock;
++import org.mockito.Mockito;
++import org.mockito.MockitoAnnotations;
++
++/**
++ * Tests {@link AbstractProducer}.
++ */
++@RunWith(JUnit4.class)
++public class AbstractProducesMethodProducerTest {
++  @Mock private ProductionComponentMonitor componentMonitor;
++  private ProducerMonitor monitor;
++  private Provider<ProductionComponentMonitor> componentMonitorProvider;
++
++  @Before
++  public void initMocks() {
++    MockitoAnnotations.initMocks(this);
++    monitor = Mockito.mock(ProducerMonitor.class, Mockito.CALLS_REAL_METHODS);
++    when(componentMonitor.producerMonitorFor(any(ProducerToken.class))).thenReturn(monitor);
++    componentMonitorProvider =
++        new Provider<ProductionComponentMonitor>() {
++          @Override
++          public ProductionComponentMonitor get() {
++            return componentMonitor;
++          }
++        };
++  }
++
++  @Test
++  public void monitor_success() throws Exception {
++    SettableFuture<Integer> delegateFuture = SettableFuture.create();
++    Producer<Integer> producer = new DelegateProducer<>(componentMonitorProvider, delegateFuture);
++
++    ListenableFuture<Integer> future = producer.get();
++    assertThat(future.isDone()).isFalse();
++    verify(monitor).ready();
++    verify(monitor).requested();
++    verify(monitor).addCallbackTo(anyListenableFuture());
++    verify(monitor).methodStarting();
++    verify(monitor).methodFinished();
++    delegateFuture.set(-42);
++    assertThat(future.get()).isEqualTo(-42);
++    verify(monitor).succeeded(-42);
++    verifyNoMoreInteractions(monitor);
++  }
++
++  @Test
++  public void monitor_failure() throws Exception {
++    SettableFuture<Integer> delegateFuture = SettableFuture.create();
++    Producer<Integer> producer = new DelegateProducer<>(componentMonitorProvider, delegateFuture);
++
++    ListenableFuture<Integer> future = producer.get();
++    assertThat(future.isDone()).isFalse();
++    verify(monitor).ready();
++    verify(monitor).requested();
++    verify(monitor).addCallbackTo(anyListenableFuture());
++    verify(monitor).methodStarting();
++    verify(monitor).methodFinished();
++    Throwable t = new RuntimeException("monkey");
++    delegateFuture.setException(t);
++    try {
++      future.get();
++      fail();
++    } catch (ExecutionException e) {
++      assertThat(e.getCause()).isSameAs(t);
++    }
++    verify(monitor).failed(t);
++    verifyNoMoreInteractions(monitor);
++  }
++
++  private ListenableFuture<?> anyListenableFuture() {
++    return any(ListenableFuture.class);
++  }
++
++  @Test(expected = NullPointerException.class)
++  public void monitor_null() throws Exception {
++    new DelegateProducer<>(null, Futures.immediateFuture(42));
++  }
++
++  static final class DelegateProducer<T> extends AbstractProducesMethodProducer<Void, T> {
++    private final ListenableFuture<T> delegate;
++
++    DelegateProducer(
++        Provider<ProductionComponentMonitor> componentMonitorProvider,
++        ListenableFuture<T> delegate) {
++      super(
++          componentMonitorProvider,
++          null, // token
++          new Provider<Executor>() {
++            @Override
++            public Executor get() {
++              return MoreExecutors.directExecutor();
++            }
++          });
++      this.delegate = delegate;
++    }
++
++    @Override
++    protected ListenableFuture<Void> collectDependencies() {
++      return Futures.immediateFuture(null);
++    }
++
++    @Override
++    protected ListenableFuture<T> callProducesMethod(Void asyncDependencies) {
++      return delegate;
++    }
++  }
++}

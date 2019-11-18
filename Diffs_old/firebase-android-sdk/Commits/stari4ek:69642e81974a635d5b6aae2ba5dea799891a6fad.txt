@@ -1,0 +1,3881 @@
+diff --git a/buildSrc/build.gradle b/buildSrc/build.gradle
+index a9e4e1202..898087a9b 100644
+--- a/buildSrc/build.gradle
++++ b/buildSrc/build.gradle
+@@ -38,6 +38,10 @@ dependencies {
+     implementation "com.jaredsburrows:gradle-license-plugin:0.8.1"
+     implementation 'digital.wup:android-maven-publish:3.6.2'
+ 
++    implementation 'io.opencensus:opencensus-api:0.18.0'
++    implementation 'io.opencensus:opencensus-exporter-stats-stackdriver:0.18.0'
++    runtime 'io.opencensus:opencensus-impl:0.18.0'
++
+     implementation 'com.android.tools.build:gradle:3.2.1'
+     testImplementation 'junit:junit:4.12'
+     testImplementation 'org.json:json:20180813'
+diff --git a/buildSrc/src/main/groovy/com/google/firebase/gradle/plugins/ci/metrics/DrainingBuildListener.java b/buildSrc/src/main/groovy/com/google/firebase/gradle/plugins/ci/metrics/DrainingBuildListener.java
+new file mode 100644
+index 000000000..66ef19ce2
+--- /dev/null
++++ b/buildSrc/src/main/groovy/com/google/firebase/gradle/plugins/ci/metrics/DrainingBuildListener.java
+@@ -0,0 +1,53 @@
++// Copyright 2018 Google LLC
++//
++// Licensed under the Apache License, Version 2.0 (the "License");
++// you may not use this file except in compliance with the License.
++// You may obtain a copy of the License at
++//
++//      http://www.apache.org/licenses/LICENSE-2.0
++//
++// Unless required by applicable law or agreed to in writing, software
++// distributed under the License is distributed on an "AS IS" BASIS,
++// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++// See the License for the specific language governing permissions and
++// limitations under the License.
++
++package com.google.firebase.gradle.plugins.ci.metrics;
++
++import org.gradle.BuildAdapter;
++import org.gradle.BuildResult;
++import org.gradle.api.logging.Logger;
++
++/**
++ * Build listener that waits for Stackdriver to export metrics before exiting.
++ *
++ * <p>Stackdriver exporter is implemented in such a way that it exports metrics on a periodic basis,
++ * with period being configurable. This means that, when the build finishes and exits, it is highly
++ * likely that there are unexported metrics in memory. For this reason we have this build listener
++ * that makes the gradle process sleep for the duration of the configured export period to make sure
++ * metrics get exported.
++ *
++ * @see <a
++ *     href="https://opencensus.io/exporters/supported-exporters/java/stackdriver-stats/">Opencensus
++ *     docs</a>
++ */
++class DrainingBuildListener extends BuildAdapter {
++  private final long sleepDuration;
++  private final Logger logger;
++
++  DrainingBuildListener(long sleepDuration, Logger logger) {
++    this.sleepDuration = sleepDuration;
++    this.logger = logger;
++  }
++
++  @Override
++  public void buildFinished(BuildResult result) {
++    try {
++      logger.lifecycle("Draining metrics to Stackdriver.");
++      Thread.sleep(sleepDuration);
++    } catch (InterruptedException e) {
++      // Restore the interrupted status
++      Thread.currentThread().interrupt();
++    }
++  }
++}
+diff --git a/buildSrc/src/main/groovy/com/google/firebase/gradle/plugins/ci/metrics/MeasuringTaskExecutionListener.java b/buildSrc/src/main/groovy/com/google/firebase/gradle/plugins/ci/metrics/MeasuringTaskExecutionListener.java
+new file mode 100644
+index 000000000..1ca34d694
+--- /dev/null
++++ b/buildSrc/src/main/groovy/com/google/firebase/gradle/plugins/ci/metrics/MeasuringTaskExecutionListener.java
+@@ -0,0 +1,92 @@
++// Copyright 2018 Google LLC
++//
++// Licensed under the Apache License, Version 2.0 (the "License");
++// you may not use this file except in compliance with the License.
++// You may obtain a copy of the License at
++//
++//      http://www.apache.org/licenses/LICENSE-2.0
++//
++// Unless required by applicable law or agreed to in writing, software
++// distributed under the License is distributed on an "AS IS" BASIS,
++// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++// See the License for the specific language governing permissions and
++// limitations under the License.
++
++package com.google.firebase.gradle.plugins.ci.metrics;
++
++import java.util.ArrayDeque;
++import java.util.HashSet;
++import java.util.Queue;
++import java.util.Set;
++import org.gradle.api.Task;
++import org.gradle.api.execution.TaskExecutionGraph;
++import org.gradle.api.execution.TaskExecutionListener;
++import org.gradle.api.tasks.TaskState;
++
++class MeasuringTaskExecutionListener implements TaskExecutionListener {
++  private static final String METRICS_START_TIME = "metricsStartTime";
++  private static final String METRICS_ELAPSED_TIME = "metricsElapsedTime";
++
++  private final Metrics metrics;
++  private final TaskExecutionGraph taskGraph;
++
++  MeasuringTaskExecutionListener(Metrics metrics, TaskExecutionGraph taskGraph) {
++    this.metrics = metrics;
++    this.taskGraph = taskGraph;
++  }
++
++  @Override
++  public void beforeExecute(Task task) {
++    recordStart(task);
++  }
++
++  @Override
++  public void afterExecute(Task task, TaskState taskState) {
++    recordElapsed(task);
++    long elapsedTime = getTotalElapsed(task);
++
++    if (taskState.getFailure() != null) {
++      metrics.measureFailure(task);
++      return;
++    }
++    metrics.measureSuccess(task, elapsedTime);
++  }
++
++  private static void recordStart(Task task) {
++    task.getExtensions().add(METRICS_START_TIME, System.currentTimeMillis());
++  }
++
++  private static void recordElapsed(Task task) {
++    long startTime = (long) task.getExtensions().getByName(METRICS_START_TIME);
++    task.getExtensions().add(METRICS_ELAPSED_TIME, System.currentTimeMillis() - startTime);
++  }
++
++  private static long getElapsed(Task task) {
++    return (long) task.getExtensions().getByName(METRICS_ELAPSED_TIME);
++  }
++
++  // a tasks elapsed time does not include how long it took for its dependencies took to execute,
++  // so we walk the dependency graph to get the total elapsed time.
++  private long getTotalElapsed(Task task) {
++    Queue<Task> queue = new ArrayDeque<>();
++    queue.add(task);
++    Set<Task> visited = new HashSet<>();
++
++    long totalElapsed = 0;
++    while (!queue.isEmpty()) {
++      Task currentTask = queue.remove();
++      if (!visited.add(currentTask)) {
++        continue;
++      }
++
++      totalElapsed += getElapsed(currentTask);
++
++      for (Task dep : taskGraph.getDependencies(currentTask)) {
++        if (!visited.contains(dep)) {
++          queue.add(dep);
++        }
++      }
++    }
++    return totalElapsed;
++  }
++}
+diff --git a/buildSrc/src/main/groovy/com/google/firebase/gradle/plugins/ci/metrics/Metrics.java b/buildSrc/src/main/groovy/com/google/firebase/gradle/plugins/ci/metrics/Metrics.java
+new file mode 100644
+index 000000000..f96e7ee90
+--- /dev/null
++++ b/buildSrc/src/main/groovy/com/google/firebase/gradle/plugins/ci/metrics/Metrics.java
+@@ -0,0 +1,26 @@
++// Copyright 2018 Google LLC
++//
++// Licensed under the Apache License, Version 2.0 (the "License");
++// you may not use this file except in compliance with the License.
++// You may obtain a copy of the License at
++//
++//      http://www.apache.org/licenses/LICENSE-2.0
++//
++// Unless required by applicable law or agreed to in writing, software
++// distributed under the License is distributed on an "AS IS" BASIS,
++// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++// See the License for the specific language governing permissions and
++// limitations under the License.
++
++package com.google.firebase.gradle.plugins.ci.metrics;
++
++import org.gradle.api.Task;
++
++/** Provides methods for measuring various parts of the build. */
++interface Metrics {
++  /** Measure successful execution of a task. */
++  void measureSuccess(Task task, long elapsedTime);
++
++  /** Measure task execution failure. */
++  void measureFailure(Task task);
++}
+diff --git a/buildSrc/src/main/groovy/com/google/firebase/gradle/plugins/ci/metrics/MetricsPlugin.java b/buildSrc/src/main/groovy/com/google/firebase/gradle/plugins/ci/metrics/MetricsPlugin.java
+new file mode 100644
+index 000000000..910c4fe59
+--- /dev/null
++++ b/buildSrc/src/main/groovy/com/google/firebase/gradle/plugins/ci/metrics/MetricsPlugin.java
+@@ -0,0 +1,41 @@
++// Copyright 2018 Google LLC
++//
++// Licensed under the Apache License, Version 2.0 (the "License");
++// you may not use this file except in compliance with the License.
++// You may obtain a copy of the License at
++//
++//      http://www.apache.org/licenses/LICENSE-2.0
++//
++// Unless required by applicable law or agreed to in writing, software
++// distributed under the License is distributed on an "AS IS" BASIS,
++// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++// See the License for the specific language governing permissions and
++// limitations under the License.
++
++package com.google.firebase.gradle.plugins.ci.metrics;
++
++import org.gradle.api.Plugin;
++import org.gradle.api.Project;
++import org.gradle.api.execution.TaskExecutionGraph;
++
++/** Instruments Gradle to measure latency and success rate of all executed tasks. */
++public class MetricsPlugin implements Plugin<Project> {
++  @Override
++  public void apply(Project project) {
++    if (!isCollectionEnabled()) {
++      project.getLogger().lifecycle("Metrics collection is disabled.");
++      return;
++    }
++    project.getLogger().lifecycle("Metrics collection is enabled.");
++
++    Metrics metrics = new StackdriverMetrics(project.getGradle(), project.getLogger());
++
++    TaskExecutionGraph taskGraph = project.getGradle().getTaskGraph();
++    taskGraph.addTaskExecutionListener(new MeasuringTaskExecutionListener(metrics, taskGraph));
++  }
++
++  private static boolean isCollectionEnabled() {
++    String enabled = System.getenv("FIREBASE_ENABLE_METRICS");
++    return enabled != null && enabled.equals("1");
++  }
++}
+diff --git a/buildSrc/src/main/groovy/com/google/firebase/gradle/plugins/ci/metrics/StackdriverMetrics.java b/buildSrc/src/main/groovy/com/google/firebase/gradle/plugins/ci/metrics/StackdriverMetrics.java
+new file mode 100644
+index 000000000..4ef071699
+--- /dev/null
++++ b/buildSrc/src/main/groovy/com/google/firebase/gradle/plugins/ci/metrics/StackdriverMetrics.java
+@@ -0,0 +1,159 @@
++// Copyright 2018 Google LLC
++//
++// Licensed under the Apache License, Version 2.0 (the "License");
++// you may not use this file except in compliance with the License.
++// You may obtain a copy of the License at
++//
++//      http://www.apache.org/licenses/LICENSE-2.0
++//
++// Unless required by applicable law or agreed to in writing, software
++// distributed under the License is distributed on an "AS IS" BASIS,
++// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++// See the License for the specific language governing permissions and
++// limitations under the License.
++
++package com.google.firebase.gradle.plugins.ci.metrics;
++
++import io.opencensus.common.Duration;
++import io.opencensus.exporter.stats.stackdriver.StackdriverStatsConfiguration;
++import io.opencensus.exporter.stats.stackdriver.StackdriverStatsExporter;
++import io.opencensus.stats.Aggregation;
++import io.opencensus.stats.Measure;
++import io.opencensus.stats.Stats;
++import io.opencensus.stats.View;
++import io.opencensus.tags.TagContext;
++import io.opencensus.tags.TagKey;
++import io.opencensus.tags.TagValue;
++import io.opencensus.tags.Tags;
++import io.opencensus.tags.propagation.TagContextBinarySerializer;
++import io.opencensus.tags.propagation.TagContextDeserializationException;
++import java.io.IOException;
++import java.util.Arrays;
++import java.util.Base64;
++import java.util.List;
++import java.util.concurrent.atomic.AtomicBoolean;
++import org.gradle.api.GradleException;
++import org.gradle.api.Task;
++import org.gradle.api.invocation.Gradle;
++import org.gradle.api.logging.Logger;
++
++/**
++ * Object used to record measurements via {@link #measureSuccess(Task, long)} and {@link
++ * #measureFailure(Task)}.
++ */
++class StackdriverMetrics implements Metrics {
++  private static final AtomicBoolean STACKDRIVER_INITIALIZED = new AtomicBoolean();
++  private static final long STACKDRIVER_UPLOAD_PERIOD_MS = 5000;
++
++  private final TagContext globalContext;
++  private final Logger logger;
++
++  private static Measure.MeasureDouble M_LATENCY =
++      Measure.MeasureDouble.create("latency", "", "ms");
++  private static Measure.MeasureLong M_SUCCESS = Measure.MeasureLong.create("success", "", "1");
++
++  private static final TagKey STAGE = TagKey.create("stage");
++  private static final TagKey GRADLE_PROJECT = TagKey.create("gradle_project");
++
++  private static final List<TagKey> TAG_KEYS =
++      Arrays.asList(
++          STAGE,
++          GRADLE_PROJECT,
++          TagKey.create("repo_owner"),
++          TagKey.create("repo_name"),
++          TagKey.create("pull_number"),
++          TagKey.create("job_name"),
++          TagKey.create("build_id"),
++          TagKey.create("job_type"));
++
++  StackdriverMetrics(Gradle gradle, Logger logger) {
++    this.logger = logger;
++    globalContext = deserializeContext();
++
++    ensureStackdriver(gradle);
++
++    Stats.getViewManager()
++        .registerView(
++            View.create(
++                View.Name.create("fireci/tasklatency"),
++                "The latency in milliseconds",
++                M_LATENCY,
++                Aggregation.LastValue.create(),
++                TAG_KEYS));
++
++    Stats.getViewManager()
++        .registerView(
++            View.create(
++                View.Name.create("fireci/tasksuccess"),
++                "Indicated success or failure.",
++                M_SUCCESS,
++                Aggregation.LastValue.create(),
++                TAG_KEYS));
++  }
++
++  /** Records failure of the execution stage named {@code name}. */
++  public void measureFailure(Task task) {
++
++    TagContext ctx =
++        Tags.getTagger()
++            .toBuilder(globalContext)
++            .put(STAGE, TagValue.create(task.getName()))
++            .put(GRADLE_PROJECT, TagValue.create(task.getProject().getPath()))
++            .build();
++    Stats.getStatsRecorder().newMeasureMap().put(M_SUCCESS, 0).record(ctx);
++  }
++
++  /** Records success and latency of the execution stage named {@code name}. */
++  public void measureSuccess(Task task, long elapsedTime) {
++
++    TagContext ctx =
++        Tags.getTagger()
++            .toBuilder(globalContext)
++            .put(STAGE, TagValue.create(task.getName()))
++            .put(GRADLE_PROJECT, TagValue.create(task.getProject().getPath()))
++            .build();
++    Stats.getStatsRecorder()
++        .newMeasureMap()
++        .put(M_SUCCESS, 1)
++        .put(M_LATENCY, elapsedTime)
++        .record(ctx);
++  }
++
++  private void ensureStackdriver(Gradle gradle) {
++    // make sure we only initialize stackdriver once as gradle daemon is not guaranteed to restart
++    // across gradle invocations.
++    if (!STACKDRIVER_INITIALIZED.compareAndSet(false, true)) {
++      logger.lifecycle("Stackdriver exporter already initialized.");
++      return;
++    }
++    logger.lifecycle("Initializing Stackdriver exporter.");
++
++    try {
++      StackdriverStatsExporter.createAndRegister(
++          StackdriverStatsConfiguration.builder()
++              .setExportInterval(Duration.fromMillis(STACKDRIVER_UPLOAD_PERIOD_MS))
++              .build());
++
++      // make sure gradle does not exit before metrics get uploaded to stackdriver.
++      gradle.addBuildListener(new DrainingBuildListener(STACKDRIVER_UPLOAD_PERIOD_MS, logger));
++    } catch (IOException e) {
++      throw new GradleException("Could not configure metrics exporter", e);
++    }
++  }
++
++  /** Extract opencensus context(if any) from environment. */
++  private static TagContext deserializeContext() {
++    String serializedContext = System.getenv("OPENCENSUS_STATS_CONTEXT");
++    if (serializedContext == null) {
++      return Tags.getTagger().empty();
++    }
++
++    TagContextBinarySerializer serializer = Tags.getTagPropagationComponent().getBinarySerializer();
++
++    try {
++      return serializer.fromByteArray(Base64.getDecoder().decode(serializedContext));
++    } catch (TagContextDeserializationException e) {
++      return Tags.getTagger().empty();
++    }
++  }
++}
+diff --git a/ci/fireci/fireci/commands.py b/ci/fireci/fireci/commands.py
+index 2685bb438..db5bc4e12 100644
+--- a/ci/fireci/fireci/commands.py
++++ b/ci/fireci/fireci/commands.py
+@@ -17,6 +17,7 @@
+ 
+ from . import gradle
+ from . import ci_command
++from . import stats
+ 
+ 
+ @click.argument('task', required=True, nargs=-1)
+diff --git a/ci/fireci/fireci/emulator.py b/ci/fireci/fireci/emulator.py
+index 5ea3aa0cc..51d058c0a 100644
+--- a/ci/fireci/fireci/emulator.py
++++ b/ci/fireci/fireci/emulator.py
+@@ -19,6 +19,8 @@
+ import subprocess
+ import time
+ 
++from . import stats
++
+ _logger = logging.getLogger('fireci.emulator')
+ 
+ EMULATOR_BINARY = 'emulator'
+@@ -65,6 +67,7 @@ def __init__(
+     self._wait_for_device_stdin = wait_for_device_stdin
+     self._logcat_stdin = logcat_stdin
+ 
++  @stats.measure_call("emulator_startup")
+   def __enter__(self):
+     _logger.info('Starting avd "{}..."'.format(self._name))
+     self._process = subprocess.Popen(
+@@ -86,6 +89,7 @@ def __enter__(self):
+         stdout=self._adb_log,
+     )
+ 
++  @stats.measure_call("emulator_shutdown")
+   def __exit__(self, exception_type, exception_value, traceback):
+     _logger.info('Shutting down avd "{}"...'.format(self._name))
+     self._kill(self._process)
+diff --git a/ci/fireci/fireci/gradle.py b/ci/fireci/fireci/gradle.py
+index dcb7e1c67..f715d9f86 100644
+--- a/ci/fireci/fireci/gradle.py
++++ b/ci/fireci/fireci/gradle.py
+@@ -17,6 +17,8 @@
+ import subprocess
+ import sys
+ 
++from . import stats
++
+ _logger = logging.getLogger('fireci.gradle')
+ 
+ ADB_INSTALL_TIMEOUT = '5'
+@@ -27,6 +29,7 @@ def P(name, value):
+   return '-P{}={}'.format(name, value)
+ 
+ 
++@stats.measure_call('gradle')
+ def run(*args, gradle_opts='', workdir=None):
+   """Invokes gradle with specified args and gradle_opts."""
+   new_env = dict(os.environ)
+@@ -34,6 +37,7 @@ def run(*args, gradle_opts='', workdir=None):
+     new_env['GRADLE_OPTS'] = gradle_opts
+   new_env[
+       'ADB_INSTALL_TIMEOUT'] = ADB_INSTALL_TIMEOUT  # 5 minutes, rather than 2 minutes
++  stats.propagate_context_into(new_env)
+ 
+   command = ['./gradlew'] + list(args)
+   _logger.info('Executing gradle command: "%s" in directory: "%s"',
+diff --git a/ci/fireci/fireci/internal.py b/ci/fireci/fireci/internal.py
+index 84e88d9fe..b96a35ef6 100644
+--- a/ci/fireci/fireci/internal.py
++++ b/ci/fireci/fireci/internal.py
+@@ -22,6 +22,7 @@
+ import shutil
+ 
+ from . import emulator
++from . import stats
+ 
+ _logger = logging.getLogger('fireci')
+ 
+@@ -104,6 +105,11 @@ class _CommonOptions:
+     default='adb',
+     help='Specifies the name/full path to the adb binary.',
+ )
++@click.option(
++    '--enable-metrics',
++    is_flag=True,
++    envvar='FIREBASE_ENABLE_METRICS',
++    help='Enables metrics collection for various build stages.')
+ @_pass_options
+ def main(options, **kwargs):
+   """Main command group.
+@@ -112,6 +118,8 @@ def main(options, **kwargs):
+     """
+   for k, v in kwargs.items():
+     setattr(options, k, v)
++  if options.enable_metrics:
++    stats.configure()
+ 
+ 
+ def ci_command(name=None):
+@@ -127,18 +135,20 @@ def ci_command(name=None):
+     """
+ 
+   def ci_command(f):
++    actual_name = f.__name__ if name is None else name
+ 
+-    @main.command(name=f.__name__ if name is None else name, help=f.__doc__)
++    @main.command(name=actual_name, help=f.__doc__)
+     @_pass_options
+     @click.pass_context
+     def new_func(ctx, options, *args, **kwargs):
+-      with _artifact_handler(options.artifact_target_dir,
+-                             options.artifact_patterns), _emulator_handler(
+-                                 options.with_emulator,
+-                                 options.artifact_target_dir,
+-                                 name=options.emulator_name,
+-                                 emulator_binary=options.emulator_binary,
+-                                 adb_binary=options.adb_binary):
++      with stats.measure("cicmd:" + actual_name), _artifact_handler(
++          options.artifact_target_dir,
++          options.artifact_patterns), _emulator_handler(
++              options.with_emulator,
++              options.artifact_target_dir,
++              name=options.emulator_name,
++              emulator_binary=options.emulator_binary,
++              adb_binary=options.adb_binary):
+         return ctx.invoke(f, *args, **kwargs)
+ 
+     return functools.update_wrapper(new_func, f)
+diff --git a/ci/fireci/fireci/stats.py b/ci/fireci/fireci/stats.py
+new file mode 100644
+index 000000000..3893819c8
+--- /dev/null
++++ b/ci/fireci/fireci/stats.py
+@@ -0,0 +1,170 @@
++# Copyright 2018 Google LLC
++#
++# Licensed under the Apache License, Version 2.0 (the "License");
++# you may not use this file except in compliance with the License.
++# You may obtain a copy of the License at
++#
++#      http://www.apache.org/licenses/LICENSE-2.0
++#
++# Unless required by applicable law or agreed to in writing, software
++# distributed under the License is distributed on an "AS IS" BASIS,
++# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++# See the License for the specific language governing permissions and
++# limitations under the License.
++
++import base64
++import contextlib
++import copy
++import functools
++import google.auth
++import google.auth.exceptions
++import logging
++import os
++import time
++
++from opencensus import tags
++from opencensus.stats import aggregation
++from opencensus.stats import measure
++from opencensus.stats import stats
++from opencensus.stats import view
++from opencensus.stats.exporters import stackdriver_exporter
++from opencensus.stats.exporters.base import StatsExporter
++from opencensus.tags import execution_context
++from opencensus.tags.propagation import binary_serializer
++
++_logger = logging.getLogger('fireci.stats')
++STATS = stats.Stats()
++
++_m_latency = measure.MeasureFloat("latency", "The latency in milliseconds",
++                                  "ms")
++_m_success = measure.MeasureInt("success", "Indicated success or failure.", "1")
++
++_key_stage = tags.TagKey("stage")
++
++_TAGS = [
++    _key_stage,
++    tags.TagKey("repo_owner"),
++    tags.TagKey("repo_name"),
++    tags.TagKey("pull_number"),
++    tags.TagKey("job_name"),
++    tags.TagKey("build_id"),
++    tags.TagKey("job_type"),
++]
++
++_METRICS_ENABLED = False
++
++
++class StdoutExporter(StatsExporter):
++  """Fallback exporter in case stackdriver cannot be configured."""
++
++  def on_register_view(self, view):
++    pass
++
++  def emit(self, view_datas):
++    _logger.info("emit %s", self.repr_data(view_datas))
++
++  def export(self, view_data):
++    _logger.info("export %s", self._repr_data(view_data))
++
++  @staticmethod
++  def _repr_data(view_data):
++    return [
++        "ViewData<view={}, start={}, end={}>".format(d.view, d.start_time,
++                                                     d.end_time)
++        for d in view_data
++    ]
++
++
++def _new_exporter():
++  """
++     Initializes a metrics exporter.
++
++     Tries to initialize a Stackdriver exporter, falls back to StdoutExporter.
++  """
++  try:
++    _, project_id = google.auth.default()
++    return stackdriver_exporter.new_stats_exporter(
++        stackdriver_exporter.Options(project_id=project_id, resource='global'))
++  except google.auth.exceptions.DefaultCredentialsError:
++    _logger.exception("Using stdout exporter")
++    return StdoutExporter()
++
++
++def configure():
++  """Globally enables metrics collection."""
++  global _METRICS_ENABLED
++  if _METRICS_ENABLED:
++    return
++  _METRICS_ENABLED = True
++
++  STATS.view_manager.register_exporter(_new_exporter())
++  latency_view = view.View(
++      "fireci/latency", "Latency of fireci execution stages", _TAGS, _m_latency,
++      aggregation.LastValueAggregation())
++  success_view = view.View(
++      "fireci/success", "Success indication of fireci execution stages", _TAGS,
++      _m_success, aggregation.LastValueAggregation())
++  STATS.view_manager.register_view(latency_view)
++  STATS.view_manager.register_view(success_view)
++
++  context = tags.TagMap()
++  for tag in _TAGS:
++    if tag.upper() in os.environ:
++      context.insert(tag, tags.TagValue(os.environ[tag.upper()]))
++
++  execution_context.set_current_tag_map(context)
++
++
++@contextlib.contextmanager
++def _measure(name):
++  tmap = copy.deepcopy(execution_context.get_current_tag_map())
++  tmap.insert(_key_stage, name)
++  start = time.time()
++  try:
++    yield
++  except:
++    mmap = STATS.stats_recorder.new_measurement_map()
++    mmap.measure_int_put(_m_success, 0)
++    mmap.record(tmap)
++    raise
++
++  elapsed = (time.time() - start) * 1000
++  mmap = STATS.stats_recorder.new_measurement_map()
++  mmap.measure_float_put(_m_latency, elapsed)
++  mmap.measure_int_put(_m_success, 1)
++  mmap.record(tmap)
++  _logger.info("%s took %sms", name, elapsed)
++
++
++@contextlib.contextmanager
++def measure(name):
++  """Context manager that measures the time it took for a block of code to execute."""
++  if not _METRICS_ENABLED:
++    yield
++    return
++  with _measure(name):
++    yield
++
++
++def measure_call(name):
++  """Function decorator that measures the time it took to execute the target function."""
++
++  def decorator(f):
++
++    def decorated(*args, **kwargs):
++      with measure(name):
++        return f(*args, **kwargs)
++
++    functools.update_wrapper(decorated, f)
++    return decorated
++
++  return decorator
++
++
++def propagate_context_into(data_dict):
++  """Propagates Tag context into a dictionary."""
++  if not _METRICS_ENABLED:
++    return
++  value = binary_serializer.BinarySerializer().to_byte_array(
++      execution_context.get_current_tag_map())
++  data_dict['OPENCENSUS_STATS_CONTEXT'] = base64.b64encode(value)
+diff --git a/ci/fireci/setup.py b/ci/fireci/setup.py
+index 09b2e32f7..20c266f8d 100755
+--- a/ci/fireci/setup.py
++++ b/ci/fireci/setup.py
+@@ -24,8 +24,14 @@
+ setup(
+     name='fireci',
+     version='0.1',
++    # this is a temporary measure until opencensus 0.2 release is out.
++    dependency_links=[
++        'https://github.com/census-instrumentation/opencensus-python/tarball/master#egg=opencensus'
++    ],
+     install_requires=[
+         'click==7.0',
++        'opencensus',
++        'google-cloud-monitoring==0.31.1',
+     ],
+     packages=find_packages(exclude=['tests']),
+     entry_points={
+diff --git a/fiamui-app/fiamui-app.gradle b/fiamui-app/fiamui-app.gradle
+index 9cd540e2b..2d00192c0 100644
+--- a/fiamui-app/fiamui-app.gradle
++++ b/fiamui-app/fiamui-app.gradle
+@@ -15,12 +15,12 @@
+ apply plugin: "com.android.application"
+ 
+ android {
+-  compileSdkVersion 27
++  compileSdkVersion project.targetSdkVersion
+ 
+   defaultConfig {
+     applicationId "com.example.firebase.fiamui"
+     minSdkVersion 16
+-    targetSdkVersion 27
++    targetSdkVersion project.targetSdkVersion
+     versionCode 1
+     versionName "1.0"
+     testInstrumentationRunner "android.support.test.runner.AndroidJUnitRunner"
+diff --git a/firebase-common/firebase-common.gradle b/firebase-common/firebase-common.gradle
+index be2184a96..ff22e2286 100644
+--- a/firebase-common/firebase-common.gradle
++++ b/firebase-common/firebase-common.gradle
+@@ -14,18 +14,16 @@
+ 
+ apply plugin: 'com.android.library'
+ 
+-def androidVersion = 28
+-
+ android {
+     adbOptions {
+         timeOutInMs 60 * 1000
+     }
+ 
+-    compileSdkVersion androidVersion
++    compileSdkVersion project.targetSdkVersion
+     defaultConfig {
+-      minSdkVersion 14
+-      targetSdkVersion androidVersion
+-
++      minSdkVersion project.minSdkVersion
++      targetSdkVersion project.targetSdkVersion
++      versionName version
+       multiDexEnabled true
+       testInstrumentationRunner "android.support.test.runner.AndroidJUnitRunner"
+     }
+@@ -56,6 +54,7 @@ dependencies {
+     implementation "com.google.android.gms:play-services-basement:$playServicesVersion"
+     implementation "com.google.android.gms:play-services-tasks:$playServicesVersion"
+ 
++    api 'com.google.auto.value:auto-value-annotations:1.6'
+     compileOnly 'com.google.code.findbugs:jsr305:3.0.2'
+ 
+     testImplementation 'com.android.support.test:runner:1.0.2'
+@@ -64,6 +63,8 @@ dependencies {
+     testImplementation "com.google.truth:truth:$googleTruthVersion"
+     testImplementation 'org.mockito:mockito-core:2.21.0'
+ 
++    annotationProcessor 'com.google.auto.value:auto-value:1.6'
++
+     androidTestImplementation 'junit:junit:4.12'
+     androidTestImplementation 'com.android.support.test:runner:1.0.2'
+     androidTestImplementation "com.google.truth:truth:$googleTruthVersion"
+diff --git a/firebase-common/src/androidTest/java/com/google/firebase/FirebaseAppTest.java b/firebase-common/src/androidTest/java/com/google/firebase/FirebaseAppTest.java
+index c5a08878d..78d60491c 100644
+--- a/firebase-common/src/androidTest/java/com/google/firebase/FirebaseAppTest.java
++++ b/firebase-common/src/androidTest/java/com/google/firebase/FirebaseAppTest.java
+@@ -43,7 +43,9 @@
+ import com.google.firebase.components.InitTracker;
+ import com.google.firebase.components.TestComponentOne;
+ import com.google.firebase.components.TestComponentTwo;
++import com.google.firebase.components.TestUserAgentDependentComponent;
+ import com.google.firebase.internal.InternalTokenResult;
++import com.google.firebase.platforminfo.UserAgentPublisher;
+ import com.google.firebase.testing.FirebaseAppRule;
+ import java.lang.reflect.InvocationTargetException;
+ import java.lang.reflect.Method;
+@@ -65,10 +67,8 @@
+ // TODO(arondeak): uncomment lines when Firebase API targets are in integ.
+ @RunWith(AndroidJUnit4.class)
+ public class FirebaseAppTest {
+-
+   protected static final String GOOGLE_APP_ID = "1:855246033427:android:6e48bff8253f3f6e6e";
+   protected static final String GOOGLE_API_KEY = "AIzaSyD3asb-2pEZVqMkmL6M9N6nHZRR_znhrh0";
+-  private static final String APP_NAME = "myApp";
+ 
+   protected static final FirebaseOptions OPTIONS =
+       new FirebaseOptions.Builder()
+@@ -118,6 +118,37 @@ public void testBackgroundStateChangeCallbacks() {
+     assertThat(backgroundState.get()).isFalse();
+   }
+ 
++  @Test
++  public void testInitializeApp_shouldPublishUserAgentPublisherThatReturnsPublishedVersions() {
++    String[] expectedUserAgent = {"firebase-common/16.0.5", "test-component/1.2.3"};
++    Context mockContext = createForwardingMockContext();
++    FirebaseApp firebaseApp = FirebaseApp.initializeApp(mockContext);
++
++    TestUserAgentDependentComponent userAgentDependant =
++        firebaseApp.get(TestUserAgentDependentComponent.class);
++    UserAgentPublisher userAgentPublisher = userAgentDependant.getUserAgentPublisher();
++    String[] actualUserAgent = userAgentPublisher.getUserAgent().split(" ");
++    Arrays.sort(actualUserAgent);
++
++    assertThat(actualUserAgent).asList().contains("test-component/1.2.3");
++  }
++
++  @Test
++  public void testInitializeApp_shouldPublishVersionForFirebaseCommon() {
++    Context mockContext = createForwardingMockContext();
++    FirebaseApp firebaseApp = FirebaseApp.initializeApp(mockContext);
++
++    TestUserAgentDependentComponent userAgentDependant =
++        firebaseApp.get(TestUserAgentDependentComponent.class);
++    UserAgentPublisher userAgentPublisher = userAgentDependant.getUserAgentPublisher();
++    String[] actualUserAgent = userAgentPublisher.getUserAgent().split(" ");
++    Arrays.sort(actualUserAgent);
++
++    // After sorting the user agents are expected to be {"firebase-common/x.y.z",
++    // "test-component/1.2.3"}
++    assertThat(actualUserAgent[0]).contains("firebase-common");
++  }
++
+   @Test
+   public void testRemovedBackgroundStateChangeCallbacksDontFire() {
+     FirebaseApp firebaseApp = FirebaseApp.initializeApp(targetContext, OPTIONS, "myApp");
+diff --git a/firebase-common/src/main/java/com/google/firebase/FirebaseApp.java b/firebase-common/src/main/java/com/google/firebase/FirebaseApp.java
+index b96067145..f265206c9 100644
+--- a/firebase-common/src/main/java/com/google/firebase/FirebaseApp.java
++++ b/firebase-common/src/main/java/com/google/firebase/FirebaseApp.java
+@@ -55,6 +55,8 @@
+ import com.google.firebase.internal.DefaultIdTokenListenersCountChangedListener;
+ import com.google.firebase.internal.InternalTokenProvider;
+ import com.google.firebase.internal.InternalTokenResult;
++import com.google.firebase.platforminfo.DefaultUserAgentPublisher;
++import com.google.firebase.platforminfo.LibraryVersionComponent;
+ import java.lang.reflect.InvocationTargetException;
+ import java.lang.reflect.Method;
+ import java.lang.reflect.Modifier;
+@@ -151,6 +153,8 @@
+   @GuardedBy("LOCK")
+   static final Map<String, FirebaseApp> INSTANCES = new ArrayMap<>();
+ 
++  private static final String FIREBASE_COMMON = "firebase-common";
++
+   private final Context applicationContext;
+   private final String name;
+   private final FirebaseOptions options;
+@@ -536,7 +540,9 @@ protected FirebaseApp(Context applicationContext, String name, FirebaseOptions o
+             registrars,
+             Component.of(applicationContext, Context.class),
+             Component.of(this, FirebaseApp.class),
+-            Component.of(options, FirebaseOptions.class));
++            Component.of(options, FirebaseOptions.class),
++            LibraryVersionComponent.create(FIREBASE_COMMON, BuildConfig.VERSION_NAME),
++            DefaultUserAgentPublisher.component());
+     publisher = componentRuntime.get(Publisher.class);
+   }
+ 
+diff --git a/firebase-common/src/main/java/com/google/firebase/components/ComponentRuntime.java b/firebase-common/src/main/java/com/google/firebase/components/ComponentRuntime.java
+index ea024c015..41b5b9bd4 100644
+--- a/firebase-common/src/main/java/com/google/firebase/components/ComponentRuntime.java
++++ b/firebase-common/src/main/java/com/google/firebase/components/ComponentRuntime.java
+@@ -75,7 +75,7 @@ private void processInstanceComponents() {
+     for (Map.Entry<Component<?>, Lazy<?>> entry : components.entrySet()) {
+       Component<?> component = entry.getKey();
+       if (!component.isValue()) {
+-        return;
++        continue;
+       }
+ 
+       Lazy<?> lazy = entry.getValue();
+diff --git a/firebase-common/src/main/java/com/google/firebase/platforminfo/DefaultUserAgentPublisher.java b/firebase-common/src/main/java/com/google/firebase/platforminfo/DefaultUserAgentPublisher.java
+new file mode 100644
+index 000000000..310cb6544
+--- /dev/null
++++ b/firebase-common/src/main/java/com/google/firebase/platforminfo/DefaultUserAgentPublisher.java
+@@ -0,0 +1,76 @@
++// Copyright 2018 Google LLC
++//
++// Licensed under the Apache License, Version 2.0 (the "License");
++// you may not use this file except in compliance with the License.
++// You may obtain a copy of the License at
++//
++//      http://www.apache.org/licenses/LICENSE-2.0
++//
++// Unless required by applicable law or agreed to in writing, software
++// distributed under the License is distributed on an "AS IS" BASIS,
++// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++// See the License for the specific language governing permissions and
++// limitations under the License.
++
++package com.google.firebase.platforminfo;
++
++import com.google.firebase.components.Component;
++import com.google.firebase.components.Dependency;
++import java.util.Iterator;
++import java.util.Set;
++
++/**
++ * Provides a user agent string that captures the SDKs and their corresponding versions.
++ *
++ * <p>Example user agent string: "firebase-common/16.1.1 firebase-firestore/16.1.2
++ * firebase-database/16.1.2"
++ */
++public class DefaultUserAgentPublisher implements UserAgentPublisher {
++  private final String javaSDKVersionUserAgent;
++  private final OutOfBandLibraryVersionRegistrar gamesSDKRegistrar;
++
++  DefaultUserAgentPublisher(
++      Set<LibraryVersion> libraryVersions, OutOfBandLibraryVersionRegistrar gamesSDKRegistrar) {
++    this.javaSDKVersionUserAgent = toUserAgent(libraryVersions);
++    this.gamesSDKRegistrar = gamesSDKRegistrar;
++  }
++
++  /**
++   * Returns the user agent string that is computed as follows 1. For our JavaSDKs, the string is
++   * computed in advance since the components framework guarantees that we receive all published
++   * versions. 2. For our GamesSDKs, the strings are recomputed each time since the registration of
++   * the versions happens out of band and we take the optimistic approach of recomputing each time.
++   */
++  @Override
++  public String getUserAgent() {
++    if (gamesSDKRegistrar.getRegisteredVersions().isEmpty()) {
++      return javaSDKVersionUserAgent;
++    }
++
++    return javaSDKVersionUserAgent + ' ' + toUserAgent(gamesSDKRegistrar.getRegisteredVersions());
++  }
++
++  private static String toUserAgent(Set<LibraryVersion> tokens) {
++    StringBuilder sb = new StringBuilder();
++    Iterator<LibraryVersion> iterator = tokens.iterator();
++    while (iterator.hasNext()) {
++      LibraryVersion token = iterator.next();
++      sb.append(token.getLibraryName()).append('/').append(token.getVersion());
++      if (iterator.hasNext()) {
++        sb.append(' ');
++      }
++    }
++    return sb.toString();
++  }
++
++  /** Creates a component to codify a user agent string that captures SDK versions. */
++  public static Component<UserAgentPublisher> component() {
++    return Component.builder(UserAgentPublisher.class)
++        .add(Dependency.setOf(LibraryVersion.class))
++        .factory(
++            c ->
++                new DefaultUserAgentPublisher(
++                    c.setOf(LibraryVersion.class), OutOfBandLibraryVersionRegistrar.getInstance()))
++        .build();
++  }
++}
+diff --git a/firebase-common/src/main/java/com/google/firebase/platforminfo/LibraryVersion.java b/firebase-common/src/main/java/com/google/firebase/platforminfo/LibraryVersion.java
+new file mode 100644
+index 000000000..b2de424cc
+--- /dev/null
++++ b/firebase-common/src/main/java/com/google/firebase/platforminfo/LibraryVersion.java
+@@ -0,0 +1,32 @@
++// Copyright 2018 Google LLC
++//
++// Licensed under the Apache License, Version 2.0 (the "License");
++// you may not use this file except in compliance with the License.
++// You may obtain a copy of the License at
++//
++//      http://www.apache.org/licenses/LICENSE-2.0
++//
++// Unless required by applicable law or agreed to in writing, software
++// distributed under the License is distributed on an "AS IS" BASIS,
++// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++// See the License for the specific language governing permissions and
++// limitations under the License.
++
++package com.google.firebase.platforminfo;
++
++import com.google.auto.value.AutoValue;
++import javax.annotation.Nonnull;
++
++/** The class is not public to ensure other components cannot depend on it. */
++@AutoValue
++abstract class LibraryVersion {
++  static LibraryVersion create(String name, String version) {
++    return new AutoValue_LibraryVersion(name, version);
++  }
++
++  @Nonnull
++  public abstract String getLibraryName();
++
++  @Nonnull
++  public abstract String getVersion();
++}
+diff --git a/firebase-common/src/main/java/com/google/firebase/platforminfo/LibraryVersionComponent.java b/firebase-common/src/main/java/com/google/firebase/platforminfo/LibraryVersionComponent.java
+new file mode 100644
+index 000000000..e9b022be2
+--- /dev/null
++++ b/firebase-common/src/main/java/com/google/firebase/platforminfo/LibraryVersionComponent.java
+@@ -0,0 +1,27 @@
++// Copyright 2018 Google LLC
++//
++// Licensed under the Apache License, Version 2.0 (the "License");
++// you may not use this file except in compliance with the License.
++// You may obtain a copy of the License at
++//
++//      http://www.apache.org/licenses/LICENSE-2.0
++//
++// Unless required by applicable law or agreed to in writing, software
++// distributed under the License is distributed on an "AS IS" BASIS,
++// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++// See the License for the specific language governing permissions and
++// limitations under the License.
++
++package com.google.firebase.platforminfo;
++
++import com.google.firebase.components.Component;
++
++/** Factory to create a component that publishes the version of an SDK */
++public class LibraryVersionComponent {
++  private LibraryVersionComponent() {}
++
++  /** Creates a component that publishes SDK versions */
++  public static Component<?> create(String sdkName, String version) {
++    return Component.intoSet(LibraryVersion.create(sdkName, version), LibraryVersion.class);
++  }
++}
+diff --git a/firebase-common/src/main/java/com/google/firebase/platforminfo/OutOfBandLibraryVersionRegistrar.java b/firebase-common/src/main/java/com/google/firebase/platforminfo/OutOfBandLibraryVersionRegistrar.java
+new file mode 100644
+index 000000000..6d59146c5
+--- /dev/null
++++ b/firebase-common/src/main/java/com/google/firebase/platforminfo/OutOfBandLibraryVersionRegistrar.java
+@@ -0,0 +1,65 @@
++// Copyright 2018 Google LLC
++//
++// Licensed under the Apache License, Version 2.0 (the "License");
++// you may not use this file except in compliance with the License.
++// You may obtain a copy of the License at
++//
++//      http://www.apache.org/licenses/LICENSE-2.0
++//
++// Unless required by applicable law or agreed to in writing, software
++// distributed under the License is distributed on an "AS IS" BASIS,
++// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++// See the License for the specific language governing permissions and
++// limitations under the License.
++
++package com.google.firebase.platforminfo;
++
++import java.util.Collections;
++import java.util.HashSet;
++import java.util.Set;
++
++/**
++ * In order to allow the C++ and Unity SDKs to publish their versions without the use of the
++ * components framework, we have a mechanism where the versions can be wired as out of band as side
++ * effects. See {@link OutOfBandLibraryVersionRegistrar#registerVersion(String, String)}
++ *
++ * <p>Java libraries should use {@link LibraryVersionComponent#create(String, String)} instead.
++ */
++public class OutOfBandLibraryVersionRegistrar {
++  private final Set<LibraryVersion> infos = new HashSet<>();
++  private static volatile OutOfBandLibraryVersionRegistrar INSTANCE;
++
++  OutOfBandLibraryVersionRegistrar() {}
++
++  /**
++   * Thread safe method to publish versions outside of the components mechanics.
++   *
++   * <p>It is the responsibility of the caller to register the version at app launch.
++   */
++  public void registerVersion(String sdkName, String version) {
++    synchronized (infos) {
++      infos.add(LibraryVersion.create(sdkName, version));
++    }
++  }
++
++  /** Returns registered versions */
++  Set<LibraryVersion> getRegisteredVersions() {
++    synchronized (infos) {
++      return Collections.unmodifiableSet(infos);
++    }
++  }
++
++  /** Returns an instance of {@link OutOfBandLibraryVersionRegistrar} */
++  public static OutOfBandLibraryVersionRegistrar getInstance() {
++    OutOfBandLibraryVersionRegistrar localRef = INSTANCE;
++    if (localRef == null) {
++      synchronized (OutOfBandLibraryVersionRegistrar.class) {
++        localRef = INSTANCE;
++        if (localRef == null) {
++          INSTANCE = localRef = new OutOfBandLibraryVersionRegistrar();
++        }
++      }
++    }
++    return localRef;
++  }
++}
+diff --git a/firebase-common/src/main/java/com/google/firebase/platforminfo/UserAgentPublisher.java b/firebase-common/src/main/java/com/google/firebase/platforminfo/UserAgentPublisher.java
+new file mode 100644
+index 000000000..077ea7e97
+--- /dev/null
++++ b/firebase-common/src/main/java/com/google/firebase/platforminfo/UserAgentPublisher.java
+@@ -0,0 +1,20 @@
++// Copyright 2018 Google LLC
++//
++// Licensed under the Apache License, Version 2.0 (the "License");
++// you may not use this file except in compliance with the License.
++// You may obtain a copy of the License at
++//
++//      http://www.apache.org/licenses/LICENSE-2.0
++//
++// Unless required by applicable law or agreed to in writing, software
++// distributed under the License is distributed on an "AS IS" BASIS,
++// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++// See the License for the specific language governing permissions and
++// limitations under the License.
++
++package com.google.firebase.platforminfo;
++
++/** Component that publishes a user agent string */
++public interface UserAgentPublisher {
++  String getUserAgent();
++}
+diff --git a/firebase-common/src/main/java/com/google/firebase/platforminfo/package-info.java b/firebase-common/src/main/java/com/google/firebase/platforminfo/package-info.java
+new file mode 100644
+index 000000000..9d3282e95
+--- /dev/null
++++ b/firebase-common/src/main/java/com/google/firebase/platforminfo/package-info.java
+@@ -0,0 +1,16 @@
++// Copyright 2018 Google LLC
++//
++// Licensed under the Apache License, Version 2.0 (the "License");
++// you may not use this file except in compliance with the License.
++// You may obtain a copy of the License at
++//
++//      http://www.apache.org/licenses/LICENSE-2.0
++//
++// Unless required by applicable law or agreed to in writing, software
++// distributed under the License is distributed on an "AS IS" BASIS,
++// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++// See the License for the specific language governing permissions and
++// limitations under the License.
++
++/** @hide */
++package com.google.firebase.platforminfo;
+diff --git a/firebase-common/src/test/java/com/google/firebase/VersionGenerationTest.java b/firebase-common/src/test/java/com/google/firebase/VersionGenerationTest.java
+new file mode 100644
+index 000000000..437c57adb
+--- /dev/null
++++ b/firebase-common/src/test/java/com/google/firebase/VersionGenerationTest.java
+@@ -0,0 +1,30 @@
++// Copyright 2018 Google LLC
++//
++// Licensed under the Apache License, Version 2.0 (the "License");
++// you may not use this file except in compliance with the License.
++// You may obtain a copy of the License at
++//
++//      http://www.apache.org/licenses/LICENSE-2.0
++//
++// Unless required by applicable law or agreed to in writing, software
++// distributed under the License is distributed on an "AS IS" BASIS,
++// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++// See the License for the specific language governing permissions and
++// limitations under the License.
++
++package com.google.firebase;
++
++import static com.google.common.truth.Truth.assertThat;
++
++import org.junit.Test;
++import org.junit.runner.RunWith;
++import org.junit.runners.JUnit4;
++
++@RunWith(JUnit4.class)
++public class VersionGenerationTest {
++
++  @Test
++  public void isVersionGenerated_shouldNotBeEmpty() {
++    assertThat(BuildConfig.VERSION_NAME).isNotEmpty();
++  }
++}
+diff --git a/firebase-common/src/test/java/com/google/firebase/components/ComponentRuntimeTest.java b/firebase-common/src/test/java/com/google/firebase/components/ComponentRuntimeTest.java
+index 28197e1e3..ba081e8ab 100644
+--- a/firebase-common/src/test/java/com/google/firebase/components/ComponentRuntimeTest.java
++++ b/firebase-common/src/test/java/com/google/firebase/components/ComponentRuntimeTest.java
+@@ -266,4 +266,22 @@ public void setComponents_shouldParticipateInCycleDetection() {
+       // success.
+     }
+   }
++
++  @Test
++  public void setComponents_shouldNotPreventValueComponentsFromBeingRegistered() {
++    ComponentRuntime runtime =
++        new ComponentRuntime(
++            EXECUTOR,
++            Collections.emptySet(),
++            Component.intoSet(1, Integer.class),
++            Component.intoSet(2, Integer.class),
++            Component.of(2f, Float.class),
++            Component.intoSet(3, Integer.class),
++            Component.intoSet(4, Integer.class),
++            Component.of(4d, Double.class));
++
++    assertThat(runtime.setOf(Integer.class)).containsExactly(1, 2, 3, 4);
++    assertThat(runtime.get(Float.class)).isEqualTo(2f);
++    assertThat(runtime.get(Double.class)).isEqualTo(4d);
++  }
+ }
+diff --git a/firebase-common/src/test/java/com/google/firebase/platforminfo/DefaultUserAgentPublisherTest.java b/firebase-common/src/test/java/com/google/firebase/platforminfo/DefaultUserAgentPublisherTest.java
+new file mode 100644
+index 000000000..034e14cdd
+--- /dev/null
++++ b/firebase-common/src/test/java/com/google/firebase/platforminfo/DefaultUserAgentPublisherTest.java
+@@ -0,0 +1,83 @@
++// Copyright 2018 Google LLC
++//
++// Licensed under the Apache License, Version 2.0 (the "License");
++// you may not use this file except in compliance with the License.
++// You may obtain a copy of the License at
++//
++//      http://www.apache.org/licenses/LICENSE-2.0
++//
++// Unless required by applicable law or agreed to in writing, software
++// distributed under the License is distributed on an "AS IS" BASIS,
++// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++// See the License for the specific language governing permissions and
++// limitations under the License.
++
++package com.google.firebase.platforminfo;
++
++import static com.google.common.truth.Truth.assertThat;
++import static org.mockito.Mockito.mock;
++import static org.mockito.Mockito.when;
++
++import java.util.Arrays;
++import java.util.HashSet;
++import java.util.Set;
++import org.junit.Before;
++import org.junit.Test;
++import org.junit.runner.RunWith;
++import org.junit.runners.JUnit4;
++
++@RunWith(JUnit4.class)
++public class DefaultUserAgentPublisherTest {
++  private Set<LibraryVersion> libraryVersions;
++  private DefaultUserAgentPublisher userAgentPublisher;
++  private OutOfBandLibraryVersionRegistrar outOfBandLibraryVersionRegistrar;
++
++  @Before
++  public void before() {
++    libraryVersions = new HashSet<>();
++    libraryVersions.add(LibraryVersion.create("foo", "1"));
++    libraryVersions.add(LibraryVersion.create("bar", "2"));
++
++    outOfBandLibraryVersionRegistrar = mock(OutOfBandLibraryVersionRegistrar.class);
++
++    when(outOfBandLibraryVersionRegistrar.getRegisteredVersions()).thenReturn(new HashSet<>());
++
++    userAgentPublisher =
++        new DefaultUserAgentPublisher(libraryVersions, outOfBandLibraryVersionRegistrar);
++  }
++
++  @Test
++  public void getUserAgent_createsConcatenatedStringOfSdkVersions() {
++    String[] expectedUserAgent = {"bar/2", "foo/1"};
++
++    String[] actualUserAgent = userAgentPublisher.getUserAgent().split(" ");
++    Arrays.sort(actualUserAgent);
++
++    assertThat(actualUserAgent).isEqualTo(expectedUserAgent);
++  }
++
++  @Test
++  public void getUserAgent_returnsEmptyString_whenVersionSetIsEmpty() {
++    userAgentPublisher =
++        new DefaultUserAgentPublisher(new HashSet<>(), outOfBandLibraryVersionRegistrar);
++
++    assertThat(userAgentPublisher.getUserAgent()).isEqualTo("");
++  }
++
++  @Test
++  public void
++      getUserAgent_returnsStringIncludingGamesSDKVersions_whenGamesSDKVersionRegistrarReturnsVersions() {
++    String[] expectedUserAgent = {"bar/2", "buzz/2", "fizz/1", "foo/1"};
++    HashSet<LibraryVersion> gamesLibraryVersions = new HashSet<>();
++    gamesLibraryVersions.add(LibraryVersion.create("fizz", "1"));
++    gamesLibraryVersions.add(LibraryVersion.create("buzz", "2"));
++    when(outOfBandLibraryVersionRegistrar.getRegisteredVersions()).thenReturn(gamesLibraryVersions);
++    userAgentPublisher =
++        new DefaultUserAgentPublisher(libraryVersions, outOfBandLibraryVersionRegistrar);
++
++    String[] actualUserAgent = userAgentPublisher.getUserAgent().split(" ");
++    Arrays.sort(actualUserAgent);
++
++    assertThat(actualUserAgent).isEqualTo(expectedUserAgent);
++  }
++}
+diff --git a/firebase-common/src/test/java/com/google/firebase/platforminfo/OutOfBandLibraryVersionRegistrarTest.java b/firebase-common/src/test/java/com/google/firebase/platforminfo/OutOfBandLibraryVersionRegistrarTest.java
+new file mode 100644
+index 000000000..d2ccffe03
+--- /dev/null
++++ b/firebase-common/src/test/java/com/google/firebase/platforminfo/OutOfBandLibraryVersionRegistrarTest.java
+@@ -0,0 +1,42 @@
++// Copyright 2018 Google LLC
++//
++// Licensed under the Apache License, Version 2.0 (the "License");
++// you may not use this file except in compliance with the License.
++// You may obtain a copy of the License at
++//
++//      http://www.apache.org/licenses/LICENSE-2.0
++//
++// Unless required by applicable law or agreed to in writing, software
++// distributed under the License is distributed on an "AS IS" BASIS,
++// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++// See the License for the specific language governing permissions and
++// limitations under the License.
++
++package com.google.firebase.platforminfo;
++
++import static com.google.common.truth.Truth.assertThat;
++
++import org.junit.Test;
++import org.junit.runner.RunWith;
++import org.junit.runners.JUnit4;
++
++@RunWith(JUnit4.class)
++public class OutOfBandLibraryVersionRegistrarTest {
++  @Test
++  public void registerVersion_persistsVersion() {
++    OutOfBandLibraryVersionRegistrar outOfBandLibraryVersionRegistrar =
++        new OutOfBandLibraryVersionRegistrar();
++    outOfBandLibraryVersionRegistrar.registerVersion("foo", "1.1.1");
++
++    assertThat(outOfBandLibraryVersionRegistrar.getRegisteredVersions())
++        .contains(LibraryVersion.create("foo", "1.1.1"));
++  }
++
++  @Test
++  public void getRegisteredVersions_returnsEmptySet_whenNoVersionsAreRegistered() {
++    OutOfBandLibraryVersionRegistrar outOfBandLibraryVersionRegistrar =
++        new OutOfBandLibraryVersionRegistrar();
++
++    assertThat(outOfBandLibraryVersionRegistrar.getRegisteredVersions()).isEmpty();
++  }
++}
+diff --git a/firebase-common/src/testUtil/com/google/firebase/components/TestComponentRegistrar.java b/firebase-common/src/testUtil/com/google/firebase/components/TestComponentRegistrar.java
+index ad135d7fc..5ebddedac 100644
+--- a/firebase-common/src/testUtil/com/google/firebase/components/TestComponentRegistrar.java
++++ b/firebase-common/src/testUtil/com/google/firebase/components/TestComponentRegistrar.java
+@@ -17,10 +17,15 @@
+ import android.content.Context;
+ import com.google.firebase.FirebaseApp;
+ import com.google.firebase.FirebaseOptions;
++import com.google.firebase.platforminfo.LibraryVersionComponent;
++import com.google.firebase.platforminfo.UserAgentPublisher;
+ import java.util.Arrays;
+ import java.util.List;
+ 
+ class TestComponentRegistrar implements ComponentRegistrar {
++  private static final String TEST_COMPONENT_NAME = "test-component";
++  private static String TEST_VERSION = "1.2.3";
++
+   @Override
+   public List<Component<?>> getComponents() {
+     return Arrays.asList(
+@@ -38,6 +43,13 @@
+                         container.get(FirebaseApp.class),
+                         container.get(FirebaseOptions.class),
+                         container.get(TestComponentOne.class)))
+-            .build());
++            .build(),
++        Component.builder(TestUserAgentDependentComponent.class)
++            .add(Dependency.required(UserAgentPublisher.class))
++            .factory(
++                container ->
++                    new TestUserAgentDependentComponent(container.get(UserAgentPublisher.class)))
++            .build(),
++        LibraryVersionComponent.create(TEST_COMPONENT_NAME, TEST_VERSION));
+   }
+ }
+diff --git a/firebase-common/src/testUtil/com/google/firebase/components/TestUserAgentDependentComponent.java b/firebase-common/src/testUtil/com/google/firebase/components/TestUserAgentDependentComponent.java
+new file mode 100644
+index 000000000..d1071c640
+--- /dev/null
++++ b/firebase-common/src/testUtil/com/google/firebase/components/TestUserAgentDependentComponent.java
+@@ -0,0 +1,29 @@
++// Copyright 2018 Google LLC
++//
++// Licensed under the Apache License, Version 2.0 (the "License");
++// you may not use this file except in compliance with the License.
++// You may obtain a copy of the License at
++//
++//      http://www.apache.org/licenses/LICENSE-2.0
++//
++// Unless required by applicable law or agreed to in writing, software
++// distributed under the License is distributed on an "AS IS" BASIS,
++// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++// See the License for the specific language governing permissions and
++// limitations under the License.
++
++package com.google.firebase.components;
++
++import com.google.firebase.platforminfo.UserAgentPublisher;
++
++public class TestUserAgentDependentComponent {
++  private final UserAgentPublisher userAgentPublisher;
++
++  public TestUserAgentDependentComponent(UserAgentPublisher userAgentPublisher) {
++    this.userAgentPublisher = userAgentPublisher;
++  }
++
++  public UserAgentPublisher getUserAgentPublisher() {
++    return userAgentPublisher;
++  }
++}
+diff --git a/firebase-database-collection/firebase-database-collection.gradle b/firebase-database-collection/firebase-database-collection.gradle
+index 7da2c76aa..e87098fb9 100644
+--- a/firebase-database-collection/firebase-database-collection.gradle
++++ b/firebase-database-collection/firebase-database-collection.gradle
+@@ -14,10 +14,8 @@
+ 
+ apply plugin: 'com.android.library'
+ 
+-def androidVersion = 28
+-
+ android {
+-    compileSdkVersion androidVersion
++    compileSdkVersion project.targetSdkVersion
+     defaultConfig {
+         minSdkVersion 9
+     }
+diff --git a/firebase-database-collection/src/main/java/com/google/firebase/database/collection/LLRBValueNode.java b/firebase-database-collection/src/main/java/com/google/firebase/database/collection/LLRBValueNode.java
+index 88ff6d55a..92b27944d 100644
+--- a/firebase-database-collection/src/main/java/com/google/firebase/database/collection/LLRBValueNode.java
++++ b/firebase-database-collection/src/main/java/com/google/firebase/database/collection/LLRBValueNode.java
+@@ -67,9 +67,9 @@ public V getValue() {
+     LLRBNode<K, V> newLeft = left == null ? this.left : left;
+     LLRBNode<K, V> newRight = right == null ? this.right : right;
+     if (color == Color.RED) {
+-      return new LLRBRedValueNode<K, V>(newKey, newValue, newLeft, newRight);
++      return new LLRBRedValueNode<>(newKey, newValue, newLeft, newRight);
+     } else {
+-      return new LLRBBlackValueNode<K, V>(newKey, newValue, newLeft, newRight);
++      return new LLRBBlackValueNode<>(newKey, newValue, newLeft, newRight);
+     }
+   }
+ 
+@@ -221,7 +221,7 @@ void setLeft(LLRBNode<K, V> left) {
+     if (n.right.isRed() && !n.left.isRed()) {
+       n = n.rotateLeft();
+     }
+-    if (n.left.isRed() && ((LLRBValueNode<K, V>) (n.left)).left.isRed()) {
++    if (n.left.isRed() && ((LLRBValueNode<K, V>) n.left).left.isRed()) {
+       n = n.rotateRight();
+     }
+     if (n.left.isRed() && n.right.isRed()) {
+@@ -232,13 +232,13 @@ void setLeft(LLRBNode<K, V> left) {
+ 
+   private LLRBValueNode<K, V> rotateLeft() {
+     LLRBValueNode<K, V> newLeft =
+-        this.copy(null, null, Color.RED, null, ((LLRBValueNode<K, V>) (this.right)).left);
++        this.copy(null, null, Color.RED, null, ((LLRBValueNode<K, V>) this.right).left);
+     return (LLRBValueNode<K, V>) this.right.copy(null, null, this.getColor(), newLeft, null);
+   }
+ 
+   private LLRBValueNode<K, V> rotateRight() {
+     LLRBValueNode<K, V> newRight =
+-        this.copy(null, null, Color.RED, ((LLRBValueNode<K, V>) (this.left)).right, null);
++        this.copy(null, null, Color.RED, ((LLRBValueNode<K, V>) this.left).right, null);
+     return (LLRBValueNode<K, V>) this.left.copy(null, null, this.getColor(), null, newRight);
+   }
+ 
+diff --git a/firebase-database-collection/src/main/java/com/google/firebase/database/collection/RBTreeSortedMap.java b/firebase-database-collection/src/main/java/com/google/firebase/database/collection/RBTreeSortedMap.java
+index 74c841ee7..061ddc323 100644
+--- a/firebase-database-collection/src/main/java/com/google/firebase/database/collection/RBTreeSortedMap.java
++++ b/firebase-database-collection/src/main/java/com/google/firebase/database/collection/RBTreeSortedMap.java
+@@ -243,7 +243,7 @@ public int indexOf(K key) {
+       public Base1_2(int size) {
+         int toCalc = size + 1;
+         length = (int) Math.floor(Math.log(toCalc) / Math.log(2));
+-        long mask = (long) (Math.pow(2, length)) - 1;
++        long mask = ((long) Math.pow(2, length)) - 1;
+         value = toCalc & mask;
+       }
+ 
+@@ -340,7 +340,7 @@ private void buildPennant(LLRBNode.Color color, int chunkSize, int start) {
+         Comparator<A> comparator) {
+       Builder<A, B, C> builder = new Builder<>(keys, values, translator);
+       Collections.sort(keys, comparator);
+-      Iterator<BooleanChunk> iter = (new Base1_2(keys.size())).iterator();
++      Iterator<BooleanChunk> iter = new Base1_2(keys.size()).iterator();
+       int index = keys.size();
+       while (iter.hasNext()) {
+         BooleanChunk next = iter.next();
+diff --git a/firebase-database/firebase-database.gradle b/firebase-database/firebase-database.gradle
+index ace96b7b0..b0ddd6bc4 100644
+--- a/firebase-database/firebase-database.gradle
++++ b/firebase-database/firebase-database.gradle
+@@ -14,9 +14,6 @@
+ 
+ apply plugin: 'com.android.library'
+ 
+-def androidVersion = 28
+-
+-
+ tasks.withType(org.gradle.api.tasks.testing.Test) {
+     testLogging {
+         exceptionFormat = 'full'
+@@ -32,10 +29,11 @@ android {
+         timeOutInMs 60 * 1000
+     }
+ 
+-    compileSdkVersion androidVersion
++    compileSdkVersion project.targetSdkVersion
+     defaultConfig {
+-        targetSdkVersion androidVersion
+-        minSdkVersion 14
++        targetSdkVersion project.targetSdkVersion
++        minSdkVersion project.minSdkVersion
++        versionName version
+         multiDexEnabled true
+         testInstrumentationRunner "android.support.test.runner.AndroidJUnitRunner"
+     }
+diff --git a/firebase-database/gradle.properties b/firebase-database/gradle.properties
+index 6d52a9fd3..76d0ec038 100644
+--- a/firebase-database/gradle.properties
++++ b/firebase-database/gradle.properties
+@@ -12,5 +12,5 @@
+ # See the License for the specific language governing permissions and
+ # limitations under the License.
+ 
+-version=16.0.6
+-latestReleasedVersion=16.0.5
++version=16.0.7
++latestReleasedVersion=16.0.6
+diff --git a/firebase-firestore/CHANGELOG.md b/firebase-firestore/CHANGELOG.md
+index bb03e1763..f3cbb6de2 100644
+--- a/firebase-firestore/CHANGELOG.md
++++ b/firebase-firestore/CHANGELOG.md
+@@ -1,17 +1,25 @@
+ # Unreleased
++
++# 18.0.1
++- [fixed] Fixed an issue where Firestore would crash if handling write batches
++  larger than 2 MB in size (#208).
++- [changed] Firestore now recovers more quickly from long periods without
++  network access (#217).
++
++# 18.0.0
+ - [changed] The `timestampsInSnapshotsEnabled` setting is now enabled by
+-  default so timestamp fields read from a `DocumentSnapshot` will be returned
+-  as `Timestamp` objects instead of `Date`. Any code expecting to receive a
+-  `Date` object must be updated.
+-- [feature] Custom objects (POJOs) can now be passed as a field value in
+-  update(), within `Map<>` objects passed to set(), in array transform
+-  operations, and in query filters.
+-- [feature] DocumentSnapshot.get() now supports retrieving fields as
+-  custom objects (POJOs) by passing a Class<T> instance, e.g.
++  default. Timestamp fields that read from a `DocumentSnapshot` are now
++  returned as `Timestamp` objects instead of `Date` objects. This is a breaking
++  change; developers must update any code that expects to receive a `Date`
++  object. See https://firebase.google.com/docs/reference/android/com/google/firebase/firestore/FirebaseFirestoreSettings.Builder.html#setTimestampsInSnapshotsEnabled(boolean) for more details.
++- [feature] Custom objects (POJOs) can now be passed in several ways: as a
++  field value in `update()`, within `Map<>` objects passed to `set()`, in array
++  transform operations, and in query filters.
++- [feature] `DocumentSnapshot.get()` now supports retrieving fields as
++  custom objects (POJOs) by passing a `Class<T>` instance, e.g.,
+   `snapshot.get("field", CustomType.class)`.
+-- [fixed] Fixed a crash that could happen when the app is shut down after
+-  a write has been sent to the server but before it has been received on
+-  a listener.
++- [fixed] Fixed an issue where if an app sent a write to the server, but the
++  app was shut down before a listener received the write, the app could crash.
+ 
+ # 17.1.5
+ - [changed] Firestore now recovers more quickly from bad network states.
+diff --git a/firebase-firestore/firebase-firestore.gradle b/firebase-firestore/firebase-firestore.gradle
+index 8115c01d7..b5c7444ce 100644
+--- a/firebase-firestore/firebase-firestore.gradle
++++ b/firebase-firestore/firebase-firestore.gradle
+@@ -15,8 +15,6 @@
+ apply plugin: 'com.android.library'
+ apply plugin: 'com.google.protobuf'
+ 
+-def androidVersion = 28
+-
+ protobuf {
+     // Configure the protoc executable
+     protoc {
+@@ -53,10 +51,11 @@ android {
+         timeOutInMs 60 * 1000
+     }
+ 
+-    compileSdkVersion androidVersion
++    compileSdkVersion project.targetSdkVersion
+     defaultConfig {
+-        targetSdkVersion androidVersion
+-        minSdkVersion 14
++        targetSdkVersion project.targetSdkVersion
++        minSdkVersion project.minSdkVersion
++        versionName version
+         multiDexEnabled true
+         testInstrumentationRunner "android.support.test.runner.AndroidJUnitRunner"
+     }
+diff --git a/firebase-firestore/gradle.properties b/firebase-firestore/gradle.properties
+index f3ad92d86..9b7be4891 100644
+--- a/firebase-firestore/gradle.properties
++++ b/firebase-firestore/gradle.properties
+@@ -1,2 +1,2 @@
+-version=17.1.5
+-latestReleasedVersion=17.1.4
++version=18.0.1
++latestReleasedVersion=18.0.0
+diff --git a/firebase-firestore/src/androidTest/java/com/google/firebase/firestore/ServerTimestampTest.java b/firebase-firestore/src/androidTest/java/com/google/firebase/firestore/ServerTimestampTest.java
+index 0f9e06529..3fb396565 100644
+--- a/firebase-firestore/src/androidTest/java/com/google/firebase/firestore/ServerTimestampTest.java
++++ b/firebase-firestore/src/androidTest/java/com/google/firebase/firestore/ServerTimestampTest.java
+@@ -215,7 +215,8 @@ public void testServerTimestampsCanRetainPreviousValueThroughConsecutiveUpdates(
+     DocumentSnapshot localSnapshot = accumulator.awaitLocalEvent();
+     assertEquals(42L, localSnapshot.get("a", ServerTimestampBehavior.PREVIOUS));
+ 
+-    docRef.update("a", FieldValue.serverTimestamp());
++    // include b=1 to ensure there's a change resulting in a new snapshot.
++    docRef.update("a", FieldValue.serverTimestamp(), "b", 1);
+     localSnapshot = accumulator.awaitLocalEvent();
+     assertEquals(42L, localSnapshot.get("a", ServerTimestampBehavior.PREVIOUS));
+ 
+diff --git a/firebase-firestore/src/androidTest/java/com/google/firebase/firestore/WriteBatchTest.java b/firebase-firestore/src/androidTest/java/com/google/firebase/firestore/WriteBatchTest.java
+index 6dc62a3b8..10544e735 100644
+--- a/firebase-firestore/src/androidTest/java/com/google/firebase/firestore/WriteBatchTest.java
++++ b/firebase-firestore/src/androidTest/java/com/google/firebase/firestore/WriteBatchTest.java
+@@ -32,7 +32,10 @@
+ import com.google.firebase.firestore.FirebaseFirestoreException.Code;
+ import com.google.firebase.firestore.testutil.EventAccumulator;
+ import com.google.firebase.firestore.testutil.IntegrationTestUtil;
++import com.google.firebase.firestore.util.Util;
+ import java.util.Arrays;
++import java.util.HashMap;
++import java.util.Map;
+ import org.junit.After;
+ import org.junit.Test;
+ import org.junit.runner.RunWith;
+@@ -253,4 +256,39 @@ public void testCanWriteTheSameDocumentMultipleTimes() {
+     assertNotNull(when);
+     assertEquals(map("a", 1L, "b", 2L, "when", when), serverSnap.getData());
+   }
++
++  @Test
++  public void testCanWriteVeryLargeBatches() {
++    // On Android, SQLite Cursors are limited reading no more than 2 MB per row (despite being able
++    // to write very large values). This test verifies that the SQLiteMutationQueue properly works
++    // around this limitation.
++
++    // Create a map containing nearly 1 MB of data. Note that if you use 1024 below this will create
++    // a document larger than 1 MB, which will be rejected by the backend as too large.
++    String a = Character.toString('a');
++    StringBuilder buf = new StringBuilder(1000);
++    for (int i = 0; i < 1000; i++) {
++      buf.append(a);
++    }
++    String kb = buf.toString();
++    Map<String, Object> values = new HashMap<>();
++    for (int j = 0; j < 1000; j++) {
++      values.put(Util.autoId(), kb);
++    }
++
++    DocumentReference doc = testDocument();
++    WriteBatch batch = doc.getFirestore().batch();
++
++    // Write a batch containing 3 copies of the data, creating a ~3 MB batch. Writing to the same
++    // document in a batch is allowed and so long as the net size of the document is under 1 MB the
++    // batch is allowed.
++    batch.set(doc, values);
++    for (int i = 0; i < 2; i++) {
++      batch.update(doc, values);
++    }
++
++    waitFor(batch.commit());
++    DocumentSnapshot snap = waitFor(doc.get());
++    assertEquals(values, snap.getData());
++  }
+ }
+diff --git a/firebase-firestore/src/androidTest/java/com/google/firebase/firestore/remote/RemoteStoreTest.java b/firebase-firestore/src/androidTest/java/com/google/firebase/firestore/remote/RemoteStoreTest.java
+new file mode 100644
+index 000000000..6cad0e582
+--- /dev/null
++++ b/firebase-firestore/src/androidTest/java/com/google/firebase/firestore/remote/RemoteStoreTest.java
+@@ -0,0 +1,116 @@
++// Copyright 2019 Google LLC
++//
++// Licensed under the Apache License, Version 2.0 (the "License");
++// you may not use this file except in compliance with the License.
++// You may obtain a copy of the License at
++//
++//      http://www.apache.org/licenses/LICENSE-2.0
++//
++// Unless required by applicable law or agreed to in writing, software
++// distributed under the License is distributed on an "AS IS" BASIS,
++// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++// See the License for the specific language governing permissions and
++// limitations under the License.
++
++package com.google.firebase.firestore.remote;
++
++import static com.google.firebase.firestore.testutil.IntegrationTestUtil.waitFor;
++
++import android.support.test.InstrumentationRegistry;
++import android.support.test.runner.AndroidJUnit4;
++import com.google.firebase.database.collection.ImmutableSortedSet;
++import com.google.firebase.firestore.auth.User;
++import com.google.firebase.firestore.core.OnlineState;
++import com.google.firebase.firestore.local.LocalStore;
++import com.google.firebase.firestore.local.MemoryPersistence;
++import com.google.firebase.firestore.local.Persistence;
++import com.google.firebase.firestore.model.DocumentKey;
++import com.google.firebase.firestore.model.mutation.MutationBatchResult;
++import com.google.firebase.firestore.testutil.IntegrationTestUtil;
++import com.google.firebase.firestore.util.AsyncQueue;
++import com.google.firebase.firestore.util.Consumer;
++import io.grpc.Status;
++import java.util.concurrent.Semaphore;
++import org.junit.Test;
++import org.junit.runner.RunWith;
++
++@RunWith(AndroidJUnit4.class)
++public class RemoteStoreTest {
++  @Test
++  public void testRemoteStoreStreamStopsWhenNetworkUnreachable() {
++    AsyncQueue testQueue = new AsyncQueue();
++    Datastore datastore =
++        new Datastore(
++            IntegrationTestUtil.testEnvDatabaseInfo(),
++            testQueue,
++            null,
++            InstrumentationRegistry.getContext());
++    Semaphore networkChangeSemaphore = new Semaphore(0);
++    RemoteStore.RemoteStoreCallback callback =
++        new RemoteStore.RemoteStoreCallback() {
++          public void handleRemoteEvent(RemoteEvent remoteEvent) {}
++
++          public void handleRejectedListen(int targetId, Status error) {}
++
++          public void handleSuccessfulWrite(MutationBatchResult successfulWrite) {}
++
++          public void handleRejectedWrite(int batchId, Status error) {}
++
++          public void handleOnlineStateChange(OnlineState onlineState) {
++            networkChangeSemaphore.release();
++          }
++
++          public ImmutableSortedSet<DocumentKey> getRemoteKeysForTarget(int targetId) {
++            return null;
++          }
++        };
++
++    FakeConnectivityMonitor connectivityMonitor = new FakeConnectivityMonitor();
++    Persistence persistence = MemoryPersistence.createEagerGcMemoryPersistence();
++    persistence.start();
++    LocalStore localStore = new LocalStore(persistence, User.UNAUTHENTICATED);
++    RemoteStore remoteStore =
++        new RemoteStore(callback, localStore, datastore, testQueue, connectivityMonitor);
++
++    waitFor(testQueue.enqueue(() -> remoteStore.forceEnableNetwork()));
++    drain(testQueue);
++    networkChangeSemaphore.drainPermits();
++
++    connectivityMonitor.goOffline();
++    waitFor(networkChangeSemaphore);
++    drain(testQueue);
++
++    waitFor(testQueue.enqueue(() -> remoteStore.forceEnableNetwork()));
++    networkChangeSemaphore.drainPermits();
++    connectivityMonitor.goOnline();
++    waitFor(networkChangeSemaphore);
++  }
++
++  private void drain(AsyncQueue testQueue) {
++    waitFor(testQueue.enqueue(() -> {}));
++  }
++
++  class FakeConnectivityMonitor implements ConnectivityMonitor {
++    private Consumer<NetworkStatus> callback = null;
++
++    @Override
++    public void addCallback(Consumer<NetworkStatus> callback) {
++      this.callback = callback;
++    }
++
++    @Override
++    public void shutdown() {}
++
++    public void goOffline() {
++      if (callback != null) {
++        callback.accept(ConnectivityMonitor.NetworkStatus.UNREACHABLE);
++      }
++    }
++
++    public void goOnline() {
++      if (callback != null) {
++        callback.accept(ConnectivityMonitor.NetworkStatus.REACHABLE);
++      }
++    }
++  }
++}
+diff --git a/firebase-firestore/src/main/java/com/google/cloud/datastore/core/number/package-info.java b/firebase-firestore/src/main/java/com/google/cloud/datastore/core/number/package-info.java
+new file mode 100644
+index 000000000..1720283dc
+--- /dev/null
++++ b/firebase-firestore/src/main/java/com/google/cloud/datastore/core/number/package-info.java
+@@ -0,0 +1,16 @@
++// Copyright 2018 Google LLC
++//
++// Licensed under the Apache License, Version 2.0 (the "License");
++// you may not use this file except in compliance with the License.
++// You may obtain a copy of the License at
++//
++//      http://www.apache.org/licenses/LICENSE-2.0
++//
++// Unless required by applicable law or agreed to in writing, software
++// distributed under the License is distributed on an "AS IS" BASIS,
++// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++// See the License for the specific language governing permissions and
++// limitations under the License.
++
++/** @hide */
++package com.google.cloud.datastore.core.number;
+diff --git a/firebase-firestore/src/main/java/com/google/firebase/firestore/core/FirestoreClient.java b/firebase-firestore/src/main/java/com/google/firebase/firestore/core/FirestoreClient.java
+index 123a4268a..8c65fa861 100644
+--- a/firebase-firestore/src/main/java/com/google/firebase/firestore/core/FirestoreClient.java
++++ b/firebase-firestore/src/main/java/com/google/firebase/firestore/core/FirestoreClient.java
+@@ -44,6 +44,8 @@
+ import com.google.firebase.firestore.model.NoDocument;
+ import com.google.firebase.firestore.model.mutation.Mutation;
+ import com.google.firebase.firestore.model.mutation.MutationBatchResult;
++import com.google.firebase.firestore.remote.AndroidConnectivityMonitor;
++import com.google.firebase.firestore.remote.ConnectivityMonitor;
+ import com.google.firebase.firestore.remote.Datastore;
+ import com.google.firebase.firestore.remote.RemoteEvent;
+ import com.google.firebase.firestore.remote.RemoteSerializer;
+@@ -241,7 +243,8 @@ private void initialize(Context context, User user, boolean usePersistence, long
+     }
+ 
+     Datastore datastore = new Datastore(databaseInfo, asyncQueue, credentialsProvider, context);
+-    remoteStore = new RemoteStore(this, localStore, datastore, asyncQueue);
++    ConnectivityMonitor connectivityMonitor = new AndroidConnectivityMonitor(context);
++    remoteStore = new RemoteStore(this, localStore, datastore, asyncQueue, connectivityMonitor);
+ 
+     syncEngine = new SyncEngine(localStore, remoteStore, user);
+     eventManager = new EventManager(syncEngine);
+diff --git a/firebase-firestore/src/main/java/com/google/firebase/firestore/local/SQLiteMutationQueue.java b/firebase-firestore/src/main/java/com/google/firebase/firestore/local/SQLiteMutationQueue.java
+index adfd3c1de..9c41c101a 100644
+--- a/firebase-firestore/src/main/java/com/google/firebase/firestore/local/SQLiteMutationQueue.java
++++ b/firebase-firestore/src/main/java/com/google/firebase/firestore/local/SQLiteMutationQueue.java
+@@ -18,6 +18,7 @@
+ import static com.google.firebase.firestore.util.Assert.fail;
+ import static com.google.firebase.firestore.util.Assert.hardAssert;
+ 
++import android.database.Cursor;
+ import android.database.sqlite.SQLiteStatement;
+ import com.google.firebase.Timestamp;
+ import com.google.firebase.firestore.auth.User;
+@@ -27,6 +28,7 @@
+ import com.google.firebase.firestore.model.mutation.Mutation;
+ import com.google.firebase.firestore.model.mutation.MutationBatch;
+ import com.google.firebase.firestore.remote.WriteStream;
++import com.google.firebase.firestore.util.Consumer;
+ import com.google.firebase.firestore.util.Util;
+ import com.google.protobuf.ByteString;
+ import com.google.protobuf.InvalidProtocolBufferException;
+@@ -42,6 +44,18 @@
+ /** A mutation queue for a specific user, backed by SQLite. */
+ final class SQLiteMutationQueue implements MutationQueue {
+ 
++  /**
++   * On Android, SQLite Cursors are limited reading no more than 2 MB per row (despite being able to
++   * write very large values). All reads of the mutations column in the mutations table need to read
++   * in chunks with SUBSTR to avoid going over this limit.
++   *
++   * <p>The value here has to be 2 MB or smaller, while allowing for all possible other values that
++   * might be selected out along with the mutations column in any given result set. Nearly 1 MB is
++   * conservative, but allows all combinations of document paths and batch ids without needing to
++   * figure out if the row has gotten too large.
++   */
++  private static final int BLOB_MAX_INLINE_LENGTH = 1000000;
++
+   private final SQLitePersistence db;
+   private final LocalSerializer serializer;
+ 
+@@ -90,10 +104,7 @@ public void start() {
+     int rows =
+         db.query("SELECT last_stream_token FROM mutation_queues WHERE uid = ?")
+             .binding(uid)
+-            .first(
+-                row -> {
+-                  lastStreamToken = ByteString.copyFrom(row.getBlob(0));
+-                });
++            .first(row -> lastStreamToken = ByteString.copyFrom(row.getBlob(0)));
+ 
+     if (rows == 0) {
+       // Ensure we write a default entry in mutation_queues since loadNextBatchIdAcrossAllUsers()
+@@ -204,9 +215,9 @@ public MutationBatch addMutationBatch(Timestamp localWriteTime, List<Mutation> m
+   @Nullable
+   @Override
+   public MutationBatch lookupMutationBatch(int batchId) {
+-    return db.query("SELECT mutations FROM mutations WHERE uid = ? AND batch_id = ?")
+-        .binding(uid, batchId)
+-        .firstValue(row -> decodeMutationBatch(row.getBlob(0)));
++    return db.query("SELECT SUBSTR(mutations, 1, ?) FROM mutations WHERE uid = ? AND batch_id = ?")
++        .binding(BLOB_MAX_INLINE_LENGTH, uid, batchId)
++        .firstValue(row -> decodeInlineMutationBatch(batchId, row.getBlob(0)));
+   }
+ 
+   @Nullable
+@@ -215,19 +226,22 @@ public MutationBatch getNextMutationBatchAfterBatchId(int batchId) {
+     int nextBatchId = batchId + 1;
+ 
+     return db.query(
+-            "SELECT mutations FROM mutations "
++            "SELECT batch_id, SUBSTR(mutations, 1, ?) FROM mutations "
+                 + "WHERE uid = ? AND batch_id >= ? "
+                 + "ORDER BY batch_id ASC LIMIT 1")
+-        .binding(uid, nextBatchId)
+-        .firstValue(row -> decodeMutationBatch(row.getBlob(0)));
++        .binding(BLOB_MAX_INLINE_LENGTH, uid, nextBatchId)
++        .firstValue(row -> decodeInlineMutationBatch(row.getInt(0), row.getBlob(1)));
+   }
+ 
+   @Override
+   public List<MutationBatch> getAllMutationBatches() {
+     List<MutationBatch> result = new ArrayList<>();
+-    db.query("SELECT mutations FROM mutations WHERE uid = ? ORDER BY batch_id ASC")
+-        .binding(uid)
+-        .forEach(row -> result.add(decodeMutationBatch(row.getBlob(0))));
++    db.query(
++            "SELECT batch_id, SUBSTR(mutations, 1, ?) "
++                + "FROM mutations "
++                + "WHERE uid = ? ORDER BY batch_id ASC")
++        .binding(BLOB_MAX_INLINE_LENGTH, uid)
++        .forEach(row -> result.add(decodeInlineMutationBatch(row.getInt(0), row.getBlob(1))));
+     return result;
+   }
+ 
+@@ -237,14 +251,15 @@ public MutationBatch getNextMutationBatchAfterBatchId(int batchId) {
+ 
+     List<MutationBatch> result = new ArrayList<>();
+     db.query(
+-            "SELECT m.mutations FROM document_mutations dm, mutations m "
++            "SELECT m.batch_id, SUBSTR(m.mutations, 1, ?) "
++                + "FROM document_mutations dm, mutations m "
+                 + "WHERE dm.uid = ? "
+                 + "AND dm.path = ? "
+                 + "AND dm.uid = m.uid "
+                 + "AND dm.batch_id = m.batch_id "
+                 + "ORDER BY dm.batch_id")
+-        .binding(uid, path)
+-        .forEach(row -> result.add(decodeMutationBatch(row.getBlob(0))));
++        .binding(BLOB_MAX_INLINE_LENGTH, uid, path)
++        .forEach(row -> result.add(decodeInlineMutationBatch(row.getInt(0), row.getBlob(1))));
+     return result;
+   }
+ 
+@@ -259,10 +274,11 @@ public MutationBatch getNextMutationBatchAfterBatchId(int batchId) {
+     SQLitePersistence.LongQuery longQuery =
+         new SQLitePersistence.LongQuery(
+             db,
+-            "SELECT DISTINCT dm.batch_id, m.mutations FROM document_mutations dm, mutations m "
++            "SELECT DISTINCT dm.batch_id, SUBSTR(m.mutations, 1, ?) "
++                + "FROM document_mutations dm, mutations m "
+                 + "WHERE dm.uid = ? "
+                 + "AND dm.path IN (",
+-            Arrays.asList(uid),
++            Arrays.asList(BLOB_MAX_INLINE_LENGTH, uid),
+             args,
+             ") "
+                 + "AND dm.uid = m.uid "
+@@ -279,7 +295,7 @@ public MutationBatch getNextMutationBatchAfterBatchId(int batchId) {
+                 int batchId = row.getInt(0);
+                 if (!uniqueBatchIds.contains(batchId)) {
+                   uniqueBatchIds.add(batchId);
+-                  result.add(decodeMutationBatch(row.getBlob(1)));
++                  result.add(decodeInlineMutationBatch(batchId, row.getBlob(1)));
+                 }
+               });
+     }
+@@ -321,14 +337,15 @@ public MutationBatch getNextMutationBatchAfterBatchId(int batchId) {
+ 
+     List<MutationBatch> result = new ArrayList<>();
+     db.query(
+-            "SELECT dm.batch_id, dm.path, m.mutations FROM document_mutations dm, mutations m "
++            "SELECT dm.batch_id, dm.path, SUBSTR(m.mutations, 1, ?) "
++                + "FROM document_mutations dm, mutations m "
+                 + "WHERE dm.uid = ? "
+                 + "AND dm.path >= ? "
+                 + "AND dm.path < ? "
+                 + "AND dm.uid = m.uid "
+                 + "AND dm.batch_id = m.batch_id "
+                 + "ORDER BY dm.batch_id")
+-        .binding(uid, prefixPath, prefixSuccessorPath)
++        .binding(BLOB_MAX_INLINE_LENGTH, uid, prefixPath, prefixSuccessorPath)
+         .forEach(
+             row -> {
+               // Ensure unique batches only. This works because the batches come out in order so we
+@@ -350,7 +367,7 @@ public MutationBatch getNextMutationBatchAfterBatchId(int batchId) {
+                 return;
+               }
+ 
+-              result.add(decodeMutationBatch(row.getBlob(2)));
++              result.add(decodeInlineMutationBatch(batchId, row.getBlob(2)));
+             });
+ 
+     return result;
+@@ -399,12 +416,79 @@ public void performConsistencyCheck() {
+         danglingMutationReferences);
+   }
+ 
+-  private MutationBatch decodeMutationBatch(byte[] bytes) {
++  /**
++   * Decodes mutation batch bytes obtained via substring. If the blob is smaller than
++   * BLOB_MAX_INLINE_LENGTH, executes additional queries to load the rest of the blob.
++   *
++   * @param batchId The batch ID of the row containing the bytes, for fallback lookup if the value
++   *     is too large.
++   * @param bytes The bytes of the first chunk of the mutation batch. Should be obtained via
++   *     SUBSTR(mutations, 1, BLOB_MAX_INLINE_LENGTH).
++   */
++  private MutationBatch decodeInlineMutationBatch(int batchId, byte[] bytes) {
+     try {
++      if (bytes.length < BLOB_MAX_INLINE_LENGTH) {
++        return serializer.decodeMutationBatch(
++            com.google.firebase.firestore.proto.WriteBatch.parseFrom(bytes));
++      }
++
++      BlobAccumulator accumulator = new BlobAccumulator(bytes);
++      while (accumulator.more) {
++        // As we read in chunks the start of the next chunk should be the total accumulated length
++        // plus 1 (since SUBSTR() counts from 1). The second argument is not adjusted because it's
++        // the length of the chunk, not the end index.
++        int start = accumulator.numChunks() * BLOB_MAX_INLINE_LENGTH + 1;
++
++        db.query("SELECT SUBSTR(mutations, ?, ?) FROM mutations WHERE uid = ? AND batch_id = ?")
++            .binding(start, BLOB_MAX_INLINE_LENGTH, uid, batchId)
++            .first(accumulator);
++      }
++
++      ByteString blob = accumulator.result();
+       return serializer.decodeMutationBatch(
+-          com.google.firebase.firestore.proto.WriteBatch.parseFrom(bytes));
++          com.google.firebase.firestore.proto.WriteBatch.parseFrom(blob));
+     } catch (InvalidProtocolBufferException e) {
+       throw fail("MutationBatch failed to parse: %s", e);
+     }
+   }
++
++  /**
++   * Explicit consumer of blob chunks, accumulating the chunks and wrapping them in a single
++   * ByteString. Accepts a Cursor whose results include the blob in column 0.
++   *
++   * <p>(This is a named class here to allow decodeInlineMutationBlock to access the result of the
++   * accumulation.)
++   */
++  private static class BlobAccumulator implements Consumer<Cursor> {
++    private final ArrayList<ByteString> chunks = new ArrayList<>();
++    private boolean more = true;
++
++    BlobAccumulator(byte[] firstChunk) {
++      addChunk(firstChunk);
++    }
++
++    int numChunks() {
++      return chunks.size();
++    }
++
++    ByteString result() {
++      // Not actually a copy; this creates a balanced rope-like structure that reuses the given
++      // ByteStrings as a part of its representation.
++      return ByteString.copyFrom(chunks);
++    }
++
++    @Override
++    public void accept(Cursor row) {
++      byte[] bytes = row.getBlob(0);
++      addChunk(bytes);
++      if (bytes.length < BLOB_MAX_INLINE_LENGTH) {
++        more = false;
++      }
++    }
++
++    private void addChunk(byte[] bytes) {
++      ByteString wrapped = ByteString.copyFrom(bytes);
++      chunks.add(wrapped);
++    }
++  }
+ }
+diff --git a/firebase-firestore/src/main/java/com/google/firebase/firestore/remote/AndroidConnectivityMonitor.java b/firebase-firestore/src/main/java/com/google/firebase/firestore/remote/AndroidConnectivityMonitor.java
+new file mode 100644
+index 000000000..b52b1b2ba
+--- /dev/null
++++ b/firebase-firestore/src/main/java/com/google/firebase/firestore/remote/AndroidConnectivityMonitor.java
+@@ -0,0 +1,137 @@
++// Copyright 2019 Google LLC
++//
++// Licensed under the Apache License, Version 2.0 (the "License");
++// you may not use this file except in compliance with the License.
++// You may obtain a copy of the License at
++//
++//      http://www.apache.org/licenses/LICENSE-2.0
++//
++// Unless required by applicable law or agreed to in writing, software
++// distributed under the License is distributed on an "AS IS" BASIS,
++// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++// See the License for the specific language governing permissions and
++// limitations under the License.
++
++package com.google.firebase.firestore.remote;
++
++import static com.google.firebase.firestore.util.Assert.hardAssert;
++
++import android.annotation.TargetApi;
++import android.content.BroadcastReceiver;
++import android.content.Context;
++import android.content.Intent;
++import android.content.IntentFilter;
++import android.net.ConnectivityManager;
++import android.net.Network;
++import android.net.NetworkInfo;
++import android.os.Build;
++import com.google.firebase.firestore.util.Consumer;
++import java.util.ArrayList;
++import java.util.List;
++import javax.annotation.Nullable;
++
++/**
++ * Android implementation of ConnectivityMonitor. Parallel implementations exist for N+ and pre-N.
++ *
++ * <p>Implementation note: Most of the code here was shamelessly stolen from
++ * https://github.com/grpc/grpc-java/blob/master/android/src/main/java/io/grpc/android/AndroidChannelBuilder.java
++ */
++public final class AndroidConnectivityMonitor implements ConnectivityMonitor {
++
++  private final Context context;
++  @Nullable private final ConnectivityManager connectivityManager;
++  @Nullable private Runnable unregisterRunnable;
++  private final List<Consumer<NetworkStatus>> callbacks = new ArrayList<>();
++
++  public AndroidConnectivityMonitor(Context context) {
++    // This notnull restriction could be eliminated... the pre-N method doesn't
++    // require a Context, and we could use that even on N+ if necessary.
++    hardAssert(context != null, "Context must be non-null");
++    this.context = context;
++
++    connectivityManager =
++        (ConnectivityManager) context.getSystemService(Context.CONNECTIVITY_SERVICE);
++    configureNetworkMonitoring();
++  }
++
++  @Override
++  public void addCallback(Consumer<NetworkStatus> callback) {
++    callbacks.add(callback);
++  }
++
++  @Override
++  public void shutdown() {
++    if (unregisterRunnable != null) {
++      unregisterRunnable.run();
++      unregisterRunnable = null;
++    }
++  }
++
++  private void configureNetworkMonitoring() {
++    // Android N added the registerDefaultNetworkCallback API to listen to changes in the device's
++    // default network. For earlier Android API levels, use the BroadcastReceiver API.
++    if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.N && connectivityManager != null) {
++      final DefaultNetworkCallback defaultNetworkCallback = new DefaultNetworkCallback();
++      connectivityManager.registerDefaultNetworkCallback(defaultNetworkCallback);
++      unregisterRunnable =
++          new Runnable() {
++            @Override
++            public void run() {
++              connectivityManager.unregisterNetworkCallback(defaultNetworkCallback);
++            }
++          };
++    } else {
++      NetworkReceiver networkReceiver = new NetworkReceiver();
++      IntentFilter networkIntentFilter = new IntentFilter(ConnectivityManager.CONNECTIVITY_ACTION);
++      context.registerReceiver(networkReceiver, networkIntentFilter);
++      unregisterRunnable =
++          new Runnable() {
++            @Override
++            public void run() {
++              context.unregisterReceiver(networkReceiver);
++            }
++          };
++    }
++  }
++
++  /** Respond to changes in the default network. Only used on API levels 24+. */
++  @TargetApi(Build.VERSION_CODES.N)
++  private class DefaultNetworkCallback extends ConnectivityManager.NetworkCallback {
++    @Override
++    public void onAvailable(Network network) {
++      for (Consumer<NetworkStatus> callback : callbacks) {
++        callback.accept(NetworkStatus.REACHABLE);
++      }
++    }
++
++    @Override
++    public void onLost(Network network) {
++      for (Consumer<NetworkStatus> callback : callbacks) {
++        callback.accept(NetworkStatus.UNREACHABLE);
++      }
++    }
++  }
++
++  /** Respond to network changes. Only used on API levels < 24. */
++  private class NetworkReceiver extends BroadcastReceiver {
++    private boolean isConnected = false;
++
++    @Override
++    public void onReceive(Context context, Intent intent) {
++      ConnectivityManager conn =
++          (ConnectivityManager) context.getSystemService(Context.CONNECTIVITY_SERVICE);
++      NetworkInfo networkInfo = conn.getActiveNetworkInfo();
++      boolean wasConnected = isConnected;
++      isConnected = networkInfo != null && networkInfo.isConnected();
++      if (isConnected && !wasConnected) {
++        for (Consumer<NetworkStatus> callback : callbacks) {
++          callback.accept(NetworkStatus.REACHABLE);
++        }
++      } else if (!isConnected && wasConnected) {
++        for (Consumer<NetworkStatus> callback : callbacks) {
++          callback.accept(NetworkStatus.UNREACHABLE);
++        }
++      }
++    }
++  }
++}
+diff --git a/firebase-firestore/src/main/java/com/google/firebase/firestore/remote/ConnectivityMonitor.java b/firebase-firestore/src/main/java/com/google/firebase/firestore/remote/ConnectivityMonitor.java
+new file mode 100644
+index 000000000..57d555145
+--- /dev/null
++++ b/firebase-firestore/src/main/java/com/google/firebase/firestore/remote/ConnectivityMonitor.java
+@@ -0,0 +1,39 @@
++// Copyright 2019 Google LLC
++//
++// Licensed under the Apache License, Version 2.0 (the "License");
++// you may not use this file except in compliance with the License.
++// You may obtain a copy of the License at
++//
++//      http://www.apache.org/licenses/LICENSE-2.0
++//
++// Unless required by applicable law or agreed to in writing, software
++// distributed under the License is distributed on an "AS IS" BASIS,
++// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++// See the License for the specific language governing permissions and
++// limitations under the License.
++
++package com.google.firebase.firestore.remote;
++
++import com.google.firebase.firestore.util.Consumer;
++
++/** Interface for monitoring changes in network connectivity/reachability. */
++public interface ConnectivityMonitor {
++  enum NetworkStatus {
++    UNREACHABLE,
++    REACHABLE,
++    // TODO(rsgowman): REACHABLE_VIA_CELLULAR.
++    // Leaving this off for now, since (a) we don't need it, and (b) it's somewhat messy to
++    // determine, and (c) we need two parallel implementations (for N+ and pre-N).
++  };
++
++  // TODO(rsgowman): Skipping isNetworkReachable() until we need it.
++  // boolean isNetworkReachable();
++
++  void addCallback(Consumer<NetworkStatus> callback);
++
++  /**
++   * Stops monitoring connectivity. After this call completes, no further callbacks will be
++   * triggered. After shutdown() is called, no further calls are allowed on this instance.
++   */
++  void shutdown();
++}
+diff --git a/firebase-firestore/src/main/java/com/google/firebase/firestore/remote/RemoteStore.java b/firebase-firestore/src/main/java/com/google/firebase/firestore/remote/RemoteStore.java
+index 06af474d6..050901ace 100644
+--- a/firebase-firestore/src/main/java/com/google/firebase/firestore/remote/RemoteStore.java
++++ b/firebase-firestore/src/main/java/com/google/firebase/firestore/remote/RemoteStore.java
+@@ -17,6 +17,7 @@
+ import static com.google.firebase.firestore.util.Assert.hardAssert;
+ 
+ import android.support.annotation.Nullable;
++import android.support.annotation.VisibleForTesting;
+ import com.google.firebase.database.collection.ImmutableSortedSet;
+ import com.google.firebase.firestore.core.OnlineState;
+ import com.google.firebase.firestore.core.Transaction;
+@@ -28,6 +29,7 @@
+ import com.google.firebase.firestore.model.mutation.MutationBatch;
+ import com.google.firebase.firestore.model.mutation.MutationBatchResult;
+ import com.google.firebase.firestore.model.mutation.MutationResult;
++import com.google.firebase.firestore.remote.ConnectivityMonitor.NetworkStatus;
+ import com.google.firebase.firestore.remote.WatchChange.DocumentChange;
+ import com.google.firebase.firestore.remote.WatchChange.ExistenceFilterWatchChange;
+ import com.google.firebase.firestore.remote.WatchChange.WatchTargetChange;
+@@ -107,6 +109,7 @@
+   private final RemoteStoreCallback remoteStoreCallback;
+   private final LocalStore localStore;
+   private final Datastore datastore;
++  private final ConnectivityMonitor connectivityMonitor;
+ 
+   /**
+    * A mapping of watched targets that the client cares about tracking and the user has explicitly
+@@ -146,10 +149,12 @@ public RemoteStore(
+       RemoteStoreCallback remoteStoreCallback,
+       LocalStore localStore,
+       Datastore datastore,
+-      AsyncQueue workerQueue) {
++      AsyncQueue workerQueue,
++      ConnectivityMonitor connectivityMonitor) {
+     this.remoteStoreCallback = remoteStoreCallback;
+     this.localStore = localStore;
+     this.datastore = datastore;
++    this.connectivityMonitor = connectivityMonitor;
+ 
+     listenTargets = new HashMap<>();
+     writePipeline = new ArrayDeque<>();
+@@ -201,6 +206,21 @@ public void onClose(Status status) {
+                 handleWriteStreamClose(status);
+               }
+             });
++
++    connectivityMonitor.addCallback(
++        (NetworkStatus networkStatus) -> {
++          workerQueue.enqueueAndForget(
++              () -> {
++                // If the network has been explicitly disabled, make sure we don't accidentally
++                // re-enable it.
++                if (canUseNetwork()) {
++                  // Tear down and re-create our network streams. This will ensure the backoffs are
++                  // reset.
++                  Logger.debug(LOG_TAG, "Restarting streams for network reachability change.");
++                  restartNetwork();
++                }
++              });
++        });
+   }
+ 
+   /** Re-enables the network. Only to be called as the counterpart to disableNetwork(). */
+@@ -221,6 +241,17 @@ public void enableNetwork() {
+     }
+   }
+ 
++  /**
++   * Re-enables the network, and forces the state to ONLINE. Without this, the state will be
++   * UNKNOWN. If the OnlineStateTracker updates the state from UNKNOWN to UNKNOWN, then it doesn't
++   * trigger the callback.
++   */
++  @VisibleForTesting
++  void forceEnableNetwork() {
++    enableNetwork();
++    onlineStateTracker.updateState(OnlineState.ONLINE);
++  }
++
+   /** Temporarily disables the network. The network can be re-enabled using enableNetwork(). */
+   public void disableNetwork() {
+     networkEnabled = false;
+@@ -242,6 +273,13 @@ private void disableNetworkInternal() {
+     cleanUpWatchStreamState();
+   }
+ 
++  private void restartNetwork() {
++    networkEnabled = false;
++    disableNetworkInternal();
++    onlineStateTracker.updateState(OnlineState.UNKNOWN);
++    enableNetwork();
++  }
++
+   /**
+    * Starts up the remote store, creating streams, restoring state from LocalStore, etc. This should
+    * called before using any other API endpoints in this class.
+@@ -257,6 +295,7 @@ public void start() {
+    */
+   public void shutdown() {
+     Logger.debug(LOG_TAG, "Shutting down");
++    connectivityMonitor.shutdown();
+     networkEnabled = false;
+     this.disableNetworkInternal();
+     datastore.shutdown();
+@@ -278,10 +317,7 @@ public void handleCredentialChange() {
+       // for the new user and re-fill the write pipeline with new mutations from the LocalStore
+       // (since mutations are per-user).
+       Logger.debug(LOG_TAG, "Restarting streams for new credential.");
+-      networkEnabled = false;
+-      disableNetworkInternal();
+-      onlineStateTracker.updateState(OnlineState.UNKNOWN);
+-      enableNetwork();
++      restartNetwork();
+     }
+   }
+ 
+diff --git a/firebase-firestore/src/main/java/com/google/firebase/firestore/util/ListenerRegistrationImpl.java b/firebase-firestore/src/main/java/com/google/firebase/firestore/util/ListenerRegistrationImpl.java
+index 630d5c58b..d42e41a29 100644
+--- a/firebase-firestore/src/main/java/com/google/firebase/firestore/util/ListenerRegistrationImpl.java
++++ b/firebase-firestore/src/main/java/com/google/firebase/firestore/util/ListenerRegistrationImpl.java
+@@ -78,6 +78,7 @@ synchronized void add(Runnable callback) {
+     CallbackList callbacks = new CallbackList();
+ 
+     @Override
++    @SuppressWarnings("SynchronizeOnNonFinalField")
+     public void onStop() {
+       super.onStop();
+ 
+@@ -100,6 +101,7 @@ public void onStop() {
+     CallbackList callbacks = new CallbackList();
+ 
+     @Override
++    @SuppressWarnings("SynchronizeOnNonFinalField")
+     public void onStop() {
+       super.onStop();
+ 
+@@ -116,6 +118,9 @@ public void onStop() {
+   @Nullable
+   private static <T> T castFragment(Class<T> fragmentClass, @Nullable Object fragment, String tag) {
+     try {
++      if (fragment == null) {
++        return null;
++      }
+       return fragmentClass.cast(fragment);
+     } catch (ClassCastException e) {
+       throw new IllegalStateException(
+@@ -132,8 +137,8 @@ public void onStop() {
+   private static final String FRAGMENT_TAG = "FirestoreOnStopObserverFragment";
+ 
+   /**
+-   * Implementation for non-FragmentActivity Activity's. Unfortunatly, all Fragment related
+-   * classes/methods with nonFragmentActivityActivity's are deprecated, implying that almost
++   * Implementation for non-FragmentActivity Activities. Unfortunately, all Fragment related
++   * classes/methods with nonFragmentActivityActivities are deprecated, implying that almost
+    * everything in this function is deprecated.
+    */
+   @SuppressWarnings("deprecation")
+diff --git a/firebase-firestore/src/test/java/com/google/firebase/firestore/DocumentChangeTest.java b/firebase-firestore/src/test/java/com/google/firebase/firestore/DocumentChangeTest.java
+index 9fc3a315d..56ca369cf 100644
+--- a/firebase-firestore/src/test/java/com/google/firebase/firestore/DocumentChangeTest.java
++++ b/firebase-firestore/src/test/java/com/google/firebase/firestore/DocumentChangeTest.java
+@@ -24,7 +24,7 @@
+ import static com.google.firebase.firestore.testutil.TestUtil.path;
+ import static com.google.firebase.firestore.testutil.TestUtil.targetChange;
+ import static java.util.Arrays.asList;
+-import static junit.framework.Assert.assertEquals;
++import static org.junit.Assert.assertEquals;
+ import static org.mockito.Mockito.mock;
+ 
+ import com.google.firebase.database.collection.ImmutableSortedMap;
+diff --git a/firebase-firestore/src/test/java/com/google/firebase/firestore/TestUtil.java b/firebase-firestore/src/test/java/com/google/firebase/firestore/TestUtil.java
+index 930906414..58d78838e 100644
+--- a/firebase-firestore/src/test/java/com/google/firebase/firestore/TestUtil.java
++++ b/firebase-firestore/src/test/java/com/google/firebase/firestore/TestUtil.java
+@@ -36,7 +36,7 @@
+ import java.util.HashMap;
+ import java.util.List;
+ import java.util.Map;
+-import junit.framework.Assert;
++import org.junit.Assert;
+ import org.robolectric.Robolectric;
+ 
+ public class TestUtil {
+diff --git a/firebase-firestore/src/test/java/com/google/firebase/firestore/core/EventManagerTest.java b/firebase-firestore/src/test/java/com/google/firebase/firestore/core/EventManagerTest.java
+index 2cf65c590..02644d365 100644
+--- a/firebase-firestore/src/test/java/com/google/firebase/firestore/core/EventManagerTest.java
++++ b/firebase-firestore/src/test/java/com/google/firebase/firestore/core/EventManagerTest.java
+@@ -15,8 +15,8 @@
+ package com.google.firebase.firestore.core;
+ 
+ import static com.google.firebase.firestore.testutil.TestUtil.path;
+-import static junit.framework.Assert.assertEquals;
+-import static org.mockito.Matchers.any;
++import static org.junit.Assert.assertEquals;
++import static org.mockito.ArgumentMatchers.any;
+ import static org.mockito.Mockito.doAnswer;
+ import static org.mockito.Mockito.inOrder;
+ import static org.mockito.Mockito.mock;
+diff --git a/firebase-firestore/src/test/java/com/google/firebase/firestore/local/LruGarbageCollectorTestCase.java b/firebase-firestore/src/test/java/com/google/firebase/firestore/local/LruGarbageCollectorTestCase.java
+index 65bdab22b..e53a1389f 100644
+--- a/firebase-firestore/src/test/java/com/google/firebase/firestore/local/LruGarbageCollectorTestCase.java
++++ b/firebase-firestore/src/test/java/com/google/firebase/firestore/local/LruGarbageCollectorTestCase.java
+@@ -124,7 +124,7 @@ private QueryData addNextQuery() {
+   }
+ 
+   private DocumentKey nextTestDocumentKey() {
+-    return DocumentKey.fromPathString("docs/doc_" + (++previousDocNum));
++    return DocumentKey.fromPathString("docs/doc_" + ++previousDocNum);
+   }
+ 
+   private Document nextTestDocument() {
+diff --git a/firebase-firestore/src/test/java/com/google/firebase/firestore/local/MutationQueueTestCase.java b/firebase-firestore/src/test/java/com/google/firebase/firestore/local/MutationQueueTestCase.java
+index ac3da7ec0..ccbbc7f0e 100644
+--- a/firebase-firestore/src/test/java/com/google/firebase/firestore/local/MutationQueueTestCase.java
++++ b/firebase-firestore/src/test/java/com/google/firebase/firestore/local/MutationQueueTestCase.java
+@@ -27,7 +27,6 @@
+ import static org.junit.Assert.assertFalse;
+ import static org.junit.Assert.assertNotNull;
+ import static org.junit.Assert.assertNull;
+-import static org.junit.Assert.assertThat;
+ import static org.junit.Assert.assertTrue;
+ 
+ import com.google.firebase.Timestamp;
+@@ -326,7 +325,6 @@ public void testAllMutationBatchesAffectingQuery_withCompoundBatches() {
+   @Test
+   public void testRemoveMutationBatches() {
+     List<MutationBatch> batches = createBatches(10);
+-    MutationBatch last = batches.get(batches.size() - 1);
+ 
+     removeMutationBatches(batches.remove(0));
+     assertEquals(9, batchCount());
+diff --git a/firebase-firestore/src/test/java/com/google/firebase/firestore/local/RemoteDocumentCacheTestCase.java b/firebase-firestore/src/test/java/com/google/firebase/firestore/local/RemoteDocumentCacheTestCase.java
+index 06c38e7ba..5b575dfaa 100644
+--- a/firebase-firestore/src/test/java/com/google/firebase/firestore/local/RemoteDocumentCacheTestCase.java
++++ b/firebase-firestore/src/test/java/com/google/firebase/firestore/local/RemoteDocumentCacheTestCase.java
+@@ -106,7 +106,7 @@ public void testReadSeveralDocumentsIncludingMissingDocument() {
+     }
+     written.put(DocumentKey.fromPathString("foo/nonexistent"), null);
+ 
+-    List<String> keys = new ArrayList(Arrays.asList(paths));
++    List<String> keys = new ArrayList<>(Arrays.asList(paths));
+     keys.add("foo/nonexistent");
+     Map<DocumentKey, MaybeDocument> read = getAll(keys);
+     assertEquals(written, read);
+diff --git a/firebase-firestore/src/test/java/com/google/firebase/firestore/local/SQLiteSchemaTest.java b/firebase-firestore/src/test/java/com/google/firebase/firestore/local/SQLiteSchemaTest.java
+index df94b7cf6..17060be2e 100644
+--- a/firebase-firestore/src/test/java/com/google/firebase/firestore/local/SQLiteSchemaTest.java
++++ b/firebase-firestore/src/test/java/com/google/firebase/firestore/local/SQLiteSchemaTest.java
+@@ -291,7 +291,7 @@ public void addsSentinelRows() {
+               String path = row.getString(0);
+               long sequenceNumber = row.getLong(1);
+ 
+-              int docNum = Integer.parseInt(path.split("_")[1]);
++              int docNum = Integer.parseInt(path.split("_", -1)[1]);
+               // The even documents were missing sequence numbers, they should now be filled in
+               // to have the new sequence number. The odd documents should have their
+               // sequence number unchanged, and so be the old value.
+diff --git a/firebase-firestore/src/test/java/com/google/firebase/firestore/model/DocumentSetTest.java b/firebase-firestore/src/test/java/com/google/firebase/firestore/model/DocumentSetTest.java
+index 77e2b8904..0c1645eea 100644
+--- a/firebase-firestore/src/test/java/com/google/firebase/firestore/model/DocumentSetTest.java
++++ b/firebase-firestore/src/test/java/com/google/firebase/firestore/model/DocumentSetTest.java
+@@ -18,10 +18,10 @@
+ import static com.google.firebase.firestore.testutil.TestUtil.docSet;
+ import static com.google.firebase.firestore.testutil.TestUtil.field;
+ import static com.google.firebase.firestore.testutil.TestUtil.map;
+-import static junit.framework.Assert.assertFalse;
+-import static junit.framework.Assert.assertNull;
+ import static org.junit.Assert.assertEquals;
++import static org.junit.Assert.assertFalse;
+ import static org.junit.Assert.assertNotEquals;
++import static org.junit.Assert.assertNull;
+ import static org.junit.Assert.assertTrue;
+ 
+ import com.google.firebase.firestore.model.value.FieldValue;
+@@ -38,13 +38,10 @@
+ public class DocumentSetTest {
+ 
+   private static final Comparator<Document> TEST_COMPARATOR =
+-      new Comparator<Document>() {
+-        @Override
+-        public int compare(Document left, Document right) {
+-          FieldValue leftValue = left.getField(field("sort"));
+-          FieldValue rightValue = right.getField(field("sort"));
+-          return leftValue.compareTo(rightValue);
+-        }
++      (left, right) -> {
++        FieldValue leftValue = left.getField(field("sort"));
++        FieldValue rightValue = right.getField(field("sort"));
++        return leftValue.compareTo(rightValue);
+       };
+ 
+   private static final Document DOC1 = doc("docs/1", 0, map("sort", 2));
+diff --git a/firebase-firestore/src/test/java/com/google/firebase/firestore/model/FieldValueTest.java b/firebase-firestore/src/test/java/com/google/firebase/firestore/model/FieldValueTest.java
+index 7855d4bea..6215f3b6c 100644
+--- a/firebase-firestore/src/test/java/com/google/firebase/firestore/model/FieldValueTest.java
++++ b/firebase-firestore/src/test/java/com/google/firebase/firestore/model/FieldValueTest.java
+@@ -275,7 +275,7 @@ public void testExtractsFields() {
+     FieldValue val = wrapObject("foo", map("a", 1, "b", true, "c", "string"));
+     assertTrue(val instanceof ObjectValue);
+     ObjectValue obj = (ObjectValue) val;
+-    assertTrue((obj.get(field("foo"))) instanceof ObjectValue);
++    assertTrue(obj.get(field("foo")) instanceof ObjectValue);
+     assertEquals(wrap(1), obj.get(field("foo.a")));
+     assertEquals(wrap(true), obj.get(field("foo.b")));
+     assertEquals(wrap("string"), obj.get(field("foo.c")));
+diff --git a/firebase-firestore/src/test/java/com/google/firebase/firestore/remote/RemoteEventTest.java b/firebase-firestore/src/test/java/com/google/firebase/firestore/remote/RemoteEventTest.java
+index aabf04506..7611a252b 100644
+--- a/firebase-firestore/src/test/java/com/google/firebase/firestore/remote/RemoteEventTest.java
++++ b/firebase-firestore/src/test/java/com/google/firebase/firestore/remote/RemoteEventTest.java
+@@ -25,11 +25,11 @@
+ import static com.google.firebase.firestore.testutil.TestUtil.version;
+ import static java.util.Arrays.asList;
+ import static java.util.Collections.emptyList;
+-import static junit.framework.Assert.fail;
+ import static org.junit.Assert.assertEquals;
+ import static org.junit.Assert.assertFalse;
+ import static org.junit.Assert.assertNull;
+ import static org.junit.Assert.assertTrue;
++import static org.junit.Assert.fail;
+ 
+ import com.google.firebase.database.collection.ImmutableSortedSet;
+ import com.google.firebase.firestore.TestUtil.TestTargetMetadataProvider;
+diff --git a/firebase-firestore/src/test/java/com/google/firebase/firestore/spec/SpecTestCase.java b/firebase-firestore/src/test/java/com/google/firebase/firestore/spec/SpecTestCase.java
+index 32cccd33d..24a9ec75d 100644
+--- a/firebase-firestore/src/test/java/com/google/firebase/firestore/spec/SpecTestCase.java
++++ b/firebase-firestore/src/test/java/com/google/firebase/firestore/spec/SpecTestCase.java
+@@ -56,6 +56,8 @@
+ import com.google.firebase.firestore.model.mutation.Mutation;
+ import com.google.firebase.firestore.model.mutation.MutationBatchResult;
+ import com.google.firebase.firestore.model.mutation.MutationResult;
++import com.google.firebase.firestore.remote.AndroidConnectivityMonitor;
++import com.google.firebase.firestore.remote.ConnectivityMonitor;
+ import com.google.firebase.firestore.remote.ExistenceFilter;
+ import com.google.firebase.firestore.remote.MockDatastore;
+ import com.google.firebase.firestore.remote.RemoteEvent;
+@@ -266,7 +268,9 @@ private void initClient() {
+     // Set up the sync engine and various stores.
+     datastore = new MockDatastore(queue, RuntimeEnvironment.application);
+ 
+-    remoteStore = new RemoteStore(this, localStore, datastore, queue);
++    ConnectivityMonitor connectivityMonitor =
++        new AndroidConnectivityMonitor(RuntimeEnvironment.application);
++    remoteStore = new RemoteStore(this, localStore, datastore, queue, connectivityMonitor);
+     syncEngine = new SyncEngine(localStore, remoteStore, currentUser);
+     eventManager = new EventManager(syncEngine);
+     localStore.start();
+diff --git a/firebase-firestore/src/test/java/com/google/firebase/firestore/util/MapperTest.java b/firebase-firestore/src/test/java/com/google/firebase/firestore/util/MapperTest.java
+index 13b3baa93..956b140ab 100644
+--- a/firebase-firestore/src/test/java/com/google/firebase/firestore/util/MapperTest.java
++++ b/firebase-firestore/src/test/java/com/google/firebase/firestore/util/MapperTest.java
+@@ -41,7 +41,7 @@
+ @Config(manifest = Config.NONE)
+ @SuppressWarnings({"unused", "WeakerAccess", "SpellCheckingInspection"})
+ public class MapperTest {
+-  private static final double EPSILON = 0.00001f;
++  private static final double EPSILON = 0.0003;
+ 
+   private static class StringBean {
+     private String value;
+diff --git a/firebase-functions/firebase-functions.gradle b/firebase-functions/firebase-functions.gradle
+index b5632182a..f90225b41 100644
+--- a/firebase-functions/firebase-functions.gradle
++++ b/firebase-functions/firebase-functions.gradle
+@@ -14,18 +14,16 @@
+ 
+ apply plugin: 'com.android.library'
+ 
+-def androidVersion = 28
+-
+ android {
+     adbOptions {
+         timeOutInMs 60 * 1000
+     }
+ 
+-    compileSdkVersion androidVersion
++    compileSdkVersion project.targetSdkVersion
+     defaultConfig {
+-        targetSdkVersion androidVersion
+-        minSdkVersion 14
+-
++        targetSdkVersion project.targetSdkVersion
++        minSdkVersion project.minSdkVersion
++        versionName version
+         multiDexEnabled true
+         testInstrumentationRunner "android.support.test.runner.AndroidJUnitRunner"
+     }
+diff --git a/firebase-inappmessaging-display/firebase-inappmessaging-display.gradle b/firebase-inappmessaging-display/firebase-inappmessaging-display.gradle
+index a4ffd4b3b..d17875974 100644
+--- a/firebase-inappmessaging-display/firebase-inappmessaging-display.gradle
++++ b/firebase-inappmessaging-display/firebase-inappmessaging-display.gradle
+@@ -15,11 +15,10 @@
+ apply plugin: "com.android.library"
+ 
+ android {
+-    compileSdkVersion 28
+-
++    compileSdkVersion project.targetSdkVersion
+     defaultConfig {
+         minSdkVersion 16
+-        targetSdkVersion 28
++        targetSdkVersion project.targetSdkVersion
+         versionCode 1
+         versionName "1.0"
+         multiDexEnabled true
+diff --git a/firebase-storage/firebase-storage.gradle b/firebase-storage/firebase-storage.gradle
+index 1ae9c9a84..dd2640083 100644
+--- a/firebase-storage/firebase-storage.gradle
++++ b/firebase-storage/firebase-storage.gradle
+@@ -14,8 +14,6 @@
+ 
+ apply plugin: 'com.android.library'
+ 
+-def androidVersion = 28
+-
+ 
+ tasks.withType(org.gradle.api.tasks.testing.Test) {
+     testLogging {
+@@ -32,11 +30,12 @@ android {
+         timeOutInMs 60 * 1000
+     }
+ 
+-    compileSdkVersion androidVersion
++    compileSdkVersion project.targetSdkVersion
+     defaultConfig {
+-        targetSdkVersion androidVersion
+-        minSdkVersion 14
++        targetSdkVersion project.targetSdkVersion
++        minSdkVersion project.minSdkVersion
+         multiDexEnabled true
++        versionName version
+         testInstrumentationRunner "android.support.test.runner.AndroidJUnitRunner"
+     }
+ 
+diff --git a/protolite-well-known-types/protolite-well-known-types.gradle b/protolite-well-known-types/protolite-well-known-types.gradle
+index f7962ff7c..fd54bd8bf 100644
+--- a/protolite-well-known-types/protolite-well-known-types.gradle
++++ b/protolite-well-known-types/protolite-well-known-types.gradle
+@@ -40,11 +40,10 @@ protobuf {
+     }
+ }
+ android {
+-    compileSdkVersion 28
+-
++    compileSdkVersion project.targetSdkVersion
+     defaultConfig {
+-        minSdkVersion 14
+-        targetSdkVersion 28
++        targetSdkVersion project.targetSdkVersion
++        minSdkVersion project.minSdkVersion
+         versionCode 1
+         versionName '1.0'
+     }
+diff --git a/root-project.gradle b/root-project.gradle
+index 3c95165a9..72ed875cc 100644
+--- a/root-project.gradle
++++ b/root-project.gradle
+@@ -37,6 +37,8 @@ buildscript {
+     }
+ }
+ 
++apply from: 'sdkProperties.gradle'
++
+ ext {
+     playServicesVersion = '16.0.1'
+     supportAnnotationsVersion = '28.0.0'
+@@ -48,6 +50,7 @@ ext {
+ 
+ apply plugin: com.google.firebase.gradle.plugins.publish.PublishingPlugin
+ apply plugin: com.google.firebase.gradle.plugins.ci.ContinuousIntegrationPlugin
++apply plugin: com.google.firebase.gradle.plugins.ci.metrics.MetricsPlugin
+ 
+ firebaseContinuousIntegration {
+     ignorePaths = [
+@@ -156,22 +159,6 @@ configure(subprojects) {
+         }
+ 
+         sub.apply plugin: LicenseResolverPlugin
+-        sub.thirdPartyLicenses {
+-            def root = "file://$rootDir/third_party/licenses"
+-
+-            add 'CCTZ', "$root/apache-2.0.txt"
+-            add 'ICU4C', "$root/icu.txt"
+-            add 'JSR 305', "$root/jsr305.txt"
+-            add 'PCRE', "$root/pcre.txt"
+-            add 'Protobuf Nano', "$root/nanoproto.txt"
+-            add 'RE2', "$root/re2.txt"
+-            add 'STL', "$root/sgi-stl.txt"
+-            add 'UTF', "$root/utf.txt"
+-            add 'darts_clone', "$root/darts_clone.txt"
+-            add 'flatbuffers', "$root/apache-2.0.txt"
+-            add 'safeparcel', "$root/apache-2.0.txt"
+-            add 'zlib', "$root/zlib.txt"
+-        }
+     }
+ }
+ 
+diff --git a/sdkProperties.gradle b/sdkProperties.gradle
+new file mode 100644
+index 000000000..4b9b817ac
+--- /dev/null
++++ b/sdkProperties.gradle
+@@ -0,0 +1,18 @@
++// Copyright 2018 Google LLC
++//
++// Licensed under the Apache License, Version 2.0 (the "License");
++// you may not use this file except in compliance with the License.
++// You may obtain a copy of the License at
++//
++//      http://www.apache.org/licenses/LICENSE-2.0
++//
++// Unless required by applicable law or agreed to in writing, software
++// distributed under the License is distributed on an "AS IS" BASIS,
++// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++// See the License for the specific language governing permissions and
++// limitations under the License.
++
++ext {
++    targetSdkVersion = 28
++    minSdkVersion = 14
++}
+\ No newline at end of file
+diff --git a/test-apps/build.gradle b/test-apps/build.gradle
+index c101239bc..a1d2a4ece 100644
+--- a/test-apps/build.gradle
++++ b/test-apps/build.gradle
+@@ -31,6 +31,8 @@ plugins {
+     id 'com.github.ben-manes.versions' version '0.20.0'
+ }
+ 
++apply from: '../sdkProperties.gradle'
++
+ allprojects {
+     ext.testBuildType = project.getProperties().get("testBuildType", "debug")
+ 
+diff --git a/test-apps/database-test-app/build.gradle b/test-apps/database-test-app/build.gradle
+index b2a06dbcc..633ceecd0 100644
+--- a/test-apps/database-test-app/build.gradle
++++ b/test-apps/database-test-app/build.gradle
+@@ -18,12 +18,12 @@ apply plugin: 'com.android.application'
+ 
+ android {
+     testBuildType = project.testBuildType
+-    compileSdkVersion 28
++    compileSdkVersion project.targetSdkVersion
+ 
+     defaultConfig {
+         applicationId "com.google.firebase.testapps.database"
+         minSdkVersion 16
+-        targetSdkVersion 28
++        targetSdkVersion project.targetSdkVersion
+         versionCode 1
+         versionName "1.0"
+         multiDexEnabled true
+diff --git a/test-apps/firestore-test-app/build.gradle b/test-apps/firestore-test-app/build.gradle
+index 33ea575d6..395d3f6c6 100644
+--- a/test-apps/firestore-test-app/build.gradle
++++ b/test-apps/firestore-test-app/build.gradle
+@@ -18,12 +18,12 @@ apply plugin: 'com.android.application'
+ 
+ android {
+     testBuildType = project.testBuildType
+-    compileSdkVersion 28
++    compileSdkVersion project.targetSdkVersion
+ 
+     defaultConfig {
+         applicationId "com.google.firebase.testapps.firestore"
+         minSdkVersion 16
+-        targetSdkVersion 28
++        targetSdkVersion project.targetSdkVersion
+         versionCode 1
+         versionName "1.0"
+         multiDexEnabled true
+diff --git a/test-apps/functions-test-app/build.gradle b/test-apps/functions-test-app/build.gradle
+index 23d0ef60a..d213d280b 100644
+--- a/test-apps/functions-test-app/build.gradle
++++ b/test-apps/functions-test-app/build.gradle
+@@ -18,12 +18,12 @@ apply plugin: 'com.android.application'
+ 
+ android {
+     testBuildType = project.testBuildType
+-    compileSdkVersion 28
++    compileSdkVersion project.targetSdkVersion
+ 
+     defaultConfig {
+         applicationId "com.google.firebase.testapps.functions"
+         minSdkVersion 16
+-        targetSdkVersion 28
++        targetSdkVersion project.targetSdkVersion
+         versionCode 1
+         versionName "1.0"
+         testInstrumentationRunner 'android.support.test.runner.AndroidJUnitRunner'
+diff --git a/test-apps/storage-test-app/build.gradle b/test-apps/storage-test-app/build.gradle
+index 3412c1c9f..452af173a 100644
+--- a/test-apps/storage-test-app/build.gradle
++++ b/test-apps/storage-test-app/build.gradle
+@@ -18,12 +18,12 @@ apply plugin: 'com.android.application'
+ 
+ android {
+     testBuildType = project.testBuildType
+-    compileSdkVersion 28
++    compileSdkVersion project.targetSdkVersion
+ 
+     defaultConfig {
+         applicationId "com.google.firebase.testapps.storage"
+         minSdkVersion 16
+-        targetSdkVersion 28
++        targetSdkVersion project.targetSdkVersion
+         versionCode 1
+         versionName "1.0"
+         multiDexEnabled true
+diff --git a/third_party/licenses/apache-2.0.txt b/third_party/licenses/apache-2.0.txt
+deleted file mode 100644
+index 7a4a3ea24..000000000
+--- a/third_party/licenses/apache-2.0.txt
++++ /dev/null
+@@ -1,202 +0,0 @@
+-
+-                                 Apache License
+-                           Version 2.0, January 2004
+-                        http://www.apache.org/licenses/
+-
+-   TERMS AND CONDITIONS FOR USE, REPRODUCTION, AND DISTRIBUTION
+-
+-   1. Definitions.
+-
+-      "License" shall mean the terms and conditions for use, reproduction,
+-      and distribution as defined by Sections 1 through 9 of this document.
+-
+-      "Licensor" shall mean the copyright owner or entity authorized by
+-      the copyright owner that is granting the License.
+-
+-      "Legal Entity" shall mean the union of the acting entity and all
+-      other entities that control, are controlled by, or are under common
+-      control with that entity. For the purposes of this definition,
+-      "control" means (i) the power, direct or indirect, to cause the
+-      direction or management of such entity, whether by contract or
+-      otherwise, or (ii) ownership of fifty percent (50%) or more of the
+-      outstanding shares, or (iii) beneficial ownership of such entity.
+-
+-      "You" (or "Your") shall mean an individual or Legal Entity
+-      exercising permissions granted by this License.
+-
+-      "Source" form shall mean the preferred form for making modifications,
+-      including but not limited to software source code, documentation
+-      source, and configuration files.
+-
+-      "Object" form shall mean any form resulting from mechanical
+-      transformation or translation of a Source form, including but
+-      not limited to compiled object code, generated documentation,
+-      and conversions to other media types.
+-
+-      "Work" shall mean the work of authorship, whether in Source or
+-      Object form, made available under the License, as indicated by a
+-      copyright notice that is included in or attached to the work
+-      (an example is provided in the Appendix below).
+-
+-      "Derivative Works" shall mean any work, whether in Source or Object
+-      form, that is based on (or derived from) the Work and for which the
+-      editorial revisions, annotations, elaborations, or other modifications
+-      represent, as a whole, an original work of authorship. For the purposes
+-      of this License, Derivative Works shall not include works that remain
+-      separable from, or merely link (or bind by name) to the interfaces of,
+-      the Work and Derivative Works thereof.
+-
+-      "Contribution" shall mean any work of authorship, including
+-      the original version of the Work and any modifications or additions
+-      to that Work or Derivative Works thereof, that is intentionally
+-      submitted to Licensor for inclusion in the Work by the copyright owner
+-      or by an individual or Legal Entity authorized to submit on behalf of
+-      the copyright owner. For the purposes of this definition, "submitted"
+-      means any form of electronic, verbal, or written communication sent
+-      to the Licensor or its representatives, including but not limited to
+-      communication on electronic mailing lists, source code control systems,
+-      and issue tracking systems that are managed by, or on behalf of, the
+-      Licensor for the purpose of discussing and improving the Work, but
+-      excluding communication that is conspicuously marked or otherwise
+-      designated in writing by the copyright owner as "Not a Contribution."
+-
+-      "Contributor" shall mean Licensor and any individual or Legal Entity
+-      on behalf of whom a Contribution has been received by Licensor and
+-      subsequently incorporated within the Work.
+-
+-   2. Grant of Copyright License. Subject to the terms and conditions of
+-      this License, each Contributor hereby grants to You a perpetual,
+-      worldwide, non-exclusive, no-charge, royalty-free, irrevocable
+-      copyright license to reproduce, prepare Derivative Works of,
+-      publicly display, publicly perform, sublicense, and distribute the
+-      Work and such Derivative Works in Source or Object form.
+-
+-   3. Grant of Patent License. Subject to the terms and conditions of
+-      this License, each Contributor hereby grants to You a perpetual,
+-      worldwide, non-exclusive, no-charge, royalty-free, irrevocable
+-      (except as stated in this section) patent license to make, have made,
+-      use, offer to sell, sell, import, and otherwise transfer the Work,
+-      where such license applies only to those patent claims licensable
+-      by such Contributor that are necessarily infringed by their
+-      Contribution(s) alone or by combination of their Contribution(s)
+-      with the Work to which such Contribution(s) was submitted. If You
+-      institute patent litigation against any entity (including a
+-      cross-claim or counterclaim in a lawsuit) alleging that the Work
+-      or a Contribution incorporated within the Work constitutes direct
+-      or contributory patent infringement, then any patent licenses
+-      granted to You under this License for that Work shall terminate
+-      as of the date such litigation is filed.
+-
+-   4. Redistribution. You may reproduce and distribute copies of the
+-      Work or Derivative Works thereof in any medium, with or without
+-      modifications, and in Source or Object form, provided that You
+-      meet the following conditions:
+-
+-      (a) You must give any other recipients of the Work or
+-          Derivative Works a copy of this License; and
+-
+-      (b) You must cause any modified files to carry prominent notices
+-          stating that You changed the files; and
+-
+-      (c) You must retain, in the Source form of any Derivative Works
+-          that You distribute, all copyright, patent, trademark, and
+-          attribution notices from the Source form of the Work,
+-          excluding those notices that do not pertain to any part of
+-          the Derivative Works; and
+-
+-      (d) If the Work includes a "NOTICE" text file as part of its
+-          distribution, then any Derivative Works that You distribute must
+-          include a readable copy of the attribution notices contained
+-          within such NOTICE file, excluding those notices that do not
+-          pertain to any part of the Derivative Works, in at least one
+-          of the following places: within a NOTICE text file distributed
+-          as part of the Derivative Works; within the Source form or
+-          documentation, if provided along with the Derivative Works; or,
+-          within a display generated by the Derivative Works, if and
+-          wherever such third-party notices normally appear. The contents
+-          of the NOTICE file are for informational purposes only and
+-          do not modify the License. You may add Your own attribution
+-          notices within Derivative Works that You distribute, alongside
+-          or as an addendum to the NOTICE text from the Work, provided
+-          that such additional attribution notices cannot be construed
+-          as modifying the License.
+-
+-      You may add Your own copyright statement to Your modifications and
+-      may provide additional or different license terms and conditions
+-      for use, reproduction, or distribution of Your modifications, or
+-      for any such Derivative Works as a whole, provided Your use,
+-      reproduction, and distribution of the Work otherwise complies with
+-      the conditions stated in this License.
+-
+-   5. Submission of Contributions. Unless You explicitly state otherwise,
+-      any Contribution intentionally submitted for inclusion in the Work
+-      by You to the Licensor shall be under the terms and conditions of
+-      this License, without any additional terms or conditions.
+-      Notwithstanding the above, nothing herein shall supersede or modify
+-      the terms of any separate license agreement you may have executed
+-      with Licensor regarding such Contributions.
+-
+-   6. Trademarks. This License does not grant permission to use the trade
+-      names, trademarks, service marks, or product names of the Licensor,
+-      except as required for reasonable and customary use in describing the
+-      origin of the Work and reproducing the content of the NOTICE file.
+-
+-   7. Disclaimer of Warranty. Unless required by applicable law or
+-      agreed to in writing, Licensor provides the Work (and each
+-      Contributor provides its Contributions) on an "AS IS" BASIS,
+-      WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or
+-      implied, including, without limitation, any warranties or conditions
+-      of TITLE, NON-INFRINGEMENT, MERCHANTABILITY, or FITNESS FOR A
+-      PARTICULAR PURPOSE. You are solely responsible for determining the
+-      appropriateness of using or redistributing the Work and assume any
+-      risks associated with Your exercise of permissions under this License.
+-
+-   8. Limitation of Liability. In no event and under no legal theory,
+-      whether in tort (including negligence), contract, or otherwise,
+-      unless required by applicable law (such as deliberate and grossly
+-      negligent acts) or agreed to in writing, shall any Contributor be
+-      liable to You for damages, including any direct, indirect, special,
+-      incidental, or consequential damages of any character arising as a
+-      result of this License or out of the use or inability to use the
+-      Work (including but not limited to damages for loss of goodwill,
+-      work stoppage, computer failure or malfunction, or any and all
+-      other commercial damages or losses), even if such Contributor
+-      has been advised of the possibility of such damages.
+-
+-   9. Accepting Warranty or Additional Liability. While redistributing
+-      the Work or Derivative Works thereof, You may choose to offer,
+-      and charge a fee for, acceptance of support, warranty, indemnity,
+-      or other liability obligations and/or rights consistent with this
+-      License. However, in accepting such obligations, You may act only
+-      on Your own behalf and on Your sole responsibility, not on behalf
+-      of any other Contributor, and only if You agree to indemnify,
+-      defend, and hold each Contributor harmless for any liability
+-      incurred by, or claims asserted against, such Contributor by reason
+-      of your accepting any such warranty or additional liability.
+-
+-   END OF TERMS AND CONDITIONS
+-
+-   APPENDIX: How to apply the Apache License to your work.
+-
+-      To apply the Apache License to your work, attach the following
+-      boilerplate notice, with the fields enclosed by brackets "[]"
+-      replaced with your own identifying information. (Don't include
+-      the brackets!)  The text should be enclosed in the appropriate
+-      comment syntax for the file format. We also recommend that a
+-      file or class name and description of purpose be included on the
+-      same "printed page" as the copyright notice for easier
+-      identification within third-party archives.
+-
+-   Copyright [yyyy] [name of copyright owner]
+-
+-   Licensed under the Apache License, Version 2.0 (the "License");
+-   you may not use this file except in compliance with the License.
+-   You may obtain a copy of the License at
+-
+-       http://www.apache.org/licenses/LICENSE-2.0
+-
+-   Unless required by applicable law or agreed to in writing, software
+-   distributed under the License is distributed on an "AS IS" BASIS,
+-   WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+-   See the License for the specific language governing permissions and
+-   limitations under the License.
+\ No newline at end of file
+diff --git a/third_party/licenses/darts_clone.txt b/third_party/licenses/darts_clone.txt
+deleted file mode 100644
+index 4fdaa9cd8..000000000
+--- a/third_party/licenses/darts_clone.txt
++++ /dev/null
+@@ -1,10 +0,0 @@
+-Copyright (c) 2008-2011, Susumu Yata
+-All rights reserved.
+-
+-Redistribution and use in source and binary forms, with or without modification, are permitted provided that the following conditions are met:
+-
+-- Redistributions of source code must retain the above copyright notice, this list of conditions and the following disclaimer.
+-- Redistributions in binary form must reproduce the above copyright notice, this list of conditions and the following disclaimer in the documentation and/or other materials provided with the distribution.
+-- Neither the name of the <ORGANIZATION> nor the names of its contributors may be used to endorse or promote products derived from this software without specific prior written permission.
+-
+-THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS "AS IS" AND ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE ARE DISCLAIMED. IN NO EVENT SHALL THE COPYRIGHT OWNER OR CONTRIBUTORS BE LIABLE FOR ANY DIRECT, INDIRECT, INCIDENTAL, SPECIAL, EXEMPLARY, OR CONSEQUENTIAL DAMAGES (INCLUDING, BUT NOT LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS OR SERVICES; LOSS OF USE, DATA, OR PROFITS; OR BUSINESS INTERRUPTION) HOWEVER CAUSED AND ON ANY THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY, OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
+\ No newline at end of file
+diff --git a/third_party/licenses/icu.txt b/third_party/licenses/icu.txt
+deleted file mode 100644
+index fd63d7fd7..000000000
+--- a/third_party/licenses/icu.txt
++++ /dev/null
+@@ -1,385 +0,0 @@
+-COPYRIGHT AND PERMISSION NOTICE (ICU 58 and later)
+-
+-Copyright © 1991-2017 Unicode, Inc. All rights reserved.
+-Distributed under the Terms of Use in http://www.unicode.org/copyright.html
+-
+-Permission is hereby granted, free of charge, to any person obtaining
+-a copy of the Unicode data files and any associated documentation
+-(the "Data Files") or Unicode software and any associated documentation
+-(the "Software") to deal in the Data Files or Software
+-without restriction, including without limitation the rights to use,
+-copy, modify, merge, publish, distribute, and/or sell copies of
+-the Data Files or Software, and to permit persons to whom the Data Files
+-or Software are furnished to do so, provided that either
+-(a) this copyright and permission notice appear with all copies
+-of the Data Files or Software, or
+-(b) this copyright and permission notice appear in associated
+-Documentation.
+-
+-THE DATA FILES AND SOFTWARE ARE PROVIDED "AS IS", WITHOUT WARRANTY OF
+-ANY KIND, EXPRESS OR IMPLIED, INCLUDING BUT NOT LIMITED TO THE
+-WARRANTIES OF MERCHANTABILITY, FITNESS FOR A PARTICULAR PURPOSE AND
+-NONINFRINGEMENT OF THIRD PARTY RIGHTS.
+-IN NO EVENT SHALL THE COPYRIGHT HOLDER OR HOLDERS INCLUDED IN THIS
+-NOTICE BE LIABLE FOR ANY CLAIM, OR ANY SPECIAL INDIRECT OR CONSEQUENTIAL
+-DAMAGES, OR ANY DAMAGES WHATSOEVER RESULTING FROM LOSS OF USE,
+-DATA OR PROFITS, WHETHER IN AN ACTION OF CONTRACT, NEGLIGENCE OR OTHER
+-TORTIOUS ACTION, ARISING OUT OF OR IN CONNECTION WITH THE USE OR
+-PERFORMANCE OF THE DATA FILES OR SOFTWARE.
+-
+-Except as contained in this notice, the name of a copyright holder
+-shall not be used in advertising or otherwise to promote the sale,
+-use or other dealings in these Data Files or Software without prior
+-written authorization of the copyright holder.
+-
+----------------------
+-
+-Third-Party Software Licenses
+-
+-This section contains third-party software notices and/or additional
+-terms for licensed third-party software components included within ICU
+-libraries.
+-
+-1. ICU License - ICU 1.8.1 to ICU 57.1
+-
+-COPYRIGHT AND PERMISSION NOTICE
+-
+-Copyright (c) 1995-2016 International Business Machines Corporation and others
+-All rights reserved.
+-
+-Permission is hereby granted, free of charge, to any person obtaining
+-a copy of this software and associated documentation files (the
+-"Software"), to deal in the Software without restriction, including
+-without limitation the rights to use, copy, modify, merge, publish,
+-distribute, and/or sell copies of the Software, and to permit persons
+-to whom the Software is furnished to do so, provided that the above
+-copyright notice(s) and this permission notice appear in all copies of
+-the Software and that both the above copyright notice(s) and this
+-permission notice appear in supporting documentation.
+-
+-THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND,
+-EXPRESS OR IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF
+-MERCHANTABILITY, FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT
+-OF THIRD PARTY RIGHTS. IN NO EVENT SHALL THE COPYRIGHT HOLDER OR
+-HOLDERS INCLUDED IN THIS NOTICE BE LIABLE FOR ANY CLAIM, OR ANY
+-SPECIAL INDIRECT OR CONSEQUENTIAL DAMAGES, OR ANY DAMAGES WHATSOEVER
+-RESULTING FROM LOSS OF USE, DATA OR PROFITS, WHETHER IN AN ACTION OF
+-CONTRACT, NEGLIGENCE OR OTHER TORTIOUS ACTION, ARISING OUT OF OR IN
+-CONNECTION WITH THE USE OR PERFORMANCE OF THIS SOFTWARE.
+-
+-Except as contained in this notice, the name of a copyright holder
+-shall not be used in advertising or otherwise to promote the sale, use
+-or other dealings in this Software without prior written authorization
+-of the copyright holder.
+-
+-All trademarks and registered trademarks mentioned herein are the
+-property of their respective owners.
+-
+-2. Chinese/Japanese Word Break Dictionary Data (cjdict.txt)
+-
+- #     The Google Chrome software developed by Google is licensed under
+- # the BSD license. Other software included in this distribution is
+- # provided under other licenses, as set forth below.
+- #
+- #  The BSD License
+- #  http://opensource.org/licenses/bsd-license.php
+- #  Copyright (C) 2006-2008, Google Inc.
+- #
+- #  All rights reserved.
+- #
+- #  Redistribution and use in source and binary forms, with or without
+- # modification, are permitted provided that the following conditions are met:
+- #
+- #  Redistributions of source code must retain the above copyright notice,
+- # this list of conditions and the following disclaimer.
+- #  Redistributions in binary form must reproduce the above
+- # copyright notice, this list of conditions and the following
+- # disclaimer in the documentation and/or other materials provided with
+- # the distribution.
+- #  Neither the name of  Google Inc. nor the names of its
+- # contributors may be used to endorse or promote products derived from
+- # this software without specific prior written permission.
+- #
+- #
+- #  THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND
+- # CONTRIBUTORS "AS IS" AND ANY EXPRESS OR IMPLIED WARRANTIES,
+- # INCLUDING, BUT NOT LIMITED TO, THE IMPLIED WARRANTIES OF
+- # MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE ARE
+- # DISCLAIMED. IN NO EVENT SHALL THE COPYRIGHT OWNER OR CONTRIBUTORS BE
+- # LIABLE FOR ANY DIRECT, INDIRECT, INCIDENTAL, SPECIAL, EXEMPLARY, OR
+- # CONSEQUENTIAL DAMAGES (INCLUDING, BUT NOT LIMITED TO, PROCUREMENT OF
+- # SUBSTITUTE GOODS OR SERVICES; LOSS OF USE, DATA, OR PROFITS; OR
+- # BUSINESS INTERRUPTION) HOWEVER CAUSED AND ON ANY THEORY OF
+- # LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY, OR TORT (INCLUDING
+- # NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE OF THIS
+- # SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
+- #
+- #
+- #  The word list in cjdict.txt are generated by combining three word lists
+- # listed below with further processing for compound word breaking. The
+- # frequency is generated with an iterative training against Google web
+- # corpora.
+- #
+- #  * Libtabe (Chinese)
+- #    - https://sourceforge.net/project/?group_id=1519
+- #    - Its license terms and conditions are shown below.
+- #
+- #  * IPADIC (Japanese)
+- #    - http://chasen.aist-nara.ac.jp/chasen/distribution.html
+- #    - Its license terms and conditions are shown below.
+- #
+- #  ---------COPYING.libtabe ---- BEGIN--------------------
+- #
+- #  /*
+- #   * Copyright (c) 1999 TaBE Project.
+- #   * Copyright (c) 1999 Pai-Hsiang Hsiao.
+- #   * All rights reserved.
+- #   *
+- #   * Redistribution and use in source and binary forms, with or without
+- #   * modification, are permitted provided that the following conditions
+- #   * are met:
+- #   *
+- #   * . Redistributions of source code must retain the above copyright
+- #   *   notice, this list of conditions and the following disclaimer.
+- #   * . Redistributions in binary form must reproduce the above copyright
+- #   *   notice, this list of conditions and the following disclaimer in
+- #   *   the documentation and/or other materials provided with the
+- #   *   distribution.
+- #   * . Neither the name of the TaBE Project nor the names of its
+- #   *   contributors may be used to endorse or promote products derived
+- #   *   from this software without specific prior written permission.
+- #   *
+- #   * THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS
+- #   * "AS IS" AND ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT
+- #   * LIMITED TO, THE IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS
+- #   * FOR A PARTICULAR PURPOSE ARE DISCLAIMED. IN NO EVENT SHALL THE
+- #   * REGENTS OR CONTRIBUTORS BE LIABLE FOR ANY DIRECT, INDIRECT,
+- #   * INCIDENTAL, SPECIAL, EXEMPLARY, OR CONSEQUENTIAL DAMAGES
+- #   * (INCLUDING, BUT NOT LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS OR
+- #   * SERVICES; LOSS OF USE, DATA, OR PROFITS; OR BUSINESS INTERRUPTION)
+- #   * HOWEVER CAUSED AND ON ANY THEORY OF LIABILITY, WHETHER IN CONTRACT,
+- #   * STRICT LIABILITY, OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE)
+- #   * ARISING IN ANY WAY OUT OF THE USE OF THIS SOFTWARE, EVEN IF ADVISED
+- #   * OF THE POSSIBILITY OF SUCH DAMAGE.
+- #   */
+- #
+- #  /*
+- #   * Copyright (c) 1999 Computer Systems and Communication Lab,
+- #   *                    Institute of Information Science, Academia
+- #       *                    Sinica. All rights reserved.
+- #   *
+- #   * Redistribution and use in source and binary forms, with or without
+- #   * modification, are permitted provided that the following conditions
+- #   * are met:
+- #   *
+- #   * . Redistributions of source code must retain the above copyright
+- #   *   notice, this list of conditions and the following disclaimer.
+- #   * . Redistributions in binary form must reproduce the above copyright
+- #   *   notice, this list of conditions and the following disclaimer in
+- #   *   the documentation and/or other materials provided with the
+- #   *   distribution.
+- #   * . Neither the name of the Computer Systems and Communication Lab
+- #   *   nor the names of its contributors may be used to endorse or
+- #   *   promote products derived from this software without specific
+- #   *   prior written permission.
+- #   *
+- #   * THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS
+- #   * "AS IS" AND ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT
+- #   * LIMITED TO, THE IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS
+- #   * FOR A PARTICULAR PURPOSE ARE DISCLAIMED. IN NO EVENT SHALL THE
+- #   * REGENTS OR CONTRIBUTORS BE LIABLE FOR ANY DIRECT, INDIRECT,
+- #   * INCIDENTAL, SPECIAL, EXEMPLARY, OR CONSEQUENTIAL DAMAGES
+- #   * (INCLUDING, BUT NOT LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS OR
+- #   * SERVICES; LOSS OF USE, DATA, OR PROFITS; OR BUSINESS INTERRUPTION)
+- #   * HOWEVER CAUSED AND ON ANY THEORY OF LIABILITY, WHETHER IN CONTRACT,
+- #   * STRICT LIABILITY, OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE)
+- #   * ARISING IN ANY WAY OUT OF THE USE OF THIS SOFTWARE, EVEN IF ADVISED
+- #   * OF THE POSSIBILITY OF SUCH DAMAGE.
+- #   */
+- #
+- #  Copyright 1996 Chih-Hao Tsai @ Beckman Institute,
+- #      University of Illinois
+- #  c-tsai4@uiuc.edu  http://casper.beckman.uiuc.edu/~c-tsai4
+- #
+- #  ---------------COPYING.libtabe-----END--------------------------------
+- #
+- #
+- #  ---------------COPYING.ipadic-----BEGIN-------------------------------
+- #
+- #  Copyright 2000, 2001, 2002, 2003 Nara Institute of Science
+- #  and Technology.  All Rights Reserved.
+- #
+- #  Use, reproduction, and distribution of this software is permitted.
+- #  Any copy of this software, whether in its original form or modified,
+- #  must include both the above copyright notice and the following
+- #  paragraphs.
+- #
+- #  Nara Institute of Science and Technology (NAIST),
+- #  the copyright holders, disclaims all warranties with regard to this
+- #  software, including all implied warranties of merchantability and
+- #  fitness, in no event shall NAIST be liable for
+- #  any special, indirect or consequential damages or any damages
+- #  whatsoever resulting from loss of use, data or profits, whether in an
+- #  action of contract, negligence or other tortuous action, arising out
+- #  of or in connection with the use or performance of this software.
+- #
+- #  A large portion of the dictionary entries
+- #  originate from ICOT Free Software.  The following conditions for ICOT
+- #  Free Software applies to the current dictionary as well.
+- #
+- #  Each User may also freely distribute the Program, whether in its
+- #  original form or modified, to any third party or parties, PROVIDED
+- #  that the provisions of Section 3 ("NO WARRANTY") will ALWAYS appear
+- #  on, or be attached to, the Program, which is distributed substantially
+- #  in the same form as set out herein and that such intended
+- #  distribution, if actually made, will neither violate or otherwise
+- #  contravene any of the laws and regulations of the countries having
+- #  jurisdiction over the User or the intended distribution itself.
+- #
+- #  NO WARRANTY
+- #
+- #  The program was produced on an experimental basis in the course of the
+- #  research and development conducted during the project and is provided
+- #  to users as so produced on an experimental basis.  Accordingly, the
+- #  program is provided without any warranty whatsoever, whether express,
+- #  implied, statutory or otherwise.  The term "warranty" used herein
+- #  includes, but is not limited to, any warranty of the quality,
+- #  performance, merchantability and fitness for a particular purpose of
+- #  the program and the nonexistence of any infringement or violation of
+- #  any right of any third party.
+- #
+- #  Each user of the program will agree and understand, and be deemed to
+- #  have agreed and understood, that there is no warranty whatsoever for
+- #  the program and, accordingly, the entire risk arising from or
+- #  otherwise connected with the program is assumed by the user.
+- #
+- #  Therefore, neither ICOT, the copyright holder, or any other
+- #  organization that participated in or was otherwise related to the
+- #  development of the program and their respective officials, directors,
+- #  officers and other employees shall be held liable for any and all
+- #  damages, including, without limitation, general, special, incidental
+- #  and consequential damages, arising out of or otherwise in connection
+- #  with the use or inability to use the program or any product, material
+- #  or result produced or otherwise obtained by using the program,
+- #  regardless of whether they have been advised of, or otherwise had
+- #  knowledge of, the possibility of such damages at any time during the
+- #  project or thereafter.  Each user will be deemed to have agreed to the
+- #  foregoing by his or her commencement of use of the program.  The term
+- #  "use" as used herein includes, but is not limited to, the use,
+- #  modification, copying and distribution of the program and the
+- #  production of secondary products from the program.
+- #
+- #  In the case where the program, whether in its original form or
+- #  modified, was distributed or delivered to or received by a user from
+- #  any person, organization or entity other than ICOT, unless it makes or
+- #  grants independently of ICOT any specific warranty to the user in
+- #  writing, such person, organization or entity, will also be exempted
+- #  from and not be held liable to the user for any such damages as noted
+- #  above as far as the program is concerned.
+- #
+- #  ---------------COPYING.ipadic-----END----------------------------------
+-
+-3. Lao Word Break Dictionary Data (laodict.txt)
+-
+- #  Copyright (c) 2013 International Business Machines Corporation
+- #  and others. All Rights Reserved.
+- #
+- # Project: http://code.google.com/p/lao-dictionary/
+- # Dictionary: http://lao-dictionary.googlecode.com/git/Lao-Dictionary.txt
+- # License: http://lao-dictionary.googlecode.com/git/Lao-Dictionary-LICENSE.txt
+- #              (copied below)
+- #
+- #  This file is derived from the above dictionary, with slight
+- #  modifications.
+- #  ----------------------------------------------------------------------
+- #  Copyright (C) 2013 Brian Eugene Wilson, Robert Martin Campbell.
+- #  All rights reserved.
+- #
+- #  Redistribution and use in source and binary forms, with or without
+- #  modification,
+- #  are permitted provided that the following conditions are met:
+- #
+- #
+- # Redistributions of source code must retain the above copyright notice, this
+- #  list of conditions and the following disclaimer. Redistributions in
+- #  binary form must reproduce the above copyright notice, this list of
+- #  conditions and the following disclaimer in the documentation and/or
+- #  other materials provided with the distribution.
+- #
+- #
+- # THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS
+- # "AS IS" AND ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT
+- # LIMITED TO, THE IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS
+- # FOR A PARTICULAR PURPOSE ARE DISCLAIMED. IN NO EVENT SHALL THE
+- # COPYRIGHT HOLDER OR CONTRIBUTORS BE LIABLE FOR ANY DIRECT,
+- # INDIRECT, INCIDENTAL, SPECIAL, EXEMPLARY, OR CONSEQUENTIAL DAMAGES
+- # (INCLUDING, BUT NOT LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS OR
+- # SERVICES; LOSS OF USE, DATA, OR PROFITS; OR BUSINESS INTERRUPTION)
+- # HOWEVER CAUSED AND ON ANY THEORY OF LIABILITY, WHETHER IN CONTRACT,
+- # STRICT LIABILITY, OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE)
+- # ARISING IN ANY WAY OUT OF THE USE OF THIS SOFTWARE, EVEN IF ADVISED
+- # OF THE POSSIBILITY OF SUCH DAMAGE.
+- #  --------------------------------------------------------------------------
+-
+-4. Burmese Word Break Dictionary Data (burmesedict.txt)
+-
+- #  Copyright (c) 2014 International Business Machines Corporation
+- #  and others. All Rights Reserved.
+- #
+- #  This list is part of a project hosted at:
+- #    github.com/kanyawtech/myanmar-karen-word-lists
+- #
+- #  --------------------------------------------------------------------------
+- #  Copyright (c) 2013, LeRoy Benjamin Sharon
+- #  All rights reserved.
+- #
+- #  Redistribution and use in source and binary forms, with or without
+- #  modification, are permitted provided that the following conditions
+- #  are met: Redistributions of source code must retain the above
+- #  copyright notice, this list of conditions and the following
+- #  disclaimer.  Redistributions in binary form must reproduce the
+- #  above copyright notice, this list of conditions and the following
+- #  disclaimer in the documentation and/or other materials provided
+- #  with the distribution.
+- #
+- #    Neither the name Myanmar Karen Word Lists, nor the names of its
+- #    contributors may be used to endorse or promote products derived
+- #    from this software without specific prior written permission.
+- #
+- #  THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND
+- #  CONTRIBUTORS "AS IS" AND ANY EXPRESS OR IMPLIED WARRANTIES,
+- #  INCLUDING, BUT NOT LIMITED TO, THE IMPLIED WARRANTIES OF
+- #  MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE ARE
+- #  DISCLAIMED. IN NO EVENT SHALL THE COPYRIGHT HOLDER OR CONTRIBUTORS
+- #  BE LIABLE FOR ANY DIRECT, INDIRECT, INCIDENTAL, SPECIAL,
+- #  EXEMPLARY, OR CONSEQUENTIAL DAMAGES (INCLUDING, BUT NOT LIMITED
+- #  TO, PROCUREMENT OF SUBSTITUTE GOODS OR SERVICES; LOSS OF USE,
+- #  DATA, OR PROFITS; OR BUSINESS INTERRUPTION) HOWEVER CAUSED AND ON
+- #  ANY THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY, OR
+- #  TORT (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF
+- #  THE USE OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF
+- #  SUCH DAMAGE.
+- #  --------------------------------------------------------------------------
+-
+-5. Time Zone Database
+-
+-  ICU uses the public domain data and code derived from Time Zone
+-Database for its time zone support. The ownership of the TZ database
+-is explained in BCP 175: Procedure for Maintaining the Time Zone
+-Database section 7.
+-
+- # 7.  Database Ownership
+- #
+- #    The TZ database itself is not an IETF Contribution or an IETF
+- #    document.  Rather it is a pre-existing and regularly updated work
+- #    that is in the public domain, and is intended to remain in the
+- #    public domain.  Therefore, BCPs 78 [RFC5378] and 79 [RFC3979] do
+- #    not apply to the TZ Database or contributions that individuals make
+- #    to it.  Should any claims be made and substantiated against the TZ
+- #    Database, the organization that is providing the IANA
+- #    Considerations defined in this RFC, under the memorandum of
+- #    understanding with the IETF, currently ICANN, may act in accordance
+- #    with all competent court orders.  No ownership claims will be made
+- #    by ICANN or the IETF Trust on the database or the code.  Any person
+- #    making a contribution to the database or code waives all rights to
+- #    future claims in that contribution or in the TZ Database.
+\ No newline at end of file
+diff --git a/third_party/licenses/jsr305.txt b/third_party/licenses/jsr305.txt
+deleted file mode 100644
+index 51eacf545..000000000
+--- a/third_party/licenses/jsr305.txt
++++ /dev/null
+@@ -1,28 +0,0 @@
+-Copyright (c) 2007-2009, JSR305 expert group
+-All rights reserved.
+-
+-http://www.opensource.org/licenses/bsd-license.php
+-
+-Redistribution and use in source and binary forms, with or without
+-modification, are permitted provided that the following conditions are met:
+-
+-    * Redistributions of source code must retain the above copyright notice,
+-      this list of conditions and the following disclaimer.
+-    * Redistributions in binary form must reproduce the above copyright notice,
+-      this list of conditions and the following disclaimer in the documentation
+-      and/or other materials provided with the distribution.
+-    * Neither the name of the JSR305 expert group nor the names of its
+-      contributors may be used to endorse or promote products derived from
+-      this software without specific prior written permission.
+-
+-THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS "AS IS"
+-AND ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO,
+-THE IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE
+-ARE DISCLAIMED. IN NO EVENT SHALL THE COPYRIGHT OWNER OR CONTRIBUTORS BE
+-LIABLE FOR ANY DIRECT, INDIRECT, INCIDENTAL, SPECIAL, EXEMPLARY, OR
+-CONSEQUENTIAL DAMAGES (INCLUDING, BUT NOT LIMITED TO, PROCUREMENT OF
+-SUBSTITUTE GOODS OR SERVICES; LOSS OF USE, DATA, OR PROFITS; OR BUSINESS
+-INTERRUPTION) HOWEVER CAUSED AND ON ANY THEORY OF LIABILITY, WHETHER IN
+-CONTRACT, STRICT LIABILITY, OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE)
+-ARISING IN ANY WAY OUT OF THE USE OF THIS SOFTWARE, EVEN IF ADVISED OF THE
+-POSSIBILITY OF SUCH DAMAGE.
+\ No newline at end of file
+diff --git a/third_party/licenses/nanoproto.txt b/third_party/licenses/nanoproto.txt
+deleted file mode 100644
+index fb690074c..000000000
+--- a/third_party/licenses/nanoproto.txt
++++ /dev/null
+@@ -1,33 +0,0 @@
+-Copyright 2008, Google Inc.
+-All rights reserved.
+-
+-Redistribution and use in source and binary forms, with or without
+-modification, are permitted provided that the following conditions are
+-met:
+-
+-    * Redistributions of source code must retain the above copyright
+-notice, this list of conditions and the following disclaimer.
+-    * Redistributions in binary form must reproduce the above
+-copyright notice, this list of conditions and the following disclaimer
+-in the documentation and/or other materials provided with the
+-distribution.
+-    * Neither the name of Google Inc. nor the names of its
+-contributors may be used to endorse or promote products derived from
+-this software without specific prior written permission.
+-
+-THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS
+-"AS IS" AND ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT
+-LIMITED TO, THE IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR
+-A PARTICULAR PURPOSE ARE DISCLAIMED. IN NO EVENT SHALL THE COPYRIGHT
+-OWNER OR CONTRIBUTORS BE LIABLE FOR ANY DIRECT, INDIRECT, INCIDENTAL,
+-SPECIAL, EXEMPLARY, OR CONSEQUENTIAL DAMAGES (INCLUDING, BUT NOT
+-LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS OR SERVICES; LOSS OF USE,
+-DATA, OR PROFITS; OR BUSINESS INTERRUPTION) HOWEVER CAUSED AND ON ANY
+-THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY, OR TORT
+-(INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE
+-OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
+-
+-Code generated by the Protocol Buffer compiler is owned by the owner
+-of the input file used when generating it.  This code is not
+-standalone and requires a support library to be linked with it.  This
+-support library is itself covered by the above license.
+\ No newline at end of file
+diff --git a/third_party/licenses/pcre.txt b/third_party/licenses/pcre.txt
+deleted file mode 100644
+index 8b76acd92..000000000
+--- a/third_party/licenses/pcre.txt
++++ /dev/null
+@@ -1,93 +0,0 @@
+-PCRE LICENCE
+-------------
+-
+-PCRE is a library of functions to support regular expressions whose syntax
+-and semantics are as close as possible to those of the Perl 5 language.
+-
+-Release 8 of PCRE is distributed under the terms of the "BSD" licence, as
+-specified below. The documentation for PCRE, supplied in the "doc"
+-directory, is distributed under the same terms as the software itself. The data
+-in the testdata directory is not copyrighted and is in the public domain.
+-
+-The basic library functions are written in C and are freestanding. Also
+-included in the distribution is a set of C++ wrapper functions, and a
+-just-in-time compiler that can be used to optimize pattern matching. These
+-are both optional features that can be omitted when the library is built.
+-
+-
+-THE BASIC LIBRARY FUNCTIONS
+----------------------------
+-
+-Written by:       Philip Hazel
+-Email local part: ph10
+-Email domain:     cam.ac.uk
+-
+-University of Cambridge Computing Service,
+-Cambridge, England.
+-
+-Copyright (c) 1997-2017 University of Cambridge
+-All rights reserved.
+-
+-
+-PCRE JUST-IN-TIME COMPILATION SUPPORT
+--------------------------------------
+-
+-Written by:       Zoltan Herczeg
+-Email local part: hzmester
+-Emain domain:     freemail.hu
+-
+-Copyright(c) 2010-2017 Zoltan Herczeg
+-All rights reserved.
+-
+-
+-STACK-LESS JUST-IN-TIME COMPILER
+---------------------------------
+-
+-Written by:       Zoltan Herczeg
+-Email local part: hzmester
+-Emain domain:     freemail.hu
+-
+-Copyright(c) 2009-2017 Zoltan Herczeg
+-All rights reserved.
+-
+-
+-THE C++ WRAPPER FUNCTIONS
+--------------------------
+-
+-Contributed by:   Google Inc.
+-
+-Copyright (c) 2007-2012, Google Inc.
+-All rights reserved.
+-
+-
+-THE "BSD" LICENCE
+------------------
+-
+-Redistribution and use in source and binary forms, with or without
+-modification, are permitted provided that the following conditions are met:
+-
+-    * Redistributions of source code must retain the above copyright notice,
+-      this list of conditions and the following disclaimer.
+-
+-    * Redistributions in binary form must reproduce the above copyright
+-      notice, this list of conditions and the following disclaimer in the
+-      documentation and/or other materials provided with the distribution.
+-
+-    * Neither the name of the University of Cambridge nor the name of Google
+-      Inc. nor the names of their contributors may be used to endorse or
+-      promote products derived from this software without specific prior
+-      written permission.
+-
+-THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS "AS IS"
+-AND ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE
+-IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE
+-ARE DISCLAIMED. IN NO EVENT SHALL THE COPYRIGHT OWNER OR CONTRIBUTORS BE
+-LIABLE FOR ANY DIRECT, INDIRECT, INCIDENTAL, SPECIAL, EXEMPLARY, OR
+-CONSEQUENTIAL DAMAGES (INCLUDING, BUT NOT LIMITED TO, PROCUREMENT OF
+-SUBSTITUTE GOODS OR SERVICES; LOSS OF USE, DATA, OR PROFITS; OR BUSINESS
+-INTERRUPTION) HOWEVER CAUSED AND ON ANY THEORY OF LIABILITY, WHETHER IN
+-CONTRACT, STRICT LIABILITY, OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE)
+-ARISING IN ANY WAY OUT OF THE USE OF THIS SOFTWARE, EVEN IF ADVISED OF THE
+-POSSIBILITY OF SUCH DAMAGE.
+-
+-End
+\ No newline at end of file
+diff --git a/third_party/licenses/re2.txt b/third_party/licenses/re2.txt
+deleted file mode 100644
+index d7f5ff1f1..000000000
+--- a/third_party/licenses/re2.txt
++++ /dev/null
+@@ -1,27 +0,0 @@
+-// Copyright (c) 2009 The RE2 Authors. All rights reserved.
+-//
+-// Redistribution and use in source and binary forms, with or without
+-// modification, are permitted provided that the following conditions are
+-// met:
+-//
+-//    * Redistributions of source code must retain the above copyright
+-// notice, this list of conditions and the following disclaimer.
+-//    * Redistributions in binary form must reproduce the above
+-// copyright notice, this list of conditions and the following disclaimer
+-// in the documentation and/or other materials provided with the
+-// distribution.
+-//    * Neither the name of Google Inc. nor the names of its
+-// contributors may be used to endorse or promote products derived from
+-// this software without specific prior written permission.
+-//
+-// THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS
+-// "AS IS" AND ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT
+-// LIMITED TO, THE IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR
+-// A PARTICULAR PURPOSE ARE DISCLAIMED. IN NO EVENT SHALL THE COPYRIGHT
+-// OWNER OR CONTRIBUTORS BE LIABLE FOR ANY DIRECT, INDIRECT, INCIDENTAL,
+-// SPECIAL, EXEMPLARY, OR CONSEQUENTIAL DAMAGES (INCLUDING, BUT NOT
+-// LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS OR SERVICES; LOSS OF USE,
+-// DATA, OR PROFITS; OR BUSINESS INTERRUPTION) HOWEVER CAUSED AND ON ANY
+-// THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY, OR TORT
+-// (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE
+-// OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
+\ No newline at end of file
+diff --git a/third_party/licenses/sgi-stl.txt b/third_party/licenses/sgi-stl.txt
+deleted file mode 100644
+index f348849de..000000000
+--- a/third_party/licenses/sgi-stl.txt
++++ /dev/null
+@@ -1,13 +0,0 @@
+-SGI STL
+-
+-The STL portion of GNU libstdc++ that is used with gcc3 and gcc4 is licensed
+-under the GPL, with the following exception:
+-
+-# As a special exception, you may use this file as part of a free software
+-# library without restriction.  Specifically, if other files instantiate
+-# templates or use macros or inline functions from this file, or you compile
+-# this file and link it with other files to produce an executable, this
+-# file does not by itself cause the resulting executable to be covered by
+-# the GNU General Public License.  This exception does not however
+-# invalidate any other reasons why the executable file might be covered by
+-# the GNU General Public License.
+diff --git a/third_party/licenses/utf.txt b/third_party/licenses/utf.txt
+deleted file mode 100644
+index 3aac547da..000000000
+--- a/third_party/licenses/utf.txt
++++ /dev/null
+@@ -1,13 +0,0 @@
+-UTF-8 Library
+-
+-The authors of this software are Rob Pike and Ken Thompson.
+-             Copyright (c) 1998-2002 by Lucent Technologies.
+-Permission to use, copy, modify, and distribute this software for any
+-purpose without fee is hereby granted, provided that this entire notice
+-is included in all copies of any software which is or includes a copy
+-or modification of this software and in all copies of the supporting
+-documentation for such software.
+-THIS SOFTWARE IS BEING PROVIDED "AS IS", WITHOUT ANY EXPRESS OR IMPLIED
+-WARRANTY.  IN PARTICULAR, NEITHER THE AUTHORS NOR LUCENT TECHNOLOGIES MAKE ANY
+-REPRESENTATION OR WARRANTY OF ANY KIND CONCERNING THE MERCHANTABILITY
+-OF THIS SOFTWARE OR ITS FITNESS FOR ANY PARTICULAR PURPOSE.
+\ No newline at end of file
+diff --git a/third_party/licenses/zlib.txt b/third_party/licenses/zlib.txt
+deleted file mode 100644
+index fac30b072..000000000
+--- a/third_party/licenses/zlib.txt
++++ /dev/null
+@@ -1,53 +0,0 @@
+-(extracted from README, except for match.S)
+-
+-Copyright notice:
+-
+- (C) 1995-2013 Jean-loup Gailly and Mark Adler
+-
+-  This software is provided 'as-is', without any express or implied
+-  warranty.  In no event will the authors be held liable for any damages
+-  arising from the use of this software.
+-
+-  Permission is granted to anyone to use this software for any purpose,
+-  including commercial applications, and to alter it and redistribute it
+-  freely, subject to the following restrictions:
+-
+-  1. The origin of this software must not be misrepresented; you must not
+-     claim that you wrote the original software. If you use this software
+-     in a product, an acknowledgment in the product documentation would be
+-     appreciated but is not required.
+-  2. Altered source versions must be plainly marked as such, and must not be
+-     misrepresented as being the original software.
+-  3. This notice may not be removed or altered from any source distribution.
+-
+-  Jean-loup Gailly        Mark Adler
+-  jloup@gzip.org          madler@alumni.caltech.edu
+-
+-If you use the zlib library in a product, we would appreciate *not* receiving
+-lengthy legal documents to sign.  The sources are provided for free but without
+-warranty of any kind.  The library has been entirely written by Jean-loup
+-Gailly and Mark Adler; it does not include third-party code.
+-
+-If you redistribute modified sources, we would appreciate that you include in
+-the file ChangeLog history information documenting your changes.  Please read
+-the FAQ for more information on the distribution of modified source versions.
+-
+-(extracted from match.S, for match.S only)
+-
+-Copyright (C) 1998, 2007 Brian Raiter <breadbox@muppetlabs.com>
+-
+-This software is provided 'as-is', without any express or implied
+-warranty.  In no event will the author be held liable for any damages
+-arising from the use of this software.
+-
+-Permission is granted to anyone to use this software for any purpose,
+-including commercial applications, and to alter it and redistribute it
+-freely, subject to the following restrictions:
+-
+-1. The origin of this software must not be misrepresented; you must not
+-  claim that you wrote the original software. If you use this software
+-  in a product, an acknowledgment in the product documentation would be
+-  appreciated but is not required.
+-2. Altered source versions must be plainly marked as such, and must not be
+-  misrepresented as being the original software.
+-3. This notice may not be removed or altered from any source distribution.
+\ No newline at end of file
+diff --git a/tools/apksize/default.gradle b/tools/apksize/default.gradle
+index 2ba697725..5f416c301 100644
+--- a/tools/apksize/default.gradle
++++ b/tools/apksize/default.gradle
+@@ -25,13 +25,13 @@ android {
+         abortOnError false
+         checkReleaseBuilds false
+     }
+-    compileSdkVersion 26
++    compileSdkVersion project.targetSdkVersion
+ 
+     defaultConfig {
+         applicationId 'com.google.apksize'
+-        minSdkVersion 26
+-	multiDexEnabled true
+-        targetSdkVersion 26
++        minSdkVersion project.targetSdkVersion
++	    multiDexEnabled true
++        targetSdkVersion project.targetSdkVersion
+         versionCode 1
+         versionName '1.0'
+     }

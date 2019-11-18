@@ -1,0 +1,794 @@
+diff --git a/BUILD b/BUILD
+index 70ec80f7f..a204e6ad3 100644
+--- a/BUILD
++++ b/BUILD
+@@ -63,6 +63,7 @@ jarjar_library(
+     deps = [
+         "//java/dagger/internal/codegen:base",
+         "//java/dagger/internal/codegen:binding",
++        "//java/dagger/internal/codegen:internal_validation",
+         "//java/dagger/internal/codegen:processor",
+         "//java/dagger/internal/codegen:shared-with-spi",
+         "//java/dagger/internal/codegen:validation",
+@@ -78,6 +79,7 @@ jarjar_library(
+     deps = [
+         "//java/dagger/internal/codegen:libbase-src.jar",
+         "//java/dagger/internal/codegen:libbinding-src.jar",
++        "//java/dagger/internal/codegen:libinternal_validation-src.jar",
+         "//java/dagger/internal/codegen:libprocessor-src.jar",
+         "//java/dagger/internal/codegen:libshared-with-spi-src.jar",
+         "//java/dagger/internal/codegen:libvalidation-src.jar",
+diff --git a/java/dagger/internal/codegen/BUILD b/java/dagger/internal/codegen/BUILD
+index e3748bfa2..d71da3408 100644
+--- a/java/dagger/internal/codegen/BUILD
++++ b/java/dagger/internal/codegen/BUILD
+@@ -198,6 +198,19 @@ java_library(
+     ],
+ )
+ 
++java_library(
++    name = "internal_validation",
++    srcs = [
++        "BindingGraphValidationModule.java",
++        "NonNullableRequestForNullableBindingValidation.java",
++        "Validation.java",
++    ],
++    deps = CODEGEN_DEPS + [
++        ":base",
++        ":binding",
++    ],
++)
++
+ # Classes that assemble the model of the generated code and write to the Filer
+ java_library(
+     name = "writing",
+@@ -296,6 +309,7 @@ java_library(
+     deps = CODEGEN_DEPS + [
+         ":base",
+         ":binding",
++        ":internal_validation",
+         ":writing",
+         ":validation",
+     ],
+diff --git a/java/dagger/internal/codegen/BindingDeclarationFormatter.java b/java/dagger/internal/codegen/BindingDeclarationFormatter.java
+index d47c59f22..6acb4ed29 100644
+--- a/java/dagger/internal/codegen/BindingDeclarationFormatter.java
++++ b/java/dagger/internal/codegen/BindingDeclarationFormatter.java
+@@ -16,7 +16,6 @@
+ 
+ package dagger.internal.codegen;
+ 
+-import static com.google.common.base.Preconditions.checkArgument;
+ import static com.google.common.collect.Sets.immutableEnumSet;
+ import static dagger.internal.codegen.ConfigurationAnnotations.getModuleSubcomponents;
+ import static dagger.internal.codegen.DiagnosticFormatting.stripCommonTypePrefixes;
+@@ -33,7 +32,6 @@
+ import com.google.common.collect.Iterables;
+ import dagger.model.BindingKind;
+ import javax.inject.Inject;
+-import javax.lang.model.element.Element;
+ import javax.lang.model.type.TypeKind;
+ import javax.lang.model.type.TypeMirror;
+ 
+@@ -103,24 +101,26 @@ public String format(BindingDeclaration bindingDeclaration) {
+       }
+     }
+ 
+-    checkArgument(
+-        bindingDeclaration.bindingElement().isPresent(),
+-        "Cannot format bindings without source elements: %s",
+-        bindingDeclaration);
+-
+-    Element bindingElement = bindingDeclaration.bindingElement().get();
+-    switch (bindingElement.asType().getKind()) {
+-      case EXECUTABLE:
+-        return methodSignatureFormatter.format(
+-            MoreElements.asExecutable(bindingElement),
+-            bindingDeclaration
+-                .contributingModule()
+-                .map(module -> MoreTypes.asDeclared(module.asType())));
+-      case DECLARED:
+-        return stripCommonTypePrefixes(bindingElement.asType().toString());
+-      default:
+-        throw new IllegalArgumentException("Formatting unsupported for element: " + bindingElement);
+-    }
++    return bindingDeclaration
++        .bindingElement()
++        .map(
++            bindingElement -> {
++              switch (bindingElement.asType().getKind()) {
++                case EXECUTABLE:
++                  return methodSignatureFormatter.format(
++                      MoreElements.asExecutable(bindingElement),
++                      bindingDeclaration
++                          .contributingModule()
++                          .map(module -> MoreTypes.asDeclared(module.asType())));
++                case DECLARED:
++                  return stripCommonTypePrefixes(bindingElement.asType().toString());
++                default:
++                  throw new IllegalArgumentException(
++                      "Formatting unsupported for element: " + bindingElement);
++              }
++            })
++        // TODO(dpb): Give synthetic bindings a better string representation.
++        .orElseGet(() -> "synthetic binding for " + bindingDeclaration.key());
+   }
+ 
+   private String formatSubcomponentDeclaration(SubcomponentDeclaration subcomponentDeclaration) {
+diff --git a/java/dagger/internal/codegen/BindingGraphConverter.java b/java/dagger/internal/codegen/BindingGraphConverter.java
+index bbc0eef36..63eab5c55 100644
+--- a/java/dagger/internal/codegen/BindingGraphConverter.java
++++ b/java/dagger/internal/codegen/BindingGraphConverter.java
+@@ -38,129 +38,140 @@
+ import dagger.model.BindingGraph.Edge;
+ import dagger.model.BindingGraph.Node;
+ import dagger.model.BindingGraphProxies;
++import javax.inject.Inject;
+ import javax.lang.model.element.Element;
+ import javax.lang.model.element.ExecutableElement;
+ import javax.lang.model.element.TypeElement;
+ 
+ /** Converts {@link dagger.internal.codegen.BindingGraph}s to {@link dagger.model.BindingGraph}s. */
+-final class BindingGraphConverter extends ComponentTreeTraverser {
++final class BindingGraphConverter {
+ 
+-  private final MutableNetwork<Node, Edge> network =
+-      NetworkBuilder.directed().allowsParallelEdges(true).allowsSelfLoops(true).build();
++  private final BindingDeclarationFormatter bindingDeclarationFormatter;
+ 
+-  private ComponentNode parentComponent;
+-  private ComponentNode currentComponent;
+-
+-  private BindingGraphConverter(BindingGraph graph) {
+-    super(graph);
++  @Inject
++  BindingGraphConverter(BindingDeclarationFormatter bindingDeclarationFormatter) {
++    this.bindingDeclarationFormatter = bindingDeclarationFormatter;
+   }
+ 
+   /**
+    * Creates the external {@link dagger.model.BindingGraph} representing the given internal root
+    * {@link dagger.internal.codegen.BindingGraph}.
+    */
+-  static dagger.model.BindingGraph convert(BindingGraph graph) {
+-    BindingGraphConverter converter = new BindingGraphConverter(graph);
+-    converter.traverseComponents();
+-    return BindingGraphProxies.bindingGraph(converter.network);
++  dagger.model.BindingGraph convert(BindingGraph graph) {
++    Traverser traverser = new Traverser(graph);
++    traverser.traverseComponents();
++    return BindingGraphProxies.bindingGraph(traverser.network);
+   }
+ 
+-  @Override
+-  protected void visitComponent(BindingGraph graph) {
+-    ComponentNode grandparentNode = parentComponent;
+-    parentComponent = currentComponent;
+-    currentComponent = componentNode(componentTreePath().toComponentPath());
+-    network.addNode(currentComponent);
+-    super.visitComponent(graph);
+-    currentComponent = parentComponent;
+-    parentComponent = grandparentNode;
+-  }
++  private final class Traverser extends ComponentTreeTraverser {
+ 
+-  @Override
+-  protected void visitSubcomponentFactoryMethod(
+-      BindingGraph graph, BindingGraph parent, ExecutableElement factoryMethod) {
+-    network.addEdge(parentComponent, currentComponent, childFactoryMethodEdge(factoryMethod));
+-    super.visitSubcomponentFactoryMethod(graph, parent, factoryMethod);
+-  }
++    private final MutableNetwork<Node, Edge> network =
++        NetworkBuilder.directed().allowsParallelEdges(true).allowsSelfLoops(true).build();
+ 
+-  @Override
+-  protected BindingGraphTraverser bindingGraphTraverser(
+-      ComponentTreePath componentTreePath, ComponentMethodDescriptor entryPointMethod) {
+-    return new BindingGraphVisitor(componentTreePath, entryPointMethod);
+-  }
++    private ComponentNode parentComponent;
++    private ComponentNode currentComponent;
+ 
+-  private final class BindingGraphVisitor extends BindingGraphTraverser {
++    Traverser(BindingGraph graph) {
++      super(graph);
++    }
+ 
+-    private Node current;
++    @Override
++    protected void visitComponent(BindingGraph graph) {
++      ComponentNode grandparentNode = parentComponent;
++      parentComponent = currentComponent;
++      currentComponent = componentNode(componentTreePath().toComponentPath());
++      network.addNode(currentComponent);
++      super.visitComponent(graph);
++      currentComponent = parentComponent;
++      parentComponent = grandparentNode;
++    }
+ 
+-    BindingGraphVisitor(
+-        ComponentTreePath componentTreePath, ComponentMethodDescriptor entryPointMethod) {
+-      super(componentTreePath, entryPointMethod);
+-      current = currentComponent;
+-      network.addNode(current);
++    @Override
++    protected void visitSubcomponentFactoryMethod(
++        BindingGraph graph, BindingGraph parent, ExecutableElement factoryMethod) {
++      network.addEdge(parentComponent, currentComponent, childFactoryMethodEdge(factoryMethod));
++      super.visitSubcomponentFactoryMethod(graph, parent, factoryMethod);
+     }
+ 
+     @Override
+-    protected void visitBinding(Binding binding, ComponentDescriptor owningComponent) {
+-      // TODO(dpb): Should we visit only bindings owned by the current component, since other
+-      // bindings will be visited in the parent?
+-      Node previous = current;
+-      current = bindingNode(resolvedBindings(), binding, owningComponent);
+-      network.addNode(current);
+-      if (binding instanceof ContributionBinding) {
+-        ContributionBinding contributionBinding = (ContributionBinding) binding;
+-        if (contributionBinding.kind().equals(SUBCOMPONENT_BUILDER)) {
+-          ImmutableSet.Builder<TypeElement> modules = ImmutableSet.builder();
+-          for (SubcomponentDeclaration subcomponentDeclaration :
+-              resolvedBindings().subcomponentDeclarations()) {
+-            modules.add(subcomponentDeclaration.contributingModule().get());
++    protected BindingGraphTraverser bindingGraphTraverser(
++        ComponentTreePath componentTreePath, ComponentMethodDescriptor entryPointMethod) {
++      return new BindingGraphVisitor(componentTreePath, entryPointMethod);
++    }
++
++    private final class BindingGraphVisitor extends BindingGraphTraverser {
++
++      private Node current;
++
++      BindingGraphVisitor(
++          ComponentTreePath componentTreePath, ComponentMethodDescriptor entryPointMethod) {
++        super(componentTreePath, entryPointMethod);
++        current = currentComponent;
++        network.addNode(current);
++      }
++
++      @Override
++      protected void visitBinding(Binding binding, ComponentDescriptor owningComponent) {
++        // TODO(dpb): Should we visit only bindings owned by the current component, since other
++        // bindings will be visited in the parent?
++        Node previous = current;
++        current = bindingNode(resolvedBindings(), binding, owningComponent);
++        network.addNode(current);
++        if (binding instanceof ContributionBinding) {
++          ContributionBinding contributionBinding = (ContributionBinding) binding;
++          if (contributionBinding.kind().equals(SUBCOMPONENT_BUILDER)) {
++            ImmutableSet.Builder<TypeElement> modules = ImmutableSet.builder();
++            for (SubcomponentDeclaration subcomponentDeclaration :
++                resolvedBindings().subcomponentDeclarations()) {
++              modules.add(subcomponentDeclaration.contributingModule().get());
++            }
++            network.addEdge(
++                current,
++                subcomponentNode(contributionBinding, owningComponent),
++                subcomponentBuilderBindingEdge(modules.build()));
+           }
+-          network.addEdge(
+-              current,
+-              subcomponentNode(contributionBinding, owningComponent),
+-              subcomponentBuilderBindingEdge(modules.build()));
+         }
++        if (network
++            .edgesConnecting(previous, current)
++            .stream()
++            .flatMap(instancesOf(DependencyEdge.class))
++            .noneMatch(e -> e.dependencyRequest().equals(dependencyRequest()))) {
++          network.addEdge(previous, current, dependencyEdge(dependencyRequest(), atEntryPoint()));
++          super.visitBinding(binding, owningComponent);
++        }
++        current = previous;
+       }
+-      if (network
+-          .edgesConnecting(previous, current)
+-          .stream()
+-          .flatMap(instancesOf(DependencyEdge.class))
+-          .noneMatch(e -> e.dependencyRequest().equals(dependencyRequest()))) {
+-        network.addEdge(
+-            previous, current, dependencyEdge(dependencyRequest(), atEntryPoint()));
+-        super.visitBinding(binding, owningComponent);
+-      }
+-      current = previous;
+-    }
+ 
+-    private ComponentNode subcomponentNode(
+-        ContributionBinding binding, ComponentDescriptor subcomponentParent) {
+-      checkArgument(binding.kind().equals(SUBCOMPONENT_BUILDER));
+-      TypeElement builderType = asTypeElement(binding.key().type());
+-      TypeElement subcomponentType = asType(builderType.getEnclosingElement());
+-      ComponentTreePath childPath =
+-          componentTreePath()
+-              .pathFromRootToAncestor(subcomponentParent)
+-              .childPath(subcomponentType);
+-      ComponentNode childNode = componentNode(childPath.toComponentPath());
+-      network.addNode(childNode);
+-      return childNode;
+-    }
++      private ComponentNode subcomponentNode(
++          ContributionBinding binding, ComponentDescriptor subcomponentParent) {
++        checkArgument(binding.kind().equals(SUBCOMPONENT_BUILDER));
++        TypeElement builderType = asTypeElement(binding.key().type());
++        TypeElement subcomponentType = asType(builderType.getEnclosingElement());
++        ComponentTreePath childPath =
++            componentTreePath()
++                .pathFromRootToAncestor(subcomponentParent)
++                .childPath(subcomponentType);
++        ComponentNode childNode = componentNode(childPath.toComponentPath());
++        network.addNode(childNode);
++        return childNode;
++      }
+ 
+-    private BindingNode bindingNode(
+-        ResolvedBindings resolvedBindings, Binding binding, ComponentDescriptor owningComponent) {
+-      ImmutableList.Builder<Element> associatedDeclarations = ImmutableList.builder();
+-      for (BindingDeclaration declaration :
+-          concat(
+-              resolvedBindings.multibindingDeclarations(),
+-              resolvedBindings.optionalBindingDeclarations(),
+-              resolvedBindings.subcomponentDeclarations())) {
+-        associatedDeclarations.add(declaration.bindingElement().get());
++      private BindingNode bindingNode(
++          ResolvedBindings resolvedBindings, Binding binding, ComponentDescriptor owningComponent) {
++        ImmutableList.Builder<Element> associatedDeclarations = ImmutableList.builder();
++        for (BindingDeclaration declaration :
++            concat(
++                resolvedBindings.multibindingDeclarations(),
++                resolvedBindings.optionalBindingDeclarations(),
++                resolvedBindings.subcomponentDeclarations())) {
++          associatedDeclarations.add(declaration.bindingElement().get());
++        }
++        return BindingGraphProxies.bindingNode(
++            componentTreePath().pathFromRootToAncestor(owningComponent).toComponentPath(),
++            binding,
++            associatedDeclarations.build(),
++            () -> bindingDeclarationFormatter.format(binding));
+       }
+-      return BindingGraphProxies.bindingNode(
+-          componentTreePath().pathFromRootToAncestor(owningComponent).toComponentPath(),
+-          binding,
+-          associatedDeclarations.build());
+     }
+   }
+ }
+diff --git a/java/dagger/internal/codegen/BindingGraphValidationModule.java b/java/dagger/internal/codegen/BindingGraphValidationModule.java
+new file mode 100644
+index 000000000..20364bf42
+--- /dev/null
++++ b/java/dagger/internal/codegen/BindingGraphValidationModule.java
+@@ -0,0 +1,32 @@
++/*
++ * Copyright (C) 2018 The Dagger Authors.
++ *
++ * Licensed under the Apache License, Version 2.0 (the "License");
++ * you may not use this file except in compliance with the License.
++ * You may obtain a copy of the License at
++ *
++ * http://www.apache.org/licenses/LICENSE-2.0
++ *
++ * Unless required by applicable law or agreed to in writing, software
++ * distributed under the License is distributed on an "AS IS" BASIS,
++ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++ * See the License for the specific language governing permissions and
++ * limitations under the License.
++ */
++
++package dagger.internal.codegen;
++
++import dagger.Binds;
++import dagger.Module;
++import dagger.multibindings.IntoSet;
++import dagger.spi.BindingGraphPlugin;
++
++/** Binds the set of {@link BindingGraphPlugin}s used to implement Dagger validation. */
++@Module
++interface BindingGraphValidationModule {
++
++  @Binds
++  @IntoSet
++  @Validation
++  BindingGraphPlugin nullable(NonNullableRequestForNullableBindingValidation validation);
++}
+diff --git a/java/dagger/internal/codegen/BindingGraphValidator.java b/java/dagger/internal/codegen/BindingGraphValidator.java
+index 815d38d9e..6328486c3 100644
+--- a/java/dagger/internal/codegen/BindingGraphValidator.java
++++ b/java/dagger/internal/codegen/BindingGraphValidator.java
+@@ -53,7 +53,6 @@
+ import static dagger.internal.codegen.ErrorMessages.abstractModuleHasInstanceBindingMethods;
+ import static dagger.internal.codegen.ErrorMessages.duplicateMapKeysError;
+ import static dagger.internal.codegen.ErrorMessages.inconsistentMapKeyAnnotationsError;
+-import static dagger.internal.codegen.ErrorMessages.nullableToNonNullable;
+ import static dagger.internal.codegen.ErrorMessages.referenceReleasingScopeMetadataMissingCanReleaseReferences;
+ import static dagger.internal.codegen.ErrorMessages.referenceReleasingScopeNotAnnotatedWithMetadata;
+ import static dagger.internal.codegen.ErrorMessages.referenceReleasingScopeNotInComponentHierarchy;
+@@ -90,7 +89,6 @@
+ import com.google.common.collect.Multimaps;
+ import com.google.common.collect.SetMultimap;
+ import com.google.common.collect.Sets;
+-import com.squareup.javapoet.TypeName;
+ import dagger.BindsOptionalOf;
+ import dagger.Component;
+ import dagger.Lazy;
+@@ -628,9 +626,6 @@ protected void visitResolvedBindings(ResolvedBindings resolvedBindings) {
+       protected void visitContributionBinding(
+           ContributionBinding binding, ComponentDescriptor owningComponent) {
+         checkBindingScope(binding, owningComponent);
+-        if (!dependencyRequest().isNullable() && binding.nullableType().isPresent()) {
+-          reportNullableBindingForNonNullableRequest(binding);
+-        }
+         if (binding.kind().equals(INJECTION)) {
+           TypeMirror type = binding.key().type();
+           ValidationReport<TypeElement> report =
+@@ -724,25 +719,6 @@ protected void visitMembersInjectionBinding(
+         return declarations.build();
+       }
+ 
+-      private void reportNullableBindingForNonNullableRequest(ContributionBinding binding) {
+-        // Note: the method signature will include the @Nullable in it!
+-        /* TODO(sameb): Sometimes javac doesn't include the Element in its output.
+-         * (Maybe this happens if the code was already compiled before this point?)
+-         * ... we manually print out the request in that case, otherwise the error
+-         * message is kind of useless. */
+-        FluentIterable<ContributionBinding> dependentContributions =
+-            FluentIterable.from(dependentBindings()).filter(ContributionBinding.class);
+-        report(owningGraph(dependentContributions.append(binding)))
+-            .addItem(
+-                nullableToNonNullable(
+-                        TypeName.get(dependencyRequest().key().type()).toString(),
+-                        bindingDeclarationFormatter.format(binding))
+-                    + "\n at: "
+-                    + formatDependencyTrace(),
+-                compilerOptions.nullableValidationKind(),
+-                entryPointElement());
+-      }
+-
+       private void validateMapKeys(
+           ContributionBinding binding, ComponentDescriptor owningComponent) {
+         checkArgument(
+diff --git a/java/dagger/internal/codegen/ComponentProcessingStep.java b/java/dagger/internal/codegen/ComponentProcessingStep.java
+index 247bda1d5..4a723e901 100644
+--- a/java/dagger/internal/codegen/ComponentProcessingStep.java
++++ b/java/dagger/internal/codegen/ComponentProcessingStep.java
+@@ -55,7 +55,9 @@
+   private final ComponentDescriptor.Factory componentDescriptorFactory;
+   private final BindingGraphFactory bindingGraphFactory;
+   private final ComponentGenerator componentGenerator;
+-  private final ImmutableList<BindingGraphPlugin> bindingGraphPlugins;
++  private final BindingGraphConverter bindingGraphConverter;
++  private final ImmutableSet<BindingGraphPlugin> validationPlugins;
++  private final ImmutableList<BindingGraphPlugin> spiPlugins;
+   private final DiagnosticReporterFactory diagnosticReporterFactory;
+ 
+   @Inject
+@@ -68,7 +70,9 @@
+       ComponentDescriptor.Factory componentDescriptorFactory,
+       BindingGraphFactory bindingGraphFactory,
+       ComponentGenerator componentGenerator,
+-      ImmutableList<BindingGraphPlugin> bindingGraphPlugins,
++      @Validation Set<BindingGraphPlugin> validationPlugins,
++      BindingGraphConverter bindingGraphConverter,
++      ImmutableList<BindingGraphPlugin> spiPlugins,
+       DiagnosticReporterFactory diagnosticReporterFactory) {
+     this.messager = messager;
+     this.componentValidator = componentValidator;
+@@ -78,7 +82,9 @@
+     this.componentDescriptorFactory = componentDescriptorFactory;
+     this.bindingGraphFactory = bindingGraphFactory;
+     this.componentGenerator = componentGenerator;
+-    this.bindingGraphPlugins = bindingGraphPlugins;
++    this.validationPlugins = ImmutableSet.copyOf(validationPlugins);
++    this.bindingGraphConverter = bindingGraphConverter;
++    this.spiPlugins = spiPlugins;
+     this.diagnosticReporterFactory = diagnosticReporterFactory;
+   }
+ 
+@@ -149,8 +155,11 @@
+           continue;
+         }
+ 
+-        if (!bindingGraphPlugins.isEmpty()) {
+-          boolean reportedErrors = executePlugins(BindingGraphConverter.convert(bindingGraph));
++        if (!validationPlugins.isEmpty() || !spiPlugins.isEmpty()) {
++          dagger.model.BindingGraph modelGraph = bindingGraphConverter.convert(bindingGraph);
++          boolean reportedErrors =
++              executePlugins(modelGraph, validationPlugins)
++                  || executePlugins(modelGraph, spiPlugins);
+           if (reportedErrors) {
+             continue;
+           }
+@@ -166,14 +175,15 @@
+ 
+   /**
+    * Calls {@link BindingGraphPlugin#visitGraph(dagger.model.BindingGraph, DiagnosticReporter)} on
+-   * each of {@code bindingGraphPlugins}.
++   * each of {@code plugins}.
+    *
+    * @return {@code true} if any plugin reported errors
+    */
+-  private boolean executePlugins(dagger.model.BindingGraph graph) {
++  private boolean executePlugins(
++      dagger.model.BindingGraph graph, Iterable<BindingGraphPlugin> plugins) {
+     // TODO(ronshapiro): Should we validate the uniqueness of plugin names?
+     boolean reportedErrors = false;
+-    for (BindingGraphPlugin plugin : bindingGraphPlugins) {
++    for (BindingGraphPlugin plugin : plugins) {
+       ErrorCountingDiagnosticReporter reporter = diagnosticReporterFactory.reporter(graph, plugin);
+       plugin.visitGraph(graph, reporter);
+       reportedErrors |= reporter.reportedErrors();
+diff --git a/java/dagger/internal/codegen/ComponentProcessor.java b/java/dagger/internal/codegen/ComponentProcessor.java
+index 9462e33c8..f14d046cc 100644
+--- a/java/dagger/internal/codegen/ComponentProcessor.java
++++ b/java/dagger/internal/codegen/ComponentProcessor.java
+@@ -97,11 +97,12 @@ public SourceVersion getSupportedSourceVersion() {
+ 
+   @Singleton
+   @Component(
+-      modules = {
+-          BindingMethodValidatorsModule.class,
+-          BindingGraphPluginsModule.class,
+-          ProcessingStepsModule.class,
+-      }
++    modules = {
++      BindingGraphPluginsModule.class,
++      BindingGraphValidationModule.class,
++      BindingMethodValidatorsModule.class,
++      ProcessingStepsModule.class,
++    }
+   )
+   interface ProcessorComponent {
+     void inject(ComponentProcessor processor);
+diff --git a/java/dagger/internal/codegen/ErrorMessages.java b/java/dagger/internal/codegen/ErrorMessages.java
+index 8a2d206b9..ef164712d 100644
+--- a/java/dagger/internal/codegen/ErrorMessages.java
++++ b/java/dagger/internal/codegen/ErrorMessages.java
+@@ -295,13 +295,6 @@ static String provisionMayNotDependOnProducerType(TypeMirror type) {
+ 
+   static final String CONTAINS_DEPENDENCY_CYCLE_FORMAT = "Found a dependency cycle:\n%s";
+ 
+-  static String nullableToNonNullable(String typeName, String bindingString) {
+-    return String.format(
+-            "%s is not nullable, but is being provided by %s",
+-            typeName,
+-            bindingString);
+-  }
+-
+   static final String CANNOT_RETURN_NULL_FROM_NON_NULLABLE_COMPONENT_METHOD =
+       "Cannot return null from a non-@Nullable component method";
+ 
+diff --git a/java/dagger/internal/codegen/NonNullableRequestForNullableBindingValidation.java b/java/dagger/internal/codegen/NonNullableRequestForNullableBindingValidation.java
+new file mode 100644
+index 000000000..0ce10f2c3
+--- /dev/null
++++ b/java/dagger/internal/codegen/NonNullableRequestForNullableBindingValidation.java
+@@ -0,0 +1,85 @@
++/*
++ * Copyright (C) 2018 The Dagger Authors.
++ *
++ * Licensed under the Apache License, Version 2.0 (the "License");
++ * you may not use this file except in compliance with the License.
++ * You may obtain a copy of the License at
++ *
++ * http://www.apache.org/licenses/LICENSE-2.0
++ *
++ * Unless required by applicable law or agreed to in writing, software
++ * distributed under the License is distributed on an "AS IS" BASIS,
++ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++ * See the License for the specific language governing permissions and
++ * limitations under the License.
++ */
++
++package dagger.internal.codegen;
++
++import static dagger.internal.codegen.DaggerStreams.toImmutableList;
++
++import com.google.common.annotations.VisibleForTesting;
++import com.google.common.collect.ImmutableList;
++import dagger.model.BindingGraph;
++import dagger.model.BindingGraph.BindingNode;
++import dagger.model.BindingGraph.DependencyEdge;
++import dagger.spi.BindingGraphPlugin;
++import dagger.spi.DiagnosticReporter;
++import javax.inject.Inject;
++
++/**
++ * Reports errors or warnings (depending on the {@code -Adagger.nullableValidation} value) for each
++ * non-nullable dependency request that is satisfied by a nullable binding.
++ */
++final class NonNullableRequestForNullableBindingValidation implements BindingGraphPlugin {
++
++  private final CompilerOptions compilerOptions;
++
++  @Inject
++  NonNullableRequestForNullableBindingValidation(CompilerOptions compilerOptions) {
++    this.compilerOptions = compilerOptions;
++  }
++
++  @Override
++  public void visitGraph(BindingGraph bindingGraph, DiagnosticReporter diagnosticReporter) {
++    for (BindingNode bindingNode : nullableBindings(bindingGraph)) {
++      for (DependencyEdge dependencyEdge : nonNullableDependencies(bindingGraph, bindingNode)) {
++        diagnosticReporter.reportDependency(
++            compilerOptions.nullableValidationKind(),
++            dependencyEdge,
++            nullableToNonNullable(
++                bindingNode.binding().key().toString(),
++                bindingNode.toString())); // will include the @Nullable
++      }
++    }
++  }
++
++  @Override
++  public String pluginName() {
++    return "Dagger/Nullable";
++  }
++
++  private ImmutableList<BindingNode> nullableBindings(BindingGraph bindingGraph) {
++    return bindingGraph
++        .bindingNodes()
++        .stream()
++        .filter(bindingNode -> bindingNode.binding().isNullable())
++        .collect(toImmutableList());
++  }
++
++  private ImmutableList<DependencyEdge> nonNullableDependencies(
++      BindingGraph bindingGraph, BindingNode bindingNode) {
++    return bindingGraph
++        .inEdges(bindingNode)
++        .stream()
++        .filter(edge -> edge instanceof DependencyEdge)
++        .map(edge -> (DependencyEdge) edge)
++        .filter(edge -> !edge.dependencyRequest().isNullable())
++        .collect(toImmutableList());
++  }
++
++  @VisibleForTesting
++  static String nullableToNonNullable(String key, String binding) {
++    return String.format("%s is not nullable, but is being provided by %s", key, binding);
++  }
++}
+diff --git a/java/dagger/internal/codegen/Validation.java b/java/dagger/internal/codegen/Validation.java
+new file mode 100644
+index 000000000..f6a4b3f4d
+--- /dev/null
++++ b/java/dagger/internal/codegen/Validation.java
+@@ -0,0 +1,31 @@
++/*
++ * Copyright (C) 2018 The Dagger Authors.
++ *
++ * Licensed under the Apache License, Version 2.0 (the "License");
++ * you may not use this file except in compliance with the License.
++ * You may obtain a copy of the License at
++ *
++ * http://www.apache.org/licenses/LICENSE-2.0
++ *
++ * Unless required by applicable law or agreed to in writing, software
++ * distributed under the License is distributed on an "AS IS" BASIS,
++ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++ * See the License for the specific language governing permissions and
++ * limitations under the License.
++ */
++
++package dagger.internal.codegen;
++
++import java.lang.annotation.Documented;
++import java.lang.annotation.Retention;
++import java.lang.annotation.RetentionPolicy;
++import javax.inject.Qualifier;
++
++/**
++ * Qualifier annotation for the {@link dagger.spi.BindingGraphPlugin}s that are used to implement
++ * core Dagger validation.
++ */
++@Documented
++@Retention(RetentionPolicy.RUNTIME)
++@Qualifier
++@interface Validation {}
+diff --git a/java/dagger/model/BindingGraph.java b/java/dagger/model/BindingGraph.java
+index 40a579e4f..9202f2ddb 100644
+--- a/java/dagger/model/BindingGraph.java
++++ b/java/dagger/model/BindingGraph.java
+@@ -17,6 +17,7 @@
+ package dagger.model;
+ 
+ import static com.google.common.base.MoreObjects.toStringHelper;
++import static com.google.common.base.Preconditions.checkNotNull;
+ import static com.google.common.collect.Sets.intersection;
+ import static com.google.common.graph.Graphs.inducedSubgraph;
+ import static com.google.common.graph.Graphs.reachableNodes;
+@@ -37,6 +38,7 @@
+ import dagger.model.BindingGraph.Node;
+ import dagger.multibindings.Multibinds;
+ import java.util.Optional;
++import java.util.function.Supplier;
+ import java.util.stream.Stream;
+ import javax.lang.model.element.Element;
+ import javax.lang.model.element.ExecutableElement;
+@@ -295,11 +297,19 @@ public String toString() {
+   @DoNotMock("Use Dagger-supplied implementations")
+   public abstract static class BindingNode implements Node {
+     static BindingNode create(
+-        ComponentPath component, Binding binding, Iterable<Element> associatedDeclarations) {
+-      return new AutoValue_BindingGraph_BindingNode(
+-          component, binding, ImmutableSet.copyOf(associatedDeclarations));
++        ComponentPath component,
++        Binding binding,
++        Iterable<Element> associatedDeclarations,
++        Supplier<String> toStringFunction) {
++      BindingNode bindingNode =
++          new AutoValue_BindingGraph_BindingNode(
++              component, binding, ImmutableSet.copyOf(associatedDeclarations));
++      bindingNode.toStringFunction = checkNotNull(toStringFunction);
++      return bindingNode;
+     }
+ 
++    private Supplier<String> toStringFunction;
++
+     /** The component that owns the {@link #binding()}. */
+     @Override
+     public abstract ComponentPath componentPath();
+@@ -318,6 +328,11 @@ static BindingNode create(
+      * </ul>
+      */
+     public abstract ImmutableSet<Element> associatedDeclarations();
++
++    @Override
++    public String toString() {
++      return toStringFunction.get();
++    }
+   }
+ 
+   /**
+diff --git a/java/dagger/model/BindingGraphProxies.java b/java/dagger/model/BindingGraphProxies.java
+index a6aa9f570..76598b1cd 100644
+--- a/java/dagger/model/BindingGraphProxies.java
++++ b/java/dagger/model/BindingGraphProxies.java
+@@ -24,6 +24,7 @@
+ import dagger.model.BindingGraph.Edge;
+ import dagger.model.BindingGraph.Node;
+ import dagger.model.BindingGraph.SubcomponentBuilderBindingEdge;
++import java.util.function.Supplier;
+ import javax.lang.model.element.Element;
+ import javax.lang.model.element.ExecutableElement;
+ import javax.lang.model.element.TypeElement;
+@@ -41,8 +42,11 @@ public static BindingGraph bindingGraph(Network<Node, Edge> network) {
+ 
+   /** Creates a new {@link BindingNode}. */
+   public static BindingNode bindingNode(
+-      ComponentPath component, Binding binding, Iterable<Element> associatedDeclarations) {
+-    return BindingNode.create(component, binding, associatedDeclarations);
++      ComponentPath component,
++      Binding binding,
++      Iterable<Element> associatedDeclarations,
++      Supplier<String> toStringFunction) {
++    return BindingNode.create(component, binding, associatedDeclarations, toStringFunction);
+   }
+ 
+   /** Creates a new {@link ComponentNode}. */
+diff --git a/javatests/dagger/internal/codegen/BUILD b/javatests/dagger/internal/codegen/BUILD
+index ed1de0917..31925565d 100644
+--- a/javatests/dagger/internal/codegen/BUILD
++++ b/javatests/dagger/internal/codegen/BUILD
+@@ -29,6 +29,7 @@ GenJavaTests(
+         "//java/dagger:core",
+         "//java/dagger/internal/codegen:base",
+         "//java/dagger/internal/codegen:binding",
++        "//java/dagger/internal/codegen:internal_validation",
+         "//java/dagger/internal/codegen:processor",
+         "//java/dagger/internal/codegen:validation",
+         "//java/dagger/internal/codegen:writing",
+diff --git a/javatests/dagger/internal/codegen/GraphValidationTest.java b/javatests/dagger/internal/codegen/GraphValidationTest.java
+index f9e0d9e51..77e6f47d4 100644
+--- a/javatests/dagger/internal/codegen/GraphValidationTest.java
++++ b/javatests/dagger/internal/codegen/GraphValidationTest.java
+@@ -22,7 +22,7 @@
+ import static com.google.testing.compile.JavaSourcesSubject.assertThat;
+ import static com.google.testing.compile.JavaSourcesSubjectFactory.javaSources;
+ import static dagger.internal.codegen.Compilers.daggerCompiler;
+-import static dagger.internal.codegen.ErrorMessages.nullableToNonNullable;
++import static dagger.internal.codegen.NonNullableRequestForNullableBindingValidation.nullableToNonNullable;
+ 
+ import com.google.common.base.Joiner;
+ import com.google.common.collect.ImmutableList;

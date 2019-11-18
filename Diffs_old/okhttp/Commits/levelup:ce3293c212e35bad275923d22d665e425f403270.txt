@@ -1,0 +1,349 @@
+diff --git a/okhttp/src/main/java/com/squareup/okhttp/internal/Base64.java b/okhttp-protocols/src/main/java/com/squareup/okhttp/internal/Base64.java
+similarity index 100%
+rename from okhttp/src/main/java/com/squareup/okhttp/internal/Base64.java
+rename to okhttp-protocols/src/main/java/com/squareup/okhttp/internal/Base64.java
+diff --git a/okhttp-protocols/src/main/java/com/squareup/okhttp/internal/spdy/NameValueBlockReader.java b/okhttp-protocols/src/main/java/com/squareup/okhttp/internal/spdy/NameValueBlockReader.java
+new file mode 100644
+index 0000000000..7ae5fdd7ec
+--- /dev/null
++++ b/okhttp-protocols/src/main/java/com/squareup/okhttp/internal/spdy/NameValueBlockReader.java
+@@ -0,0 +1,123 @@
++package com.squareup.okhttp.internal.spdy;
++
++import com.squareup.okhttp.internal.Util;
++import java.io.Closeable;
++import java.io.DataInputStream;
++import java.io.IOException;
++import java.io.InputStream;
++import java.util.ArrayList;
++import java.util.List;
++import java.util.zip.DataFormatException;
++import java.util.zip.Inflater;
++import java.util.zip.InflaterInputStream;
++
++/**
++ * Reads a SPDY/3 Name/Value header block. This class is made complicated by the
++ * requirement that we're strict with which bytes we put in the compressed bytes
++ * buffer. We need to put all compressed bytes into that buffer -- but no other
++ * bytes.
++ */
++class NameValueBlockReader implements Closeable {
++  private final DataInputStream nameValueBlockIn;
++  private final FillableInflaterInputStream fillableInflaterInputStream;
++  private int compressedLimit;
++
++  NameValueBlockReader(final InputStream in) {
++    // Limit the inflater input stream to only those bytes in the Name/Value block. We cut the
++    // inflater off at its source because we can't predict the ratio of compressed bytes to
++    // uncompressed bytes.
++    InputStream throttleStream = new InputStream() {
++      @Override public int read() throws IOException {
++        return Util.readSingleByte(this);
++      }
++
++      @Override public int read(byte[] buffer, int offset, int byteCount) throws IOException {
++        byteCount = Math.min(byteCount, compressedLimit);
++        int consumed = in.read(buffer, offset, byteCount);
++        compressedLimit -= consumed;
++        return consumed;
++      }
++
++      @Override public void close() throws IOException {
++        in.close();
++      }
++    };
++
++    // Subclass inflater to install a dictionary when it's needed.
++    Inflater inflater = new Inflater() {
++      @Override public int inflate(byte[] buffer, int offset, int count)
++          throws DataFormatException {
++        int result = super.inflate(buffer, offset, count);
++        if (result == 0 && needsDictionary()) {
++          setDictionary(Spdy3.DICTIONARY);
++          result = super.inflate(buffer, offset, count);
++        }
++        return result;
++      }
++    };
++
++    fillableInflaterInputStream = new FillableInflaterInputStream(throttleStream, inflater);
++    nameValueBlockIn = new DataInputStream(fillableInflaterInputStream);
++  }
++
++  /** Extend the inflater stream so we can eagerly fill the compressed bytes buffer if necessary. */
++  static class FillableInflaterInputStream extends InflaterInputStream {
++    public FillableInflaterInputStream(InputStream in, Inflater inf) {
++      super(in, inf);
++    }
++
++    @Override public void fill() throws IOException {
++      super.fill(); // This method is protected in the superclass.
++    }
++  }
++
++  public List<String> readNameValueBlock(int length) throws IOException {
++    this.compressedLimit += length;
++    try {
++      int numberOfPairs = nameValueBlockIn.readInt();
++      if (numberOfPairs < 0) {
++        throw new IOException("numberOfPairs < 0: " + numberOfPairs);
++      }
++      if (numberOfPairs > 1024) {
++        throw new IOException("numberOfPairs > 1024: " + numberOfPairs);
++      }
++      List<String> entries = new ArrayList<String>(numberOfPairs * 2);
++      for (int i = 0; i < numberOfPairs; i++) {
++        String name = readString();
++        String values = readString();
++        if (name.length() == 0) throw new IOException(String.format("name.length == 0"));
++        entries.add(name);
++        entries.add(values);
++      }
++
++      doneReading();
++
++      return entries;
++    } catch (DataFormatException e) {
++      throw new IOException(e.getMessage());
++    }
++  }
++
++  private void doneReading() throws IOException {
++    if (compressedLimit == 0) return;
++
++    // Read any outstanding unread bytes. One side-effect of deflate compression is that sometimes
++    // there are bytes remaining in the stream after we've consumed all of the content.
++    fillableInflaterInputStream.fill();
++
++    if (compressedLimit != 0) {
++      throw new IOException("compressedLimit > 0: " + compressedLimit);
++    }
++  }
++
++  private String readString() throws DataFormatException, IOException {
++    int length = nameValueBlockIn.readInt();
++    byte[] bytes = new byte[length];
++    Util.readFully(nameValueBlockIn, bytes);
++    return new String(bytes, 0, length, "UTF-8");
++  }
++
++  @Override public void close() throws IOException {
++    nameValueBlockIn.close();
++  }
++}
+diff --git a/okhttp-protocols/src/main/java/com/squareup/okhttp/internal/spdy/Spdy3.java b/okhttp-protocols/src/main/java/com/squareup/okhttp/internal/spdy/Spdy3.java
+index 4a1cbb28e6..5d9a49b3a2 100644
+--- a/okhttp-protocols/src/main/java/com/squareup/okhttp/internal/spdy/Spdy3.java
++++ b/okhttp-protocols/src/main/java/com/squareup/okhttp/internal/spdy/Spdy3.java
+@@ -25,13 +25,8 @@
+ import java.io.OutputStream;
+ import java.io.UnsupportedEncodingException;
+ import java.net.ProtocolException;
+-import java.util.ArrayList;
+ import java.util.List;
+-import java.util.logging.Logger;
+-import java.util.zip.DataFormatException;
+ import java.util.zip.Deflater;
+-import java.util.zip.Inflater;
+-import java.util.zip.InflaterInputStream;
+ 
+ final class Spdy3 implements Variant {
+   static final int TYPE_DATA = 0x0;
+@@ -103,13 +98,12 @@
+   /** Read spdy/3 frames. */
+   static final class Reader implements FrameReader {
+     private final DataInputStream in;
+-    private final DataInputStream nameValueBlockIn;
+     private final boolean client;
+-    private int compressedLimit;
++    private final NameValueBlockReader nameValueBlockReader;
+ 
+     Reader(InputStream in, boolean client) {
+       this.in = new DataInputStream(in);
+-      this.nameValueBlockIn = newNameValueBlockStream();
++      this.nameValueBlockReader = new NameValueBlockReader(in);
+       this.client = client;
+     }
+ 
+@@ -202,7 +196,7 @@ private void readSynStream(Handler handler, int flags, int length) throws IOExce
+       int associatedStreamId = w2 & 0x7fffffff;
+       int priority = (s3 & 0xe000) >>> 13;
+       int slot = s3 & 0xff;
+-      List<String> nameValueBlock = readNameValueBlock(length - 10);
++      List<String> nameValueBlock = nameValueBlockReader.readNameValueBlock(length - 10);
+ 
+       boolean inFinished = (flags & FLAG_FIN) != 0;
+       boolean outFinished = (flags & FLAG_UNIDIRECTIONAL) != 0;
+@@ -213,7 +207,7 @@ private void readSynStream(Handler handler, int flags, int length) throws IOExce
+     private void readSynReply(Handler handler, int flags, int length) throws IOException {
+       int w1 = in.readInt();
+       int streamId = w1 & 0x7fffffff;
+-      List<String> nameValueBlock = readNameValueBlock(length - 4);
++      List<String> nameValueBlock = nameValueBlockReader.readNameValueBlock(length - 4);
+       boolean inFinished = (flags & FLAG_FIN) != 0;
+       handler.headers(false, inFinished, streamId, -1, -1, nameValueBlock, HeadersMode.SPDY_REPLY);
+     }
+@@ -232,7 +226,7 @@ private void readRstStream(Handler handler, int flags, int length) throws IOExce
+     private void readHeaders(Handler handler, int flags, int length) throws IOException {
+       int w1 = in.readInt();
+       int streamId = w1 & 0x7fffffff;
+-      List<String> nameValueBlock = readNameValueBlock(length - 4);
++      List<String> nameValueBlock = nameValueBlockReader.readNameValueBlock(length - 4);
+       handler.headers(false, false, streamId, -1, -1, nameValueBlock, HeadersMode.SPDY_HEADERS);
+     }
+ 
+@@ -245,79 +239,6 @@ private void readWindowUpdate(Handler handler, int flags, int length) throws IOE
+       handler.windowUpdate(streamId, deltaWindowSize, false);
+     }
+ 
+-    private DataInputStream newNameValueBlockStream() {
+-      // Limit the inflater input stream to only those bytes in the Name/Value block.
+-      final InputStream throttleStream = new InputStream() {
+-        @Override public int read() throws IOException {
+-          return Util.readSingleByte(this);
+-        }
+-
+-        @Override public int read(byte[] buffer, int offset, int byteCount) throws IOException {
+-          byteCount = Math.min(byteCount, compressedLimit);
+-          int consumed = in.read(buffer, offset, byteCount);
+-          compressedLimit -= consumed;
+-          return consumed;
+-        }
+-
+-        @Override public void close() throws IOException {
+-          in.close();
+-        }
+-      };
+-
+-      // Subclass inflater to install a dictionary when it's needed.
+-      Inflater inflater = new Inflater() {
+-        @Override public int inflate(byte[] buffer, int offset, int count)
+-            throws DataFormatException {
+-          int result = super.inflate(buffer, offset, count);
+-          if (result == 0 && needsDictionary()) {
+-            setDictionary(DICTIONARY);
+-            result = super.inflate(buffer, offset, count);
+-          }
+-          return result;
+-        }
+-      };
+-
+-      return new DataInputStream(new InflaterInputStream(throttleStream, inflater));
+-    }
+-
+-    private List<String> readNameValueBlock(int length) throws IOException {
+-      this.compressedLimit += length;
+-      try {
+-        int numberOfPairs = nameValueBlockIn.readInt();
+-        if (numberOfPairs < 0) {
+-          Logger.getLogger(getClass().getName()).warning("numberOfPairs < 0: " + numberOfPairs);
+-          throw ioException("numberOfPairs < 0");
+-        }
+-        if (numberOfPairs > 1024) {
+-          Logger.getLogger(getClass().getName()).warning("numberOfPairs > 1024: " + numberOfPairs);
+-          throw ioException("numberOfPairs > 1024");
+-        }
+-        List<String> entries = new ArrayList<String>(numberOfPairs * 2);
+-        for (int i = 0; i < numberOfPairs; i++) {
+-          String name = readString();
+-          String values = readString();
+-          if (name.length() == 0) throw ioException("name.length == 0");
+-          entries.add(name);
+-          entries.add(values);
+-        }
+-
+-        if (compressedLimit != 0) {
+-          Logger.getLogger(getClass().getName()).warning("compressedLimit > 0: " + compressedLimit);
+-        }
+-
+-        return entries;
+-      } catch (DataFormatException e) {
+-        throw new IOException(e.getMessage());
+-      }
+-    }
+-
+-    private String readString() throws DataFormatException, IOException {
+-      int length = nameValueBlockIn.readInt();
+-      byte[] bytes = new byte[length];
+-      Util.readFully(nameValueBlockIn, bytes);
+-      return new String(bytes, 0, length, "UTF-8");
+-    }
+-
+     private void readPing(Handler handler, int flags, int length) throws IOException {
+       if (length != 4) throw ioException("TYPE_PING length: %d != 4", length);
+       int id = in.readInt();
+@@ -358,7 +279,7 @@ private static IOException ioException(String message, Object... args) throws IO
+     }
+ 
+     @Override public void close() throws IOException {
+-      Util.closeAll(in, nameValueBlockIn);
++      Util.closeAll(in, nameValueBlockReader);
+     }
+   }
+ 
+diff --git a/okhttp-protocols/src/test/java/com/squareup/okhttp/internal/spdy/MockSpdyPeer.java b/okhttp-protocols/src/test/java/com/squareup/okhttp/internal/spdy/MockSpdyPeer.java
+index dfdd1d09ae..99ddc6dc56 100644
+--- a/okhttp-protocols/src/test/java/com/squareup/okhttp/internal/spdy/MockSpdyPeer.java
++++ b/okhttp-protocols/src/test/java/com/squareup/okhttp/internal/spdy/MockSpdyPeer.java
+@@ -61,6 +61,15 @@ public FrameWriter sendFrame() {
+     return frameWriter;
+   }
+ 
++  /**
++   * Sends a manually-constructed frame. This is useful to test frames that
++   * won't be generated naturally.
++   */
++  public void sendFrame(byte[] frame) throws IOException {
++    outFrames.add(new OutFrame(frameCount++, bytesOut.size(), Integer.MAX_VALUE));
++    bytesOut.write(frame);
++  }
++
+   /**
+    * Sends a frame, truncated to {@code truncateToLength} bytes. This is only
+    * useful for testing error handling as the truncated frame will be
+diff --git a/okhttp-protocols/src/test/java/com/squareup/okhttp/internal/spdy/SpdyConnectionTest.java b/okhttp-protocols/src/test/java/com/squareup/okhttp/internal/spdy/SpdyConnectionTest.java
+index ebc67603d3..b0f23f44cd 100644
+--- a/okhttp-protocols/src/test/java/com/squareup/okhttp/internal/spdy/SpdyConnectionTest.java
++++ b/okhttp-protocols/src/test/java/com/squareup/okhttp/internal/spdy/SpdyConnectionTest.java
+@@ -16,6 +16,7 @@
+ 
+ package com.squareup.okhttp.internal.spdy;
+ 
++import com.squareup.okhttp.internal.Base64;
+ import com.squareup.okhttp.internal.Util;
+ import java.io.ByteArrayOutputStream;
+ import java.io.IOException;
+@@ -1011,6 +1012,33 @@
+     }
+   }
+ 
++  /** https://github.com/square/okhttp/issues/333 */
++  @Test public void nameValueBlockHasTrailingCompressedBytes() throws Exception {
++    // write the mocking script
++    peer.acceptFrame(); // SYN_STREAM
++    // This specially-formatted frame has trailing deflated bytes after the name value block.
++    String frame = "gAMAAgAAAgkAAAABeLvjxqfCYgAAAAD//2IAAAAA//9iAAAAAP//YgQAAAD//2IAAAAA//9iAAAAAP/"
++        + "/YgAAAAD//2IEAAAA//9KBAAAAP//YgAAAAD//2IAAAAA//9iAAAAAP//sgEAAAD//2IAAAAA\n//9iBAAAAP//Y"
++        + "gIAAAD//2IGAAAA//9iAQAAAP//YgUAAAD//2IDAAAA//9iBwAAAP//4gAAAAD//+IEAAAA///iAgAAAP//4gYAA"
++        + "AD//+IBAAAA///iBQAAAP//4gMAAAD//+IHAAAA//8SAAAAAP//EgQAAAD//xICAAAA//8SBgAAAP//EgEAAAD//"
++        + "xIFAAAA//8SAwAAAP//EgcAAAD//5IAAAAA//+SBAAAAP//kgIAAAD//5IGAAAA//+SAQAAAP//kgUAAAD//5IDA"
++        + "AAA//+SBwAAAP//UgAAAAD//1IEAAAA//9SAgAAAP//UgYAAAD//1IBAAAA//9SBQAAAP//UgMAAAD//1IHAAAA/"
++        + "//SAAAAAP//0gQAAAD//9ICAAAA///SBgAAAP//0gEAAAD//9IFAAAA///SAwAAAP//0gcAAAD//zIAAAAA//8yB"
++        + "AAAAP//MgIAAAD//zIGAAAA//8yAQAAAP//MgUAAAD//zIDAAAA//8yBwAAAP//sgAAAAD//7IEAAAA//+yAgAAA"
++        + "P//sgYAAAD//w==";
++    peer.sendFrame(Base64.decode(frame.getBytes(UTF_8)));
++    peer.sendFrame().data(true, 1, "robot".getBytes("UTF-8"));
++    peer.acceptFrame(); // DATA
++    peer.play();
++
++    // play it back
++    SpdyConnection connection = new SpdyConnection.Builder(true, peer.openSocket()).build();
++    SpdyStream stream = connection.newStream(Arrays.asList("b", "banana"), true, true);
++    assertEquals("a", stream.getResponseHeaders().get(0));
++    assertEquals(60, stream.getResponseHeaders().get(1).length());
++    assertStreamData("robot", stream.getInputStream());
++  }
++
+   private void writeAndClose(SpdyStream stream, String data) throws IOException {
+     OutputStream out = stream.getOutputStream();
+     out.write(data.getBytes("UTF-8"));

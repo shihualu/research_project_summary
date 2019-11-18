@@ -1,0 +1,769 @@
+diff --git a/compiler/src/main/java/dagger/internal/codegen/Binding.java b/compiler/src/main/java/dagger/internal/codegen/Binding.java
+index bcfa2bd26..4b05e88aa 100644
+--- a/compiler/src/main/java/dagger/internal/codegen/Binding.java
++++ b/compiler/src/main/java/dagger/internal/codegen/Binding.java
+@@ -17,18 +17,23 @@
+ 
+ import com.google.auto.common.MoreElements;
+ import com.google.common.base.Optional;
++import com.google.common.collect.ImmutableList;
+ import com.google.common.collect.ImmutableSet;
++import com.google.common.collect.Lists;
++import java.util.List;
+ import java.util.Set;
+ import javax.lang.model.element.Element;
+ import javax.lang.model.element.Name;
+ import javax.lang.model.element.PackageElement;
+ import javax.lang.model.element.TypeElement;
++import javax.lang.model.element.TypeParameterElement;
+ import javax.lang.model.type.ArrayType;
+ import javax.lang.model.type.DeclaredType;
+ import javax.lang.model.type.TypeMirror;
+ import javax.lang.model.type.WildcardType;
+ import javax.lang.model.util.SimpleElementVisitor6;
+ import javax.lang.model.util.SimpleTypeVisitor6;
++import javax.lang.model.util.Types;
+ 
+ import static javax.lang.model.element.Modifier.PUBLIC;
+ 
+@@ -58,14 +63,6 @@
+     }
+   }
+ 
+-  /**
+-   * True if this represents a binding that refers to a type with parameters, and the
+-   * parameters have been resolved based on a requesting key. For example, a ProvisionBinding for
+-   * {@code List<T>} might be resolved to {@code List<Foo>} or {@code List<Bar>} depending on how
+-   * it's requested.
+-   */
+-  abstract boolean isResolved();
+-
+   /** The {@link Key} that is provided by this binding. */
+   protected abstract Key key();
+ 
+@@ -157,4 +154,47 @@ public Void visitWildcard(WildcardType t, ImmutableSet.Builder<String> p) {
+     return packages.build();
+   }
+ 
++  /**
++   * Returns true if this is a binding for a key that has a different type parameter list than the
++   * element it's providing.
++   */
++  abstract boolean hasNonDefaultTypeParameters();
++
++  // TODO(sameb): Remove the TypeElement parameter and pull it from the TypeMirror.
++  static boolean hasNonDefaultTypeParameters(TypeElement element, TypeMirror type, Types types) {
++    // If the element has no type parameters, nothing can be wrong.
++    if (element.getTypeParameters().isEmpty()) {
++      return false;
++    }
++    
++    List<TypeMirror> defaultTypes = Lists.newArrayList();
++    for (TypeParameterElement parameter : element.getTypeParameters()) {
++      defaultTypes.add(parameter.asType());
++    }
++    
++    List<TypeMirror> actualTypes =
++        type.accept(new SimpleTypeVisitor6<List<TypeMirror>, Void>() {
++          @Override
++          protected List<TypeMirror> defaultAction(TypeMirror e, Void p) {
++            return ImmutableList.of();
++          }
++
++          @Override
++          public List<TypeMirror> visitDeclared(DeclaredType t, Void p) {
++            return ImmutableList.copyOf(t.getTypeArguments());
++          }
++        }, null);
++    
++    // The actual type parameter size can be different if the user is using a raw type.
++    if (defaultTypes.size() != actualTypes.size()) {
++      return true;
++    }
++
++    for (int i = 0; i < defaultTypes.size(); i++) {
++      if (!types.isSameType(defaultTypes.get(i), actualTypes.get(i))) {
++        return true;
++      }
++    }
++    return false;
++  }
+ }
+diff --git a/compiler/src/main/java/dagger/internal/codegen/BindingGraphValidator.java b/compiler/src/main/java/dagger/internal/codegen/BindingGraphValidator.java
+index 07893a47f..f21f865e5 100644
+--- a/compiler/src/main/java/dagger/internal/codegen/BindingGraphValidator.java
++++ b/compiler/src/main/java/dagger/internal/codegen/BindingGraphValidator.java
+@@ -47,7 +47,10 @@
+ import javax.lang.model.element.AnnotationMirror;
+ import javax.lang.model.element.ExecutableElement;
+ import javax.lang.model.element.TypeElement;
++import javax.lang.model.type.DeclaredType;
++import javax.lang.model.type.TypeKind;
+ import javax.lang.model.type.TypeMirror;
++import javax.lang.model.util.SimpleTypeVisitor6;
+ import javax.lang.model.util.Types;
+ import javax.tools.Diagnostic;
+ 
+@@ -56,6 +59,7 @@
+ import static com.google.common.collect.Iterables.getOnlyElement;
+ import static dagger.internal.codegen.ConfigurationAnnotations.getComponentDependencies;
+ import static dagger.internal.codegen.ErrorMessages.INDENT;
++import static dagger.internal.codegen.ErrorMessages.MEMBERS_INJECTION_WITH_UNBOUNDED_TYPE;
+ import static dagger.internal.codegen.ErrorMessages.REQUIRES_AT_INJECT_CONSTRUCTOR_OR_PROVIDER_FORMAT;
+ import static dagger.internal.codegen.ErrorMessages.REQUIRES_AT_INJECT_CONSTRUCTOR_OR_PROVIDER_OR_PRODUCER_FORMAT;
+ import static dagger.internal.codegen.ErrorMessages.REQUIRES_PROVIDER_FORMAT;
+@@ -199,6 +203,12 @@ private boolean validateResolvedBinding(
+           reportDuplicateBindings(path, reportBuilder);
+           return false;
+         }
++        if (membersInjectionBindings.size() == 1) {
++          MembersInjectionBinding binding = getOnlyElement(membersInjectionBindings);
++          if (!validateMembersInjectionBinding(binding, path, reportBuilder)) {
++            return false;
++          }
++        }
+         break;
+       default:
+         throw new AssertionError();
+@@ -206,6 +216,49 @@ private boolean validateResolvedBinding(
+     return true;
+   }
+ 
++  /**
++   * Validates a members injection binding, returning false (and reporting the error) if it wasn't
++   * valid.
++   */
++  private boolean validateMembersInjectionBinding(MembersInjectionBinding binding,
++      final Deque<ResolvedRequest> path, final Builder<BindingGraph> reportBuilder) {
++    return binding.key().type().accept(new SimpleTypeVisitor6<Boolean, Void>() {
++      @Override protected Boolean defaultAction(TypeMirror e, Void p) {
++        reportBuilder.addItem("Invalid members injection request.",
++            path.peek().request().requestElement());
++        return false;
++      }
++
++      @Override public Boolean visitDeclared(DeclaredType type, Void ignored) {
++        // If the key has type arguments, validate that each type argument is declared.
++        // Otherwise the type argument may be a wildcard (or other type), and we can't
++        // resolve that to actual types.
++        for (TypeMirror arg : type.getTypeArguments()) {
++          if (arg.getKind() != TypeKind.DECLARED) {
++            reportBuilder.addItem(MEMBERS_INJECTION_WITH_UNBOUNDED_TYPE,
++                path.peek().request().requestElement());
++            return false;
++          }
++        }
++
++        TypeElement element = MoreElements.asType(type.asElement());
++        // Also validate that the key is not the erasure of a generic type.
++        // If it is, that means the user referred to Foo<T> as just 'Foo',
++        // which we don't allow.  (This is a judgement call -- we *could*
++        // allow it and instantiate the type bounds... but we don't.)
++        if (!MoreTypes.asDeclared(element.asType()).getTypeArguments().isEmpty()
++            && types.isSameType(types.erasure(element.asType()), type)) {
++          reportBuilder.addItem(
++              String.format(ErrorMessages.MEMBERS_INJECTION_WITH_RAW_TYPE, type.toString()),
++              path.peek().request().requestElement());
++          return false;
++        }
++
++        return true; // valid
++      }
++    }, null);
++  }
++
+   /**
+    * Validates that among the dependencies are at most one scoped dependency,
+    * that there are no cycles within the scoping chain, and that singleton
+diff --git a/compiler/src/main/java/dagger/internal/codegen/ErrorMessages.java b/compiler/src/main/java/dagger/internal/codegen/ErrorMessages.java
+index a14cf39d6..2a2e91b68 100644
+--- a/compiler/src/main/java/dagger/internal/codegen/ErrorMessages.java
++++ b/compiler/src/main/java/dagger/internal/codegen/ErrorMessages.java
+@@ -191,6 +191,12 @@
+   static final String MEMBERS_INJECTION_DOES_NOT_IMPLY_PROVISION =
+       "This type supports members injection but cannot be implicitly provided.";
+ 
++  static final String MEMBERS_INJECTION_WITH_RAW_TYPE =
++      "%s has type parameters, cannot members inject the raw type.";
++
++  static final String MEMBERS_INJECTION_WITH_UNBOUNDED_TYPE =
++      "Type parameters must be bounded for members injection.";
++
+   static final String CONTAINS_DEPENDENCY_CYCLE_FORMAT = "%s.%s() contains a dependency cycle:\n%s";
+ 
+   static final String MALFORMED_MODULE_METHOD_FORMAT =
+diff --git a/compiler/src/main/java/dagger/internal/codegen/FactoryGenerator.java b/compiler/src/main/java/dagger/internal/codegen/FactoryGenerator.java
+index cdd986e28..78bc2dd6f 100644
+--- a/compiler/src/main/java/dagger/internal/codegen/FactoryGenerator.java
++++ b/compiler/src/main/java/dagger/internal/codegen/FactoryGenerator.java
+@@ -92,7 +92,7 @@ ClassName nameGeneratedType(ProvisionBinding binding) {
+   @Override
+   ImmutableSet<JavaWriter> write(ClassName generatedTypeName, ProvisionBinding binding) {
+     // We don't want to write out resolved bindings -- we want to write out the generic version.
+-    checkState(!binding.isResolved());
++    checkState(!binding.hasNonDefaultTypeParameters());
+ 
+     TypeMirror keyType = binding.provisionType().equals(Type.MAP)
+         ? Util.getProvidedValueTypeOfMap(MoreTypes.asDeclared(binding.key().type()))
+diff --git a/compiler/src/main/java/dagger/internal/codegen/InjectBindingRegistry.java b/compiler/src/main/java/dagger/internal/codegen/InjectBindingRegistry.java
+index 145ad678f..e41f6e9cf 100644
+--- a/compiler/src/main/java/dagger/internal/codegen/InjectBindingRegistry.java
++++ b/compiler/src/main/java/dagger/internal/codegen/InjectBindingRegistry.java
+@@ -72,7 +72,7 @@ void generateBindings(SourceFileGenerator<B> generator) throws SourceFileGenerat
+       for (B binding = bindingsRequiringGeneration.poll();
+           binding != null;
+           binding = bindingsRequiringGeneration.poll()) {
+-        checkState(!binding.isResolved());
++        checkState(!binding.hasNonDefaultTypeParameters());
+         generator.generate(binding);
+         materializedBindings.add(binding);
+       }
+@@ -116,7 +116,7 @@ void tryToGenerateBinding(B binding, ClassName factoryName, boolean explicit) {
+     
+     /** Returns true if the binding needs to be generated. */
+     private boolean shouldGenerateBinding(B binding, ClassName factoryName) {
+-      return !binding.isResolved()
++      return !binding.hasNonDefaultTypeParameters()
+           && elements.getTypeElement(factoryName.canonicalName()) == null
+           && !materializedBindings.contains(binding)
+           && !bindingsRequiringGeneration.contains(binding);
+@@ -127,7 +127,7 @@ private boolean shouldGenerateBinding(B binding, ClassName factoryName) {
+     private void tryToCacheBinding(B binding) {
+       // We only cache resolved bindings or unresolved bindings w/o type arguments.
+       // Unresolved bindings w/ type arguments aren't valid for the object graph.
+-      if (binding.isResolved()          
++      if (binding.hasNonDefaultTypeParameters()          
+           || binding.bindingTypeElement().getTypeParameters().isEmpty()) {        
+         Key key = binding.key();
+         Binding previousValue = bindingsByKey.put(key, binding);
+@@ -183,7 +183,7 @@ MembersInjectionBinding registerBinding(MembersInjectionBinding binding) {
+   private ProvisionBinding registerBinding(ProvisionBinding binding, boolean explicit) {
+     ClassName factoryName = SourceFiles.factoryNameForProvisionBinding(binding);
+     provisionBindings.tryRegisterBinding(binding, factoryName, explicit);
+-    if (binding.isResolved()) {
++    if (binding.hasNonDefaultTypeParameters()) {
+       provisionBindings.tryToGenerateBinding(provisionBindingFactory.unresolve(binding),
+           factoryName, explicit);
+     }
+@@ -202,13 +202,13 @@ private MembersInjectionBinding registerBinding(
+       // empty members injection bindings are special and don't need source files.
+       // so, we just pretend
+       membersInjectionBindings.pretendBindingGenerated(binding, membersInjectorName);
+-      if (binding.isResolved()) {
++      if (binding.hasNonDefaultTypeParameters()) {
+         membersInjectionBindings.pretendBindingGenerated(
+             membersInjectionBindingFactory.unresolve(binding), membersInjectorName);
+       }
+     } else {
+       membersInjectionBindings.tryRegisterBinding(binding, membersInjectorName, explicit);
+-      if (binding.isResolved()) {
++      if (binding.hasNonDefaultTypeParameters()) {
+         membersInjectionBindings.tryToGenerateBinding(
+             membersInjectionBindingFactory.unresolve(binding), membersInjectorName, explicit);
+       }
+diff --git a/compiler/src/main/java/dagger/internal/codegen/MembersInjectionBinding.java b/compiler/src/main/java/dagger/internal/codegen/MembersInjectionBinding.java
+index 11420de3a..9868c661d 100644
+--- a/compiler/src/main/java/dagger/internal/codegen/MembersInjectionBinding.java
++++ b/compiler/src/main/java/dagger/internal/codegen/MembersInjectionBinding.java
+@@ -138,18 +138,17 @@ private InjectionSite injectionSiteForInjectField(VariableElement fieldElement,
+ 
+     /** Returns an unresolved version of this binding. */
+     MembersInjectionBinding unresolve(MembersInjectionBinding binding) {
+-      checkState(binding.isResolved());
++      checkState(binding.hasNonDefaultTypeParameters());
+       DeclaredType unresolved = MoreTypes.asDeclared(binding.bindingElement().asType());
+       return forInjectedType(unresolved, Optional.<TypeMirror>absent());
+     }
+ 
+     /**
+      * Returns a MembersInjectionBinding for the given type. If {@code resolvedType} is present,
+-     * this will return a {@link Binding#isResolved() resolved} binding, with the key &
+-     * type resolved to the given type (using {@link Types#asMemberOf(DeclaredType, Element)}).
++     * this will return a resolved binding, with the key & type resolved to the given type (using
++     * {@link Types#asMemberOf(DeclaredType, Element)}).
+      */
+     MembersInjectionBinding forInjectedType(DeclaredType type, Optional<TypeMirror> resolvedType) {
+-      boolean isResolved = false;
+       // If the class this is injecting has some type arguments, resolve everything.
+       if (!type.getTypeArguments().isEmpty() && resolvedType.isPresent()) {
+         DeclaredType resolved = MoreTypes.asDeclared(resolvedType.get());
+@@ -158,7 +157,6 @@ MembersInjectionBinding forInjectedType(DeclaredType type, Optional<TypeMirror>
+             "erased expected type: %s, erased actual type: %s",
+             types.erasure(resolved), types.erasure(type));
+         type = resolved;
+-        isResolved = true;
+       }
+ 
+       TypeElement typeElement = MoreElements.asType(type.asElement());
+@@ -205,7 +203,6 @@ MembersInjectionBinding forInjectedType(DeclaredType type, Optional<TypeMirror>
+ 
+       Key key = keyFactory.forMembersInjectedType(type);
+       return new AutoValue_MembersInjectionBinding(
+-          isResolved,
+           key,
+           dependencies,
+           new ImmutableSet.Builder<DependencyRequest>()
+@@ -213,6 +210,7 @@ MembersInjectionBinding forInjectedType(DeclaredType type, Optional<TypeMirror>
+               .addAll(parentInjectorRequest.asSet())
+               .build(),
+           findBindingPackage(key),
++          hasNonDefaultTypeParameters(typeElement, key.type(), types),
+           typeElement,
+           injectionSites,
+           parentInjectorRequest);
+diff --git a/compiler/src/main/java/dagger/internal/codegen/MembersInjectorGenerator.java b/compiler/src/main/java/dagger/internal/codegen/MembersInjectorGenerator.java
+index 061359121..642d6e966 100644
+--- a/compiler/src/main/java/dagger/internal/codegen/MembersInjectorGenerator.java
++++ b/compiler/src/main/java/dagger/internal/codegen/MembersInjectorGenerator.java
+@@ -106,7 +106,7 @@ ClassName nameGeneratedType(MembersInjectionBinding binding) {
+   @Override
+   ImmutableSet<JavaWriter> write(ClassName generatedTypeName, MembersInjectionBinding binding) {
+     // We don't want to write out resolved bindings -- we want to write out the generic version.
+-    checkState(!binding.isResolved());
++    checkState(!binding.hasNonDefaultTypeParameters());
+ 
+     TypeName injectedTypeName = TypeNames.forTypeMirror(binding.key().type());
+     JavaWriter writer = JavaWriter.inPackage(generatedTypeName.packageName());
+diff --git a/compiler/src/main/java/dagger/internal/codegen/ProductionBinding.java b/compiler/src/main/java/dagger/internal/codegen/ProductionBinding.java
+index d45d44d91..ba3c2e28c 100644
+--- a/compiler/src/main/java/dagger/internal/codegen/ProductionBinding.java
++++ b/compiler/src/main/java/dagger/internal/codegen/ProductionBinding.java
+@@ -121,11 +121,11 @@ ProductionBinding forProducesMethod(
+           ? Kind.FUTURE_PRODUCTION
+           : Kind.IMMEDIATE;
+       return new AutoValue_ProductionBinding(
+-          false /* not resolved */,
+           key,
+           producesMethod,
+           dependencies,
+           findBindingPackage(key),
++          false,
+           Optional.of(MoreTypes.asTypeElement(declaredContainer)),
+           kind,
+           producesAnnotation.type(),
+@@ -138,11 +138,11 @@ ProductionBinding forImplicitMapBinding(DependencyRequest explicitRequest,
+       checkNotNull(implicitRequest);
+       ImmutableSet<DependencyRequest> dependencies = ImmutableSet.of(implicitRequest);
+       return new AutoValue_ProductionBinding(
+-          false /* not resolved */,
+           explicitRequest.key(),
+           implicitRequest.requestElement(),
+           dependencies,
+           findBindingPackage(explicitRequest.key()),
++          false,
+           Optional.<TypeElement>absent(),
+           Kind.FUTURE_PRODUCTION,
+           Produces.Type.MAP,
+@@ -155,11 +155,11 @@ ProductionBinding forComponentMethod(ExecutableElement componentMethod) {
+       checkArgument(componentMethod.getParameters().isEmpty());
+       checkArgument(MoreTypes.isTypeOf(ListenableFuture.class, componentMethod.getReturnType()));
+       return new AutoValue_ProductionBinding(
+-          false /* not resolved */,
+           keyFactory.forProductionComponentMethod(componentMethod),
+           componentMethod,
+           ImmutableSet.<DependencyRequest>of(),
+           Optional.<String>absent(),
++          false,
+           Optional.<TypeElement>absent(),
+           Kind.COMPONENT_PRODUCTION,
+           Produces.Type.UNIQUE,
+diff --git a/compiler/src/main/java/dagger/internal/codegen/ProvisionBinding.java b/compiler/src/main/java/dagger/internal/codegen/ProvisionBinding.java
+index 83c3788bd..355adea77 100644
+--- a/compiler/src/main/java/dagger/internal/codegen/ProvisionBinding.java
++++ b/compiler/src/main/java/dagger/internal/codegen/ProvisionBinding.java
+@@ -152,15 +152,15 @@ FactoryCreationStrategy factoryCreationStrategy() {
+ 
+     /** Returns an unresolved version of this binding. */
+     ProvisionBinding unresolve(ProvisionBinding binding) {
+-      checkState(binding.isResolved());
++      checkState(binding.hasNonDefaultTypeParameters());
+       return forInjectConstructor((ExecutableElement) binding.bindingElement(),
+           Optional.<TypeMirror>absent());
+     }
+ 
+     /**
+      * Returns a ProvisionBinding for the given element. If {@code resolvedType} is present, this
+-     * will return a {@link Binding#isResolved() resolved} binding, with the key & type
+-     * resolved to the given type (using {@link Types#asMemberOf(DeclaredType, Element)}).
++     * will return a resolved binding, with the key & type resolved to the given type (using
++     * {@link Types#asMemberOf(DeclaredType, Element)}).
+      */
+     ProvisionBinding forInjectConstructor(ExecutableElement constructorElement,
+         Optional<TypeMirror> resolvedType) {
+@@ -169,7 +169,6 @@ ProvisionBinding forInjectConstructor(ExecutableElement constructorElement,
+       checkArgument(isAnnotationPresent(constructorElement, Inject.class));
+       checkArgument(!getQualifier(constructorElement).isPresent());
+ 
+-      boolean isResolved = false;
+       ExecutableType cxtorType = MoreTypes.asExecutable(constructorElement.asType());
+       DeclaredType enclosingCxtorType =
+           MoreTypes.asDeclared(constructorElement.getEnclosingElement().asType());
+@@ -182,7 +181,6 @@ ProvisionBinding forInjectConstructor(ExecutableElement constructorElement,
+             types.erasure(resolved), types.erasure(enclosingCxtorType));
+         cxtorType = MoreTypes.asExecutable(types.asMemberOf(resolved, constructorElement));
+         enclosingCxtorType = resolved;
+-        isResolved = true;
+       }
+ 
+       Key key = keyFactory.forInjectConstructorWithResolvedType(enclosingCxtorType);
+@@ -195,13 +193,16 @@ ProvisionBinding forInjectConstructor(ExecutableElement constructorElement,
+           membersInjectionRequest(enclosingCxtorType);
+       Optional<AnnotationMirror> scope =
+           getScopeAnnotation(constructorElement.getEnclosingElement());
++      
++      TypeElement bindingTypeElement =
++          MoreElements.asType(constructorElement.getEnclosingElement());
+ 
+       return new AutoValue_ProvisionBinding(
+-          isResolved,
+           key,
+           constructorElement,
+           dependencies,
+           findBindingPackage(key),
++          hasNonDefaultTypeParameters(bindingTypeElement, key.type(), types),
+           Optional.<TypeElement>absent(),
+           Kind.INJECTION,
+           Provides.Type.UNIQUE,
+@@ -244,11 +245,11 @@ ProvisionBinding forProvidesMethod(ExecutableElement providesMethod, TypeMirror
+               resolvedMethod.getParameterTypes());
+       Optional<AnnotationMirror> scope = getScopeAnnotation(providesMethod);
+       return new AutoValue_ProvisionBinding(
+-          false /* not resolved */,
+           key,
+           providesMethod,
+           dependencies,
+           findBindingPackage(key),
++          false /* no non-default parameter types */,
+           Optional.of(MoreTypes.asTypeElement(declaredContainer)),
+           Kind.PROVISION,
+           providesAnnotation.type(),
+@@ -263,11 +264,11 @@ ProvisionBinding forImplicitMapBinding(DependencyRequest explicitRequest,
+       ImmutableSet<DependencyRequest> dependencies = ImmutableSet.of(implicitRequest);
+       Optional<AnnotationMirror> scope = getScopeAnnotation(implicitRequest.requestElement());
+       return new AutoValue_ProvisionBinding(
+-          false /* not resolved */,
+           explicitRequest.key(),
+           implicitRequest.requestElement(),
+           dependencies,
+           findBindingPackage(explicitRequest.key()),
++          false /* no non-default parameter types */,
+           Optional.<TypeElement>absent(),
+           Kind.SYNTHETIC_PROVISON,
+           Provides.Type.MAP,
+@@ -280,11 +281,11 @@ ProvisionBinding forComponent(TypeElement componentDefinitionType) {
+       checkArgument(isAnnotationPresent(componentDefinitionType, Component.class)
+           || isAnnotationPresent(componentDefinitionType, ProductionComponent.class));
+       return new AutoValue_ProvisionBinding(
+-          false /* not resolved */,
+           keyFactory.forComponent(componentDefinitionType.asType()),
+           componentDefinitionType,
+           ImmutableSet.<DependencyRequest>of(),
+           Optional.<String>absent(),
++          false /* no non-default parameter types */,
+           Optional.<TypeElement>absent(),
+           Kind.COMPONENT,
+           Provides.Type.UNIQUE,
+@@ -298,11 +299,11 @@ ProvisionBinding forComponentMethod(ExecutableElement componentMethod) {
+       checkArgument(componentMethod.getParameters().isEmpty());
+       Optional<AnnotationMirror> scope = getScopeAnnotation(componentMethod);
+       return new AutoValue_ProvisionBinding(
+-          false /* not resolved */,
+           keyFactory.forComponentMethod(componentMethod),
+           componentMethod,
+           ImmutableSet.<DependencyRequest>of(),
+           Optional.<String>absent(),
++          false /* no non-default parameter types */,
+           Optional.<TypeElement>absent(),
+           Kind.COMPONENT_PROVISION,
+           Provides.Type.UNIQUE,
+diff --git a/compiler/src/test/java/dagger/internal/codegen/ComponentProcessorTest.java b/compiler/src/test/java/dagger/internal/codegen/ComponentProcessorTest.java
+index ea5fd26f5..ea3a14348 100644
+--- a/compiler/src/test/java/dagger/internal/codegen/ComponentProcessorTest.java
++++ b/compiler/src/test/java/dagger/internal/codegen/ComponentProcessorTest.java
+@@ -1734,97 +1734,6 @@
+         .withErrorContaining(
+             "test.B<? extends test.A> cannot be provided without an @Provides-annotated method");
+   }
+-  
+-  @Test public void arrayGenericsRequiresAtProvides() {
+-    JavaFileObject aFile = JavaFileObjects.forSourceLines("test.A",
+-        "package test;",
+-        "",
+-        "import javax.inject.Inject;",
+-        "",
+-        "final class A {",
+-        "  @Inject A() {}",
+-        "}");
+-    JavaFileObject bFile = JavaFileObjects.forSourceLines("test.B",
+-        "package test;",
+-        "",
+-        "import javax.inject.Inject;",
+-        "import javax.inject.Provider;",
+-        "",
+-        "final class B<T> {",
+-        "  @Inject B(T t) {}",
+-        "}");
+-    JavaFileObject cFile = JavaFileObjects.forSourceLines("test.C",
+-        "package test;",
+-        "",
+-        "import javax.inject.Inject;",
+-        "import javax.inject.Provider;",
+-        "",
+-        "final class C {",
+-        "  @Inject C(B<Object[]> b) {}",
+-        "}");
+-    JavaFileObject componentFile = JavaFileObjects.forSourceLines("test.SimpleComponent",
+-        "package test;",
+-        "",
+-        "import dagger.Component;",
+-        "import dagger.Lazy;",
+-        "",
+-        "import javax.inject.Provider;",
+-        "",
+-        "@Component",
+-        "interface SimpleComponent {",
+-        "  C c();",
+-        "}");
+-    assertAbout(javaSources()).that(ImmutableList.of(aFile, bFile, cFile, componentFile))
+-        .processedWith(new ComponentProcessor())
+-        .failsToCompile()
+-        .withErrorContaining("test.B<java.lang.Object[]> cannot be provided without"
+-            + " an @Provides-annotated method");
+-  }
+-  
+-  @Test public void rawTypeGenericsRequiresAtProvides() {
+-    JavaFileObject aFile = JavaFileObjects.forSourceLines("test.A",
+-        "package test;",
+-        "",
+-        "import javax.inject.Inject;",
+-        "",
+-        "final class A {",
+-        "  @Inject A() {}",
+-        "}");
+-    JavaFileObject bFile = JavaFileObjects.forSourceLines("test.B",
+-        "package test;",
+-        "",
+-        "import javax.inject.Inject;",
+-        "import javax.inject.Provider;",
+-        "",
+-        "final class B<T> {",
+-        "  @Inject B(T t) {}",
+-        "}");
+-    JavaFileObject cFile = JavaFileObjects.forSourceLines("test.C",
+-        "package test;",
+-        "",
+-        "import javax.inject.Inject;",
+-        "import javax.inject.Provider;",
+-        "",
+-        "final class C {",
+-        "  @Inject C(B b) {}",
+-        "}");
+-    JavaFileObject componentFile = JavaFileObjects.forSourceLines("test.SimpleComponent",
+-        "package test;",
+-        "",
+-        "import dagger.Component;",
+-        "import dagger.Lazy;",
+-        "",
+-        "import javax.inject.Provider;",
+-        "",
+-        "@Component",
+-        "interface SimpleComponent {",
+-        "  C c();",
+-        "}");
+-    assertAbout(javaSources()).that(ImmutableList.of(aFile, bFile, cFile, componentFile))
+-        .processedWith(new ComponentProcessor())
+-        .failsToCompile()
+-        .withErrorContaining("test.B cannot be provided without an @Provides-annotated method");
+-  }
+  
+   @Test
+   @Ignore // modify this test as necessary while debugging for your situation.
+diff --git a/compiler/src/test/java/dagger/internal/codegen/GraphValidationTest.java b/compiler/src/test/java/dagger/internal/codegen/GraphValidationTest.java
+index d9e56d04a..df5edf005 100644
+--- a/compiler/src/test/java/dagger/internal/codegen/GraphValidationTest.java
++++ b/compiler/src/test/java/dagger/internal/codegen/GraphValidationTest.java
+@@ -16,7 +16,6 @@
+ package dagger.internal.codegen;
+ 
+ import com.google.common.base.Joiner;
+-
+ import com.google.common.collect.ImmutableList;
+ import com.google.testing.compile.JavaFileObjects;
+ import java.util.Arrays;
+@@ -24,6 +23,7 @@
+ import org.junit.Test;
+ import org.junit.runner.RunWith;
+ import org.junit.runners.JUnit4;
++
+ import static com.google.common.truth.Truth.assertAbout;
+ import static com.google.testing.compile.JavaSourceSubjectFactory.javaSource;
+ import static com.google.testing.compile.JavaSourcesSubjectFactory.javaSources;
+@@ -658,4 +658,168 @@
+         .failsToCompile()
+         .withErrorContaining(expectedMsg);
+   }
++  
++  @Test public void arrayGenericsRequiresAtProvides() {
++    JavaFileObject aFile = JavaFileObjects.forSourceLines("test.A",
++        "package test;",
++        "",
++        "import javax.inject.Inject;",
++        "",
++        "final class A {",
++        "  @Inject A() {}",
++        "}");
++    JavaFileObject bFile = JavaFileObjects.forSourceLines("test.B",
++        "package test;",
++        "",
++        "import javax.inject.Inject;",
++        "import javax.inject.Provider;",
++        "",
++        "final class B<T> {",
++        "  @Inject B(T t) {}",
++        "}");
++    JavaFileObject cFile = JavaFileObjects.forSourceLines("test.C",
++        "package test;",
++        "",
++        "import javax.inject.Inject;",
++        "import javax.inject.Provider;",
++        "",
++        "final class C {",
++        "  @Inject C(B<Object[]> b) {}",
++        "}");
++    JavaFileObject componentFile = JavaFileObjects.forSourceLines("test.SimpleComponent",
++        "package test;",
++        "",
++        "import dagger.Component;",
++        "import dagger.Lazy;",
++        "",
++        "import javax.inject.Provider;",
++        "",
++        "@Component",
++        "interface SimpleComponent {",
++        "  C c();",
++        "}");
++    assertAbout(javaSources()).that(ImmutableList.of(aFile, bFile, cFile, componentFile))
++        .processedWith(new ComponentProcessor())
++        .failsToCompile()
++        .withErrorContaining("test.B<java.lang.Object[]> cannot be provided without"
++            + " an @Provides-annotated method");
++  }
++  
++  @Test public void rawTypeGenericsRequiresAtProvides() {
++    JavaFileObject aFile = JavaFileObjects.forSourceLines("test.A",
++        "package test;",
++        "",
++        "import javax.inject.Inject;",
++        "",
++        "final class A {",
++        "  @Inject A() {}",
++        "}");
++    JavaFileObject bFile = JavaFileObjects.forSourceLines("test.B",
++        "package test;",
++        "",
++        "import javax.inject.Inject;",
++        "import javax.inject.Provider;",
++        "",
++        "final class B<T> {",
++        "  @Inject B(T t) {}",
++        "}");
++    JavaFileObject cFile = JavaFileObjects.forSourceLines("test.C",
++        "package test;",
++        "",
++        "import javax.inject.Inject;",
++        "import javax.inject.Provider;",
++        "",
++        "final class C {",
++        "  @Inject C(B b) {}",
++        "}");
++    JavaFileObject componentFile = JavaFileObjects.forSourceLines("test.SimpleComponent",
++        "package test;",
++        "",
++        "import dagger.Component;",
++        "import dagger.Lazy;",
++        "",
++        "import javax.inject.Provider;",
++        "",
++        "@Component",
++        "interface SimpleComponent {",
++        "  C c();",
++        "}");
++    assertAbout(javaSources()).that(ImmutableList.of(aFile, bFile, cFile, componentFile))
++        .processedWith(new ComponentProcessor())
++        .failsToCompile()
++        .withErrorContaining("test.B cannot be provided without an @Provides-annotated method");
++  }
++  
++  @Test public void rawTypeMembersInjectFails() {
++    JavaFileObject aFile = JavaFileObjects.forSourceLines("test.A",
++        "package test;",
++        "",
++        "import javax.inject.Inject;",
++        "",
++        "final class A {",
++        "  @Inject A() {}",
++        "}");
++    JavaFileObject bFile = JavaFileObjects.forSourceLines("test.B",
++        "package test;",
++        "",
++        "import javax.inject.Inject;",
++        "",
++        "final class B<T extends Number> {",
++        "  @Inject A a;",
++        "  B(T t) {}",
++        "}");
++    JavaFileObject componentFile = JavaFileObjects.forSourceLines("test.SimpleComponent",
++        "package test;",
++        "",
++        "import dagger.Component;",
++        "import dagger.Lazy;",
++        "",
++        "import javax.inject.Provider;",
++        "",
++        "@Component",
++        "interface SimpleComponent {",
++        "  void inject(B b);",
++        "}");
++    assertAbout(javaSources()).that(ImmutableList.of(aFile, bFile, componentFile))
++        .processedWith(new ComponentProcessor())
++        .failsToCompile()
++        .withErrorContaining(
++            String.format(ErrorMessages.MEMBERS_INJECTION_WITH_RAW_TYPE, "test.B"));
++  }
++  
++  @Test public void unboundedMembersInjectionFails() {
++    JavaFileObject aFile = JavaFileObjects.forSourceLines("test.A",
++        "package test;",
++        "",
++        "import javax.inject.Inject;",
++        "",
++        "final class A {",
++        "  @Inject A() {}",
++        "}");
++    JavaFileObject bFile = JavaFileObjects.forSourceLines("test.B",
++        "package test;",
++        "",
++        "import javax.inject.Inject;",
++        "",
++        "final class B<T extends Number> {",
++        "  @Inject A a;",
++        "  B(T t) {}",
++        "}");
++    JavaFileObject componentFile = JavaFileObjects.forSourceLines("test.SimpleComponent",
++        "package test;",
++        "",
++        "import dagger.Component;",
++        "import dagger.Lazy;",
++        "",
++        "import javax.inject.Provider;",
++        "",
++        "@Component",
++        "interface SimpleComponent {",
++        "  void inject(B<? extends Number> b);",
++        "}");
++    assertAbout(javaSources()).that(ImmutableList.of(aFile, bFile, componentFile))
++        .processedWith(new ComponentProcessor())
++        .failsToCompile()
++        .withErrorContaining(ErrorMessages.MEMBERS_INJECTION_WITH_UNBOUNDED_TYPE);
++  }
+ }

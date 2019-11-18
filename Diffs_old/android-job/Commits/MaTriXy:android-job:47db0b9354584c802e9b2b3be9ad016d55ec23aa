@@ -1,0 +1,256 @@
+diff --git a/library/src/main/java/com/evernote/android/job/JobManager.java b/library/src/main/java/com/evernote/android/job/JobManager.java
+index f46b82e..d15097d 100644
+--- a/library/src/main/java/com/evernote/android/job/JobManager.java
++++ b/library/src/main/java/com/evernote/android/job/JobManager.java
+@@ -200,6 +200,8 @@ public void schedule(JobRequest request) {
+             cancelAllForTag(request.getTag());
+         }
+ 
++        JobProxy.Common.cleanUpOrphanedJob(mContext, request.getJobId());
++
+         request.setScheduledAt(System.currentTimeMillis());
+         mJobStorage.put(request);
+ 
+@@ -308,7 +310,9 @@ public JobApi getApi() {
+      */
+     public boolean cancel(int jobId) {
+         // call both methods
+-        return cancelInner(getJobRequest(jobId)) | cancelInner(getJob(jobId));
++        boolean result = cancelInner(getJobRequest(jobId)) | cancelInner(getJob(jobId));
++        JobProxy.Common.cleanUpOrphanedJob(mContext, jobId); // do this as well, just in case
++        return result;
+     }
+ 
+     /**
+@@ -333,7 +337,7 @@ public int cancelAllForTag(@NonNull String tag) {
+     private boolean cancelInner(@Nullable JobRequest request) {
+         if (request != null) {
+             CAT.i("Found pending job %s, canceling", request);
+-            getJobProxy(request).cancel(request);
++            getJobProxy(request).cancel(request.getJobId());
+             getJobStorage().remove(request);
+             return true;
+         } else {
+diff --git a/library/src/main/java/com/evernote/android/job/JobProxy.java b/library/src/main/java/com/evernote/android/job/JobProxy.java
+index 96c0b32..fe771d9 100644
+--- a/library/src/main/java/com/evernote/android/job/JobProxy.java
++++ b/library/src/main/java/com/evernote/android/job/JobProxy.java
+@@ -51,7 +51,7 @@
+ 
+     void plantPeriodic(JobRequest request);
+ 
+-    void cancel(JobRequest request);
++    void cancel(int jobId);
+ 
+     boolean isPlatformJobScheduled(JobRequest request);
+ 
+@@ -151,5 +151,22 @@ public JobRequest getPendingRequest() {
+                 return Job.Result.FAILURE;
+             }
+         }
++
++        public void cleanUpOrphanedJob() {
++            cleanUpOrphanedJob(mContext, mJobId);
++        }
++
++        public static void cleanUpOrphanedJob(Context context, int jobId) {
++            /*
++             * That's necessary if the database was deleted and jobs (especially the JobScheduler) are still around.
++             * Then if a new job is being scheduled, it's possible that the new job has the ID of the old one. Here
++             * we make sure, that no job is left in the system.
++             */
++            for (JobApi jobApi : JobApi.values()) {
++                if (jobApi.isSupported(context)) {
++                    jobApi.getCachedProxy(context).cancel(jobId);
++                }
++            }
++        }
+     }
+ }
+diff --git a/library/src/main/java/com/evernote/android/job/gcm/JobProxyGcm.java b/library/src/main/java/com/evernote/android/job/gcm/JobProxyGcm.java
+index a543e96..41c9bd2 100644
+--- a/library/src/main/java/com/evernote/android/job/gcm/JobProxyGcm.java
++++ b/library/src/main/java/com/evernote/android/job/gcm/JobProxyGcm.java
+@@ -94,8 +94,8 @@ public void plantPeriodic(JobRequest request) {
+     }
+ 
+     @Override
+-    public void cancel(JobRequest request) {
+-        mGcmNetworkManager.cancelTask(createTag(request), PlatformGcmService.class);
++    public void cancel(int jobId) {
++        mGcmNetworkManager.cancelTask(createTag(jobId), PlatformGcmService.class);
+     }
+ 
+     @Override
+@@ -105,7 +105,11 @@ public boolean isPlatformJobScheduled(JobRequest request) {
+     }
+ 
+     protected String createTag(JobRequest request) {
+-        return String.valueOf(request.getJobId());
++        return createTag(request.getJobId());
++    }
++
++    protected String createTag(int jobId) {
++        return String.valueOf(jobId);
+     }
+ 
+     protected int convertNetworkType(@NonNull JobRequest.NetworkType networkType) {
+diff --git a/library/src/main/java/com/evernote/android/job/gcm/PlatformGcmService.java b/library/src/main/java/com/evernote/android/job/gcm/PlatformGcmService.java
+index d199a7d..81f721c 100644
+--- a/library/src/main/java/com/evernote/android/job/gcm/PlatformGcmService.java
++++ b/library/src/main/java/com/evernote/android/job/gcm/PlatformGcmService.java
+@@ -45,6 +45,7 @@ public int onRunTask(TaskParams taskParams) {
+ 
+         JobRequest request = common.getPendingRequest();
+         if (request == null) {
++            common.cleanUpOrphanedJob();
+             return GcmNetworkManager.RESULT_FAILURE;
+         }
+ 
+diff --git a/library/src/main/java/com/evernote/android/job/v14/JobProxy14.java b/library/src/main/java/com/evernote/android/job/v14/JobProxy14.java
+index 3430563..4d2bdd1 100644
+--- a/library/src/main/java/com/evernote/android/job/v14/JobProxy14.java
++++ b/library/src/main/java/com/evernote/android/job/v14/JobProxy14.java
+@@ -74,11 +74,12 @@ public void plantPeriodic(JobRequest request) {
+     }
+ 
+     @Override
+-    public void cancel(JobRequest request) {
++    public void cancel(int jobId) {
+         AlarmManager alarmManager = getAlarmManager();
+         if (alarmManager != null) {
+             try {
+-                alarmManager.cancel(getPendingIntent(request, request.isPeriodic()));
++                alarmManager.cancel(getPendingIntent(jobId, createPendingIntentFlags(true)));
++                alarmManager.cancel(getPendingIntent(jobId, createPendingIntentFlags(false)));
+             } catch (Exception e) {
+                 // java.lang.SecurityException: get application info: Neither user 1010133 nor
+                 // current process has android.permission.INTERACT_ACROSS_USERS.
+@@ -93,20 +94,28 @@ public boolean isPlatformJobScheduled(JobRequest request) {
+         return pendingIntent != null;
+     }
+ 
+-    protected PendingIntent getPendingIntent(JobRequest request, boolean repeating) {
++    protected int createPendingIntentFlags(boolean repeating) {
+         int flags = PendingIntent.FLAG_UPDATE_CURRENT;
+         if (!repeating) {
+             flags |= PendingIntent.FLAG_ONE_SHOT;
+         }
+-        return getPendingIntent(request, flags);
++        return flags;
++    }
++
++    protected PendingIntent getPendingIntent(JobRequest request, boolean repeating) {
++        return getPendingIntent(request, createPendingIntentFlags(repeating));
+     }
+ 
+     protected PendingIntent getPendingIntent(JobRequest request, int flags) {
+-        Intent intent = PlatformAlarmReceiver.createIntent(request);
++        return getPendingIntent(request.getJobId(), flags);
++    }
++
++    protected PendingIntent getPendingIntent(int jobId, int flags) {
++        Intent intent = PlatformAlarmReceiver.createIntent(jobId);
+ 
+         // repeating PendingIntent with service seams to have problems
+         try {
+-            return PendingIntent.getBroadcast(mContext, request.getJobId(), intent, flags);
++            return PendingIntent.getBroadcast(mContext, jobId, intent, flags);
+         } catch (Exception e) {
+             // java.lang.SecurityException: Permission Denial: getIntentSender() from pid=31482, uid=10057,
+             // (need uid=-1) is not allowed to send as package com.evernote
+diff --git a/library/src/main/java/com/evernote/android/job/v14/PlatformAlarmReceiver.java b/library/src/main/java/com/evernote/android/job/v14/PlatformAlarmReceiver.java
+index 17331e9..44675c2 100644
+--- a/library/src/main/java/com/evernote/android/job/v14/PlatformAlarmReceiver.java
++++ b/library/src/main/java/com/evernote/android/job/v14/PlatformAlarmReceiver.java
+@@ -29,7 +29,6 @@
+ import android.content.Intent;
+ import android.support.v4.content.WakefulBroadcastReceiver;
+ 
+-import com.evernote.android.job.JobRequest;
+ import com.evernote.android.job.util.JobCat;
+ import com.evernote.android.job.util.JobUtil;
+ 
+@@ -47,9 +46,8 @@
+ 
+     private static final CatLog CAT = new JobCat("PlatformAlarmReceiver");
+ 
+-    /*package*/ static Intent createIntent(JobRequest request) {
+-        return new Intent(ACTION_RUN_JOB)
+-                .putExtra(EXTRA_JOB_ID, request.getJobId());
++    /*package*/ static Intent createIntent(int jobId) {
++        return new Intent(ACTION_RUN_JOB).putExtra(EXTRA_JOB_ID, jobId);
+     }
+ 
+     @Override
+diff --git a/library/src/main/java/com/evernote/android/job/v14/PlatformAlarmService.java b/library/src/main/java/com/evernote/android/job/v14/PlatformAlarmService.java
+index 29d404f..25fe220 100644
+--- a/library/src/main/java/com/evernote/android/job/v14/PlatformAlarmService.java
++++ b/library/src/main/java/com/evernote/android/job/v14/PlatformAlarmService.java
+@@ -66,21 +66,24 @@ protected void onHandleIntent(final Intent intent) {
+         final JobProxy.Common common = new JobProxy.Common(this, jobId);
+ 
+         final JobRequest request = common.getPendingRequest();
+-        if (request != null) {
+-            // parallel execution
+-            EXECUTOR_SERVICE.execute(new Runnable() {
+-                @Override
+-                public void run() {
+-                    common.executeJobRequest(request);
++        if (request == null) {
++            common.cleanUpOrphanedJob();
++            return;
++        }
+ 
+-                    // call here, our own wake lock could be acquired too late
+-                    try {
+-                        PlatformAlarmReceiver.completeWakefulIntent(intent);
+-                    } catch (Exception e) {
+-                        // could end in a NPE if the intent has no wake lock
+-                    }
++        // parallel execution
++        EXECUTOR_SERVICE.execute(new Runnable() {
++            @Override
++            public void run() {
++                common.executeJobRequest(request);
++
++                // call here, our own wake lock could be acquired too late
++                try {
++                    PlatformAlarmReceiver.completeWakefulIntent(intent);
++                } catch (Exception e) {
++                    // could end in a NPE if the intent has no wake lock
+                 }
+-            });
+-        }
++            }
++        });
+     }
+ }
+diff --git a/library/src/main/java/com/evernote/android/job/v21/JobProxy21.java b/library/src/main/java/com/evernote/android/job/v21/JobProxy21.java
+index 667e7e1..6991a49 100644
+--- a/library/src/main/java/com/evernote/android/job/v21/JobProxy21.java
++++ b/library/src/main/java/com/evernote/android/job/v21/JobProxy21.java
+@@ -103,9 +103,9 @@ public void plantPeriodic(JobRequest request) {
+     }
+ 
+     @Override
+-    public void cancel(JobRequest request) {
++    public void cancel(int jobId) {
+         try {
+-            getJobScheduler().cancel(request.getJobId());
++            getJobScheduler().cancel(jobId);
+         } catch (Exception e) {
+             // https://gist.github.com/vRallev/5d48a4a8e8d05067834e
+             CAT.e(e);
+diff --git a/library/src/main/java/com/evernote/android/job/v21/PlatformJobService.java b/library/src/main/java/com/evernote/android/job/v21/PlatformJobService.java
+index 3d119dc..fb5d914 100644
+--- a/library/src/main/java/com/evernote/android/job/v21/PlatformJobService.java
++++ b/library/src/main/java/com/evernote/android/job/v21/PlatformJobService.java
+@@ -61,6 +61,7 @@ public boolean onStartJob(final JobParameters params) {
+ 
+         final JobRequest request = common.getPendingRequest();
+         if (request == null) {
++            common.cleanUpOrphanedJob();
+             return false;
+         }
+ 

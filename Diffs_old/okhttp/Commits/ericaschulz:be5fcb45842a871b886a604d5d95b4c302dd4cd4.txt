@@ -1,0 +1,1643 @@
+diff --git a/CHANGELOG.md b/CHANGELOG.md
+index 5422a13f3b..86e3bee13f 100644
+--- a/CHANGELOG.md
++++ b/CHANGELOG.md
+@@ -1,6 +1,16 @@
+ Change Log
+ ==========
+ 
++## Version 3.8.1
++
++_2017-06-18_
++
++ *  Fix: Recover gracefully from stale coalesced connections. We had a bug where
++    connection coalescing (introduced in OkHttp 3.7.0) and stale connection
++    recovery could interact to cause a `NoSuchElementException` crash in the
++    `RouteSelector`.
++
++
+ ## Version 3.8.0
+ 
+ _2017-05-13_
+diff --git a/README.md b/README.md
+index 4bd5e136f1..1754c6d0c7 100644
+--- a/README.md
++++ b/README.md
+@@ -11,12 +11,12 @@ Download [the latest JAR][3] or grab via Maven:
+ <dependency>
+   <groupId>com.squareup.okhttp3</groupId>
+   <artifactId>okhttp</artifactId>
+-  <version>3.8.0</version>
++  <version>3.8.1</version>
+ </dependency>
+ ```
+ or Gradle:
+ ```groovy
+-compile 'com.squareup.okhttp3:okhttp:3.8.0'
++compile 'com.squareup.okhttp3:okhttp:3.8.1'
+ ```
+ 
+ Snapshots of the development version are available in [Sonatype's `snapshots` repository][snap].
+@@ -36,13 +36,13 @@ Download [the latest JAR][4] or grab via Maven:
+ <dependency>
+   <groupId>com.squareup.okhttp3</groupId>
+   <artifactId>mockwebserver</artifactId>
+-  <version>3.8.0</version>
++  <version>3.8.1</version>
+   <scope>test</scope>
+ </dependency>
+ ```
+ or Gradle:
+ ```groovy
+-testCompile 'com.squareup.okhttp3:mockwebserver:3.8.0'
++testCompile 'com.squareup.okhttp3:mockwebserver:3.8.1'
+ ```
+ 
+ ProGuard
+diff --git a/okhttp-tests/src/test/java/okhttp3/ConnectionPoolTest.java b/okhttp-tests/src/test/java/okhttp3/ConnectionPoolTest.java
+index 0d07c26b2d..9ef1b146ca 100644
+--- a/okhttp-tests/src/test/java/okhttp3/ConnectionPoolTest.java
++++ b/okhttp-tests/src/test/java/okhttp3/ConnectionPoolTest.java
+@@ -83,7 +83,8 @@
+ 
+     RealConnection c1 = newConnection(pool, routeA1, 50L);
+     synchronized (pool) {
+-      StreamAllocation streamAllocation = new StreamAllocation(pool, addressA, null);
++      StreamAllocation streamAllocation = new StreamAllocation(pool, addressA, null,
++          EventListener.NONE, null);
+       streamAllocation.acquire(c1);
+     }
+ 
+@@ -176,7 +177,8 @@
+   /** Use a helper method so there's no hidden reference remaining on the stack. */
+   private void allocateAndLeakAllocation(ConnectionPool pool, RealConnection connection) {
+     synchronized (pool) {
+-      StreamAllocation leak = new StreamAllocation(pool, connection.route().address(), null);
++      StreamAllocation leak = new StreamAllocation(pool, connection.route().address(), null,
++          EventListener.NONE, null);
+       leak.acquire(connection);
+     }
+   }
+diff --git a/okhttp-tests/src/test/java/okhttp3/EventListenerTest.java b/okhttp-tests/src/test/java/okhttp3/EventListenerTest.java
+new file mode 100644
+index 0000000000..29b7fa4016
+--- /dev/null
++++ b/okhttp-tests/src/test/java/okhttp3/EventListenerTest.java
+@@ -0,0 +1,436 @@
++/*
++ * Copyright (C) 2017 Square, Inc.
++ *
++ * Licensed under the Apache License, Version 2.0 (the "License");
++ * you may not use this file except in compliance with the License.
++ * You may obtain a copy of the License at
++ *
++ *      http://www.apache.org/licenses/LICENSE-2.0
++ *
++ * Unless required by applicable law or agreed to in writing, software
++ * distributed under the License is distributed on an "AS IS" BASIS,
++ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++ * See the License for the specific language governing permissions and
++ * limitations under the License.
++ */
++package okhttp3;
++
++import java.io.IOException;
++import java.net.InetAddress;
++import java.net.UnknownHostException;
++import java.util.ArrayDeque;
++import java.util.ArrayList;
++import java.util.Arrays;
++import java.util.Collections;
++import java.util.Deque;
++import java.util.List;
++import okhttp3.internal.DoubleInetAddressDns;
++import okhttp3.internal.SingleInetAddressDns;
++import okhttp3.internal.tls.SslClient;
++import okhttp3.mockwebserver.MockResponse;
++import okhttp3.mockwebserver.MockWebServer;
++import okhttp3.mockwebserver.SocketPolicy;
++import org.junit.Before;
++import org.junit.Rule;
++import org.junit.Test;
++
++import static org.junit.Assert.assertEquals;
++import static org.junit.Assert.assertFalse;
++import static org.junit.Assert.assertNotNull;
++import static org.junit.Assert.assertNull;
++import static org.junit.Assert.assertSame;
++import static org.junit.Assert.assertTrue;
++import static org.junit.Assert.fail;
++
++public final class EventListenerTest {
++  @Rule public final MockWebServer server = new MockWebServer();
++
++  private OkHttpClient client;
++  private final SingleInetAddressDns singleDns = new SingleInetAddressDns();
++  private final RecordingEventListener listener = new RecordingEventListener();
++  private final SslClient sslClient = SslClient.localhost();
++
++  @Before public void setUp() {
++    client = new OkHttpClient.Builder()
++        .dns(singleDns)
++        .eventListener(listener)
++        .build();
++  }
++
++  @Test public void successfulCallEventSequence() throws IOException {
++    server.enqueue(new MockResponse());
++
++    Call call = client.newCall(new Request.Builder()
++        .url(server.url("/"))
++        .build());
++    Response response = call.execute();
++    assertEquals(200, response.code());
++    response.body().close();
++
++    List<Class<?>> expectedEvents = Arrays.asList(DnsStart.class, DnsEnd.class);
++    assertEquals(expectedEvents, listener.recordedEventTypes());
++  }
++
++  @Test public void successfulHttpsCallEventSequence() throws IOException {
++    enableTls(false);
++    server.enqueue(new MockResponse());
++
++    Call call = client.newCall(new Request.Builder()
++        .url(server.url("/"))
++        .build());
++    Response response = call.execute();
++    assertEquals(200, response.code());
++    response.body().close();
++
++    List<Class<?>> expectedEvents = Arrays.asList(
++        DnsStart.class, DnsEnd.class,
++        SecureConnectStart.class, SecureConnectEnd.class);
++    assertEquals(expectedEvents, listener.recordedEventTypes());
++  }
++
++  @Test public void successfulDnsLookup() throws IOException {
++    server.enqueue(new MockResponse());
++
++    Call call = client.newCall(new Request.Builder()
++        .url(server.url("/"))
++        .build());
++    Response response = call.execute();
++    assertEquals(200, response.code());
++    response.body().close();
++
++    DnsStart dnsStart = listener.removeUpToEvent(DnsStart.class);
++    assertSame(call, dnsStart.call);
++    assertEquals("localhost", dnsStart.domainName);
++
++    DnsEnd dnsEnd = listener.removeUpToEvent(DnsEnd.class);
++    assertSame(call, dnsEnd.call);
++    assertEquals("localhost", dnsEnd.domainName);
++    assertEquals(1, dnsEnd.inetAddressList.size());
++    assertNull(dnsEnd.throwable);
++  }
++
++  @Test public void noDnsLookupOnPooledConnection() throws IOException {
++    server.enqueue(new MockResponse());
++    server.enqueue(new MockResponse());
++
++    // Seed the pool.
++    Call call1 = client.newCall(new Request.Builder()
++        .url(server.url("/"))
++        .build());
++    Response response1 = call1.execute();
++    assertEquals(200, response1.code());
++    response1.body().close();
++
++    listener.clearAllEvents();
++
++    Call call2 = client.newCall(new Request.Builder()
++        .url(server.url("/"))
++        .build());
++    Response response2 = call2.execute();
++    assertEquals(200, response2.code());
++    response2.body().close();
++
++    List<Class<?>> recordedEvents = listener.recordedEventTypes();
++    assertFalse(recordedEvents.contains(DnsStart.class));
++    assertFalse(recordedEvents.contains(DnsEnd.class));
++  }
++
++  @Test public void multipleDnsLookupsForSingleCall() throws IOException {
++    server.enqueue(new MockResponse()
++        .setResponseCode(301)
++        .setHeader("Location", "http://www.fakeurl:" + server.getPort()));
++    server.enqueue(new MockResponse());
++
++    FakeDns dns = new FakeDns();
++    dns.set("fakeurl", singleDns.lookup(server.getHostName()));
++    dns.set("www.fakeurl", singleDns.lookup(server.getHostName()));
++
++    client = client.newBuilder()
++        .dns(dns)
++        .build();
++
++    Call call = client.newCall(new Request.Builder()
++        .url("http://fakeurl:" + server.getPort())
++        .build());
++    Response response = call.execute();
++    assertEquals(200, response.code());
++    response.body().close();
++
++    listener.removeUpToEvent(DnsStart.class);
++    listener.removeUpToEvent(DnsEnd.class);
++    listener.removeUpToEvent(DnsStart.class);
++    listener.removeUpToEvent(DnsEnd.class);
++  }
++
++  @Test public void failedDnsLookup() {
++    client = client.newBuilder()
++        .dns(new FakeDns())
++        .build();
++    Call call = client.newCall(new Request.Builder()
++        .url("http://fakeurl/")
++        .build());
++    try {
++      call.execute();
++      fail();
++    } catch (IOException expected) {
++    }
++
++    listener.removeUpToEvent(DnsStart.class);
++
++    DnsEnd dnsEnd = listener.removeUpToEvent(DnsEnd.class);
++    assertSame(call, dnsEnd.call);
++    assertEquals("fakeurl", dnsEnd.domainName);
++    assertNull(dnsEnd.inetAddressList);
++    assertTrue(dnsEnd.throwable instanceof UnknownHostException);
++  }
++
++  @Test public void emptyDnsLookup() {
++    Dns emptyDns = new Dns() {
++      @Override public List<InetAddress> lookup(String hostname) throws UnknownHostException {
++        return Collections.emptyList();
++      }
++    };
++
++    client = client.newBuilder()
++        .dns(emptyDns)
++        .build();
++    Call call = client.newCall(new Request.Builder()
++        .url("http://fakeurl/")
++        .build());
++    try {
++      call.execute();
++      fail();
++    } catch (IOException expected) {
++    }
++
++    listener.removeUpToEvent(DnsStart.class);
++
++    DnsEnd dnsEnd = listener.removeUpToEvent(DnsEnd.class);
++    assertSame(call, dnsEnd.call);
++    assertEquals("fakeurl", dnsEnd.domainName);
++    assertNull(dnsEnd.inetAddressList);
++    assertTrue(dnsEnd.throwable instanceof UnknownHostException);
++  }
++
++  @Test public void successfulSecureConnect() throws IOException {
++    enableTls(false);
++    server.enqueue(new MockResponse());
++
++    Call call = client.newCall(new Request.Builder()
++        .url(server.url("/"))
++        .build());
++    Response response = call.execute();
++    assertEquals(200, response.code());
++    response.body().close();
++
++    SecureConnectStart secureStart = listener.removeUpToEvent(SecureConnectStart.class);
++    assertSame(call, secureStart.call);
++
++    SecureConnectEnd secureEnd = listener.removeUpToEvent(SecureConnectEnd.class);
++    assertSame(call, secureEnd.call);
++    assertNotNull(secureEnd.handshake);
++    assertNull(secureEnd.throwable);
++  }
++
++  @Test public void failedSecureConnect() {
++    enableTls(false);
++    server.enqueue(new MockResponse()
++        .setSocketPolicy(SocketPolicy.FAIL_HANDSHAKE));
++
++    Call call = client.newCall(new Request.Builder()
++        .url(server.url("/"))
++        .build());
++    try {
++      call.execute();
++      fail();
++    } catch (IOException expected) {
++    }
++
++    SecureConnectStart secureStart = listener.removeUpToEvent(SecureConnectStart.class);
++    assertSame(call, secureStart.call);
++
++    SecureConnectEnd secureEnd = listener.removeUpToEvent(SecureConnectEnd.class);
++    assertSame(call, secureEnd.call);
++    assertNull(secureEnd.handshake);
++    assertTrue(secureEnd.throwable instanceof IOException);
++  }
++
++  @Test public void secureConnectWithTunnel() throws IOException {
++    enableTls(true);
++    server.enqueue(new MockResponse()
++        .setSocketPolicy(SocketPolicy.UPGRADE_TO_SSL_AT_END));
++    server.enqueue(new MockResponse());
++
++    client = client.newBuilder()
++        .proxy(server.toProxyAddress())
++        .build();
++
++    Call call = client.newCall(new Request.Builder()
++        .url(server.url("/"))
++        .build());
++    Response response = call.execute();
++    assertEquals(200, response.code());
++    response.body().close();
++
++    SecureConnectStart secureStart = listener.removeUpToEvent(SecureConnectStart.class);
++    assertSame(call, secureStart.call);
++
++    SecureConnectEnd secureEnd = listener.removeUpToEvent(SecureConnectEnd.class);
++    assertSame(call, secureEnd.call);
++    assertNotNull(secureEnd.handshake);
++    assertNull(secureEnd.throwable);
++  }
++
++  @Test public void multipleSecureConnectsForSingleCall() throws IOException {
++    enableTls(false);
++    server.enqueue(new MockResponse()
++        .setSocketPolicy(SocketPolicy.FAIL_HANDSHAKE));
++    server.enqueue(new MockResponse());
++
++    client = client.newBuilder()
++        .dns(new DoubleInetAddressDns())
++        .build();
++
++    Call call = client.newCall(new Request.Builder()
++        .url(server.url("/"))
++        .build());
++    Response response = call.execute();
++    assertEquals(200, response.code());
++    response.body().close();
++
++    listener.removeUpToEvent(SecureConnectStart.class);
++    listener.removeUpToEvent(SecureConnectEnd.class);
++
++    listener.removeUpToEvent(SecureConnectStart.class);
++    listener.removeUpToEvent(SecureConnectEnd.class);
++  }
++
++  @Test public void noSecureConnectsOnPooledConnection() throws IOException {
++    enableTls(false);
++    server.enqueue(new MockResponse());
++    server.enqueue(new MockResponse());
++
++    client = client.newBuilder()
++        .dns(new DoubleInetAddressDns())
++        .build();
++
++    // Seed the pool.
++    Call call1 = client.newCall(new Request.Builder()
++        .url(server.url("/"))
++        .build());
++    Response response1 = call1.execute();
++    assertEquals(200, response1.code());
++    response1.body().close();
++
++    listener.clearAllEvents();
++
++    Call call2 = client.newCall(new Request.Builder()
++        .url(server.url("/"))
++        .build());
++    Response response2 = call2.execute();
++    assertEquals(200, response2.code());
++    response2.body().close();
++
++    List<Class<?>> recordedEvents = listener.recordedEventTypes();
++    assertFalse(recordedEvents.contains(SecureConnectStart.class));
++    assertFalse(recordedEvents.contains(SecureConnectEnd.class));
++  }
++
++  private void enableTls(boolean tunnelProxy) {
++    client = client.newBuilder()
++        .sslSocketFactory(sslClient.socketFactory, sslClient.trustManager)
++        .hostnameVerifier(new RecordingHostnameVerifier())
++        .build();
++    server.useHttps(sslClient.socketFactory, tunnelProxy);
++  }
++
++  static final class DnsStart {
++    final Call call;
++    final String domainName;
++
++    DnsStart(Call call, String domainName) {
++      this.call = call;
++      this.domainName = domainName;
++    }
++  }
++
++  static final class DnsEnd {
++    final Call call;
++    final String domainName;
++    final List<InetAddress> inetAddressList;
++    final Throwable throwable;
++
++    DnsEnd(Call call, String domainName, List<InetAddress> inetAddressList, Throwable throwable) {
++      this.call = call;
++      this.domainName = domainName;
++      this.inetAddressList = inetAddressList;
++      this.throwable = throwable;
++    }
++  }
++
++  static final class SecureConnectStart {
++    final Call call;
++
++    SecureConnectStart(Call call) {
++      this.call = call;
++    }
++  }
++
++  static final class SecureConnectEnd {
++    final Call call;
++    final Handshake handshake;
++    final Throwable throwable;
++
++    SecureConnectEnd(Call call, Handshake handshake, Throwable throwable) {
++      this.call = call;
++      this.handshake = handshake;
++      this.throwable = throwable;
++    }
++  }
++
++  static final class RecordingEventListener extends EventListener {
++    final Deque<Object> eventSequence = new ArrayDeque<>();
++
++    /**
++     * Removes recorded events up to (and including) an event is found whose class equals
++     * {@code eventClass} and returns it.
++     */
++    <T> T removeUpToEvent(Class<T> eventClass) {
++      Object event = eventSequence.poll();
++      while (event != null && !eventClass.isInstance(event)) {
++        event = eventSequence.poll();
++      }
++      if (event == null) throw new AssertionError();
++      return (T) event;
++    }
++
++    List<Class<?>> recordedEventTypes() {
++      List<Class<?>> eventTypes = new ArrayList<>();
++      for (Object event : eventSequence) {
++        eventTypes.add(event.getClass());
++      }
++      return eventTypes;
++    }
++
++    void clearAllEvents() {
++      eventSequence.clear();
++    }
++
++    @Override public void dnsStart(Call call, String domainName) {
++      eventSequence.offer(new DnsStart(call, domainName));
++    }
++
++    @Override public void dnsEnd(Call call, String domainName, List<InetAddress> inetAddressList,
++        Throwable throwable) {
++      eventSequence.offer(new DnsEnd(call, domainName, inetAddressList, throwable));
++    }
++
++    @Override public void secureConnectStart(Call call) {
++      eventSequence.offer(new SecureConnectStart(call));
++    }
++
++    @Override public void secureConnectEnd(Call call, Handshake handshake, Throwable throwable) {
++      eventSequence.offer(new SecureConnectEnd(call, handshake, throwable));
++    }
++  }
++}
+diff --git a/okhttp-tests/src/test/java/okhttp3/internal/connection/RouteSelectorTest.java b/okhttp-tests/src/test/java/okhttp3/internal/connection/RouteSelectorTest.java
+index 347ea7ef37..0f43e54da1 100644
+--- a/okhttp-tests/src/test/java/okhttp3/internal/connection/RouteSelectorTest.java
++++ b/okhttp-tests/src/test/java/okhttp3/internal/connection/RouteSelectorTest.java
+@@ -34,6 +34,7 @@
+ import okhttp3.Address;
+ import okhttp3.Authenticator;
+ import okhttp3.ConnectionSpec;
++import okhttp3.EventListener;
+ import okhttp3.FakeDns;
+ import okhttp3.Protocol;
+ import okhttp3.Route;
+@@ -84,7 +85,8 @@
+ 
+   @Test public void singleRoute() throws Exception {
+     Address address = httpAddress();
+-    RouteSelector routeSelector = new RouteSelector(address, routeDatabase);
++    RouteSelector routeSelector = new RouteSelector(address, routeDatabase, null,
++        EventListener.NONE);
+ 
+     assertTrue(routeSelector.hasNext());
+     dns.set(uriHost, dns.allocate(1));
+@@ -101,13 +103,14 @@
+ 
+   @Test public void singleRouteReturnsFailedRoute() throws Exception {
+     Address address = httpAddress();
+-    RouteSelector routeSelector = new RouteSelector(address, routeDatabase);
++    RouteSelector routeSelector = new RouteSelector(address, routeDatabase, null,
++        EventListener.NONE);
+ 
+     assertTrue(routeSelector.hasNext());
+     dns.set(uriHost, dns.allocate(1));
+     Route route = routeSelector.next();
+     routeDatabase.failed(route);
+-    routeSelector = new RouteSelector(address, routeDatabase);
++    routeSelector = new RouteSelector(address, routeDatabase, null, EventListener.NONE);
+     assertRoute(routeSelector.next(), address, NO_PROXY, dns.lookup(uriHost, 0), uriPort);
+     assertFalse(routeSelector.hasNext());
+     try {
+@@ -120,7 +123,8 @@
+   @Test public void explicitProxyTriesThatProxysAddressesOnly() throws Exception {
+     Address address = new Address(uriHost, uriPort, dns, socketFactory, null, null, null,
+         authenticator, proxyA, protocols, connectionSpecs, proxySelector);
+-    RouteSelector routeSelector = new RouteSelector(address, routeDatabase);
++    RouteSelector routeSelector = new RouteSelector(address, routeDatabase, null,
++        EventListener.NONE);
+ 
+     assertTrue(routeSelector.hasNext());
+     dns.set(proxyAHost, dns.allocate(2));
+@@ -135,7 +139,8 @@
+   @Test public void explicitDirectProxy() throws Exception {
+     Address address = new Address(uriHost, uriPort, dns, socketFactory, null, null, null,
+         authenticator, NO_PROXY, protocols, connectionSpecs, proxySelector);
+-    RouteSelector routeSelector = new RouteSelector(address, routeDatabase);
++    RouteSelector routeSelector = new RouteSelector(address, routeDatabase, null,
++        EventListener.NONE);
+ 
+     assertTrue(routeSelector.hasNext());
+     dns.set(uriHost, dns.allocate(2));
+@@ -162,7 +167,8 @@
+ 
+     Address address = new Address(uriHost, uriPort, dns, socketFactory, null, null, null,
+         authenticator, null, protocols, connectionSpecs, nullProxySelector);
+-    RouteSelector routeSelector = new RouteSelector(address, routeDatabase);
++    RouteSelector routeSelector = new RouteSelector(address, routeDatabase, null,
++        EventListener.NONE);
+     assertTrue(routeSelector.hasNext());
+     dns.set(uriHost, dns.allocate(1));
+     assertRoute(routeSelector.next(), address, NO_PROXY, dns.lookup(uriHost, 0), uriPort);
+@@ -173,7 +179,8 @@
+ 
+   @Test public void proxySelectorReturnsNoProxies() throws Exception {
+     Address address = httpAddress();
+-    RouteSelector routeSelector = new RouteSelector(address, routeDatabase);
++    RouteSelector routeSelector = new RouteSelector(address, routeDatabase, null,
++        EventListener.NONE);
+ 
+     assertTrue(routeSelector.hasNext());
+     dns.set(uriHost, dns.allocate(2));
+@@ -190,7 +197,8 @@
+ 
+     proxySelector.proxies.add(proxyA);
+     proxySelector.proxies.add(proxyB);
+-    RouteSelector routeSelector = new RouteSelector(address, routeDatabase);
++    RouteSelector routeSelector = new RouteSelector(address, routeDatabase, null,
++        EventListener.NONE);
+     proxySelector.assertRequests(address.url().uri());
+ 
+     // First try the IP addresses of the first proxy, in sequence.
+@@ -214,7 +222,8 @@
+     Address address = httpAddress();
+ 
+     proxySelector.proxies.add(NO_PROXY);
+-    RouteSelector routeSelector = new RouteSelector(address, routeDatabase);
++    RouteSelector routeSelector = new RouteSelector(address, routeDatabase, null,
++        EventListener.NONE);
+     proxySelector.assertRequests(address.url().uri());
+ 
+     // Only the origin server will be attempted.
+@@ -232,7 +241,8 @@
+     proxySelector.proxies.add(proxyA);
+     proxySelector.proxies.add(proxyB);
+     proxySelector.proxies.add(proxyA);
+-    RouteSelector routeSelector = new RouteSelector(address, routeDatabase);
++    RouteSelector routeSelector = new RouteSelector(address, routeDatabase, null,
++        EventListener.NONE);
+     proxySelector.assertRequests(address.url().uri());
+ 
+     assertTrue(routeSelector.hasNext());
+@@ -261,7 +271,8 @@
+     Address address = httpsAddress();
+     proxySelector.proxies.add(proxyA);
+     proxySelector.proxies.add(proxyB);
+-    RouteSelector routeSelector = new RouteSelector(address, routeDatabase);
++    RouteSelector routeSelector = new RouteSelector(address, routeDatabase, null,
++        EventListener.NONE);
+ 
+     // Proxy A
+     dns.set(proxyAHost, dns.allocate(2));
+@@ -281,7 +292,8 @@
+ 
+   @Test public void failedRoutesAreLast() throws Exception {
+     Address address = httpsAddress();
+-    RouteSelector routeSelector = new RouteSelector(address, routeDatabase);
++    RouteSelector routeSelector = new RouteSelector(address, routeDatabase, null,
++        EventListener.NONE);
+ 
+     final int numberOfAddresses = 2;
+     dns.set(uriHost, dns.allocate(numberOfAddresses));
+@@ -297,7 +309,7 @@
+     // Add first regular route as failed.
+     routeDatabase.failed(regularRoutes.get(0));
+     // Reset selector
+-    routeSelector = new RouteSelector(address, routeDatabase);
++    routeSelector = new RouteSelector(address, routeDatabase, null, EventListener.NONE);
+ 
+     List<Route> routesWithFailedRoute = new ArrayList<>();
+     while (routeSelector.hasNext()) {
+diff --git a/okhttp-tests/src/test/java/okhttp3/internal/publicsuffix/PublicSuffixDatabaseTest.java b/okhttp-tests/src/test/java/okhttp3/internal/publicsuffix/PublicSuffixDatabaseTest.java
+index df765a67c1..9e9ec71dd8 100644
+--- a/okhttp-tests/src/test/java/okhttp3/internal/publicsuffix/PublicSuffixDatabaseTest.java
++++ b/okhttp-tests/src/test/java/okhttp3/internal/publicsuffix/PublicSuffixDatabaseTest.java
+@@ -106,7 +106,7 @@
+   }
+ 
+   @Test public void allPublicSuffixes() throws IOException {
+-    InputStream resource = PublicSuffixDatabaseTest.class.getClassLoader()
++    InputStream resource = PublicSuffixDatabaseTest.class
+         .getResourceAsStream(PUBLIC_SUFFIX_RESOURCE);
+     BufferedSource source = Okio.buffer(new GzipSource(Okio.source(resource)));
+     int length = source.readInt();
+@@ -128,7 +128,7 @@
+   }
+ 
+   @Test public void publicSuffixExceptions() throws IOException {
+-    InputStream resource = PublicSuffixDatabaseTest.class.getClassLoader()
++    InputStream resource = PublicSuffixDatabaseTest.class
+         .getResourceAsStream(PUBLIC_SUFFIX_RESOURCE);
+     BufferedSource source = Okio.buffer(new GzipSource(Okio.source(resource)));
+     int length = source.readInt();
+diff --git a/okhttp/src/main/java/okhttp3/EventListener.java b/okhttp/src/main/java/okhttp3/EventListener.java
+index dacf475679..3c64409d38 100644
+--- a/okhttp/src/main/java/okhttp3/EventListener.java
++++ b/okhttp/src/main/java/okhttp3/EventListener.java
+@@ -17,9 +17,9 @@
+ 
+ import java.net.InetAddress;
+ import java.util.List;
++import javax.annotation.Nullable;
+ 
+-// TODO(jwilson): make this public after the 3.8 release.
+-abstract class EventListener {
++public abstract class EventListener {
+   public static final EventListener NONE = new EventListener() {
+   };
+ 
+@@ -34,21 +34,64 @@ public EventListener create(Call call) {
+   public void fetchStart(Call call) {
+   }
+ 
++  /**
++   * Invoked just prior to a DNS lookup. See {@link Dns#lookup(String)}.
++   *
++   * <p>This can be invoked more than 1 time for a single {@link Call}. For example, if the response
++   * to the {@link Call#request()} is a redirect to a different host.
++   *
++   * <p>If the {@link Call} is able to reuse an existing pooled connection, this method will not be
++   * invoked. See {@link ConnectionPool}.
++   */
+   public void dnsStart(Call call, String domainName) {
+   }
+ 
+-  public void dnsEnd(Call call, String domainName, List<InetAddress> inetAddressList,
+-      Throwable throwable) {
++  /**
++   * Invoked immediately after a DNS lookup.
++   *
++   * <p>This method is always invoked after {@link #dnsStart(Call, String)}.
++   *
++   * <p>{@code inetAddressList} will be non-null and {@code throwable} will be null in the case of a
++   * successful DNS lookup.
++   *
++   * <p>{@code inetAddressList} will be null and {@code throwable} will be non-null in the case of a
++   * failed DNS lookup.
++   */
++  public void dnsEnd(Call call, String domainName, @Nullable List<InetAddress> inetAddressList,
++      @Nullable Throwable throwable) {
+   }
+ 
+   public void connectStart(Call call, InetAddress address, int port) {
+   }
+ 
++  /**
++   * Invoked just prior to initiating a TLS connection.
++   *
++   * <p>This method is invoked if the following conditions are met:
++   * <ul>
++   *   <li>The {@link Call#request()} requires TLS.</li>
++   *   <li>No existing connection from the {@link ConnectionPool} can be reused.</li>
++   * </ul>
++   *
++   * <p>This can be invoked more than 1 time for a single {@link Call}. For example, if the response
++   * to the {@link Call#request()} is a redirect to a different address, or a connection is retried.
++   */
+   public void secureConnectStart(Call call) {
+   }
+ 
+-  public void secureConnectEnd(Call call, Handshake handshake,
+-      Throwable throwable) {
++  /**
++   * Invoked immediately after a TLS connection was attempted.
++   *
++   * <p>This method is always invoked after {@link #secureConnectStart(Call)}.
++   *
++   * <p>{@code handshake} will be non-null and {@code throwable} will be null in the case of a
++   * successful TLS connection.
++   *
++   * <p>{@code handshake} will be null and {@code throwable} will be non-null in the case of a
++   * failed TLS connection attempt.
++   */
++  public void secureConnectEnd(Call call, @Nullable Handshake handshake,
++      @Nullable Throwable throwable) {
+   }
+ 
+   public void connectEnd(Call call,  InetAddress address, int port, String protocol,
+@@ -83,6 +126,16 @@ public void fetchEnd(Call call, Throwable throwable) {
+   }
+ 
+   public interface Factory {
++    /**
++     * Creates an instance of the {@link EventListener} for a particular {@link Call}. The returned
++     * {@link EventListener} instance will be used during the lifecycle of the {@code call}.
++     *
++     * <p>This method is invoked after the {@code call} is created. See
++     * {@link OkHttpClient#newCall(Request)}.
++     *
++     * <p><strong>It is an error for implementations to issue any mutating operations on the
++     * {@code call} instance from this method.</strong>
++     */
+     EventListener create(Call call);
+   }
+ }
+diff --git a/okhttp/src/main/java/okhttp3/OkHttpClient.java b/okhttp/src/main/java/okhttp3/OkHttpClient.java
+index 6f1c42903c..d61ed5de2f 100644
+--- a/okhttp/src/main/java/okhttp3/OkHttpClient.java
++++ b/okhttp/src/main/java/okhttp3/OkHttpClient.java
+@@ -186,7 +186,7 @@ public void apply(ConnectionSpec tlsConfiguration, SSLSocket sslSocket, boolean
+       }
+ 
+       @Override public Call newWebSocketCall(OkHttpClient client, Request originalRequest) {
+-        return new RealCall(client, originalRequest, true);
++        return RealCall.newRealCall(client, originalRequest, true);
+       }
+     };
+   }
+@@ -407,8 +407,7 @@ public Dispatcher dispatcher() {
+     return networkInterceptors;
+   }
+ 
+-  // TODO(jwilson): make this public after the 3.8 release.
+-  /*public*/ EventListener.Factory eventListenerFactory() {
++  public EventListener.Factory eventListenerFactory() {
+     return eventListenerFactory;
+   }
+ 
+@@ -416,7 +415,7 @@ public Dispatcher dispatcher() {
+    * Prepares the {@code request} to be executed at some point in the future.
+    */
+   @Override public Call newCall(Request request) {
+-    return new RealCall(this, request, false /* for web socket */);
++    return RealCall.newRealCall(this, request, false /* for web socket */);
+   }
+ 
+   /**
+@@ -887,15 +886,13 @@ public Builder addNetworkInterceptor(Interceptor interceptor) {
+       return this;
+     }
+ 
+-    // TODO(jwilson): make this public after the 3.8 release.
+-    /*public*/ Builder eventListener(EventListener eventListener) {
++    public Builder eventListener(EventListener eventListener) {
+       if (eventListener == null) throw new NullPointerException("eventListener == null");
+       this.eventListenerFactory = EventListener.factory(eventListener);
+       return this;
+     }
+ 
+-    // TODO(jwilson): make this public after the 3.8 release.
+-    /*public*/ Builder eventListenerFactory(EventListener.Factory eventListenerFactory) {
++    public Builder eventListenerFactory(EventListener.Factory eventListenerFactory) {
+       if (eventListenerFactory == null) {
+         throw new NullPointerException("eventListenerFactory == null");
+       }
+diff --git a/okhttp/src/main/java/okhttp3/RealCall.java b/okhttp/src/main/java/okhttp3/RealCall.java
+index 9df348b8dd..d09c1b7d44 100644
+--- a/okhttp/src/main/java/okhttp3/RealCall.java
++++ b/okhttp/src/main/java/okhttp3/RealCall.java
+@@ -33,7 +33,12 @@
+ final class RealCall implements Call {
+   final OkHttpClient client;
+   final RetryAndFollowUpInterceptor retryAndFollowUpInterceptor;
+-  final EventListener eventListener;
++
++  /**
++   * There is a cycle between the {@link Call} and {@link EventListener} that makes this awkward.
++   * This will be set after we create the call instance then create the event listener instance.
++   */
++  private EventListener eventListener;
+ 
+   /** The application's original request unadulterated by redirects or auth headers. */
+   final Request originalRequest;
+@@ -42,16 +47,18 @@
+   // Guarded by this.
+   private boolean executed;
+ 
+-  RealCall(OkHttpClient client, Request originalRequest, boolean forWebSocket) {
+-    final EventListener.Factory eventListenerFactory = client.eventListenerFactory();
+-
++  private RealCall(OkHttpClient client, Request originalRequest, boolean forWebSocket) {
+     this.client = client;
+     this.originalRequest = originalRequest;
+     this.forWebSocket = forWebSocket;
+     this.retryAndFollowUpInterceptor = new RetryAndFollowUpInterceptor(client, forWebSocket);
++  }
+ 
+-    // TODO(jwilson): this is unsafe publication and not threadsafe.
+-    this.eventListener = eventListenerFactory.create(this);
++  static RealCall newRealCall(OkHttpClient client, Request originalRequest, boolean forWebSocket) {
++    // Safely publish the Call instance to the EventListener.
++    RealCall call = new RealCall(client, originalRequest, forWebSocket);
++    call.eventListener = client.eventListenerFactory().create(call);
++    return call;
+   }
+ 
+   @Override public Request request() {
+@@ -102,7 +109,7 @@ private void captureCallStackTrace() {
+ 
+   @SuppressWarnings("CloneDoesntCallSuperClone") // We are a final type & this saves clearing state.
+   @Override public RealCall clone() {
+-    return new RealCall(client, originalRequest, forWebSocket);
++    return RealCall.newRealCall(client, originalRequest, forWebSocket);
+   }
+ 
+   StreamAllocation streamAllocation() {
+@@ -181,7 +188,7 @@ Response getResponseWithInterceptorChain() throws IOException {
+     interceptors.add(new CallServerInterceptor(forWebSocket));
+ 
+     Interceptor.Chain chain = new RealInterceptorChain(
+-        interceptors, null, null, null, 0, originalRequest, client.readTimeoutMillis() );
++        interceptors, null, null, null, 0, originalRequest, this, eventListener);
+     return chain.proceed(originalRequest);
+   }
+ }
+diff --git a/okhttp/src/main/java/okhttp3/RequestBody.java b/okhttp/src/main/java/okhttp3/RequestBody.java
+index 11497b9f2f..3cb29477d3 100644
+--- a/okhttp/src/main/java/okhttp3/RequestBody.java
++++ b/okhttp/src/main/java/okhttp3/RequestBody.java
+@@ -30,14 +30,14 @@
+   public abstract @Nullable MediaType contentType();
+ 
+   /**
+-   * Returns the number of bytes that will be written to {@code out} in a call to {@link #writeTo},
++   * Returns the number of bytes that will be written to {@code sink} in a call to {@link #writeTo},
+    * or -1 if that count is unknown.
+    */
+   public long contentLength() throws IOException {
+     return -1;
+   }
+ 
+-  /** Writes the content of this request to {@code out}. */
++  /** Writes the content of this request to {@code sink}. */
+   public abstract void writeTo(BufferedSink sink) throws IOException;
+ 
+   /**
+diff --git a/okhttp/src/main/java/okhttp3/internal/connection/RealConnection.java b/okhttp/src/main/java/okhttp3/internal/connection/RealConnection.java
+index a38eab6a62..1df7ae98b8 100644
+--- a/okhttp/src/main/java/okhttp3/internal/connection/RealConnection.java
++++ b/okhttp/src/main/java/okhttp3/internal/connection/RealConnection.java
+@@ -34,10 +34,12 @@
+ import javax.net.ssl.SSLSocket;
+ import javax.net.ssl.SSLSocketFactory;
+ import okhttp3.Address;
++import okhttp3.Call;
+ import okhttp3.CertificatePinner;
+ import okhttp3.Connection;
+ import okhttp3.ConnectionPool;
+ import okhttp3.ConnectionSpec;
++import okhttp3.EventListener;
+ import okhttp3.Handshake;
+ import okhttp3.HttpUrl;
+ import okhttp3.OkHttpClient;
+@@ -121,8 +123,8 @@ public static RealConnection testConnection(
+     return result;
+   }
+ 
+-  public void connect(
+-      int connectTimeout, int readTimeout, int writeTimeout, boolean connectionRetryEnabled) {
++  public void connect(int connectTimeout, int readTimeout, int writeTimeout,
++      boolean connectionRetryEnabled, Call call, EventListener eventListener) {
+     if (protocol != null) throw new IllegalStateException("already connected");
+ 
+     RouteException routeException = null;
+@@ -148,7 +150,7 @@ public void connect(
+         } else {
+           connectSocket(connectTimeout, readTimeout);
+         }
+-        establishProtocol(connectionSpecSelector);
++        establishProtocol(connectionSpecSelector, call, eventListener);
+         break;
+       } catch (IOException e) {
+         closeQuietly(socket);
+@@ -241,14 +243,22 @@ private void connectSocket(int connectTimeout, int readTimeout) throws IOExcepti
+     }
+   }
+ 
+-  private void establishProtocol(ConnectionSpecSelector connectionSpecSelector) throws IOException {
++  private void establishProtocol(ConnectionSpecSelector connectionSpecSelector, Call call,
++      EventListener eventListener) throws IOException {
+     if (route.address().sslSocketFactory() == null) {
+       protocol = Protocol.HTTP_1_1;
+       socket = rawSocket;
+       return;
+     }
+ 
+-    connectTls(connectionSpecSelector);
++    eventListener.secureConnectStart(call);
++    try {
++      connectTls(connectionSpecSelector);
++    } catch (Exception e) {
++      eventListener.secureConnectEnd(call, null, e);
++      throw e;
++    }
++    eventListener.secureConnectEnd(call, handshake, null);
+ 
+     if (protocol == Protocol.HTTP_2) {
+       socket.setSoTimeout(0); // HTTP/2 connection timeouts are set per-stream.
+diff --git a/okhttp/src/main/java/okhttp3/internal/connection/RouteSelector.java b/okhttp/src/main/java/okhttp3/internal/connection/RouteSelector.java
+index 5dd9d2b7e7..ba1491c6e4 100644
+--- a/okhttp/src/main/java/okhttp3/internal/connection/RouteSelector.java
++++ b/okhttp/src/main/java/okhttp3/internal/connection/RouteSelector.java
+@@ -27,6 +27,8 @@
+ import java.util.List;
+ import java.util.NoSuchElementException;
+ import okhttp3.Address;
++import okhttp3.Call;
++import okhttp3.EventListener;
+ import okhttp3.HttpUrl;
+ import okhttp3.Route;
+ import okhttp3.internal.Util;
+@@ -38,6 +40,8 @@
+ public final class RouteSelector {
+   private final Address address;
+   private final RouteDatabase routeDatabase;
++  private final Call call;
++  private final EventListener eventListener;
+ 
+   /* The most recently attempted route. */
+   private Proxy lastProxy;
+@@ -54,9 +58,12 @@
+   /* State for negotiating failed routes */
+   private final List<Route> postponedRoutes = new ArrayList<>();
+ 
+-  public RouteSelector(Address address, RouteDatabase routeDatabase) {
++  public RouteSelector(Address address, RouteDatabase routeDatabase, Call call,
++      EventListener eventListener) {
+     this.address = address;
+     this.routeDatabase = routeDatabase;
++    this.call = call;
++    this.eventListener = eventListener;
+ 
+     resetNextProxy(address.url(), address.proxy());
+   }
+@@ -167,12 +174,25 @@ private void resetNextInetSocketAddress(Proxy proxy) throws IOException {
+     if (proxy.type() == Proxy.Type.SOCKS) {
+       inetSocketAddresses.add(InetSocketAddress.createUnresolved(socketHost, socketPort));
+     } else {
++      eventListener.dnsStart(call, socketHost);
++
+       // Try each address for best behavior in mixed IPv4/IPv6 environments.
+-      List<InetAddress> addresses = address.dns().lookup(socketHost);
++      List<InetAddress> addresses;
++      try {
++        addresses = address.dns().lookup(socketHost);
++      } catch (Exception e) {
++        eventListener.dnsEnd(call, socketHost, null, e);
++        throw e;
++      }
+       if (addresses.isEmpty()) {
+-        throw new UnknownHostException(address.dns() + " returned no addresses for " + socketHost);
++        UnknownHostException exception = new UnknownHostException(
++            address.dns() + " returned no addresses for " + socketHost);
++        eventListener.dnsEnd(call, socketHost, null, exception);
++        throw exception;
+       }
+ 
++      eventListener.dnsEnd(call, socketHost, addresses, null);
++
+       for (int i = 0, size = addresses.size(); i < size; i++) {
+         InetAddress inetAddress = addresses.get(i);
+         inetSocketAddresses.add(new InetSocketAddress(inetAddress, socketPort));
+diff --git a/okhttp/src/main/java/okhttp3/internal/connection/StreamAllocation.java b/okhttp/src/main/java/okhttp3/internal/connection/StreamAllocation.java
+index ce3d984a85..47782a9e55 100644
+--- a/okhttp/src/main/java/okhttp3/internal/connection/StreamAllocation.java
++++ b/okhttp/src/main/java/okhttp3/internal/connection/StreamAllocation.java
+@@ -20,7 +20,9 @@
+ import java.lang.ref.WeakReference;
+ import java.net.Socket;
+ import okhttp3.Address;
++import okhttp3.Call;
+ import okhttp3.ConnectionPool;
++import okhttp3.EventListener;
+ import okhttp3.OkHttpClient;
+ import okhttp3.Route;
+ import okhttp3.internal.Internal;
+@@ -73,6 +75,8 @@
+   public final Address address;
+   private Route route;
+   private final ConnectionPool connectionPool;
++  private final Call call;
++  private final EventListener eventListener;
+   private final Object callStackTrace;
+ 
+   // State guarded by connectionPool.
+@@ -83,10 +87,13 @@
+   private boolean canceled;
+   private HttpCodec codec;
+ 
+-  public StreamAllocation(ConnectionPool connectionPool, Address address, Object callStackTrace) {
++  public StreamAllocation(ConnectionPool connectionPool, Address address, Call call,
++      EventListener eventListener, Object callStackTrace) {
+     this.connectionPool = connectionPool;
+     this.address = address;
+-    this.routeSelector = new RouteSelector(address, routeDatabase());
++    this.call = call;
++    this.eventListener = eventListener;
++    this.routeSelector = new RouteSelector(address, routeDatabase(), call, eventListener);
+     this.callStackTrace = callStackTrace;
+   }
+ 
+@@ -191,7 +198,8 @@ private RealConnection findConnection(int connectTimeout, int readTimeout, int w
+     }
+ 
+     // Do TCP + TLS handshakes. This is a blocking operation.
+-    result.connect(connectTimeout, readTimeout, writeTimeout, connectionRetryEnabled);
++    result.connect(
++        connectTimeout, readTimeout, writeTimeout, connectionRetryEnabled, call, eventListener);
+     routeDatabase().connected(result.route());
+ 
+     Socket socket = null;
+diff --git a/okhttp/src/main/java/okhttp3/internal/http/RealInterceptorChain.java b/okhttp/src/main/java/okhttp3/internal/http/RealInterceptorChain.java
+index def12835c2..b7d02f5015 100644
+--- a/okhttp/src/main/java/okhttp3/internal/http/RealInterceptorChain.java
++++ b/okhttp/src/main/java/okhttp3/internal/http/RealInterceptorChain.java
+@@ -17,8 +17,9 @@
+ 
+ import java.io.IOException;
+ import java.util.List;
+-import java.util.concurrent.TimeUnit;
++import okhttp3.Call;
+ import okhttp3.Connection;
++import okhttp3.EventListener;
+ import okhttp3.Interceptor;
+ import okhttp3.Request;
+ import okhttp3.Response;
+@@ -31,43 +32,32 @@
+  */
+ public final class RealInterceptorChain implements Interceptor.Chain {
+   private final List<Interceptor> interceptors;
+-
+-
+   private final StreamAllocation streamAllocation;
+   private final HttpCodec httpCodec;
+   private final RealConnection connection;
+   private final int index;
+   private final Request request;
++  private final Call call;
++  private final EventListener eventListener;
+   private int calls;
+ 
+-  private final int readTimeout;
+-
+   public RealInterceptorChain(List<Interceptor> interceptors, StreamAllocation streamAllocation,
+-                              HttpCodec httpCodec, RealConnection connection, int index,
+-                              Request request, int readTimeout) {
++                              HttpCodec httpCodec, RealConnection connection, int index, Request request, Call call,
++                              EventListener eventListener) {
+     this.interceptors = interceptors;
++    this.connection = connection;
+     this.streamAllocation = streamAllocation;
+     this.httpCodec = httpCodec;
+-    this.connection = connection;
+     this.index = index;
+     this.request = request;
+-    this.readTimeout = readTimeout;
++    this.call = call;
++    this.eventListener = eventListener;
+   }
+ 
+   @Override public Connection connection() {
+     return connection;
+   }
+ 
+-  @Override
+-  public int getReadTimeout() {
+-    return readTimeout;
+-  }
+-
+-  @Override
+-  public Interceptor.Chain withReadTimeout(int newReadTimeout, TimeUnit timeUnit) {
+-    return new RealInterceptorChain(interceptors, streamAllocation, httpCodec, connection, index, request, (int) timeUnit.toMillis(newReadTimeout));
+-  }
+-
+   public StreamAllocation streamAllocation() {
+     return streamAllocation;
+   }
+@@ -76,6 +66,14 @@ public HttpCodec httpStream() {
+     return httpCodec;
+   }
+ 
++  public Call call() {
++    return call;
++  }
++
++  public EventListener eventListener() {
++    return eventListener;
++  }
++
+   @Override public Request request() {
+     return request;
+   }
+@@ -85,7 +83,7 @@ public HttpCodec httpStream() {
+   }
+ 
+   public Response proceed(Request request, StreamAllocation streamAllocation, HttpCodec httpCodec,
+-      RealConnection connection) throws IOException {
++                          RealConnection connection) throws IOException {
+     if (index >= interceptors.size()) throw new AssertionError();
+ 
+     calls++;
+@@ -103,8 +101,8 @@ public Response proceed(Request request, StreamAllocation streamAllocation, Http
+     }
+ 
+     // Call the next interceptor in the chain.
+-    RealInterceptorChain next = new RealInterceptorChain(
+-        interceptors, streamAllocation, httpCodec, connection, index + 1, request, readTimeout);
++    RealInterceptorChain next = new RealInterceptorChain(interceptors, streamAllocation, httpCodec,
++        connection, index + 1, request, call, eventListener);
+     Interceptor interceptor = interceptors.get(index);
+     Response response = interceptor.intercept(next);
+ 
+diff --git a/okhttp/src/main/java/okhttp3/internal/http/RetryAndFollowUpInterceptor.java b/okhttp/src/main/java/okhttp3/internal/http/RetryAndFollowUpInterceptor.java
+index 792ddc9299..990be2a9af 100644
+--- a/okhttp/src/main/java/okhttp3/internal/http/RetryAndFollowUpInterceptor.java
++++ b/okhttp/src/main/java/okhttp3/internal/http/RetryAndFollowUpInterceptor.java
+@@ -27,8 +27,10 @@
+ import javax.net.ssl.SSLPeerUnverifiedException;
+ import javax.net.ssl.SSLSocketFactory;
+ import okhttp3.Address;
++import okhttp3.Call;
+ import okhttp3.CertificatePinner;
+ import okhttp3.Connection;
++import okhttp3.EventListener;
+ import okhttp3.HttpUrl;
+ import okhttp3.Interceptor;
+ import okhttp3.OkHttpClient;
+@@ -102,9 +104,12 @@ public StreamAllocation streamAllocation() {
+ 
+   @Override public Response intercept(Chain chain) throws IOException {
+     Request request = chain.request();
++    RealInterceptorChain realChain = (RealInterceptorChain) chain;
++    Call call = realChain.call();
++    EventListener eventListener = realChain.eventListener();
+ 
+-    streamAllocation = new StreamAllocation(
+-        client.connectionPool(), createAddress(request.url()), callStackTrace);
++    streamAllocation = new StreamAllocation(client.connectionPool(), createAddress(request.url()),
++        call, eventListener, callStackTrace);
+ 
+     int followUpCount = 0;
+     Response priorResponse = null;
+@@ -117,7 +122,7 @@ public StreamAllocation streamAllocation() {
+       Response response = null;
+       boolean releaseConnection = true;
+       try {
+-        response = ((RealInterceptorChain) chain).proceed(request, streamAllocation, null, null);
++        response = realChain.proceed(request, streamAllocation, null, null);
+         releaseConnection = false;
+       } catch (RouteException e) {
+         // The attempt to connect via a route failed. The request will not have been sent.
+@@ -172,8 +177,8 @@ public StreamAllocation streamAllocation() {
+ 
+       if (!sameConnection(response, followUp.url())) {
+         streamAllocation.release();
+-        streamAllocation = new StreamAllocation(
+-            client.connectionPool(), createAddress(followUp.url()), callStackTrace);
++        streamAllocation = new StreamAllocation(client.connectionPool(),
++            createAddress(followUp.url()), call, eventListener, callStackTrace);
+       } else if (streamAllocation.codec() != null) {
+         throw new IllegalStateException("Closing the body of " + response
+             + " didn't close its backing stream. Bad interceptor?");
+diff --git a/okhttp/src/main/java/okhttp3/internal/http2/Http2Connection.java b/okhttp/src/main/java/okhttp3/internal/http2/Http2Connection.java
+index fc89d0f10b..023a7ff35d 100644
+--- a/okhttp/src/main/java/okhttp3/internal/http2/Http2Connection.java
++++ b/okhttp/src/main/java/okhttp3/internal/http2/Http2Connection.java
+@@ -541,7 +541,7 @@ public Builder pushObserver(PushObserver pushObserver) {
+       return this;
+     }
+ 
+-    public Http2Connection build() throws IOException {
++    public Http2Connection build() {
+       return new Http2Connection(this);
+     }
+   }
+diff --git a/okhttp/src/main/java/okhttp3/internal/platform/AndroidPlatform.java b/okhttp/src/main/java/okhttp3/internal/platform/AndroidPlatform.java
+index ac3b278780..31772c63f7 100644
+--- a/okhttp/src/main/java/okhttp3/internal/platform/AndroidPlatform.java
++++ b/okhttp/src/main/java/okhttp3/internal/platform/AndroidPlatform.java
+@@ -23,6 +23,7 @@
+ import java.net.InetSocketAddress;
+ import java.net.Socket;
+ import java.security.cert.Certificate;
++import java.security.cert.TrustAnchor;
+ import java.security.cert.X509Certificate;
+ import java.util.List;
+ import javax.net.ssl.SSLPeerUnverifiedException;
+@@ -31,7 +32,9 @@
+ import javax.net.ssl.X509TrustManager;
+ import okhttp3.Protocol;
+ import okhttp3.internal.Util;
++import okhttp3.internal.tls.BasicTrustRootIndex;
+ import okhttp3.internal.tls.CertificateChainCleaner;
++import okhttp3.internal.tls.TrustRootIndex;
+ 
+ /** Android 2.3 or better. */
+ class AndroidPlatform extends Platform {
+@@ -230,6 +233,21 @@ public static Platform buildIfSupported() {
+     return null;
+   }
+ 
++  @Override
++  public TrustRootIndex buildTrustRootIndex(X509TrustManager trustManager) {
++
++    try {
++      // From org.conscrypt.TrustManagerImpl, we want the method with this signature:
++      // private TrustAnchor findTrustAnchorByIssuerAndSignature(X509Certificate lastCert);
++      Method method = trustManager.getClass().getDeclaredMethod(
++              "findTrustAnchorByIssuerAndSignature", X509Certificate.class);
++      method.setAccessible(true);
++      return new AndroidTrustRootIndex(trustManager, method);
++    } catch (NoSuchMethodException e) {
++      return super.buildTrustRootIndex(trustManager);
++    }
++  }
++
+   /**
+    * X509TrustManagerExtensions was added to Android in API 17 (Android 4.2, released in late 2012).
+    * This is the best way to get a clean chain on Android because it uses the same code as the TLS
+@@ -327,4 +345,55 @@ static CloseGuard get() {
+       return new CloseGuard(getMethod, openMethod, warnIfOpenMethod);
+     }
+   }
++
++  /**
++   * An index of trusted root certificates that exploits knowledge of Android implementation
++   * details. This class is potentially much faster to initialize than {@link BasicTrustRootIndex}
++   * because it doesn't need to load and index trusted CA certificates.
++   *
++   * <p>This class uses APIs added to Android in API 14 (Android 4.0, released October 2011). This
++   * class shouldn't be used in Android API 17 or better because those releases are better served by
++   * {@link AndroidPlatform.AndroidCertificateChainCleaner}.
++   */
++  static final class AndroidTrustRootIndex implements TrustRootIndex {
++    private final X509TrustManager trustManager;
++    private final Method findByIssuerAndSignatureMethod;
++
++    AndroidTrustRootIndex(X509TrustManager trustManager, Method findByIssuerAndSignatureMethod) {
++      this.findByIssuerAndSignatureMethod = findByIssuerAndSignatureMethod;
++      this.trustManager = trustManager;
++    }
++
++    @Override public X509Certificate findByIssuerAndSignature(X509Certificate cert) {
++      try {
++        TrustAnchor trustAnchor = (TrustAnchor) findByIssuerAndSignatureMethod.invoke(
++                trustManager, cert);
++        return trustAnchor != null
++                ? trustAnchor.getTrustedCert()
++                : null;
++      } catch (IllegalAccessException e) {
++        throw new AssertionError();
++      } catch (InvocationTargetException e) {
++        return null;
++      }
++    }
++
++    @Override
++    public boolean equals(Object obj) {
++      if (obj == this) {
++        return true;
++      }
++      if (!(obj instanceof AndroidTrustRootIndex)) {
++        return false;
++      }
++      AndroidTrustRootIndex that = (AndroidTrustRootIndex) obj;
++      return trustManager.equals(that.trustManager)
++              && findByIssuerAndSignatureMethod.equals(that.findByIssuerAndSignatureMethod);
++    }
++
++    @Override
++    public int hashCode() {
++      return trustManager.hashCode() + 31 * findByIssuerAndSignatureMethod.hashCode();
++    }
++  }
+ }
+diff --git a/okhttp/src/main/java/okhttp3/internal/platform/Platform.java b/okhttp/src/main/java/okhttp3/internal/platform/Platform.java
+index 83c36fdd0f..7ff1c717c3 100644
+--- a/okhttp/src/main/java/okhttp3/internal/platform/Platform.java
++++ b/okhttp/src/main/java/okhttp3/internal/platform/Platform.java
+@@ -30,6 +30,7 @@
+ import okhttp3.OkHttpClient;
+ import okhttp3.Protocol;
+ import okhttp3.internal.tls.BasicCertificateChainCleaner;
++import okhttp3.internal.tls.BasicTrustRootIndex;
+ import okhttp3.internal.tls.CertificateChainCleaner;
+ import okhttp3.internal.tls.TrustRootIndex;
+ import okio.Buffer;
+@@ -164,7 +165,7 @@ public void logCloseableLeak(String message, Object stackTrace) {
+   }
+ 
+   public CertificateChainCleaner buildCertificateChainCleaner(X509TrustManager trustManager) {
+-    return new BasicCertificateChainCleaner(TrustRootIndex.get(trustManager));
++    return new BasicCertificateChainCleaner(buildTrustRootIndex(trustManager));
+   }
+ 
+   /** Attempt to match the host runtime to a capable Platform implementation. */
+@@ -228,4 +229,8 @@ private static Platform findPlatform() {
+ 
+     return null;
+   }
++
++    public TrustRootIndex buildTrustRootIndex(X509TrustManager trustManager) {
++      return new BasicTrustRootIndex(trustManager.getAcceptedIssuers());
++    }
+ }
+diff --git a/okhttp/src/main/java/okhttp3/internal/publicsuffix/PublicSuffixDatabase.java b/okhttp/src/main/java/okhttp3/internal/publicsuffix/PublicSuffixDatabase.java
+index 20e64aa17e..75dafdd0a3 100644
+--- a/okhttp/src/main/java/okhttp3/internal/publicsuffix/PublicSuffixDatabase.java
++++ b/okhttp/src/main/java/okhttp3/internal/publicsuffix/PublicSuffixDatabase.java
+@@ -306,8 +306,7 @@ private void readTheList() throws IOException {
+     byte[] publicSuffixListBytes;
+     byte[] publicSuffixExceptionListBytes;
+ 
+-    InputStream resource = PublicSuffixDatabase.class.getClassLoader().getResourceAsStream(
+-        PUBLIC_SUFFIX_RESOURCE);
++    InputStream resource = PublicSuffixDatabase.class.getResourceAsStream(PUBLIC_SUFFIX_RESOURCE);
+     if (resource == null) return;
+ 
+     BufferedSource bufferedSource = Okio.buffer(new GzipSource(Okio.source(resource)));
+diff --git a/okhttp/src/main/java/okhttp3/internal/tls/BasicTrustRootIndex.java b/okhttp/src/main/java/okhttp3/internal/tls/BasicTrustRootIndex.java
+new file mode 100644
+index 0000000000..cfd8923668
+--- /dev/null
++++ b/okhttp/src/main/java/okhttp3/internal/tls/BasicTrustRootIndex.java
+@@ -0,0 +1,70 @@
++/*
++ * Copyright (C) 2016 Square, Inc.
++ *
++ * Licensed under the Apache License, Version 2.0 (the "License");
++ * you may not use this file except in compliance with the License.
++ * You may obtain a copy of the License at
++ *
++ *      http://www.apache.org/licenses/LICENSE-2.0
++ *
++ * Unless required by applicable law or agreed to in writing, software
++ * distributed under the License is distributed on an "AS IS" BASIS,
++ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++ * See the License for the specific language governing permissions and
++ * limitations under the License.
++ */
++package okhttp3.internal.tls;
++
++import java.security.PublicKey;
++import java.security.cert.X509Certificate;
++import java.util.LinkedHashMap;
++import java.util.LinkedHashSet;
++import java.util.Map;
++import java.util.Set;
++import javax.security.auth.x500.X500Principal;
++
++/** A simple index that of trusted root certificates that have been loaded into memory. */
++public final class BasicTrustRootIndex implements TrustRootIndex {
++  private final Map<X500Principal, Set<X509Certificate>> subjectToCaCerts;
++
++  public BasicTrustRootIndex(X509Certificate... caCerts) {
++    subjectToCaCerts = new LinkedHashMap<>();
++    for (X509Certificate caCert : caCerts) {
++      X500Principal subject = caCert.getSubjectX500Principal();
++      Set<X509Certificate> subjectCaCerts = subjectToCaCerts.get(subject);
++      if (subjectCaCerts == null) {
++        subjectCaCerts = new LinkedHashSet<>(1);
++        subjectToCaCerts.put(subject, subjectCaCerts);
++      }
++      subjectCaCerts.add(caCert);
++    }
++  }
++
++  @Override public X509Certificate findByIssuerAndSignature(X509Certificate cert) {
++    X500Principal issuer = cert.getIssuerX500Principal();
++    Set<X509Certificate> subjectCaCerts = subjectToCaCerts.get(issuer);
++    if (subjectCaCerts == null) return null;
++
++    for (X509Certificate caCert : subjectCaCerts) {
++      PublicKey publicKey = caCert.getPublicKey();
++      try {
++        cert.verify(publicKey);
++        return caCert;
++      } catch (Exception ignored) {
++      }
++    }
++
++    return null;
++  }
++
++  @Override public boolean equals(Object other) {
++    if (other == this) return true;
++    return other instanceof okhttp3.internal.tls.BasicTrustRootIndex
++        && ((okhttp3.internal.tls.BasicTrustRootIndex) other).subjectToCaCerts.equals(
++        subjectToCaCerts);
++  }
++
++  @Override public int hashCode() {
++    return subjectToCaCerts.hashCode();
++  }
++}
+diff --git a/okhttp/src/main/java/okhttp3/internal/tls/CertificateChainCleaner.java b/okhttp/src/main/java/okhttp3/internal/tls/CertificateChainCleaner.java
+index 3e69f23061..98060db27a 100644
+--- a/okhttp/src/main/java/okhttp3/internal/tls/CertificateChainCleaner.java
++++ b/okhttp/src/main/java/okhttp3/internal/tls/CertificateChainCleaner.java
+@@ -42,6 +42,6 @@ public static CertificateChainCleaner get(X509TrustManager trustManager) {
+   }
+ 
+   public static CertificateChainCleaner get(X509Certificate... caCerts) {
+-    return new BasicCertificateChainCleaner(TrustRootIndex.get(caCerts));
++    return new BasicCertificateChainCleaner(new BasicTrustRootIndex(caCerts));
+   }
+ }
+diff --git a/okhttp/src/main/java/okhttp3/internal/tls/TrustRootIndex.java b/okhttp/src/main/java/okhttp3/internal/tls/TrustRootIndex.java
+index b677203e68..499f120e33 100644
+--- a/okhttp/src/main/java/okhttp3/internal/tls/TrustRootIndex.java
++++ b/okhttp/src/main/java/okhttp3/internal/tls/TrustRootIndex.java
+@@ -15,132 +15,9 @@
+  */
+ package okhttp3.internal.tls;
+ 
+-import java.lang.reflect.InvocationTargetException;
+-import java.lang.reflect.Method;
+-import java.security.PublicKey;
+-import java.security.cert.TrustAnchor;
+ import java.security.cert.X509Certificate;
+-import java.util.LinkedHashMap;
+-import java.util.LinkedHashSet;
+-import java.util.Map;
+-import java.util.Set;
+-import javax.net.ssl.X509TrustManager;
+-import javax.security.auth.x500.X500Principal;
+ 
+-public abstract class TrustRootIndex {
++public interface TrustRootIndex {
+   /** Returns the trusted CA certificate that signed {@code cert}. */
+-  public abstract X509Certificate findByIssuerAndSignature(X509Certificate cert);
+-
+-  public static TrustRootIndex get(X509TrustManager trustManager) {
+-    try {
+-      // From org.conscrypt.TrustManagerImpl, we want the method with this signature:
+-      // private TrustAnchor findTrustAnchorByIssuerAndSignature(X509Certificate lastCert);
+-      Method method = trustManager.getClass().getDeclaredMethod(
+-          "findTrustAnchorByIssuerAndSignature", X509Certificate.class);
+-      method.setAccessible(true);
+-      return new AndroidTrustRootIndex(trustManager, method);
+-    } catch (NoSuchMethodException e) {
+-      return get(trustManager.getAcceptedIssuers());
+-    }
+-  }
+-
+-  public static TrustRootIndex get(X509Certificate... caCerts) {
+-    return new BasicTrustRootIndex(caCerts);
+-  }
+-
+-  /**
+-   * An index of trusted root certificates that exploits knowledge of Android implementation
+-   * details. This class is potentially much faster to initialize than {@link BasicTrustRootIndex}
+-   * because it doesn't need to load and index trusted CA certificates.
+-   *
+-   * <p>This class uses APIs added to Android in API 14 (Android 4.0, released October 2011). This
+-   * class shouldn't be used in Android API 17 or better because those releases are better served by
+-   * {@link okhttp3.internal.AndroidPlatform.AndroidCertificateChainCleaner}.
+-   */
+-  static final class AndroidTrustRootIndex extends TrustRootIndex {
+-    private final X509TrustManager trustManager;
+-    private final Method findByIssuerAndSignatureMethod;
+-
+-    AndroidTrustRootIndex(X509TrustManager trustManager, Method findByIssuerAndSignatureMethod) {
+-      this.findByIssuerAndSignatureMethod = findByIssuerAndSignatureMethod;
+-      this.trustManager = trustManager;
+-    }
+-
+-    @Override public X509Certificate findByIssuerAndSignature(X509Certificate cert) {
+-      try {
+-        TrustAnchor trustAnchor = (TrustAnchor) findByIssuerAndSignatureMethod.invoke(
+-            trustManager, cert);
+-        return trustAnchor != null
+-            ? trustAnchor.getTrustedCert()
+-            : null;
+-      } catch (IllegalAccessException e) {
+-        throw new AssertionError();
+-      } catch (InvocationTargetException e) {
+-        return null;
+-      }
+-    }
+-
+-    @Override
+-    public boolean equals(Object obj) {
+-      if (obj == this) {
+-        return true;
+-      }
+-      if (!(obj instanceof AndroidTrustRootIndex)) {
+-        return false;
+-      }
+-      AndroidTrustRootIndex that = (AndroidTrustRootIndex) obj;
+-      return trustManager.equals(that.trustManager)
+-              && findByIssuerAndSignatureMethod.equals(that.findByIssuerAndSignatureMethod);
+-    }
+-
+-    @Override
+-    public int hashCode() {
+-      return trustManager.hashCode() + 31 * findByIssuerAndSignatureMethod.hashCode();
+-    }
+-  }
+-
+-  /** A simple index that of trusted root certificates that have been loaded into memory. */
+-  static final class BasicTrustRootIndex extends TrustRootIndex {
+-    private final Map<X500Principal, Set<X509Certificate>> subjectToCaCerts;
+-
+-    BasicTrustRootIndex(X509Certificate... caCerts) {
+-      subjectToCaCerts = new LinkedHashMap<>();
+-      for (X509Certificate caCert : caCerts) {
+-        X500Principal subject = caCert.getSubjectX500Principal();
+-        Set<X509Certificate> subjectCaCerts = subjectToCaCerts.get(subject);
+-        if (subjectCaCerts == null) {
+-          subjectCaCerts = new LinkedHashSet<>(1);
+-          subjectToCaCerts.put(subject, subjectCaCerts);
+-        }
+-        subjectCaCerts.add(caCert);
+-      }
+-    }
+-
+-    @Override public X509Certificate findByIssuerAndSignature(X509Certificate cert) {
+-      X500Principal issuer = cert.getIssuerX500Principal();
+-      Set<X509Certificate> subjectCaCerts = subjectToCaCerts.get(issuer);
+-      if (subjectCaCerts == null) return null;
+-
+-      for (X509Certificate caCert : subjectCaCerts) {
+-        PublicKey publicKey = caCert.getPublicKey();
+-        try {
+-          cert.verify(publicKey);
+-          return caCert;
+-        } catch (Exception ignored) {
+-        }
+-      }
+-
+-      return null;
+-    }
+-
+-    @Override public boolean equals(Object other) {
+-      if (other == this) return true;
+-      return other instanceof BasicTrustRootIndex
+-          && ((BasicTrustRootIndex) other).subjectToCaCerts.equals(subjectToCaCerts);
+-    }
+-
+-    @Override public int hashCode() {
+-      return subjectToCaCerts.hashCode();
+-    }
+-  }
++  X509Certificate findByIssuerAndSignature(X509Certificate cert);
+ }
+diff --git a/okhttp/src/main/resources/publicsuffixes.gz b/okhttp/src/main/resources/okhttp3/internal/publicsuffix/publicsuffixes.gz
+similarity index 100%
+rename from okhttp/src/main/resources/publicsuffixes.gz
+rename to okhttp/src/main/resources/okhttp3/internal/publicsuffix/publicsuffixes.gz
+diff --git a/okhttp/src/test/java/okhttp3/internal/publicsuffix/PublicSuffixListGenerator.java b/okhttp/src/test/java/okhttp3/internal/publicsuffix/PublicSuffixListGenerator.java
+index c32032ee15..50b1f8703a 100644
+--- a/okhttp/src/test/java/okhttp3/internal/publicsuffix/PublicSuffixListGenerator.java
++++ b/okhttp/src/test/java/okhttp3/internal/publicsuffix/PublicSuffixListGenerator.java
+@@ -40,7 +40,8 @@
+  */
+ public final class PublicSuffixListGenerator {
+   private static final String OKHTTP_RESOURCE_DIR = "okhttp" + File.separator + "src"
+-      + File.separator + "main" + File.separator + "resources";
++      + File.separator + "main" + File.separator + "resources" + File.separator
++      + "okhttp3" + File.separator + "internal" + File.separator + "publicsuffix";
+ 
+   private static final ByteString EXCEPTION_RULE_MARKER = ByteString.encodeUtf8("!");
+   private static final String WILDCARD_CHAR = "*";

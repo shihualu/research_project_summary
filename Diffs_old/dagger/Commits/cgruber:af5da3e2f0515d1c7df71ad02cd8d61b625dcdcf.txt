@@ -1,0 +1,206 @@
+diff --git a/compiler/src/it/tck/pom.xml b/compiler/src/it/tck/pom.xml
+index cc4b196cc..ecbcb34f5 100644
+--- a/compiler/src/it/tck/pom.xml
++++ b/compiler/src/it/tck/pom.xml
+@@ -28,6 +28,11 @@ limitations under the License.
+   <artifactId>tck</artifactId>
+   <name>TCK</name>
+   <dependencies>
++    <dependency>
++      <!-- Force the correct version of Guava to be on the classpath. -->
++      <groupId>com.google.guava</groupId>
++      <artifactId>guava</artifactId>
++    </dependency>
+     <dependency>
+       <groupId>com.google.dagger</groupId>
+       <artifactId>dagger</artifactId>
+diff --git a/compiler/src/main/java/dagger/internal/codegen/BindingGraphValidator.java b/compiler/src/main/java/dagger/internal/codegen/BindingGraphValidator.java
+index db0057ec9..ad57c475b 100644
+--- a/compiler/src/main/java/dagger/internal/codegen/BindingGraphValidator.java
++++ b/compiler/src/main/java/dagger/internal/codegen/BindingGraphValidator.java
+@@ -176,7 +176,6 @@ void validateSubgraph() {
+               entryPoint.get(),
+               new ArrayDeque<ResolvedRequest>(),
+               new LinkedHashSet<BindingKey>(),
+-              subject,
+               new HashSet<DependencyRequest>());
+         }
+       }
+@@ -248,7 +247,6 @@ private void traverseRequest(
+         DependencyRequest request,
+         Deque<ResolvedRequest> bindingPath,
+         LinkedHashSet<BindingKey> keysInPath,
+-        BindingGraph graph,
+         Set<DependencyRequest> resolvedRequests) {
+       verify(bindingPath.size() == keysInPath.size(),
+           "mismatched path vs keys -- (%s vs %s)", bindingPath, keysInPath);
+@@ -264,14 +262,19 @@ private void traverseRequest(
+ 
+       // If request has already been resolved, avoid re-traversing the binding path.
+       if (resolvedRequests.add(request)) {
+-        ResolvedRequest resolvedRequest = ResolvedRequest.create(request, graph);
++        ResolvedRequest resolvedRequest = ResolvedRequest.create(request, subject);
+         bindingPath.push(resolvedRequest);
+         keysInPath.add(requestKey);
+         validateResolvedBinding(bindingPath, resolvedRequest.binding());
+ 
+-        for (Binding binding : resolvedRequest.binding().bindings()) {
+-          for (DependencyRequest nextRequest : binding.implicitDependencies()) {
+-            traverseRequest(nextRequest, bindingPath, keysInPath, graph, resolvedRequests);
++        // Validate all dependencies within the component that owns the binding.
++        for (Map.Entry<ComponentDescriptor, Collection<Binding>> entry :
++            resolvedRequest.binding().bindingsByComponent().asMap().entrySet()) {
++          Validation validation = validationForComponent(entry.getKey());
++          for (Binding binding : entry.getValue()) {
++            for (DependencyRequest nextRequest : binding.implicitDependencies()) {
++              validation.traverseRequest(nextRequest, bindingPath, keysInPath, resolvedRequests);
++            }
+           }
+         }
+         bindingPath.poll();
+@@ -279,6 +282,20 @@ private void traverseRequest(
+       }
+     }
+ 
++    private Validation validationForComponent(ComponentDescriptor component) {
++      if (component.equals(subject.componentDescriptor())) {
++        return this;
++      } else if (parent.isPresent()) {
++        return parent.get().validationForComponent(component);
++      } else {
++        throw new IllegalArgumentException(
++            String.format(
++                "unknown component %s within %s",
++                component.componentDefinitionType(),
++                subject.componentDescriptor().componentDefinitionType()));
++      }
++    }
++
+     /**
+      * Reports errors if the set of bindings resolved is inconsistent with the type of the binding.
+      */
+diff --git a/compiler/src/main/java/dagger/internal/codegen/ResolvedBindings.java b/compiler/src/main/java/dagger/internal/codegen/ResolvedBindings.java
+index 90e07ea7e..00ded026b 100644
+--- a/compiler/src/main/java/dagger/internal/codegen/ResolvedBindings.java
++++ b/compiler/src/main/java/dagger/internal/codegen/ResolvedBindings.java
+@@ -97,6 +97,16 @@ public Key key() {
+         throw new AssertionError(bindingKey());
+     }
+   }
++  
++  /**
++   * All bindings for {@link #bindingKey()}, indexed by the component in which they were resolved.
++   */
++  ImmutableSetMultimap<ComponentDescriptor, Binding> bindingsByComponent() {
++    return new ImmutableSetMultimap.Builder<ComponentDescriptor, Binding>()
++        .putAll(allContributionBindings())
++        .putAll(allMembersInjectionBindings().entrySet())
++        .build();
++  }
+ 
+   /**
+    * {@code true} if there are no {@link #bindings()} or {@link #multibindingDeclarations()}.
+@@ -173,23 +183,7 @@ static ResolvedBindings forContributionBindings(
+         ImmutableMap.<ComponentDescriptor, MembersInjectionBinding>of(),
+         ImmutableSet.copyOf(multibindings));
+   }
+-
+-  /**
+-   * Creates a {@link ResolvedBindings} for contribution bindings.
+-   */
+-  static ResolvedBindings forContributionBindings(
+-      BindingKey bindingKey,
+-      ComponentDescriptor owningComponent,
+-      ContributionBinding... ownedContributionBindings) {
+-    return forContributionBindings(
+-        bindingKey,
+-        owningComponent,
+-        ImmutableSetMultimap.<ComponentDescriptor, ContributionBinding>builder()
+-            .putAll(owningComponent, ownedContributionBindings)
+-            .build(),
+-        ImmutableSet.<MultibindingDeclaration>of());
+-  }
+-
++  
+   /**
+    * Creates a {@link ResolvedBindings} for members injection bindings.
+    */
+diff --git a/compiler/src/test/java/dagger/internal/codegen/GraphValidationTest.java b/compiler/src/test/java/dagger/internal/codegen/GraphValidationTest.java
+index 6fba4320c..73b581993 100644
+--- a/compiler/src/test/java/dagger/internal/codegen/GraphValidationTest.java
++++ b/compiler/src/test/java/dagger/internal/codegen/GraphValidationTest.java
+@@ -1354,4 +1354,58 @@ public void subcomponentBindingConflictsWithParentWithNullableViolationAsWarning
+         .in(parentConflictsWithChild)
+         .onLine(9);
+   }
++  
++  @Test
++  public void bindingUsedOnlyInSubcomponentDependsOnBindingOnlyInSubcomponent() {
++    JavaFileObject parent =
++        JavaFileObjects.forSourceLines(
++            "Parent",
++            "import dagger.Component;",
++            "",
++            "@Component(modules = ParentModule.class)",
++            "interface Parent {",
++            "  Child child();",
++            "}");
++    JavaFileObject parentModule =
++        JavaFileObjects.forSourceLines(
++            "ParentModule",
++            "import dagger.Module;",
++            "import dagger.Provides;",
++            "",
++            "@Module",
++            "class ParentModule {",
++            "  @Provides static Object needsString(String string) {",
++            "    return \"needs string: \" + string;",
++            "  }",
++            "}");
++    JavaFileObject child =
++        JavaFileObjects.forSourceLines(
++            "Child",
++            "import dagger.Subcomponent;",
++            "",
++            "@Subcomponent(modules = ChildModule.class)",
++            "interface Child {",
++            "  String string();",
++            "  Object needsString();",
++            "}");
++    JavaFileObject childModule =
++        JavaFileObjects.forSourceLines(
++            "ChildModule",
++            "import dagger.Module;",
++            "import dagger.Provides;",
++            "",
++            "@Module",
++            "class ChildModule {",
++            "  @Provides static String string() {",
++            "    return \"child string\";",
++            "  }",
++            "}");
++    assertAbout(javaSources())
++        .that(ImmutableList.of(parent, parentModule, child, childModule))
++        .processedWith(new ComponentProcessor())
++        .failsToCompile()
++        .withErrorContaining("[Child.needsString()] java.lang.String cannot be provided")
++        .in(parent)
++        .onLine(4);
++  }
+ }
+diff --git a/examples/simple/pom.xml b/examples/simple/pom.xml
+index e3e260f35..e690d06d5 100644
+--- a/examples/simple/pom.xml
++++ b/examples/simple/pom.xml
+@@ -27,6 +27,11 @@
+   <name>Examples: Simple</name>
+ 
+   <dependencies>
++    <dependency>
++      <!-- Force the correct version of Guava to be on the classpath. -->
++      <groupId>com.google.guava</groupId>
++      <artifactId>guava</artifactId>
++    </dependency>
+     <dependency>
+       <groupId>com.google.dagger</groupId>
+       <artifactId>dagger</artifactId>

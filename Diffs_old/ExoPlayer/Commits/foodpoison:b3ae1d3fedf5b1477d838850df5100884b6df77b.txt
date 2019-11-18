@@ -1,0 +1,286 @@
+diff --git a/RELEASENOTES.md b/RELEASENOTES.md
+index ba615c4b91..6094046b87 100644
+--- a/RELEASENOTES.md
++++ b/RELEASENOTES.md
+@@ -2,6 +2,7 @@
+ 
+ ### dev-v2 (not yet released) ###
+ 
++* Offline: Add option to remove all downloads.
+ * Decoders:
+   * Prefer codecs that advertise format support over ones that do not, even if
+     they are listed lower in the `MediaCodecList`.
+diff --git a/library/core/src/main/java/com/google/android/exoplayer2/offline/DefaultDownloadIndex.java b/library/core/src/main/java/com/google/android/exoplayer2/offline/DefaultDownloadIndex.java
+index 06f308d1e9..ef4bd00f20 100644
+--- a/library/core/src/main/java/com/google/android/exoplayer2/offline/DefaultDownloadIndex.java
++++ b/library/core/src/main/java/com/google/android/exoplayer2/offline/DefaultDownloadIndex.java
+@@ -233,6 +233,19 @@ public void setDownloadingStatesToQueued() throws DatabaseIOException {
+     }
+   }
+ 
++  @Override
++  public void setStatesToRemoving() throws DatabaseIOException {
++    ensureInitialized();
++    try {
++      ContentValues values = new ContentValues();
++      values.put(COLUMN_STATE, Download.STATE_REMOVING);
++      SQLiteDatabase writableDatabase = databaseProvider.getWritableDatabase();
++      writableDatabase.update(tableName, values, /* whereClause= */ null, /* whereArgs= */ null);
++    } catch (SQLException e) {
++      throw new DatabaseIOException(e);
++    }
++  }
++
+   @Override
+   public void setStopReason(int stopReason) throws DatabaseIOException {
+     ensureInitialized();
+diff --git a/library/core/src/main/java/com/google/android/exoplayer2/offline/DownloadManager.java b/library/core/src/main/java/com/google/android/exoplayer2/offline/DownloadManager.java
+index 3bf03dd3e8..ec5ff81d97 100644
+--- a/library/core/src/main/java/com/google/android/exoplayer2/offline/DownloadManager.java
++++ b/library/core/src/main/java/com/google/android/exoplayer2/offline/DownloadManager.java
+@@ -133,10 +133,11 @@ default void onRequirementsStateChanged(
+   private static final int MSG_SET_MIN_RETRY_COUNT = 5;
+   private static final int MSG_ADD_DOWNLOAD = 6;
+   private static final int MSG_REMOVE_DOWNLOAD = 7;
+-  private static final int MSG_TASK_STOPPED = 8;
+-  private static final int MSG_CONTENT_LENGTH_CHANGED = 9;
+-  private static final int MSG_UPDATE_PROGRESS = 10;
+-  private static final int MSG_RELEASE = 11;
++  private static final int MSG_REMOVE_ALL_DOWNLOADS = 8;
++  private static final int MSG_TASK_STOPPED = 9;
++  private static final int MSG_CONTENT_LENGTH_CHANGED = 10;
++  private static final int MSG_UPDATE_PROGRESS = 11;
++  private static final int MSG_RELEASE = 12;
+ 
+   private static final String TAG = "DownloadManager";
+ 
+@@ -446,6 +447,12 @@ public void removeDownload(String id) {
+     internalHandler.obtainMessage(MSG_REMOVE_DOWNLOAD, id).sendToTarget();
+   }
+ 
++  /** Cancels all pending downloads and removes all downloaded data. */
++  public void removeAllDownloads() {
++    pendingMessages++;
++    internalHandler.obtainMessage(MSG_REMOVE_ALL_DOWNLOADS).sendToTarget();
++  }
++
+   /**
+    * Stops the downloads and releases resources. Waits until the downloads are persisted to the
+    * download index. The manager must not be accessed after this method has been called.
+@@ -652,6 +659,9 @@ public void handleMessage(Message message) {
+           id = (String) message.obj;
+           removeDownload(id);
+           break;
++        case MSG_REMOVE_ALL_DOWNLOADS:
++          removeAllDownloads();
++          break;
+         case MSG_TASK_STOPPED:
+           Task task = (Task) message.obj;
+           onTaskStopped(task);
+@@ -797,6 +807,36 @@ private void removeDownload(String id) {
+       syncTasks();
+     }
+ 
++    private void removeAllDownloads() {
++      List<Download> terminalDownloads = new ArrayList<>();
++      try (DownloadCursor cursor = downloadIndex.getDownloads(STATE_COMPLETED, STATE_FAILED)) {
++        while (cursor.moveToNext()) {
++          terminalDownloads.add(cursor.getDownload());
++        }
++      } catch (IOException e) {
++        Log.e(TAG, "Failed to load downloads.");
++      }
++      for (int i = 0; i < downloads.size(); i++) {
++        downloads.set(i, copyDownloadWithState(downloads.get(i), STATE_REMOVING));
++      }
++      for (int i = 0; i < terminalDownloads.size(); i++) {
++        downloads.add(copyDownloadWithState(terminalDownloads.get(i), STATE_REMOVING));
++      }
++      Collections.sort(downloads, InternalHandler::compareStartTimes);
++      try {
++        downloadIndex.setStatesToRemoving();
++      } catch (IOException e) {
++        Log.e(TAG, "Failed to update index.", e);
++      }
++      ArrayList<Download> updateList = new ArrayList<>(downloads);
++      for (int i = 0; i < downloads.size(); i++) {
++        DownloadUpdate update =
++            new DownloadUpdate(downloads.get(i), /* isRemove= */ false, updateList);
++        mainHandler.obtainMessage(MSG_DOWNLOAD_UPDATE, update).sendToTarget();
++      }
++      syncTasks();
++    }
++
+     private void release() {
+       for (Task task : activeTasks.values()) {
+         task.cancel(/* released= */ true);
+@@ -1057,16 +1097,7 @@ private Download putDownloadWithState(Download download, @Download.State int sta
+       // to set STATE_STOPPED either, because it doesn't have a stopReason argument.
+       Assertions.checkState(
+           state != STATE_COMPLETED && state != STATE_FAILED && state != STATE_STOPPED);
+-      return putDownload(
+-          new Download(
+-              download.request,
+-              state,
+-              download.startTimeMs,
+-              /* updateTimeMs= */ System.currentTimeMillis(),
+-              download.contentLength,
+-              /* stopReason= */ 0,
+-              FAILURE_REASON_NONE,
+-              download.progress));
++      return putDownload(copyDownloadWithState(download, state));
+     }
+ 
+     private Download putDownload(Download download) {
+@@ -1120,6 +1151,18 @@ private int getDownloadIndex(String id) {
+       return C.INDEX_UNSET;
+     }
+ 
++    private static Download copyDownloadWithState(Download download, @Download.State int state) {
++      return new Download(
++          download.request,
++          state,
++          download.startTimeMs,
++          /* updateTimeMs= */ System.currentTimeMillis(),
++          download.contentLength,
++          /* stopReason= */ 0,
++          FAILURE_REASON_NONE,
++          download.progress);
++    }
++
+     private static int compareStartTimes(Download first, Download second) {
+       return Util.compareLong(first.startTimeMs, second.startTimeMs);
+     }
+diff --git a/library/core/src/main/java/com/google/android/exoplayer2/offline/DownloadService.java b/library/core/src/main/java/com/google/android/exoplayer2/offline/DownloadService.java
+index fdd7163a2c..3900dc8e93 100644
+--- a/library/core/src/main/java/com/google/android/exoplayer2/offline/DownloadService.java
++++ b/library/core/src/main/java/com/google/android/exoplayer2/offline/DownloadService.java
+@@ -77,6 +77,16 @@
+   public static final String ACTION_REMOVE_DOWNLOAD =
+       "com.google.android.exoplayer.downloadService.action.REMOVE_DOWNLOAD";
+ 
++  /**
++   * Removes all downloads. Extras:
++   *
++   * <ul>
++   *   <li>{@link #KEY_FOREGROUND} - See {@link #KEY_FOREGROUND}.
++   * </ul>
++   */
++  public static final String ACTION_REMOVE_ALL_DOWNLOADS =
++      "com.google.android.exoplayer.downloadService.action.REMOVE_ALL_DOWNLOADS";
++
+   /**
+    * Resumes all downloads except those that have a non-zero {@link Download#stopReason}. Extras:
+    *
+@@ -296,6 +306,19 @@ public static Intent buildRemoveDownloadIntent(
+         .putExtra(KEY_CONTENT_ID, id);
+   }
+ 
++  /**
++   * Builds an {@link Intent} for removing all downloads.
++   *
++   * @param context A {@link Context}.
++   * @param clazz The concrete download service being targeted by the intent.
++   * @param foreground Whether this intent will be used to start the service in the foreground.
++   * @return The created intent.
++   */
++  public static Intent buildRemoveAllDownloadsIntent(
++      Context context, Class<? extends DownloadService> clazz, boolean foreground) {
++    return getIntent(context, clazz, ACTION_REMOVE_ALL_DOWNLOADS, foreground);
++  }
++
+   /**
+    * Builds an {@link Intent} for resuming all downloads.
+    *
+@@ -414,6 +437,19 @@ public static void sendRemoveDownload(
+     startService(context, intent, foreground);
+   }
+ 
++  /**
++   * Starts the service if not started already and removes all downloads.
++   *
++   * @param context A {@link Context}.
++   * @param clazz The concrete download service to be started.
++   * @param foreground Whether the service is started in the foreground.
++   */
++  public static void sendRemoveAllDownloads(
++      Context context, Class<? extends DownloadService> clazz, boolean foreground) {
++    Intent intent = buildRemoveAllDownloadsIntent(context, clazz, foreground);
++    startService(context, intent, foreground);
++  }
++
+   /**
+    * Starts the service if not started already and resumes all downloads.
+    *
+@@ -560,6 +596,9 @@ public int onStartCommand(Intent intent, int flags, int startId) {
+           downloadManager.removeDownload(contentId);
+         }
+         break;
++      case ACTION_REMOVE_ALL_DOWNLOADS:
++        downloadManager.removeAllDownloads();
++        break;
+       case ACTION_RESUME_DOWNLOADS:
+         downloadManager.resumeDownloads();
+         break;
+diff --git a/library/core/src/main/java/com/google/android/exoplayer2/offline/WritableDownloadIndex.java b/library/core/src/main/java/com/google/android/exoplayer2/offline/WritableDownloadIndex.java
+index ae634f8544..dc7085c85e 100644
+--- a/library/core/src/main/java/com/google/android/exoplayer2/offline/WritableDownloadIndex.java
++++ b/library/core/src/main/java/com/google/android/exoplayer2/offline/WritableDownloadIndex.java
+@@ -44,6 +44,13 @@
+    */
+   void setDownloadingStatesToQueued() throws IOException;
+ 
++  /**
++   * Sets all states to {@link Download#STATE_REMOVING}.
++   *
++   * @throws IOException If an error occurs updating the state.
++   */
++  void setStatesToRemoving() throws IOException;
++
+   /**
+    * Sets the stop reason of the downloads in a terminal state ({@link Download#STATE_COMPLETED},
+    * {@link Download#STATE_FAILED}).
+diff --git a/library/core/src/test/java/com/google/android/exoplayer2/offline/DownloadManagerTest.java b/library/core/src/test/java/com/google/android/exoplayer2/offline/DownloadManagerTest.java
+index a3df647efe..3a3067853e 100644
+--- a/library/core/src/test/java/com/google/android/exoplayer2/offline/DownloadManagerTest.java
++++ b/library/core/src/test/java/com/google/android/exoplayer2/offline/DownloadManagerTest.java
+@@ -243,6 +243,27 @@ public void secondSameRemoveRequestIgnored() throws Throwable {
+     downloadManagerListener.blockUntilTasksCompleteAndThrowAnyDownloadError();
+   }
+ 
++  @Test
++  public void removeAllDownloads_removesAllDownloads() throws Throwable {
++    // Finish one download and keep one running.
++    DownloadRunner runner1 = new DownloadRunner(uri1);
++    DownloadRunner runner2 = new DownloadRunner(uri2);
++    runner1.postDownloadRequest();
++    runner1.getDownloader(0).unblock();
++    downloadManagerListener.blockUntilTasksCompleteAndThrowAnyDownloadError();
++    runner2.postDownloadRequest();
++
++    runner1.postRemoveAllRequest();
++    runner1.getDownloader(1).unblock();
++    runner2.getDownloader(1).unblock();
++    downloadManagerListener.blockUntilTasksCompleteAndThrowAnyDownloadError();
++
++    runner1.getTask().assertRemoved();
++    runner2.getTask().assertRemoved();
++    assertThat(downloadManager.getCurrentDownloads()).isEmpty();
++    assertThat(downloadIndex.getDownloads().getCount()).isEqualTo(0);
++  }
++
+   @Test
+   public void differentDownloadRequestsMerged() throws Throwable {
+     DownloadRunner runner = new DownloadRunner(uri1);
+@@ -605,6 +626,11 @@ private DownloadRunner postRemoveRequest() {
+       return this;
+     }
+ 
++    private DownloadRunner postRemoveAllRequest() {
++      runOnMainThread(() -> downloadManager.removeAllDownloads());
++      return this;
++    }
++
+     private DownloadRunner postDownloadRequest(StreamKey... keys) {
+       DownloadRequest downloadRequest =
+           new DownloadRequest(

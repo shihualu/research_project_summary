@@ -1,0 +1,186 @@
+diff --git a/src/main/java/com/ning/http/client/providers/netty/NettyAsyncHttpProvider.java b/src/main/java/com/ning/http/client/providers/netty/NettyAsyncHttpProvider.java
+index 9ec4564da..2419c2f84 100644
+--- a/src/main/java/com/ning/http/client/providers/netty/NettyAsyncHttpProvider.java
++++ b/src/main/java/com/ning/http/client/providers/netty/NettyAsyncHttpProvider.java
+@@ -94,7 +94,9 @@
+ import org.jboss.netty.handler.codec.http.HttpResponse;
+ import org.jboss.netty.handler.codec.http.HttpResponseDecoder;
+ import org.jboss.netty.handler.codec.http.HttpVersion;
++import org.jboss.netty.handler.codec.http.websocketx.BinaryWebSocketFrame;
+ import org.jboss.netty.handler.codec.http.websocketx.CloseWebSocketFrame;
++import org.jboss.netty.handler.codec.http.websocketx.TextWebSocketFrame;
+ import org.jboss.netty.handler.codec.http.websocketx.WebSocket08FrameDecoder;
+ import org.jboss.netty.handler.codec.http.websocketx.WebSocket08FrameEncoder;
+ import org.jboss.netty.handler.codec.http.websocketx.WebSocketFrame;
+@@ -116,6 +118,7 @@
+ import java.nio.channels.ClosedChannelException;
+ import java.nio.channels.FileChannel;
+ import java.nio.channels.WritableByteChannel;
++import java.nio.charset.Charset;
+ import java.security.GeneralSecurityException;
+ import java.security.NoSuchAlgorithmException;
+ import java.util.ArrayList;
+@@ -145,6 +148,7 @@
+     private static final String WEBSOCKET = "ws";
+     private static final String WEBSOCKET_SSL = "wss";
+     private final static Logger log = LoggerFactory.getLogger(NettyAsyncHttpProvider.class);
++    private final static Charset UTF8 = Charset.forName("UTF-8");
+     private final ClientBootstrap plainBootstrap;
+     private final ClientBootstrap secureBootstrap;
+     private final ClientBootstrap webSocketBootstrap;
+@@ -2371,7 +2375,15 @@ public void onClose(ChannelHandlerContext ctx, ChannelStateEvent e) {
+     }
+ 
+     private final class WebSocketProtocol implements Protocol {
+-
++        private static final byte OPCODE_CONT = 0x0;
++        private static final byte OPCODE_TEXT = 0x1;
++        private static final byte OPCODE_BINARY = 0x2;
++        private static final byte OPCODE_UNKNOWN = -1;
++
++    	   protected ChannelBuffer byteBuffer = null;
++    	   protected StringBuilder textBuffer = null;
++    	   protected byte pendingOpcode = OPCODE_UNKNOWN;
++ 
+         // @Override
+         public void handle(ChannelHandlerContext ctx, MessageEvent e) throws Exception {
+             NettyResponseFuture future = NettyResponseFuture.class.cast(ctx.getAttachment());
+@@ -2448,6 +2460,13 @@ public void handle(ChannelHandlerContext ctx, MessageEvent e) throws Exception {
+             } else if (e.getMessage() instanceof WebSocketFrame) {
+                 final WebSocketFrame frame = (WebSocketFrame) e.getMessage();
+ 
++                if(frame instanceof TextWebSocketFrame) {
++                	pendingOpcode = OPCODE_TEXT;
++                }
++                else if(frame instanceof BinaryWebSocketFrame) {
++                	pendingOpcode = OPCODE_BINARY;
++                }
++                
+                 HttpChunk webSocketChunk = new HttpChunk() {
+                     private ChannelBuffer content;
+ 
+@@ -2473,8 +2492,13 @@ public void setContent(ChannelBuffer content) {
+                     h.onBodyPartReceived(rp);
+ 
+                     NettyWebSocket webSocket = NettyWebSocket.class.cast(h.onCompleted());
+-                    webSocket.onMessage(rp.getBodyPartBytes());
+-                    webSocket.onTextMessage(frame.getBinaryData().toString("UTF-8"));
++                   
++                    if(pendingOpcode == OPCODE_BINARY) {
++                        webSocket.onBinaryFragment(rp.getBodyPartBytes(),frame.isFinalFragment());
++                    }
++                    else {
++                        webSocket.onTextFragment(frame.getBinaryData().toString(UTF8),frame.isFinalFragment());
++                    }
+ 
+                     if (CloseWebSocketFrame.class.isAssignableFrom(frame.getClass())) {
+                         try {
+diff --git a/src/main/java/com/ning/http/client/providers/netty/NettyWebSocket.java b/src/main/java/com/ning/http/client/providers/netty/NettyWebSocket.java
+index 498e15ba1..3e0f7947e 100644
+--- a/src/main/java/com/ning/http/client/providers/netty/NettyWebSocket.java
++++ b/src/main/java/com/ning/http/client/providers/netty/NettyWebSocket.java
+@@ -27,6 +27,8 @@
+ 
+ import java.util.concurrent.ConcurrentLinkedQueue;
+ 
++import java.io.ByteArrayOutputStream;
++
+ import static org.jboss.netty.buffer.ChannelBuffers.wrappedBuffer;
+ 
+ public class NettyWebSocket implements WebSocket {
+@@ -35,6 +37,10 @@
+     private final Channel channel;
+     private final ConcurrentLinkedQueue<WebSocketListener> listeners = new ConcurrentLinkedQueue<WebSocketListener>();
+ 
++    private StringBuilder textBuffer;
++    private ByteArrayOutputStream byteBuffer;
++    private int maxBufferSize = 128000000;
++
+     public NettyWebSocket(Channel channel) {
+         this.channel = channel;
+     }
+@@ -90,6 +96,17 @@ public WebSocket removeWebSocketListener(WebSocketListener l) {
+         return this;
+     }
+ 
++    public int getMaxBufferSize() {
++    	return maxBufferSize;
++    }
++    
++    public void setMaxBufferSize(int bufferSize) {
++    	maxBufferSize = bufferSize;
++    	
++    	if(maxBufferSize < 8192)
++    		maxBufferSize = 8192;
++    }
++    
+     // @Override
+     public boolean isOpen() {
+         return channel.isOpen();
+@@ -102,11 +119,31 @@ public void close() {
+         channel.close();
+     }
+ 
+-    protected void onMessage(byte[] message) {
++    protected void onBinaryFragment(byte[] message, boolean last) {
+         for (WebSocketListener l : listeners) {
+             if (WebSocketByteListener.class.isAssignableFrom(l.getClass())) {
+                 try {
+-                    WebSocketByteListener.class.cast(l).onMessage(message);
++                	WebSocketByteListener.class.cast(l).onFragment(message,last);
++                	
++                	if(byteBuffer == null) {
++                		byteBuffer = new ByteArrayOutputStream();
++                	}
++                	
++                	byteBuffer.write(message);
++                	
++                	if(byteBuffer.size() > maxBufferSize) {
++                		Exception e = new Exception("Exceeded Netty Web Socket maximum buffer size of " + getMaxBufferSize());
++                        l.onError(e);
++                		this.close();
++                		return;
++                	}
++                	
++
++                	if(last) {
++                    	WebSocketByteListener.class.cast(l).onMessage(byteBuffer.toByteArray());
++                    	byteBuffer = null;
++                    	textBuffer = null;
++                	}
+                 } catch (Exception ex) {
+                     l.onError(ex);
+                 }
+@@ -114,11 +151,30 @@ protected void onMessage(byte[] message) {
+         }
+     }
+ 
+-    protected void onTextMessage(String message) {
++    protected void onTextFragment(String message, boolean last) {
+         for (WebSocketListener l : listeners) {
+             if (WebSocketTextListener.class.isAssignableFrom(l.getClass())) {
+                 try {
+-                    WebSocketTextListener.class.cast(l).onMessage(message);
++                    WebSocketTextListener.class.cast(l).onFragment(message,last);
++                    
++                	if(textBuffer == null) {
++                		textBuffer = new StringBuilder();
++                	}
++                	
++                	textBuffer.append(message);
++                	
++                	if(textBuffer.length() > maxBufferSize) {
++                		Exception e = new Exception("Exceeded Netty Web Socket maximum buffer size of " + getMaxBufferSize());
++                        l.onError(e);
++                		this.close();
++                		return;
++                	}
++                	
++                	if(last) {
++                    	WebSocketTextListener.class.cast(l).onMessage(textBuffer.toString());
++                    	byteBuffer = null;
++                    	textBuffer = null;
++                	}
+                 } catch (Exception ex) {
+                     l.onError(ex);
+                 }

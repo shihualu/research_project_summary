@@ -1,0 +1,626 @@
+diff --git a/library/src/main/java/com/bumptech/glide/GlideBuilder.java b/library/src/main/java/com/bumptech/glide/GlideBuilder.java
+index f08630240..f3dd75777 100644
+--- a/library/src/main/java/com/bumptech/glide/GlideBuilder.java
++++ b/library/src/main/java/com/bumptech/glide/GlideBuilder.java
+@@ -46,6 +46,7 @@
+   @Nullable
+   private RequestManagerFactory requestManagerFactory;
+   private GlideExecutor animationExecutor;
++  private boolean isActiveResourceRetentionAllowed = true;
+ 
+   /**
+    * Sets the {@link com.bumptech.glide.load.engine.bitmap_recycle.BitmapPool} implementation to use
+@@ -326,6 +327,45 @@ public GlideBuilder setLogLevel(int logLevel) {
+     return this;
+   }
+ 
++  /**
++   * If set to {@code true}, allows Glide to re-capture resources that are loaded into
++   * {@link com.bumptech.glide.request.target.Target}s which are subsequently de-referenced and
++   * garbage collected without being cleared.
++   *
++   * <p>Glide's resource re-use system is permissive, which means that's acceptable for callers to
++   * load resources into {@link com.bumptech.glide.request.target.Target}s and then never clear the
++   * {@link com.bumptech.glide.request.target.Target}. To do so, Glide uses
++   * {@link java.lang.ref.WeakReference}s to track resources that belong to
++   * {@link com.bumptech.glide.request.target.Target}s that haven't yet been cleared. Setting
++   * this method to {@code true} allows Glide to also maintain a hard reference to the underlying
++   * resource so that if the {@link com.bumptech.glide.request.target.Target} is garbage collected,
++   * Glide can return the underlying resource to it's memory cache so that subsequent requests will
++   * not unexpectedly re-load the resource from disk or source. As a side affect, it will take
++   * the system slightly longer to garbage collect the underlying resource because the weak
++   * reference has to be cleared and processed before the hard reference is removed. As a result,
++   * setting this method to {@code true} may transiently increase the memory usage of an
++   * application.
++   *
++   * <p>Setting this method to {@code false} will allow the platform to garbage collect resources
++   * more quickly, but will lead to unexpected memory cache misses if callers load resources into
++   * {@link com.bumptech.glide.request.target.Target}s but never clear them.
++   *
++   * <p>Regardless of what value this method is set to, it's always good practice to clear
++   * {@link com.bumptech.glide.request.target.Target}s when you're done with the corresponding
++   * resource. Clearing {@link com.bumptech.glide.request.target.Target}s allows Glide to maximize
++   * resource re-use, minimize memory overhead and minimize unexpected behavior resulting from
++   * edge cases.
++   *
++   * <p>Defaults to {@code true}.
++   *
++   * @return This builder.
++   */
++  public GlideBuilder setIsActiveResourceRetentionAllowed(
++      boolean isActiveResourceRetentionAllowed) {
++    this.isActiveResourceRetentionAllowed = isActiveResourceRetentionAllowed;
++    return this;
++  }
++
+   void setRequestManagerFactory(@Nullable RequestManagerFactory factory) {
+     this.requestManagerFactory = factory;
+   }
+@@ -386,7 +426,8 @@ public Glide build(Context context) {
+               diskCacheExecutor,
+               sourceExecutor,
+               GlideExecutor.newUnlimitedSourceExecutor(),
+-              GlideExecutor.newAnimationExecutor());
++              GlideExecutor.newAnimationExecutor(),
++              isActiveResourceRetentionAllowed);
+     }
+ 
+     RequestManagerRetriever requestManagerRetriever =
+diff --git a/library/src/main/java/com/bumptech/glide/load/engine/ActiveResources.java b/library/src/main/java/com/bumptech/glide/load/engine/ActiveResources.java
+index fc91f7d37..5a69c8937 100644
+--- a/library/src/main/java/com/bumptech/glide/load/engine/ActiveResources.java
++++ b/library/src/main/java/com/bumptech/glide/load/engine/ActiveResources.java
+@@ -1,7 +1,10 @@
+ package com.bumptech.glide.load.engine;
+ 
++import android.os.Handler;
++import android.os.Handler.Callback;
+ import android.os.Looper;
+-import android.os.MessageQueue;
++import android.os.Message;
++import android.os.Process;
+ import android.support.annotation.NonNull;
+ import android.support.annotation.Nullable;
+ import android.support.annotation.VisibleForTesting;
+@@ -9,28 +12,59 @@
+ import com.bumptech.glide.load.engine.EngineResource.ResourceListener;
+ import com.bumptech.glide.util.Preconditions;
+ import com.bumptech.glide.util.Synthetic;
++import com.bumptech.glide.util.Util;
+ import java.lang.ref.ReferenceQueue;
+ import java.lang.ref.WeakReference;
+ import java.util.HashMap;
+ import java.util.Map;
++import java.util.concurrent.TimeUnit;
+ 
+ final class ActiveResources {
++  private static final int MSG_CLEAN_REF = 1;
++
++  private final boolean isActiveResourceRetentionAllowed;
++  private final Handler mainHandler = new Handler(Looper.getMainLooper(), new Callback() {
++    @Override
++    public boolean handleMessage(Message msg) {
++      if (msg.what == MSG_CLEAN_REF) {
++        cleanupActiveReference((ResourceWeakReference) msg.obj);
++        return true;
++      }
++      return false;
++    }
++  });
+   @VisibleForTesting
+   final Map<Key, ResourceWeakReference> activeEngineResources = new HashMap<>();
++
++  private ResourceListener listener;
++
+   // Lazily instantiate to avoid exceptions if Glide is initialized on a background thread. See
+   // #295.
+   @Nullable
+   private ReferenceQueue<EngineResource<?>> resourceReferenceQueue;
+-  private ResourceListener listener;
++  @Nullable
++  private Thread cleanReferenceQueueThread;
++  private volatile boolean isShutdown;
++  @Nullable
++  private volatile DequeuedResourceCallback cb;
++
++  ActiveResources(boolean isActiveResourceRetentionAllowed) {
++    this.isActiveResourceRetentionAllowed = isActiveResourceRetentionAllowed;
++  }
+ 
+   void setListener(ResourceListener listener) {
+     this.listener = listener;
+   }
+ 
+   void activate(Key key, EngineResource<?> resource) {
+-    ResourceWeakReference removed =
+-        activeEngineResources.put(
+-            key, new ResourceWeakReference(key, resource, getReferenceQueue()));
++    ResourceWeakReference toPut =
++        new ResourceWeakReference(
++            key,
++            resource,
++            getReferenceQueue(),
++            isActiveResourceRetentionAllowed);
++
++    ResourceWeakReference removed = activeEngineResources.put(key, toPut);
+     if (removed != null) {
+       removed.reset();
+     }
+@@ -58,6 +92,7 @@ void deactivate(Key key) {
+   }
+ 
+   private void cleanupActiveReference(@NonNull ResourceWeakReference ref) {
++    Util.assertMainThread();
+     activeEngineResources.remove(ref.key);
+ 
+     if (!ref.isCacheable || ref.resource == null) {
+@@ -72,22 +107,59 @@ private void cleanupActiveReference(@NonNull ResourceWeakReference ref) {
+   private ReferenceQueue<EngineResource<?>> getReferenceQueue() {
+     if (resourceReferenceQueue == null) {
+       resourceReferenceQueue = new ReferenceQueue<>();
+-      MessageQueue queue = Looper.myQueue();
+-      queue.addIdleHandler(new RefQueueIdleHandler());
++      cleanReferenceQueueThread = new Thread(new Runnable() {
++        @SuppressWarnings("InfiniteLoopStatement")
++        @Override
++        public void run() {
++          Process.setThreadPriority(Process.THREAD_PRIORITY_BACKGROUND);
++          ResourceWeakReference ref;
++          while (!isShutdown) {
++            try {
++              ref = (ResourceWeakReference) resourceReferenceQueue.remove();
++              mainHandler.obtainMessage(MSG_CLEAN_REF, ref).sendToTarget();
++
++              // This section for testing only.
++              DequeuedResourceCallback current = cb;
++              if (current != null) {
++                current.onResourceDequeued();
++              }
++              // End for testing only.
++            } catch (InterruptedException e) {
++              Thread.currentThread().interrupt();
++            }
++          }
++        }
++      }, "glide-active-resources");
++      cleanReferenceQueueThread.start();
+     }
+     return resourceReferenceQueue;
+   }
+ 
+-  // Responsible for cleaning up the active resource map by remove weak references that have been
+-  // cleared.
+-  private class RefQueueIdleHandler implements MessageQueue.IdleHandler {
+-    @Override
+-    public boolean queueIdle() {
+-      ResourceWeakReference ref;
+-      while ((ref = (ResourceWeakReference) getReferenceQueue().poll()) != null) {
+-        cleanupActiveReference(ref);
++  @VisibleForTesting
++  void setEnqueuedResourceCallback(DequeuedResourceCallback cb) {
++    this.cb = cb;
++  }
++
++  @VisibleForTesting
++  interface DequeuedResourceCallback {
++    void onResourceDequeued();
++  }
++
++  @VisibleForTesting
++  void shutdown() {
++    isShutdown = true;
++    if (cleanReferenceQueueThread == null) {
++      return;
++    }
++
++    cleanReferenceQueueThread.interrupt();
++    try {
++      cleanReferenceQueueThread.join(TimeUnit.SECONDS.toMillis(5));
++      if (cleanReferenceQueueThread.isAlive()) {
++        throw new RuntimeException("Failed to join in time");
+       }
+-      return true;
++    } catch (InterruptedException e) {
++      Thread.currentThread().interrupt();
+     }
+   }
+ 
+@@ -103,11 +175,13 @@ public boolean queueIdle() {
+     ResourceWeakReference(
+         @NonNull Key key,
+         @NonNull EngineResource<?> referent,
+-        @NonNull ReferenceQueue<? super EngineResource<?>> queue) {
++        @NonNull ReferenceQueue<? super EngineResource<?>> queue,
++        boolean isActiveResourceRetentionAllowed) {
+       super(referent, queue);
+       this.key = Preconditions.checkNotNull(key);
+       this.resource =
+-          referent.isCacheable() ? Preconditions.checkNotNull(referent.getResource()) : null;
++          referent.isCacheable() && isActiveResourceRetentionAllowed
++              ? Preconditions.checkNotNull(referent.getResource()) : null;
+       isCacheable = referent.isCacheable();
+     }
+ 
+diff --git a/library/src/main/java/com/bumptech/glide/load/engine/Engine.java b/library/src/main/java/com/bumptech/glide/load/engine/Engine.java
+index 171548a81..3bccb0f29 100644
+--- a/library/src/main/java/com/bumptech/glide/load/engine/Engine.java
++++ b/library/src/main/java/com/bumptech/glide/load/engine/Engine.java
+@@ -42,12 +42,14 @@
+   private final DecodeJobFactory decodeJobFactory;
+   private final ActiveResources activeResources;
+ 
+-  public Engine(MemoryCache memoryCache,
++  public Engine(
++      MemoryCache memoryCache,
+       DiskCache.Factory diskCacheFactory,
+       GlideExecutor diskCacheExecutor,
+       GlideExecutor sourceExecutor,
+       GlideExecutor sourceUnlimitedExecutor,
+-      GlideExecutor animationExecutor) {
++      GlideExecutor animationExecutor,
++      boolean isActiveResourceRetentionAllowed) {
+     this(
+         memoryCache,
+         diskCacheFactory,
+@@ -60,7 +62,8 @@ public Engine(MemoryCache memoryCache,
+         /*activeResources=*/ null,
+         /*engineJobFactory=*/ null,
+         /*decodeJobFactory=*/ null,
+-        /*resourceRecycler=*/ null);
++        /*resourceRecycler=*/ null,
++        isActiveResourceRetentionAllowed);
+   }
+ 
+   @VisibleForTesting
+@@ -75,12 +78,13 @@ public Engine(MemoryCache memoryCache,
+       ActiveResources activeResources,
+       EngineJobFactory engineJobFactory,
+       DecodeJobFactory decodeJobFactory,
+-      ResourceRecycler resourceRecycler) {
++      ResourceRecycler resourceRecycler,
++      boolean isActiveResourceRetentionAllowed) {
+     this.cache = cache;
+     this.diskCacheProvider = new LazyDiskCacheProvider(diskCacheFactory);
+ 
+     if (activeResources == null) {
+-      activeResources = new ActiveResources();
++      activeResources = new ActiveResources(isActiveResourceRetentionAllowed);
+     }
+     this.activeResources = activeResources;
+     activeResources.setListener(this);
+@@ -334,6 +338,7 @@ public void clearDiskCache() {
+   public void shutdown() {
+     engineJobFactory.shutdown();
+     diskCacheProvider.clearDiskCacheIfCreated();
++    activeResources.shutdown();
+   }
+ 
+   /**
+diff --git a/library/src/test/java/com/bumptech/glide/load/engine/ActiveResourcesTest.java b/library/src/test/java/com/bumptech/glide/load/engine/ActiveResourcesTest.java
+index 8f69875f7..70ea46c48 100644
+--- a/library/src/test/java/com/bumptech/glide/load/engine/ActiveResourcesTest.java
++++ b/library/src/test/java/com/bumptech/glide/load/engine/ActiveResourcesTest.java
+@@ -7,11 +7,13 @@
+ import static org.mockito.Mockito.reset;
+ import static org.mockito.Mockito.verify;
+ 
+-import android.os.MessageQueue.IdleHandler;
+ import com.bumptech.glide.load.Key;
++import com.bumptech.glide.load.engine.ActiveResources.DequeuedResourceCallback;
+ import com.bumptech.glide.load.engine.ActiveResources.ResourceWeakReference;
+ import com.bumptech.glide.load.engine.EngineResource.ResourceListener;
+ import com.bumptech.glide.tests.GlideShadowLooper;
++import java.util.concurrent.CountDownLatch;
++import org.junit.After;
+ import org.junit.Before;
+ import org.junit.Test;
+ import org.junit.runner.RunWith;
+@@ -20,6 +22,7 @@
+ import org.mockito.MockitoAnnotations;
+ import org.robolectric.RobolectricTestRunner;
+ import org.robolectric.annotation.Config;
++import org.robolectric.shadows.ShadowLooper;
+ 
+ @RunWith(RobolectricTestRunner.class)
+ @Config(shadows = GlideShadowLooper.class)
+@@ -34,12 +37,17 @@
+   @Before
+   public void setUp() {
+     MockitoAnnotations.initMocks(this);
+-    resources = new ActiveResources();
++    resources = new ActiveResources(/*isActiveResourceRetentionAllowed=*/ true);
+     resources.setListener(listener);
+ 
+     reset(GlideShadowLooper.queue);
+   }
+ 
++  @After
++  public void tearDown() {
++    resources.shutdown();
++  }
++
+   @Test
+   public void get_withMissingKey_returnsNull() {
+     assertThat(resources.get(key)).isNull();
+@@ -142,9 +150,7 @@ public void queueIdle_afterResourceRemovedFromActive_doesNotCallListener() {
+     ResourceWeakReference weakRef = resources.activeEngineResources.get(key);
+     resources.deactivate(key);
+ 
+-    weakRef.enqueue();
+-
+-    triggerQueueIdle();
++    enqueueAndWaitForRef(weakRef);
+ 
+     verify(listener, never()).onResourceReleased(any(Key.class), any(EngineResource.class));
+   }
+@@ -156,9 +162,7 @@ public void queueIdle_withCacheableResourceInActive_callListener() {
+     resources.activate(key, engineResource);
+ 
+     ResourceWeakReference weakRef = resources.activeEngineResources.get(key);
+-    weakRef.enqueue();
+-
+-    triggerQueueIdle();
++    enqueueAndWaitForRef(weakRef);
+ 
+     ArgumentCaptor<EngineResource<?>> captor = getEngineResourceCaptor();
+ 
+@@ -173,29 +177,27 @@ public void queueIdle_withCacheableResourceInActive_callListener() {
+   }
+ 
+   @Test
+-  public void queueIdle_withNotCacheableResourceInActive_callListener() {
++  public void queueIdle_withNotCacheableResourceInActive_doesNotCallListener() {
+     EngineResource<Object> engineResource =
+         new EngineResource<>(resource, /*isCacheable=*/ false, /*isRecyclable=*/ true);
+     resources.activate(key, engineResource);
+ 
+     ResourceWeakReference weakRef = resources.activeEngineResources.get(key);
+     weakRef.enqueue();
+-
+-    triggerQueueIdle();
++    enqueueAndWaitForRef(weakRef);
+ 
+     verify(listener, never()).onResourceReleased(any(Key.class), any(EngineResource.class));
+   }
+ 
+   @Test
+-  public void queueIdle_withCacheableResourceInActive_removesResourceFromActive() {
++  public void queueIdle_withCacheableResourceInActive_removesResourceFromActive()
++      throws InterruptedException {
+     EngineResource<Object> engineResource =
+         new EngineResource<>(resource, /*isCacheable=*/ true, /*isRecyclable=*/ true);
+     resources.activate(key, engineResource);
+ 
+     ResourceWeakReference weakRef = resources.activeEngineResources.get(key);
+-    weakRef.enqueue();
+-
+-    triggerQueueIdle();
++    enqueueAndWaitForRef(weakRef);
+ 
+     assertThat(resources.get(key)).isNull();
+   }
+@@ -207,9 +209,7 @@ public void queueIdle_withNotCacheableResourceInActive_removesResourceFromActive
+     resources.activate(key, engineResource);
+ 
+     ResourceWeakReference weakRef = resources.activeEngineResources.get(key);
+-    weakRef.enqueue();
+-
+-    triggerQueueIdle();
++    enqueueAndWaitForRef(weakRef);
+ 
+     assertThat(resources.get(key)).isNull();
+   }
+@@ -245,11 +245,10 @@ public void queueIdle_withQueuedReferenceRetrievedFromGet_notifiesListener() {
+     resources.activate(key, engineResource);
+ 
+     ResourceWeakReference weakRef = resources.activeEngineResources.get(key);
+-    weakRef.enqueue();
+ 
+     resources.get(key);
+ 
+-    triggerQueueIdle();
++    enqueueAndWaitForRef(weakRef);
+ 
+     ArgumentCaptor<EngineResource<?>> captor = getEngineResourceCaptor();
+     verify(listener).onResourceReleased(eq(key), captor.capture());
+@@ -263,11 +262,12 @@ public void queueIdle_withQueuedReferenceRetrievedFromGetAndNotCacheable_doesNot
+     resources.activate(key, engineResource);
+ 
+     ResourceWeakReference weakRef = resources.activeEngineResources.get(key);
++    CountDownLatch latch = getLatchForClearedRef();
+     weakRef.enqueue();
+ 
+     resources.get(key);
+ 
+-    triggerQueueIdle();
++    waitForLatch(latch);
+ 
+     verify(listener, never()).onResourceReleased(any(Key.class), any(EngineResource.class));
+   }
+@@ -279,29 +279,31 @@ public void queueIdle_withQueuedReferenceDeactivated_doesNotNotifyListener() {
+     resources.activate(key, engineResource);
+ 
+     ResourceWeakReference weakRef = resources.activeEngineResources.get(key);
++    CountDownLatch latch = getLatchForClearedRef();
+     weakRef.enqueue();
+ 
+     resources.deactivate(key);
+ 
+-    triggerQueueIdle();
++    waitForLatch(latch);
+ 
+     verify(listener, never()).onResourceReleased(any(Key.class), any(EngineResource.class));
+   }
+ 
+   @Test
+-  public void queueIdle_afterReferenceQueuedThenReactived_doesNotNotifyListner() {
++  public void queueIdle_afterReferenceQueuedThenReactivated_doesNotNotifyListener() {
+     EngineResource<Object> first =
+         new EngineResource<>(resource, /*isCacheable=*/ true, /*isRecyclable=*/ true);
+     resources.activate(key, first);
+ 
+     ResourceWeakReference weakRef = resources.activeEngineResources.get(key);
++    CountDownLatch latch = getLatchForClearedRef();
+     weakRef.enqueue();
+ 
+     EngineResource<Object> second =
+         new EngineResource<>(resource, /*isCacheable=*/ true, /*isRecyclable=*/ true);
+     resources.activate(key, second);
+ 
+-    triggerQueueIdle();
++    waitForLatch(latch);
+ 
+     verify(listener, never()).onResourceReleased(any(Key.class), any(EngineResource.class));
+   }
+@@ -315,10 +317,73 @@ public void activate_withNonCacheableResource_doesNotSaveResource() {
+     assertThat(resources.activeEngineResources.get(key).resource).isNull();
+   }
+ 
+-  private void triggerQueueIdle() {
+-    ArgumentCaptor<IdleHandler> captor = ArgumentCaptor.forClass(IdleHandler.class);
+-    verify(GlideShadowLooper.queue).addIdleHandler(captor.capture());
+-    captor.getValue().queueIdle();
++  @Test
++  public void get_withActiveClearedKey_cacheableResource_retentionDisabled_doesNotCallListener() {
++    resources = new ActiveResources(/*isActiveResourceRetentionAllowed=*/ false);
++    EngineResource<Object> engineResource =
++        new EngineResource<>(resource, /*isCacheable=*/ true, /*isRecyclable=*/ true);
++    resources.activate(key, engineResource);
++    resources.activeEngineResources.get(key).clear();
++    resources.get(key);
++
++    verify(listener, never()).onResourceReleased(any(Key.class), any(EngineResource.class));
++  }
++
++  @Test
++  public void get_withQueuedReference_retentionDisabled_returnsResource() {
++    resources = new ActiveResources(/*isActiveResourceRetentionAllowed=*/ false);
++    EngineResource<Object> engineResource =
++        new EngineResource<>(resource, /*isCacheable=*/ true, /*isRecyclable=*/ true);
++    resources.activate(key, engineResource);
++
++    ResourceWeakReference weakRef = resources.activeEngineResources.get(key);
++    weakRef.enqueue();
++
++    assertThat(resources.get(key)).isEqualTo(engineResource);
++  }
++
++  @Test
++  public void queueIdle_withQueuedReferenceRetrievedFromGet_retentionDisabled_doesNotNotify() {
++    resources = new ActiveResources(/*isActiveResourceRetentionAllowed=*/ false);
++    EngineResource<Object> engineResource =
++        new EngineResource<>(resource, /*isCacheable=*/ true, /*isRecyclable=*/ true);
++    resources.activate(key, engineResource);
++
++    ResourceWeakReference weakRef = resources.activeEngineResources.get(key);
++    CountDownLatch latch = getLatchForClearedRef();
++    weakRef.enqueue();
++
++    resources.get(key);
++
++    waitForLatch(latch);
++
++    verify(listener, never()).onResourceReleased(any(Key.class), any(EngineResource.class));
++  }
++
++  private void enqueueAndWaitForRef(ResourceWeakReference ref) {
++    CountDownLatch latch = getLatchForClearedRef();
++    ref.enqueue();
++    waitForLatch(latch);
++  }
++
++  private void waitForLatch(CountDownLatch latch) {
++     try {
++      latch.await();
++    } catch (InterruptedException e) {
++      throw new RuntimeException(e);
++    }
++    ShadowLooper.getShadowMainLooper().runToEndOfTasks();
++  }
++
++  private CountDownLatch getLatchForClearedRef() {
++    final CountDownLatch toWait = new CountDownLatch(1);
++    resources.setEnqueuedResourceCallback(new DequeuedResourceCallback() {
++      @Override
++      public void onResourceDequeued() {
++        toWait.countDown();
++      }
++    });
++    return toWait;
+   }
+ 
+   @SuppressWarnings("unchecked")
+diff --git a/library/src/test/java/com/bumptech/glide/load/engine/EngineTest.java b/library/src/test/java/com/bumptech/glide/load/engine/EngineTest.java
+index 9beed462e..4decb9a07 100644
+--- a/library/src/test/java/com/bumptech/glide/load/engine/EngineTest.java
++++ b/library/src/test/java/com/bumptech/glide/load/engine/EngineTest.java
+@@ -14,12 +14,10 @@
+ import static org.mockito.Mockito.doAnswer;
+ import static org.mockito.Mockito.mock;
+ import static org.mockito.Mockito.never;
+-import static org.mockito.Mockito.reset;
+ import static org.mockito.Mockito.times;
+ import static org.mockito.Mockito.verify;
+ import static org.mockito.Mockito.when;
+ 
+-import android.os.MessageQueue.IdleHandler;
+ import com.bumptech.glide.GlideContext;
+ import com.bumptech.glide.Priority;
+ import com.bumptech.glide.load.DataSource;
+@@ -39,7 +37,6 @@
+ import org.junit.Before;
+ import org.junit.Test;
+ import org.junit.runner.RunWith;
+-import org.mockito.ArgumentCaptor;
+ import org.mockito.invocation.InvocationOnMock;
+ import org.mockito.stubbing.Answer;
+ import org.robolectric.RobolectricTestRunner;
+@@ -471,28 +468,6 @@ public Object answer(InvocationOnMock invocationOnMock) throws Throwable {
+     verify(harness.cb).onResourceReady(any(Resource.class), eq(DataSource.MEMORY_CACHE));
+   }
+ 
+-  @Test
+-  public void load_afterResourceIsGcedFromActive_returnsFromMemoryCache() {
+-    // clear previous calls to addIdleHandler
+-    reset(GlideShadowLooper.queue);
+-    when(harness.resource.getResource()).thenReturn(mock(Resource.class));
+-    when(harness.resource.isCacheable()).thenReturn(true);
+-    harness.cache = new LruResourceCache(100);
+-    doAnswer(new Answer<Object>() {
+-      @Override
+-      public Object answer(InvocationOnMock invocationOnMock) throws Throwable {
+-        harness.callOnEngineJobComplete();
+-        return null;
+-      }
+-    }).when(harness.job).start(any(DecodeJob.class));
+-    harness.doLoad();
+-    ArgumentCaptor<IdleHandler> captor = ArgumentCaptor.forClass(IdleHandler.class);
+-    verify(GlideShadowLooper.queue).addIdleHandler(captor.capture());
+-    captor.getValue().queueIdle();
+-    harness.doLoad();
+-    verify(harness.cb).onResourceReady(any(Resource.class), eq(DataSource.MEMORY_CACHE));
+-  }
+-
+   @Test
+   public void load_withOnlyRetrieveFromCache_andPreviousNormalLoad_startsNewLoad() {
+     EngineJob<?> first = harness.job;
+@@ -654,7 +629,8 @@ public void onEngineJobCancelled_withOnlyRetrieveFromCacheAndOldJobForKey_doesNo
+     @SuppressWarnings("rawtypes")
+     final EngineResource resource = mock(EngineResource.class);
+     final Jobs jobs = new Jobs();
+-    final ActiveResources activeResources = new ActiveResources();
++    final ActiveResources activeResources =
++        new ActiveResources(/*isActiveResourceRetentionAllowed=*/ true);
+ 
+     final int width = 100;
+     final int height = 100;
+@@ -729,7 +705,8 @@ Engine getEngine() {
+                 activeResources,
+                 engineJobFactory,
+                 decodeJobFactory,
+-                resourceRecycler);
++                resourceRecycler,
++                /*isActiveResourceRetentionAllowed=*/ true);
+       }
+       return engine;
+     }

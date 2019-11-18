@@ -1,0 +1,529 @@
+diff --git a/CHANGELOG.md b/CHANGELOG.md
+index 20780a2..a268256 100644
+--- a/CHANGELOG.md
++++ b/CHANGELOG.md
+@@ -1,3 +1,11 @@
++## 1.2.5 (2018-03-19)
++* Handle platform bug where querying the network state throws an NPE internally, see #380
++* Fix database access on main thread, see #385
++* Fix misleading log message for some internal improvements, see #391
++* Fix race condition when scheduling a job with `setUpdateCurrent(true)` where multiple jobs could have been scheduled, see #396
++* Fix bug where a daily job runs twice a day, see #406
++* Fix a bug where periodic jobs in the flex support mode weren't properly canceled while the job was running, see #407
++
+ ## 1.2.4 (2018-02-08)
+ * Add `scheduleAsync()` to the `DailyJob` class for scheduling daily jobs asynchronously to avoid IO operations on the main thread, see #371
+ 
+diff --git a/README.md b/README.md
+index feeec4e..1e36d4b 100644
+--- a/README.md
++++ b/README.md
+@@ -8,7 +8,7 @@ Download [the latest version](http://search.maven.org/#search|gav|1|g:"com.evern
+ 
+ ```groovy
+ dependencies {
+-    compile 'com.evernote:android-job:1.2.4'
++    compile 'com.evernote:android-job:1.2.5'
+ }
+ ```
+ 
+diff --git a/build.gradle b/build.gradle
+index 534f90e..0bde310 100644
+--- a/build.gradle
++++ b/build.gradle
+@@ -38,6 +38,6 @@ ext {
+ }
+ 
+ task wrapper(type: Wrapper) {
+-    gradleVersion = '4.5.1'
++    gradleVersion = '4.6'
+     distributionUrl = "https://services.gradle.org/distributions/gradle-$gradleVersion-all.zip"
+ }
+diff --git a/gradle.properties b/gradle.properties
+index 9dcbca6..6614db3 100644
+--- a/gradle.properties
++++ b/gradle.properties
+@@ -1,3 +1,3 @@
+-#VERSION_NAME=1.2.4
+-VERSION_NAME=1.2.4-SNAPSHOT
++#VERSION_NAME=1.2.5
++VERSION_NAME=1.2.5-SNAPSHOT
+ VERSION_CODE=1
+\ No newline at end of file
+diff --git a/gradle/wrapper/gradle-wrapper.jar b/gradle/wrapper/gradle-wrapper.jar
+index 99340b4..c44b679 100644
+Binary files a/gradle/wrapper/gradle-wrapper.jar and b/gradle/wrapper/gradle-wrapper.jar differ
+diff --git a/gradle/wrapper/gradle-wrapper.properties b/gradle/wrapper/gradle-wrapper.properties
+index 8941bfb..3f0f9be 100644
+--- a/gradle/wrapper/gradle-wrapper.properties
++++ b/gradle/wrapper/gradle-wrapper.properties
+@@ -2,4 +2,4 @@ distributionBase=GRADLE_USER_HOME
+ distributionPath=wrapper/dists
+ zipStoreBase=GRADLE_USER_HOME
+ zipStorePath=wrapper/dists
+-distributionUrl=https\://services.gradle.org/distributions/gradle-4.5.1-all.zip
++distributionUrl=https\://services.gradle.org/distributions/gradle-4.6-all.zip
+diff --git a/library/src/main/java/com/evernote/android/job/DailyJob.java b/library/src/main/java/com/evernote/android/job/DailyJob.java
+index ffa00ab..1e31996 100644
+--- a/library/src/main/java/com/evernote/android/job/DailyJob.java
++++ b/library/src/main/java/com/evernote/android/job/DailyJob.java
+@@ -64,7 +64,7 @@
+      * @return The unique ID for this job.
+      */
+     public static int schedule(@NonNull JobRequest.Builder baseBuilder, long startMs, long endMs) {
+-        return schedule(baseBuilder, true, startMs, endMs);
++        return schedule(baseBuilder, true, startMs, endMs, false);
+     }
+ 
+     /**
+@@ -123,7 +123,7 @@ public static int startNowOnce(@NonNull JobRequest.Builder baseBuilder) {
+                 .schedule();
+     }
+ 
+-    private static int schedule(@NonNull JobRequest.Builder builder, boolean newJob, long startMs, long endMs) {
++    private static int schedule(@NonNull JobRequest.Builder builder, boolean newJob, long startMs, long endMs, boolean isReschedule) {
+         if (startMs >= DAY || endMs >= DAY || startMs < 0 || endMs < 0) {
+             throw new IllegalArgumentException("startMs or endMs should be less than one day (in milliseconds)");
+         }
+@@ -145,6 +145,11 @@ private static int schedule(@NonNull JobRequest.Builder builder, boolean newJob,
+ 
+         startDelay = (startDelay + startMs) % TimeUnit.DAYS.toMillis(1);
+ 
++        if (isReschedule && startDelay < TimeUnit.HOURS.toMillis(12)) {
++            // it happens that the job runs too early and while rescheduling we schedule the job for the same day again
++            startDelay += TimeUnit.DAYS.toMillis(1);
++        }
++
+         if (startMs > endMs) {
+             // e.g. when job should run between 10pm and 2am
+             endMs += TimeUnit.DAYS.toMillis(1);
+@@ -214,7 +219,7 @@ protected final Result onRunJob(@NonNull Params params) {
+ 
+                     // don't update current, it would cancel this currently running job
+                     int newJobId = schedule(request.createBuilder(), false,
+-                            extras.getLong(EXTRA_START_MS, 0) % DAY, extras.getLong(EXTRA_END_MS, 0L) % DAY);
++                            extras.getLong(EXTRA_START_MS, 0) % DAY, extras.getLong(EXTRA_END_MS, 0L) % DAY, true);
+ 
+                     request = JobManager.instance().getJobRequest(newJobId);
+                     if (request != null) {
+diff --git a/library/src/main/java/com/evernote/android/job/Job.java b/library/src/main/java/com/evernote/android/job/Job.java
+index 3374e7c..8760ecc 100644
+--- a/library/src/main/java/com/evernote/android/job/Job.java
++++ b/library/src/main/java/com/evernote/android/job/Job.java
+@@ -82,9 +82,9 @@
+     private WeakReference<Context> mContextReference;
+     private Context mApplicationContext;
+ 
+-    private boolean mCanceled;
+-    private boolean mDeleted;
+-    private long mFinishedTimeStamp = -1;
++    private volatile boolean mCanceled;
++    private volatile boolean mDeleted;
++    private volatile long mFinishedTimeStamp = -1;
+ 
+     private Result mResult = Result.FAILURE;
+ 
+@@ -292,31 +292,34 @@ public final void cancel() {
+         cancel(false);
+     }
+ 
+-    /*package*/ final void cancel(boolean deleted) {
++    /*package*/ final synchronized boolean cancel(boolean deleted) {
+         if (!isFinished()) {
+             if (!mCanceled) {
+                 mCanceled = true;
+                 onCancel();
+             }
+-            mDeleted = deleted;
++            mDeleted |= deleted;
++            return true;
++        } else {
++            return false;
+         }
+     }
+ 
+     /**
+      * @return {@code true} if this {@link Job} was canceled.
+      */
+-    protected final boolean isCanceled() {
++    protected final synchronized boolean isCanceled() {
+         return mCanceled;
+     }
+ 
+     /**
+      * @return {@code true} if the {@link Job} finished.
+      */
+-    public final boolean isFinished() {
++    public final synchronized boolean isFinished() {
+         return mFinishedTimeStamp > 0;
+     }
+ 
+-    /*package*/ final long getFinishedTimeStamp() {
++    /*package*/ final synchronized long getFinishedTimeStamp() {
+         return mFinishedTimeStamp;
+     }
+ 
+@@ -324,7 +327,7 @@ public final boolean isFinished() {
+         return mResult;
+     }
+ 
+-    /*package*/ final boolean isDeleted() {
++    /*package*/ final synchronized boolean isDeleted() {
+         return mDeleted;
+     }
+ 
+diff --git a/library/src/main/java/com/evernote/android/job/JobManager.java b/library/src/main/java/com/evernote/android/job/JobManager.java
+index e824733..9b12c22 100644
+--- a/library/src/main/java/com/evernote/android/job/JobManager.java
++++ b/library/src/main/java/com/evernote/android/job/JobManager.java
+@@ -168,7 +168,9 @@ private JobManager(Context context) {
+      *
+      * @param request The {@link JobRequest} which will run in the future.
+      */
+-    public void schedule(@NonNull JobRequest request) {
++    public synchronized void schedule(@NonNull JobRequest request) {
++        // call must be synchronized, otherwise with isUpdateCurrent() true it's possible to end up in a race condition with multiple jobs scheduled
++
+         if (mJobCreatorHolder.isEmpty()) {
+             CAT.w("you haven't registered a JobCreator with addJobCreator(), it's likely that your job never will be executed");
+         }
+@@ -404,9 +406,8 @@ private boolean cancelInner(@Nullable JobRequest request) {
+     }
+ 
+     private boolean cancelInner(@Nullable Job job) {
+-        if (job != null && !job.isFinished() && !job.isCanceled()) {
++        if (job != null && job.cancel(true)) {
+             CAT.i("Cancel running %s", job);
+-            job.cancel(true);
+             return true;
+         } else {
+             return false;
+diff --git a/library/src/main/java/com/evernote/android/job/util/Device.java b/library/src/main/java/com/evernote/android/job/util/Device.java
+index 4785e7f..d39be20 100644
+--- a/library/src/main/java/com/evernote/android/job/util/Device.java
++++ b/library/src/main/java/com/evernote/android/job/util/Device.java
+@@ -99,7 +99,13 @@ public static boolean isIdle(Context context) {
+     @NonNull
+     public static JobRequest.NetworkType getNetworkType(@NonNull Context context) {
+         ConnectivityManager connectivityManager = (ConnectivityManager) context.getSystemService(Context.CONNECTIVITY_SERVICE);
+-        NetworkInfo networkInfo = connectivityManager.getActiveNetworkInfo();
++        NetworkInfo networkInfo;
++        try {
++            networkInfo = connectivityManager.getActiveNetworkInfo();
++        } catch (Throwable t) {
++            return JobRequest.NetworkType.ANY;
++        }
++
+         if (networkInfo == null || !networkInfo.isConnectedOrConnecting()) {
+             return JobRequest.NetworkType.ANY;
+         }
+diff --git a/library/src/main/java/com/evernote/android/job/v21/JobProxy21.java b/library/src/main/java/com/evernote/android/job/v21/JobProxy21.java
+index 846df7b..31274d7 100644
+--- a/library/src/main/java/com/evernote/android/job/v21/JobProxy21.java
++++ b/library/src/main/java/com/evernote/android/job/v21/JobProxy21.java
+@@ -79,7 +79,7 @@ public void plantOneOff(JobRequest request) {
+         }
+ 
+         mCat.d("Schedule one-off jobInfo %s, %s, start %s, end %s (from now), reschedule count %d", scheduleResultToString(scheduleResult),
+-                request, JobUtil.timeToString(startMs), JobUtil.timeToString(endMs), Common.getRescheduleCount(request));
++                request, JobUtil.timeToString(startMs), JobUtil.timeToString(Common.getEndMs(request, false)), Common.getRescheduleCount(request));
+     }
+ 
+     @Override
+diff --git a/library/src/main/java/com/evernote/android/job/v21/PlatformJobService.java b/library/src/main/java/com/evernote/android/job/v21/PlatformJobService.java
+index c306d04..9b0834a 100644
+--- a/library/src/main/java/com/evernote/android/job/v21/PlatformJobService.java
++++ b/library/src/main/java/com/evernote/android/job/v21/PlatformJobService.java
+@@ -52,35 +52,35 @@
+ 
+     @Override
+     public boolean onStartJob(final JobParameters params) {
+-        final int jobId = params.getJobId();
+-        final JobProxy.Common common = new JobProxy.Common(this, CAT, jobId);
+-
+-        // don't mark starting!
+-        final JobRequest request = common.getPendingRequest(true, false);
+-        if (request == null) {
+-            return false;
+-        }
+-
+-        if (request.isTransient()) {
+-            if (TransientBundleCompat.startWithTransientBundle(this, request)) {
+-                if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+-                    // should only happen during testing if an API is disabled
+-                    CAT.d("PendingIntent for transient bundle is not null although running on O, using compat mode, request %s", request);
+-                }
+-                return false;
+-
+-            } else if (Build.VERSION.SDK_INT < Build.VERSION_CODES.O) {
+-                CAT.d("PendingIntent for transient job %s expired", request);
+-                return false;
+-            }
+-        }
+-
+-        common.markStarting(request);
+-
+         JobConfig.getExecutorService().execute(new Runnable() {
+             @Override
+             public void run() {
+                 try {
++                    final int jobId = params.getJobId();
++                    final JobProxy.Common common = new JobProxy.Common(PlatformJobService.this, CAT, jobId);
++
++                    // don't mark starting!
++                    final JobRequest request = common.getPendingRequest(true, false);
++                    if (request == null) {
++                        return;
++                    }
++
++                    if (request.isTransient()) {
++                        if (TransientBundleCompat.startWithTransientBundle(PlatformJobService.this, request)) {
++                            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
++                                // should only happen during testing if an API is disabled
++                                CAT.d("PendingIntent for transient bundle is not null although running on O, using compat mode, request %s", request);
++                            }
++                            return;
++
++                        } else if (Build.VERSION.SDK_INT < Build.VERSION_CODES.O) {
++                            CAT.d("PendingIntent for transient job %s expired", request);
++                            return;
++                        }
++                    }
++
++                    common.markStarting(request);
++
+                     common.executeJobRequest(request, getTransientBundle(params));
+ 
+                 } finally {
+diff --git a/library/src/test/java/com/evernote/android/job/DailyJobTest.java b/library/src/test/java/com/evernote/android/job/DailyJobTest.java
+index dc3f3cf..0696bed 100644
+--- a/library/src/test/java/com/evernote/android/job/DailyJobTest.java
++++ b/library/src/test/java/com/evernote/android/job/DailyJobTest.java
+@@ -271,6 +271,22 @@ public void verifyLastRunIsSet() {
+         assertThat(request.getLastRun()).isEqualTo(clock.currentTimeMillis());
+     }
+ 
++    @SuppressWarnings("ConstantConditions")
++    @Test
++    public void verifyEarlyExecution() {
++        TestClock clock = new TestClock();
++        clock.setTime(13, 0);
++
++        JobRequest request = verifyExecutionAndSuccessfulReschedule(clock, TimeUnit.HOURS.toMillis(14), TimeUnit.HOURS.toMillis(15));
++        assertThat(request.getStartMs()).isEqualTo(TimeUnit.HOURS.toMillis(25));
++        assertThat(request.getEndMs()).isEqualTo(TimeUnit.HOURS.toMillis(26));
++
++        int id = DailyJob.schedule(DummyJobs.createBuilder(DummyJobs.SuccessDailyJob.class), TimeUnit.HOURS.toMillis(14), TimeUnit.HOURS.toMillis(15));
++        request = manager().getJobRequest(id);
++        assertThat(request.getStartMs()).isEqualTo(TimeUnit.HOURS.toMillis(1));
++        assertThat(request.getEndMs()).isEqualTo(TimeUnit.HOURS.toMillis(2));
++    }
++
+     @Test
+     public void verifyRequirementsEnforcedSkipsJob() {
+         long time = 1L;
+diff --git a/library/src/test/java/com/evernote/android/job/JobManagerTest.java b/library/src/test/java/com/evernote/android/job/JobManagerTest.java
+index 5c94c3d..7fc731c 100644
+--- a/library/src/test/java/com/evernote/android/job/JobManagerTest.java
++++ b/library/src/test/java/com/evernote/android/job/JobManagerTest.java
+@@ -293,4 +293,35 @@ public void testCancelAndEdit() {
+         JobRequest request = manager().getJobRequest(newId);
+         assertThat(request.getEndMs()).isGreaterThan(9_000);
+     }
++
++    @Test
++    public void testWithUpdateCurrentRaceCondition() throws InterruptedException {
++        final JobRequest.Builder builder = new JobRequest.Builder("any").setExecutionWindow(300_000, 400_000).setUpdateCurrent(true);
++
++        final CountDownLatch latchWait = new CountDownLatch(2);
++        final CountDownLatch latchStart = new CountDownLatch(1);
++        final CountDownLatch latchFinished = new CountDownLatch(2);
++
++        for (int i = 0; i < 5; i++) {
++            new Thread() {
++                @Override
++                public void run() {
++                    latchWait.countDown();
++                    try {
++                        latchStart.await();
++                    } catch (InterruptedException e) {
++                        throw new IllegalStateException(e);
++                    }
++                    manager().schedule(builder.build());
++                    latchFinished.countDown();
++                }
++            }.start();
++        }
++
++        assertThat(latchWait.await(10, TimeUnit.SECONDS)).isTrue();
++        latchStart.countDown();
++        assertThat(latchFinished.await(10, TimeUnit.SECONDS)).isTrue();
++
++        assertThat(manager().getAllJobRequests().size()).isEqualTo(1);
++    }
+ }
+diff --git a/library/src/test/java/com/evernote/android/job/JobPeriodicCancelTest.java b/library/src/test/java/com/evernote/android/job/JobPeriodicCancelTest.java
+index f8bb0bd..76ba08c 100644
+--- a/library/src/test/java/com/evernote/android/job/JobPeriodicCancelTest.java
++++ b/library/src/test/java/com/evernote/android/job/JobPeriodicCancelTest.java
+@@ -41,47 +41,89 @@ public Job create(@NonNull String tag) {
+ 
+     @Test
+     @Config(sdk = Build.VERSION_CODES.N)
+-    public void verifyPeriodicFlexNotRescheduledN() throws Exception {
+-        runJobAndCancelAllDuringExecution(true);
++    public void verifyPeriodicFlexNotRescheduledN() {
++        runJobAndCancelAllDuringExecution(true, false);
+         assertThat(manager().getAllJobRequests()).isEmpty();
+     }
+ 
+     @Test
+     @Config(sdk = Build.VERSION_CODES.N)
+-    public void verifyPeriodicNotRescheduledN() throws Exception {
+-        runJobAndCancelAllDuringExecution(false);
++    public void verifyPeriodicNotRescheduledN() {
++        runJobAndCancelAllDuringExecution(false, false);
++        assertThat(manager().getAllJobRequests()).isEmpty();
++    }
++
++    @Test
++    @Config(sdk = Build.VERSION_CODES.N)
++    public void verifyPeriodicFlexNotRescheduledNSwap() {
++        runJobAndCancelAllDuringExecution(true, true);
++        assertThat(manager().getAllJobRequests()).isEmpty();
++    }
++
++    @Test
++    @Config(sdk = Build.VERSION_CODES.N)
++    public void verifyPeriodicNotRescheduledNSwao() {
++        runJobAndCancelAllDuringExecution(false, true);
++        assertThat(manager().getAllJobRequests()).isEmpty();
++    }
++
++    @Test
++    @Config(sdk = Build.VERSION_CODES.M)
++    public void verifyPeriodicFlexNotRescheduledM() {
++        runJobAndCancelAllDuringExecution(true, false);
+         assertThat(manager().getAllJobRequests()).isEmpty();
+     }
+ 
+     @Test
+     @Config(sdk = Build.VERSION_CODES.M)
+-    public void verifyPeriodicFlexNotRescheduledM() throws Exception {
+-        runJobAndCancelAllDuringExecution(true);
++    public void verifyPeriodicNotRescheduledM() {
++        runJobAndCancelAllDuringExecution(false, false);
+         assertThat(manager().getAllJobRequests()).isEmpty();
+     }
+ 
+     @Test
+     @Config(sdk = Build.VERSION_CODES.M)
+-    public void verifyPeriodicNotRescheduledM() throws Exception {
+-        runJobAndCancelAllDuringExecution(false);
++    public void verifyPeriodicFlexNotRescheduledMSwap() {
++        runJobAndCancelAllDuringExecution(true, true);
++        assertThat(manager().getAllJobRequests()).isEmpty();
++    }
++
++    @Test
++    @Config(sdk = Build.VERSION_CODES.M)
++    public void verifyPeriodicNotRescheduledMSwap() {
++        runJobAndCancelAllDuringExecution(false, true);
+         assertThat(manager().getAllJobRequests()).isEmpty();
+     }
+ 
+     @Test
+     @Config(sdk = Build.VERSION_CODES.KITKAT)
+-    public void verifyPeriodicFlexNotRescheduledK() throws Exception {
+-        runJobAndCancelAllDuringExecution(true);
++    public void verifyPeriodicFlexNotRescheduledK() {
++        runJobAndCancelAllDuringExecution(true, false);
+         assertThat(manager().getAllJobRequests()).isEmpty();
+     }
+ 
+     @Test
+     @Config(sdk = Build.VERSION_CODES.KITKAT)
+-    public void verifyPeriodicNotRescheduledK() throws Exception {
+-        runJobAndCancelAllDuringExecution(false);
++    public void verifyPeriodicNotRescheduledK() {
++        runJobAndCancelAllDuringExecution(false, false);
+         assertThat(manager().getAllJobRequests()).isEmpty();
+     }
+ 
+-    private void runJobAndCancelAllDuringExecution(boolean flex) {
++    @Test
++    @Config(sdk = Build.VERSION_CODES.KITKAT)
++    public void verifyPeriodicFlexNotRescheduledKSwap() {
++        runJobAndCancelAllDuringExecution(true, true);
++        assertThat(manager().getAllJobRequests()).isEmpty();
++    }
++
++    @Test
++    @Config(sdk = Build.VERSION_CODES.KITKAT)
++    public void verifyPeriodicNotRescheduledKSwap() {
++        runJobAndCancelAllDuringExecution(false, true);
++        assertThat(manager().getAllJobRequests()).isEmpty();
++    }
++
++    private void runJobAndCancelAllDuringExecution(boolean flex, boolean swapCancelOrder) {
+         try {
+             final int jobId = new JobRequest.Builder("any")
+                 .setPeriodic(TimeUnit.MINUTES.toMillis(15), TimeUnit.MINUTES.toMillis(flex ? 5 : 15))
+@@ -101,12 +143,18 @@ public void run() {
+                 }
+             }.start();
+ 
+-            assertThat(mJob.mStartedLatch.await(3, TimeUnit.SECONDS)).isTrue();
++            assertThat(mJob.mStartedLatch.await(30, TimeUnit.SECONDS)).isTrue();
+ 
+-            manager().cancelAll();
++            if (swapCancelOrder) {
++                manager().getJob(request.getJobId()).cancel(); // this might be called in onStopJob()
++                manager().cancelAll();
++            } else {
++                manager().cancelAll();
++                manager().getJob(request.getJobId()).cancel(); // this might be called in onStopJob()
++            }
+ 
+             mJob.mBlockingLatch.countDown();
+-            assertThat(waitFinishExecution.await(3, TimeUnit.SECONDS)).isTrue();
++            assertThat(waitFinishExecution.await(30, TimeUnit.SECONDS)).isTrue();
+ 
+ 
+         } catch (InterruptedException e) {
+diff --git a/library/src/test/java/com/evernote/android/job/util/DeviceTest.java b/library/src/test/java/com/evernote/android/job/util/DeviceTest.java
+index cd49b45..d74fc1b 100644
+--- a/library/src/test/java/com/evernote/android/job/util/DeviceTest.java
++++ b/library/src/test/java/com/evernote/android/job/util/DeviceTest.java
+@@ -129,4 +129,31 @@ public void testNetworkStateWifiAndRoaming() {
+ 
+         assertThat(Device.getNetworkType(context)).isEqualTo(JobRequest.NetworkType.UNMETERED);
+     }
++
++    @Test
++    public void testNetworkStateVpn() {
++        NetworkInfo networkInfo = mock(NetworkInfo.class);
++        when(networkInfo.isConnected()).thenReturn(true);
++        when(networkInfo.isConnectedOrConnecting()).thenReturn(true);
++        when(networkInfo.getType()).thenReturn(ConnectivityManager.TYPE_VPN);
++
++        ConnectivityManager connectivityManager = mock(ConnectivityManager.class);
++        when(connectivityManager.getActiveNetworkInfo()).thenReturn(networkInfo);
++
++        Context context = mock(MockContext.class);
++        when(context.getSystemService(Context.CONNECTIVITY_SERVICE)).thenReturn(connectivityManager);
++
++        assertThat(Device.getNetworkType(context)).isEqualTo(JobRequest.NetworkType.NOT_ROAMING);
++    }
++
++    @Test
++    public void testPlatformBug() {
++        ConnectivityManager connectivityManager = mock(ConnectivityManager.class);
++        when(connectivityManager.getActiveNetworkInfo()).thenThrow(new NullPointerException());
++
++        Context context = mock(MockContext.class);
++        when(context.getSystemService(Context.CONNECTIVITY_SERVICE)).thenReturn(connectivityManager);
++
++        assertThat(Device.getNetworkType(context)).isEqualTo(JobRequest.NetworkType.ANY);
++    }
+ }

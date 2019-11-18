@@ -1,0 +1,529 @@
+diff --git a/README.md b/README.md
+index e86a10e..882c28c 100644
+--- a/README.md
++++ b/README.md
+@@ -3,6 +3,8 @@ Tape by Square, Inc.
+ 
+ Tape is a collection of queue-related classes for Android and Java.
+ 
++This fork extends the queue with retry policies.
++
+ `QueueFile` is a lightning-fast, transactional, file-based FIFO. Addition and
+ removal from an instance is an O(1) operation and is atomic. Writes are
+ synchronous; data will be written to disk before an operation returns. The
+@@ -23,17 +25,9 @@ prepares and executes enqueued tasks.
+ Download
+ --------
+ 
+-Download [the latest JAR][2] or grab via Maven:
+-```xml
+-<dependency>
+-  <groupId>com.squareup</groupId>
+-  <artifactId>tape</artifactId>
+-  <version>1.2.3</version>
+-</dependency>
+-```
+-or Gradle:
++Grab via Gradle:
+ ```groovy
+-compile 'com.squareup:tape:1.2.3'
++compile 'com.github.flix-tech:tape:v1.2.3'
+ ```
+ 
+ 
+@@ -42,6 +36,7 @@ License
+ -------
+ 
+     Copyright 2012 Square, Inc.
++    Copyright 2016 FlixMobility GmbH
+ 
+     Licensed under the Apache License, Version 2.0 (the "License");
+     you may not use this file except in compliance with the License.
+@@ -58,4 +53,3 @@ License
+ 
+ 
+  [1]: http://square.github.com/tape/
+- [2]: http://repository.sonatype.org/service/local/artifact/maven/redirect?r=central-proxy&g=com.squareup&a=tape&v=LATEST
+diff --git a/tape/src/main/java/com/squareup/tape/FileObjectQueue.java b/tape/src/main/java/com/squareup/tape/FileObjectQueue.java
+index a8cbc8f..6cc7e31 100644
+--- a/tape/src/main/java/com/squareup/tape/FileObjectQueue.java
++++ b/tape/src/main/java/com/squareup/tape/FileObjectQueue.java
+@@ -1,4 +1,5 @@
+ // Copyright 2012 Square, Inc.
++// Copyright 2016 FlixMobility GmbH
+ package com.squareup.tape;
+ 
+ import java.io.ByteArrayOutputStream;
+@@ -12,7 +13,7 @@
+  * queue manager.  This class is not thread safe; instances should be kept
+  * thread-confined.
+  * <p>
+- * The {@link #add( Object )}, {@link #peek()}, {@link #remove()}, and
++ * The {@link #add(Object, long, int)}, {@link #peek()}, {@link #remove()}, and
+  * {@link #setListener(ObjectQueue.Listener)} methods may throw a
+  * {@link FileException} if the underlying {@link QueueFile} experiences an
+  * {@link java.io.IOException}.
+@@ -40,10 +41,14 @@ public FileObjectQueue(File file, Converter<T> converter) throws IOException {
+   }
+ 
+   @Override public final void add(T entry) {
++    add(entry, 0, -1);
++  }
++
++  @Override public final void add(T entry, long validUntil, int retryCount) {
+     try {
+       bytes.reset();
+       converter.toStream(entry, bytes);
+-      queueFile.add(bytes.getArray(), 0, bytes.size());
++      queueFile.add(bytes.getArray(), 0, bytes.size(), validUntil, retryCount);
+       if (listener != null) listener.onAdd(this, entry);
+     } catch (IOException e) {
+       throw new FileException("Failed to add entry.", e, file);
+@@ -69,6 +74,16 @@ public FileObjectQueue(File file, Converter<T> converter) throws IOException {
+     }
+   }
+ 
++  @Override public final boolean drop() {
++    try {
++      boolean dropped = queueFile.drop();
++      if (dropped && listener != null) listener.onRemove(this);
++      return dropped;
++    } catch (IOException e) {
++      throw new FileException("Failed to drop.", e, file);
++    }
++  }
++
+   public final void close() {
+     try {
+       queueFile.close();
+diff --git a/tape/src/main/java/com/squareup/tape/InMemoryObjectQueue.java b/tape/src/main/java/com/squareup/tape/InMemoryObjectQueue.java
+index 42e14c3..37065d4 100644
+--- a/tape/src/main/java/com/squareup/tape/InMemoryObjectQueue.java
++++ b/tape/src/main/java/com/squareup/tape/InMemoryObjectQueue.java
+@@ -1,4 +1,5 @@
+ // Copyright 2012 Square, Inc.
++// Copyright 2016 FlixMobility GmbH
+ package com.squareup.tape;
+ 
+ import java.util.LinkedList;
+@@ -11,21 +12,37 @@
+  * @param <T> The type of elements in the queue.
+  */
+ public class InMemoryObjectQueue<T> implements ObjectQueue<T> {
+-  private final Queue<T> tasks;
++  private final Queue<Entry<T>> tasks;
+   private Listener<T> listener;
+ 
+   @SuppressWarnings("unchecked")
+   public InMemoryObjectQueue() {
+-    tasks = (Queue<T>) new LinkedList();
++    tasks = (Queue<Entry<T>>) new LinkedList();
+   }
+ 
+   @Override public void add(T entry) {
+-    tasks.add(entry);
++    add(entry, 0, -1);
++  }
++
++  @Override public void add(T entry, long validUntil, int retryCount) {
++    if (retryCount == 0) retryCount = -1;
++    tasks.add(new Entry<T>(entry, validUntil, retryCount));
+     if (listener != null) listener.onAdd(this, entry);
+   }
+ 
+   @Override public T peek() {
+-    return tasks.peek();
++    Entry<T> wrapper = tasks.peek();
++
++    if (wrapper == null) {
++      return null;
++    }
++
++    if (wrapper.validUntil > 0 && wrapper.validUntil < System.currentTimeMillis()) {
++      remove();
++      return peek();
++    }
++
++    return wrapper.entry;
+   }
+ 
+   @Override public int size() {
+@@ -37,12 +54,33 @@ public InMemoryObjectQueue() {
+     if (listener != null) listener.onRemove(this);
+   }
+ 
++  @Override public boolean drop() {
++    Entry<T> wrapper = tasks.peek();
++    if (wrapper == null) return false;
++    boolean shouldRemove = wrapper.retryCount > 0 && --wrapper.retryCount == 0;
++    shouldRemove |= wrapper.validUntil > 0 && wrapper.validUntil < System.currentTimeMillis();
++    if (shouldRemove) remove();
++    return shouldRemove;
++  }
++
+   @Override public void setListener(Listener<T> listener) {
+     if (listener != null) {
+-      for (T task : tasks) {
+-        listener.onAdd(this, task);
++      for (Entry<T> task : tasks) {
++        listener.onAdd(this, task.entry);
+       }
+     }
+     this.listener = listener;
+   }
++
++  private static class Entry<T> {
++    T entry;
++    long validUntil;
++    int retryCount;
++
++    Entry(T entry, long validUntil, int retryCount) {
++      this.entry = entry;
++      this.validUntil = validUntil;
++      this.retryCount = retryCount;
++    }
++  }
+ }
+diff --git a/tape/src/main/java/com/squareup/tape/ObjectQueue.java b/tape/src/main/java/com/squareup/tape/ObjectQueue.java
+index 6eb8b25..217ea32 100644
+--- a/tape/src/main/java/com/squareup/tape/ObjectQueue.java
++++ b/tape/src/main/java/com/squareup/tape/ObjectQueue.java
+@@ -1,4 +1,5 @@
+ // Copyright 2011 Square, Inc.
++// Copyright 2016 FlixMobility GmbH
+ package com.squareup.tape;
+ 
+ /**
+@@ -14,6 +15,9 @@
+   /** Enqueues an entry that can be processed at any time. */
+   void add(T entry);
+ 
++  /** Enqueues an entry that can be processed at any time. */
++  void add(T entry, long validUntil, int retryCount);
++
+   /**
+    * Returns the head of the queue, or {@code null} if the queue is empty. Does not modify the
+    * queue.
+@@ -23,6 +27,9 @@
+   /** Removes the head of the queue. */
+   void remove();
+ 
++  /** Drops the head of the queue if policy is active. */
++  boolean drop();
++
+   /**
+    * Sets a listener on this queue. Invokes {@link Listener#onAdd} once for each entry that's
+    * already in the queue. If an error occurs while reading the data, the listener will not receive
+diff --git a/tape/src/main/java/com/squareup/tape/QueueFile.java b/tape/src/main/java/com/squareup/tape/QueueFile.java
+index a66b3c5..8353a0a 100644
+--- a/tape/src/main/java/com/squareup/tape/QueueFile.java
++++ b/tape/src/main/java/com/squareup/tape/QueueFile.java
+@@ -1,5 +1,6 @@
+ /*
+  * Copyright (C) 2010 Square, Inc.
++ * Copyright (C) 2016 FlixMobility GmbH
+  *
+  * Licensed under the Apache License, Version 2.0 (the "License");
+  * you may not use this file except in compliance with the License.
+@@ -84,8 +85,10 @@
+    *     Last Element Position  (4 bytes, =0 if null)
+    * <p/>
+    *   Element:
+-   *     Length (4 bytes)
+-   *     Data   (Length bytes)
++   *     Ttl          (8 bytes)
++   *     Retry Count  (4 bytes)
++   *     Length       (4 bytes)
++   *     Data         (Length bytes)
+    * </pre>
+    *
+    * Visible for testing.
+@@ -123,6 +126,33 @@ public QueueFile(File file) throws IOException {
+     readHeader();
+   }
+ 
++  /**
++   * Stores an {@code long} in the {@code byte[]}. The behavior is equivalent to calling
++   * {@link RandomAccessFile#writeLong}.
++   */
++  private static void writeLong(byte[] buffer, int offset, long value) {
++    buffer[offset] = (byte) (value >> 56);
++    buffer[offset + 1] = (byte) (value >> 48);
++    buffer[offset + 2] = (byte) (value >> 40);
++    buffer[offset + 3] = (byte) (value >> 32);
++    buffer[offset + 4] = (byte) (value >> 24);
++    buffer[offset + 5] = (byte) (value >> 16);
++    buffer[offset + 6] = (byte) (value >> 8);
++    buffer[offset + 7] = (byte) value;
++  }
++
++  /** Reads an {@code long} from the {@code byte[]}. */
++  private static long readLong(byte[] buffer, int offset) {
++    return ((buffer[offset] & 0xffL) << 56)
++            + ((buffer[offset + 1] & 0xffL) << 48)
++            + ((buffer[offset + 2] & 0xffL) << 40)
++            + ((buffer[offset + 3] & 0xffL) << 32)
++            + ((buffer[offset + 4] & 0xffL) << 24)
++            + ((buffer[offset + 5] & 0xffL) << 16)
++            + ((buffer[offset + 6] & 0xffL) << 8)
++            + (buffer[offset + 7] & 0xffL);
++  }
++
+   /**
+    * Stores int in buffer. The behavior is equivalent to calling {@link
+    * java.io.RandomAccessFile#writeInt}.
+@@ -149,9 +179,9 @@ private static void writeInts(byte[] buffer, int... values) {
+   /** Reads an int from a byte[]. */
+   private static int readInt(byte[] buffer, int offset) {
+     return ((buffer[offset] & 0xff) << 24)
+-        + ((buffer[offset + 1] & 0xff) << 16)
+-        + ((buffer[offset + 2] & 0xff) << 8)
+-        + (buffer[offset + 3] & 0xff);
++            + ((buffer[offset + 1] & 0xff) << 16)
++            + ((buffer[offset + 2] & 0xff) << 8)
++            + (buffer[offset + 3] & 0xff);
+   }
+ 
+   /** Reads the header. */
+@@ -188,8 +218,10 @@ private void writeHeader(int fileLength, int elementCount, int firstPosition, in
+   private Element readElement(int position) throws IOException {
+     if (position == 0) return Element.NULL;
+     ringRead(position, buffer, 0, Element.HEADER_LENGTH);
+-    int length = readInt(buffer, 0);
+-    return new Element(position, length);
++    long validUntil = readLong(buffer, Element.VALID_UNTIL_OFFSET);
++    int retryCount = readInt(buffer, Element.RETRY_COUNT_OFFSET);
++    int length = readInt(buffer, Element.LENGTH_OFFSET);
++    return new Element(position, length, validUntil, retryCount);
+   }
+ 
+   /** Atomically initializes a new file. */
+@@ -284,7 +316,7 @@ private void ringRead(int position, byte[] buffer, int offset, int count) throws
+    * @param data to copy bytes from
+    */
+   public void add(byte[] data) throws IOException {
+-    add(data, 0, data.length);
++    add(data, 0, data.length, 0, -1);
+   }
+ 
+   /**
+@@ -296,21 +328,44 @@ public void add(byte[] data) throws IOException {
+    * @throws IndexOutOfBoundsException if {@code offset < 0} or {@code count < 0}, or if {@code offset + count} is
+    *                                   bigger than the length of {@code buffer}.
+    */
+-  public synchronized void add(byte[] data, int offset, int count) throws IOException {
++  public void add(byte[] data, int offset, int count) throws IOException {
++    add(data, offset, count, 0, -1);
++  }
++
++  /**
++   * Adds an element to the end of the queue.
++   *
++   * @param data to copy bytes from
++   * @param offset to start from in buffer
++   * @param count number of bytes to copy
++   * @param validUntil policy
++   * @param retryCount policy
++   * @throws IndexOutOfBoundsException if {@code offset < 0} or {@code count < 0}, or if {@code
++   * offset + count} is bigger than the length of {@code buffer}.
++   */
++  public synchronized void add(byte[] data, int offset, int count, long validUntil, int retryCount) throws IOException {
+     nonNull(data, "buffer");
+     if ((offset | count) < 0 || count > data.length - offset) {
+       throw new IndexOutOfBoundsException();
+     }
+ 
++    if (retryCount == 0) {
++      retryCount = -1;
++    }
++
+     expandIfNecessary(count);
+ 
+     // Insert a new element after the current last element.
+     boolean wasEmpty = isEmpty();
+     int position = wasEmpty ? HEADER_LENGTH : wrapPosition(last.position + Element.HEADER_LENGTH + last.length);
+-    Element newLast = new Element(position, count);
++    Element newLast = new Element(position, count, validUntil, retryCount);
+ 
++    // Write validUntil
++    writeLong(buffer, Element.VALID_UNTIL_OFFSET, validUntil);
++    // Write retryCount
++    writeInt(buffer, Element.RETRY_COUNT_OFFSET, retryCount);
+     // Write length.
+-    writeInt(buffer, 0, count);
++    writeInt(buffer, Element.LENGTH_OFFSET, count);
+     ringWrite(newLast.position, buffer, 0, Element.HEADER_LENGTH);
+ 
+     // Write data.
+@@ -392,7 +447,11 @@ private void expandIfNecessary(int dataLength) throws IOException {
+     if (last.position < first.position) {
+       int newLastPosition = fileLength + last.position - HEADER_LENGTH;
+       writeHeader(newLength, elementCount, first.position, newLastPosition);
+-      last = new Element(newLastPosition, last.length);
++      byte[] buffer = new byte[Element.HEADER_LENGTH];
++      ringRead(newLastPosition, buffer, 0, Element.HEADER_LENGTH);
++      long validUntil = readLong(buffer, Element.VALID_UNTIL_OFFSET);
++      int retryCount = readInt(buffer, Element.RETRY_COUNT_OFFSET);
++      last = new Element(newLastPosition, last.length, validUntil, retryCount);
+     } else {
+       writeHeader(newLength, elementCount, first.position, last.position);
+     }
+@@ -410,9 +469,14 @@ private void setLength(int newLength) throws IOException {
+   /** Reads the eldest element. Returns null if the queue is empty. */
+   public synchronized byte[] peek() throws IOException {
+     if (isEmpty()) return null;
+-    int length = first.length;
+-    byte[] data = new byte[length];
+-    ringRead(first.position + Element.HEADER_LENGTH, data, 0, length);
++
++    if (first.validUntil > 0 && first.validUntil < System.currentTimeMillis()) {
++      remove();
++      return peek();
++    }
++
++    byte[] data = new byte[first.length];
++    ringRead(first.position + Element.HEADER_LENGTH, data, 0, first.length);
+     return data;
+   }
+ 
+@@ -423,6 +487,27 @@ public synchronized void peek(ElementReader reader) throws IOException {
+     }
+   }
+ 
++  public synchronized boolean drop() throws IOException {
++    if (isEmpty()) return false;
++
++    boolean shouldWrite = first.retryCount > 0;
++    boolean shouldRemove = shouldWrite && --first.retryCount == 0;
++    shouldRemove |= first.validUntil > 0 && first.validUntil < System.currentTimeMillis();
++
++    if (shouldRemove) {
++      remove();
++      return true;
++    }
++
++    if (shouldWrite) {
++      byte[] buffer = new byte[4];
++      writeInt(buffer, 0, first.retryCount);
++      ringWrite(first.position + Element.RETRY_COUNT_OFFSET, buffer, 0, 4);
++    }
++
++    return false;
++  }
++
+   /**
+    * Invokes the given reader once for each element in the queue, from eldest to
+    * most recently added.
+@@ -504,10 +589,12 @@ public synchronized void remove() throws IOException {
+ 
+       int newFirstPosition = wrapPosition(first.position + firstTotalLength);
+       ringRead(newFirstPosition, buffer, 0, Element.HEADER_LENGTH);
+-      int length = readInt(buffer, 0);
++      int length = readInt(buffer, Element.LENGTH_OFFSET);
++      long validUntil = readLong(buffer, Element.VALID_UNTIL_OFFSET);
++      int retryCount = readInt(buffer, Element.RETRY_COUNT_OFFSET);
+       writeHeader(fileLength, elementCount - 1, newFirstPosition, last.position);
+       elementCount--;
+-      first = new Element(newFirstPosition, length);
++      first = new Element(newFirstPosition, length, validUntil, retryCount);
+     }
+   }
+ 
+@@ -558,12 +645,15 @@ public synchronized void close() throws IOException {
+ 
+   /** A pointer to an element. */
+   static class Element {
++    static final int VALID_UNTIL_OFFSET = 0;
++    static final int RETRY_COUNT_OFFSET = 8;
++    static final int LENGTH_OFFSET = 12;
+ 
+     /** Length of element header in bytes. */
+-    static final int HEADER_LENGTH = 4;
++    static final int HEADER_LENGTH = 16;
+ 
+     /** Null element. */
+-    static final Element NULL = new Element(0, 0);
++    static final Element NULL = new Element(0, 0, 0, -1);
+ 
+     /** Position in file. */
+     final int position;
+@@ -571,15 +661,23 @@ public synchronized void close() throws IOException {
+     /** The length of the data. */
+     final int length;
+ 
++    /** Ttl of element */
++    final long validUntil;
++
++    /** Retry count */
++    int retryCount;
++
+     /**
+      * Constructs a new element.
+      *
+      * @param position within file
+      * @param length   of data
+      */
+-    Element(int position, int length) {
++    Element(int position, int length, long validUntil, int retryCount) {
+       this.position = position;
+       this.length = length;
++      this.validUntil = validUntil;
++      this.retryCount = retryCount;
+     }
+ 
+     @Override public String toString() {
+diff --git a/tape/src/main/java/com/squareup/tape/TaskQueue.java b/tape/src/main/java/com/squareup/tape/TaskQueue.java
+index 32cb2bb..9cdd5c1 100644
+--- a/tape/src/main/java/com/squareup/tape/TaskQueue.java
++++ b/tape/src/main/java/com/squareup/tape/TaskQueue.java
+@@ -1,4 +1,5 @@
+ // Copyright 2012 Square, Inc.
++// Copyright 2016 FlixMobility GmbH
+ package com.squareup.tape;
+ 
+ /**
+@@ -38,13 +39,24 @@ public TaskQueue(ObjectQueue<T> delegate, TaskInjector<T> taskInjector) {
+   }
+ 
+   @Override public void add(T entry) {
+-    delegate.add(entry);
++    add(entry, 0, -1);
++  }
++
++  @Override public void add(T entry, long validUntil, int retryCount) {
++    if (retryCount == 0) {
++      retryCount = -1;
++    }
++    delegate.add(entry, validUntil, retryCount);
+   }
+ 
+   @Override public void remove() {
+     delegate.remove();
+   }
+ 
++  @Override public boolean drop() {
++    return delegate.drop();
++  }
++
+   @Override public void setListener(final Listener<T> listener) {
+     if (listener != null) {
+       // Intercept event delivery to pass the correct TaskQueue instance to listener.
+diff --git a/tape/src/test/java/com/squareup/tape/QueueFileTest.java b/tape/src/test/java/com/squareup/tape/QueueFileTest.java
+index 228d5c1..dffbda2 100644
+--- a/tape/src/test/java/com/squareup/tape/QueueFileTest.java
++++ b/tape/src/test/java/com/squareup/tape/QueueFileTest.java
+@@ -618,7 +618,7 @@
+     queue.add(values[4]);
+ 
+     // Read from header to first element and make sure it's zeroed.
+-    int firstElementPadding = 1028;
++    int firstElementPadding = Element.HEADER_LENGTH + 1024;
+     byte[] data = new byte[firstElementPadding];
+     queue.raf.seek(HEADER_LENGTH);
+     queue.raf.readFully(data, 0, firstElementPadding);
+diff --git a/tape/src/test/resources/one-entry-serialized-queue b/tape/src/test/resources/one-entry-serialized-queue
+index b71bdb1..c75d3f8 100644
+Binary files a/tape/src/test/resources/one-entry-serialized-queue and b/tape/src/test/resources/one-entry-serialized-queue differ
+diff --git a/tape/src/test/resources/truncated-one-entry-serialized-queue b/tape/src/test/resources/truncated-one-entry-serialized-queue
+index 5443a50..c546d29 100644
+Binary files a/tape/src/test/resources/truncated-one-entry-serialized-queue and b/tape/src/test/resources/truncated-one-entry-serialized-queue differ

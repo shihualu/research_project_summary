@@ -1,0 +1,429 @@
+diff --git a/okhttp-tls/src/main/java/okhttp3/tls/HeldCertificate.kt b/okhttp-tls/src/main/java/okhttp3/tls/HeldCertificate.kt
+index 6fae9ee615..e82a9fde19 100644
+--- a/okhttp-tls/src/main/java/okhttp3/tls/HeldCertificate.kt
++++ b/okhttp-tls/src/main/java/okhttp3/tls/HeldCertificate.kt
+@@ -16,7 +16,9 @@
+ package okhttp3.tls
+ 
+ import okhttp3.internal.canParseAsIpAddress
++import okio.Buffer
+ import okio.ByteString
++import okio.ByteString.Companion.decodeBase64
+ import okio.ByteString.Companion.toByteString
+ import org.bouncycastle.asn1.ASN1Encodable
+ import org.bouncycastle.asn1.DERSequence
+@@ -27,14 +29,20 @@ import org.bouncycastle.asn1.x509.X509Extensions
+ import org.bouncycastle.jce.provider.BouncyCastleProvider
+ import org.bouncycastle.x509.X509V3CertificateGenerator
+ import java.math.BigInteger
++import java.security.GeneralSecurityException
++import java.security.KeyFactory
+ import java.security.KeyPair
+ import java.security.KeyPairGenerator
+ import java.security.PrivateKey
+ import java.security.PublicKey
+ import java.security.SecureRandom
+ import java.security.Security
++import java.security.cert.CertificateFactory
+ import java.security.cert.X509Certificate
++import java.security.interfaces.ECPublicKey
+ import java.security.interfaces.RSAPrivateKey
++import java.security.interfaces.RSAPublicKey
++import java.security.spec.PKCS8EncodedKeySpec
+ import java.util.Date
+ import java.util.UUID
+ import java.util.concurrent.TimeUnit
+@@ -353,7 +361,7 @@ class HeldCertificate(
+         BigInteger.ONE
+       }
+       val signatureAlgorithm = if (signedByKeyPair.private is RSAPrivateKey) {
+-        "SHA256WithRSAEncryption"
++        "SHA256WithRSA"
+       } else {
+         "SHA256withECDSA"
+       }
+@@ -419,4 +427,103 @@ class HeldCertificate(
+       }
+     }
+   }
++
++  companion object {
++    private val PEM_REGEX = Regex("""-----BEGIN ([!-,.-~ ]*)-----([^-]*)-----END \1-----""")
++
++    /**
++     * Decodes a multiline string that contains both a [certificate][certificatePem] and a
++     * [private key][privateKeyPkcs8Pem], both [PEM-encoded][rfc_7468]. A typical input string looks
++     * like this:
++     *
++     * ```
++     * -----BEGIN CERTIFICATE-----
++     * MIIBYTCCAQegAwIBAgIBKjAKBggqhkjOPQQDAjApMRQwEgYDVQQLEwtlbmdpbmVl
++     * cmluZzERMA8GA1UEAxMIY2FzaC5hcHAwHhcNNzAwMTAxMDAwMDA1WhcNNzAwMTAx
++     * MDAwMDEwWjApMRQwEgYDVQQLEwtlbmdpbmVlcmluZzERMA8GA1UEAxMIY2FzaC5h
++     * cHAwWTATBgcqhkjOPQIBBggqhkjOPQMBBwNCAASda8ChkQXxGELnrV/oBnIAx3dD
++     * ocUOJfdz4pOJTP6dVQB9U3UBiW5uSX/MoOD0LL5zG3bVyL3Y6pDwKuYvfLNhoyAw
++     * HjAcBgNVHREBAf8EEjAQhwQBAQEBgghjYXNoLmFwcDAKBggqhkjOPQQDAgNIADBF
++     * AiAyHHg1N6YDDQiY920+cnI5XSZwEGhAtb9PYWO8bLmkcQIhAI2CfEZf3V/obmdT
++     * yyaoEufLKVXhrTQhRfodTeigi4RX
++     * -----END CERTIFICATE-----
++     * -----BEGIN PRIVATE KEY-----
++     * MEECAQAwEwYHKoZIzj0CAQYIKoZIzj0DAQcEJzAlAgEBBCA7ODT0xhGSNn4ESj6J
++     * lu/GJQZoU9lDrCPeUcQ28tzOWw==
++     * -----END PRIVATE KEY-----
++     * ```
++     *
++     * The string should contain exactly one certificate and one private key in [PKCS #8][rfc_5208]
++     * format. It should not contain any other PEM-encoded blocks, but it may contain other text
++     * which will be ignored.
++     *
++     * Encode a held certificate into this format by concatenating the results of
++     * [certificatePem()][certificatePem] and [privateKeyPkcs8Pem()][privateKeyPkcs8Pem].
++     *
++     * [rfc_7468]: https://tools.ietf.org/html/rfc7468
++     * [rfc_5208]: https://tools.ietf.org/html/rfc5208
++     */
++    @JvmStatic
++    fun decode(certificateAndPrivateKeyPem: String): HeldCertificate {
++      var certificatePem: String? = null
++      var pkcs8Base64: String? = null
++      for (match in PEM_REGEX.findAll(certificateAndPrivateKeyPem)) {
++        when (val label = match.groups[1]!!.value) {
++          "CERTIFICATE" -> {
++            require(certificatePem == null) { "string includes multiple certificates" }
++            certificatePem = match.groups[0]!!.value // Keep --BEGIN-- and --END-- for certificates.
++          }
++          "PRIVATE KEY" -> {
++            require(pkcs8Base64 == null) { "string includes multiple private keys" }
++            pkcs8Base64 = match.groups[2]!!.value // Include the contents only for PKCS8.
++          }
++          else -> {
++            throw IllegalArgumentException("unexpected type: $label")
++          }
++        }
++      }
++      require(certificatePem != null) { "string does not include a certificate" }
++      require(pkcs8Base64 != null) { "string does not include a private key" }
++
++      return decode(certificatePem, pkcs8Base64)
++    }
++
++    private fun decode(certificatePem: String, pkcs8Base64Text: String): HeldCertificate {
++      val certificate = try {
++        decodePem(certificatePem)
++      } catch (e: GeneralSecurityException) {
++        throw IllegalArgumentException("failed to decode certificate", e)
++      }
++
++      val privateKey = try {
++        val pkcs8Bytes = pkcs8Base64Text.decodeBase64()
++            ?: throw IllegalArgumentException("failed to decode private key")
++
++        // The private key doesn't tell us its type but it's okay because the certificate knows!
++        val keyType = when (certificate.publicKey) {
++          is ECPublicKey -> "EC"
++          is RSAPublicKey -> "RSA"
++          else -> throw IllegalArgumentException("unexpected key type: ${certificate.publicKey}")
++        }
++
++        decodePkcs8(pkcs8Bytes, keyType)
++      } catch (e: GeneralSecurityException) {
++        throw IllegalArgumentException("failed to decode private key", e)
++      }
++
++      val keyPair = KeyPair(certificate.publicKey, privateKey)
++      return HeldCertificate(keyPair, certificate)
++    }
++
++    private fun decodePem(pem: String): X509Certificate {
++      val certificates = CertificateFactory.getInstance("X.509")
++          .generateCertificates(Buffer().writeUtf8(pem).inputStream())
++      return certificates.iterator().next() as X509Certificate
++    }
++
++    private fun decodePkcs8(data: ByteString, keyAlgorithm: String): PrivateKey {
++      val keyFactory = KeyFactory.getInstance(keyAlgorithm)
++      return keyFactory.generatePrivate(PKCS8EncodedKeySpec(data.toByteArray()))
++    }
++  }
+ }
+diff --git a/okhttp-tls/src/test/java/okhttp3/tls/HeldCertificateTest.java b/okhttp-tls/src/test/java/okhttp3/tls/HeldCertificateTest.java
+index 76dbeb81f1..378e154069 100644
+--- a/okhttp-tls/src/test/java/okhttp3/tls/HeldCertificateTest.java
++++ b/okhttp-tls/src/test/java/okhttp3/tls/HeldCertificateTest.java
+@@ -31,6 +31,7 @@
+ import static java.util.Arrays.asList;
+ import static org.assertj.core.api.Assertions.assertThat;
+ import static org.assertj.core.data.Offset.offset;
++import static org.junit.Assert.fail;
+ 
+ public final class HeldCertificateTest {
+   @Test public void defaultCertificate() throws CertificateParsingException {
+@@ -219,4 +220,268 @@
+     assertThat(root.certificate().getSigAlgName()).isEqualTo("SHA256WITHECDSA");
+     assertThat(leaf.certificate().getSigAlgName()).isEqualTo("SHA256WITHECDSA");
+   }
++
++  @Test public void decodeEcdsa256() throws Exception {
++    // The certificate + private key below was generated programmatically:
++    //
++    // HeldCertificate heldCertificate = new HeldCertificate.Builder()
++    //     .validityInterval(5_000L, 10_000L)
++    //     .addSubjectAlternativeName("1.1.1.1")
++    //     .addSubjectAlternativeName("cash.app")
++    //     .serialNumber(42L)
++    //     .commonName("cash.app")
++    //     .organizationalUnit("engineering")
++    //     .ecdsa256()
++    //     .build();
++
++    String certificatePem = ""
++        + "-----BEGIN CERTIFICATE-----\n"
++        + "MIIBYTCCAQegAwIBAgIBKjAKBggqhkjOPQQDAjApMRQwEgYDVQQLEwtlbmdpbmVl\n"
++        + "cmluZzERMA8GA1UEAxMIY2FzaC5hcHAwHhcNNzAwMTAxMDAwMDA1WhcNNzAwMTAx\n"
++        + "MDAwMDEwWjApMRQwEgYDVQQLEwtlbmdpbmVlcmluZzERMA8GA1UEAxMIY2FzaC5h\n"
++        + "cHAwWTATBgcqhkjOPQIBBggqhkjOPQMBBwNCAASda8ChkQXxGELnrV/oBnIAx3dD\n"
++        + "ocUOJfdz4pOJTP6dVQB9U3UBiW5uSX/MoOD0LL5zG3bVyL3Y6pDwKuYvfLNhoyAw\n"
++        + "HjAcBgNVHREBAf8EEjAQhwQBAQEBgghjYXNoLmFwcDAKBggqhkjOPQQDAgNIADBF\n"
++        + "AiAyHHg1N6YDDQiY920+cnI5XSZwEGhAtb9PYWO8bLmkcQIhAI2CfEZf3V/obmdT\n"
++        + "yyaoEufLKVXhrTQhRfodTeigi4RX\n"
++        + "-----END CERTIFICATE-----\n";
++    String pkcs8Pem = ""
++        + "-----BEGIN PRIVATE KEY-----\n"
++        + "MEECAQAwEwYHKoZIzj0CAQYIKoZIzj0DAQcEJzAlAgEBBCA7ODT0xhGSNn4ESj6J\n"
++        + "lu/GJQZoU9lDrCPeUcQ28tzOWw==\n"
++        + "-----END PRIVATE KEY-----\n";
++
++    HeldCertificate heldCertificate = HeldCertificate.decode(certificatePem + pkcs8Pem);
++    assertThat(heldCertificate.certificatePem()).isEqualTo(certificatePem);
++    assertThat(heldCertificate.privateKeyPkcs8Pem()).isEqualTo(pkcs8Pem);
++
++    X509Certificate certificate = heldCertificate.certificate();
++    assertThat(certificate.getNotBefore().getTime()).isEqualTo(5_000L);
++    assertThat(certificate.getNotAfter().getTime()).isEqualTo(10_000L);
++
++    assertThat(certificate.getSubjectAlternativeNames()).containsExactly(
++        asList(GeneralName.iPAddress, "1.1.1.1"),
++        asList(GeneralName.dNSName, "cash.app"));
++
++    assertThat(certificate.getSubjectX500Principal().getName())
++        .isEqualTo("CN=cash.app,OU=engineering");
++  }
++
++  @Test public void decodeRsa512() throws Exception {
++    // The certificate + private key below was generated with OpenSSL. Never generate certificates
++    // with MD5 or 512-bit RSA; that's insecure!
++    //
++    // openssl req \
++    //   -x509 \
++    //   -md5 \
++    //   -nodes \
++    //   -days 1 \
++    //   -newkey rsa:512 \
++    //   -keyout privateKey.key \
++    //   -out certificate.crt
++
++    String certificatePem = ""
++        + "-----BEGIN CERTIFICATE-----\n"
++        + "MIIBFzCBwgIJAIVAqagcVN7/MA0GCSqGSIb3DQEBBAUAMBMxETAPBgNVBAMMCGNh\n"
++        + "c2guYXBwMB4XDTE5MDkwNzAyMjg0NFoXDTE5MDkwODAyMjg0NFowEzERMA8GA1UE\n"
++        + "AwwIY2FzaC5hcHAwXDANBgkqhkiG9w0BAQEFAANLADBIAkEA8qAeoubm4mBTD9/J\n"
++        + "ujLQkfk/fuJt/T5pVQ1vUEqxfcMw0zYgszQ5C2MiIl7M6JkTRKU01q9hVFCR83wX\n"
++        + "zIdrLQIDAQABMA0GCSqGSIb3DQEBBAUAA0EAO1UpwhrkW3Ho1nZK/taoUQOoqz/n\n"
++        + "HFVMtyEkm5gBDgz8nJXwb3zbegclQyH+kVou02S8zC5WWzEtd0R8S0LsTA==\n"
++        + "-----END CERTIFICATE-----\n";
++    String pkcs8Pem = ""
++        + "-----BEGIN PRIVATE KEY-----\n"
++        + "MIIBVQIBADANBgkqhkiG9w0BAQEFAASCAT8wggE7AgEAAkEA8qAeoubm4mBTD9/J\n"
++        + "ujLQkfk/fuJt/T5pVQ1vUEqxfcMw0zYgszQ5C2MiIl7M6JkTRKU01q9hVFCR83wX\n"
++        + "zIdrLQIDAQABAkEA7dEA9o/5k77y68ZhRv9z7QEwucBcKzQ3rsSCbWMpYqg924F9\n"
++        + "L8Z76kzSedSO2PN8mg6y/OLL+qBuTeUK/yiowQIhAP0cknFMbqeNX6uvj/S+V7in\n"
++        + "bIhQkhcSdJjRw8fxMnJpAiEA9WTp9wzJpn+9etZo0jJ8wkM0+LTMNELo47Ctz7l1\n"
++        + "kiUCIQCi34vslD5wWyzBEcwUtZdFH5dbcF1Rs3KMFA9jzfWkYQIgHtiWiFV1K5a3\n"
++        + "DK/S8UkjYY/tIq4nVRJsD+LvlkLrwnkCIECcz4yF4HQgv+Tbzj/gGSBl1VIliTcB\n"
++        + "Rc5RUQ0mZJQF\n"
++        + "-----END PRIVATE KEY-----\n";
++
++    HeldCertificate heldCertificate = HeldCertificate.decode(pkcs8Pem + certificatePem);
++    assertThat(heldCertificate.certificatePem()).isEqualTo(certificatePem);
++    assertThat(heldCertificate.privateKeyPkcs8Pem()).isEqualTo(pkcs8Pem);
++
++    X509Certificate certificate = heldCertificate.certificate();
++    assertThat(certificate.getSubjectX500Principal().getName())
++        .isEqualTo("CN=cash.app");
++  }
++
++  @Test public void decodeRsa2048() throws Exception {
++    // The certificate + private key below was generated programmatically:
++    //
++    // HeldCertificate heldCertificate = new HeldCertificate.Builder()
++    //     .validityInterval(5_000L, 10_000L)
++    //     .addSubjectAlternativeName("1.1.1.1")
++    //     .addSubjectAlternativeName("cash.app")
++    //     .serialNumber(42L)
++    //     .commonName("cash.app")
++    //     .organizationalUnit("engineering")
++    //     .rsa2048()
++    //     .build();
++
++    String certificatePem = ""
++        + "-----BEGIN CERTIFICATE-----\n"
++        + "MIIC7TCCAdWgAwIBAgIBKjANBgkqhkiG9w0BAQsFADApMRQwEgYDVQQLEwtlbmdp\n"
++        + "bmVlcmluZzERMA8GA1UEAxMIY2FzaC5hcHAwHhcNNzAwMTAxMDAwMDA1WhcNNzAw\n"
++        + "MTAxMDAwMDEwWjApMRQwEgYDVQQLEwtlbmdpbmVlcmluZzERMA8GA1UEAxMIY2Fz\n"
++        + "aC5hcHAwggEiMA0GCSqGSIb3DQEBAQUAA4IBDwAwggEKAoIBAQCaU+vrUPL0APGI\n"
++        + "SXIuRX4xRrigXmGKx+GRPnWDWvGJwOm23Vpq/eZxQx6PbSUB1+QZzAwge20RpNAp\n"
++        + "2lt5/qFtgUpEon2j06rd/0+ODqqVJX+6d3SpmF1fPfKUB6AOZbxEkaJpBSTavoTg\n"
++        + "G2M/NMdjZjrcB3quNQcLg54mmI3HJm1zOd/8i2fZjvoiyVY30Inn2SmQsAotXw1u\n"
++        + "aE/319bnR2sQlnkp6MJU0eLEtKyRif/IODvY+mtRYYdkFtoeT6qQPMIh+gF/H3to\n"
++        + "5tjs3g59QC8k2TJDop4EFYUOwdrtnb8wUiBnLyURD1szASE2IO2Ftk1zaNOPKtrv\n"
++        + "VeJuB/mpAgMBAAGjIDAeMBwGA1UdEQEB/wQSMBCHBAEBAQGCCGNhc2guYXBwMA0G\n"
++        + "CSqGSIb3DQEBCwUAA4IBAQAPm7vfk+rxSucxxbFiimmFKBw+ymieLY/kznNh0lHJ\n"
++        + "q15fsMYK7TTTt2FFqyfVXhhRZegLrkrGb3+4Dz1uNtcRrjT4qo+T/JOuZGxtBLbm\n"
++        + "4/hkFSYavtd2FW+/CK7EnQKUyabgLOblb21IHOlcPwpSe6KkJjpwq0TV/ozzfk/q\n"
++        + "kGRA7/Ubn5TMRYyHWnod2SS14+BkItcWN03Z7kvyMYrpNZpu6vQRYsqJJFMcmpGZ\n"
++        + "sZQW31gO2arPmfNotkQdFdNL12c9YZKkJGhyK6NcpffD2l6O9NS5SRD5RnkvBxQw\n"
++        + "fX5DamL8je/YKSLQ4wgUA/5iVKlCiJGQi6fYIJ0kxayO\n"
++        + "-----END CERTIFICATE-----\n";
++    String pkcs8Pem = ""
++        + "-----BEGIN PRIVATE KEY-----\n"
++        + "MIIEvwIBADANBgkqhkiG9w0BAQEFAASCBKkwggSlAgEAAoIBAQCaU+vrUPL0APGI\n"
++        + "SXIuRX4xRrigXmGKx+GRPnWDWvGJwOm23Vpq/eZxQx6PbSUB1+QZzAwge20RpNAp\n"
++        + "2lt5/qFtgUpEon2j06rd/0+ODqqVJX+6d3SpmF1fPfKUB6AOZbxEkaJpBSTavoTg\n"
++        + "G2M/NMdjZjrcB3quNQcLg54mmI3HJm1zOd/8i2fZjvoiyVY30Inn2SmQsAotXw1u\n"
++        + "aE/319bnR2sQlnkp6MJU0eLEtKyRif/IODvY+mtRYYdkFtoeT6qQPMIh+gF/H3to\n"
++        + "5tjs3g59QC8k2TJDop4EFYUOwdrtnb8wUiBnLyURD1szASE2IO2Ftk1zaNOPKtrv\n"
++        + "VeJuB/mpAgMBAAECggEAOlOXaYNZn1Cv+INRrR1EmVkSNEIXeX0bymohvbhka1zG\n"
++        + "t/8myiMVsh7c8PYeM3kl034j4y7ixPVWW0sUoaHT3vArYo9LDtzTyj1REu6GGAJp\n"
++        + "KM82/1X/jBx8jufm3SokIoIsMKbqC+ZPj+ep9dx7sxyTCE+nVSnjdL2Uyx+DDg3o\n"
++        + "na237HTScWIi+tMv5QGEwqLHS2q+NZYfjgnSxNY8BRw4XZCcIZRko9niuB5gUjj/\n"
++        + "y01HwvOCWuOMaSKZak1OdOaz3427/TkhYIqf6ft0ELF+ASRk3BLQA06pRt88H3u2\n"
++        + "3vsHJsWr2rkCN0h9uDp2o50ZQ5fvlxqG0QIZmvkIkQKBgQDOHeZKvXO5IxQ+S8ed\n"
++        + "09bC5SKiclCdW+Ry7N2x1MBfrxc4TTTTNaUN9Qdc6RXANG9bX2CJv0Dkh/0yH3z9\n"
++        + "Bdq6YcoP6DFCX46jwhCKvxMX9h9PFLvY7l2VSe7NfboGzvYLCy8ErsGuio8u9MHZ\n"
++        + "osX2ch6Gdhn1xUwLCw+T7rNwjQKBgQC/rWb0sWfgbKhEqV+u5oov+fFjooWmTQlQ\n"
++        + "jcj+lMWUOkitnPmX9TsH5JDa8I89Y0gJGu7Lfg8XSH+4FCCfX3mSLYwVH5vAIvmr\n"
++        + "TjMqRwSahQuTr/g+lx7alpcUHYv3z6b3WYIXFPPr3t7grWNJ14wMv9DnItWOg84H\n"
++        + "LlxAvXXsjQKBgQCRPPhdignVVyaYjwVl7TPTuWoiVbMAbxQW91lwSZ4UzmfqQF0M\n"
++        + "xyw7HYHGsmelPE2LcTWxWpb7cee0PgPwtwNdejLL6q1rO7JjKghF/EYUCFYff1iu\n"
++        + "j6hZ3fLr0cAXtBYjygmjnxDTUMd8KvO9y7j644cm8GlyiUgAMBcWAolmsQKBgQCT\n"
++        + "AJQTWfPGxM6QSi3d32VfwhsFROGnVzGrm/HofYTCV6jhraAmkKcDOKJ3p0LT286l\n"
++        + "XQiC/FzqiGmbbaRPVlPQbiofESzMQIamgMTwyaKYNy1XyP9kUVYSYqfff4GXPqRY\n"
++        + "00bYGPOxlC3utkuNmEgKhxnaCncqY5+hFkceR6+nCQKBgQC1Gonjhw0lYe43aHpp\n"
++        + "nDJKv3FnyN3wxjsR2c9sWpDzHA6CMVhSeLoXCB9ishmrSE/CygNlTU1TEy63xN22\n"
++        + "+dMHl5I/urMesjKKWiKZHdbWVIjJDv25r3jrN9VLr4q6AD9r1Su5G0o2j0N5ujVg\n"
++        + "SzpFHp+ZzhL/SANa8EqlcF6ItQ==\n"
++        + "-----END PRIVATE KEY-----\n";
++
++    HeldCertificate heldCertificate = HeldCertificate.decode(pkcs8Pem + certificatePem);
++    assertThat(heldCertificate.certificatePem()).isEqualTo(certificatePem);
++    assertThat(heldCertificate.privateKeyPkcs8Pem()).isEqualTo(pkcs8Pem);
++
++    X509Certificate certificate = heldCertificate.certificate();
++    assertThat(certificate.getNotBefore().getTime()).isEqualTo(5_000L);
++    assertThat(certificate.getNotAfter().getTime()).isEqualTo(10_000L);
++
++    assertThat(certificate.getSubjectAlternativeNames()).containsExactly(
++        asList(GeneralName.iPAddress, "1.1.1.1"),
++        asList(GeneralName.dNSName, "cash.app"));
++
++    assertThat(certificate.getSubjectX500Principal().getName())
++        .isEqualTo("CN=cash.app,OU=engineering");
++  }
++
++  @Test public void decodeWrongNumber() {
++    String certificatePem = ""
++        + "-----BEGIN CERTIFICATE-----\n"
++        + "MIIBYTCCAQegAwIBAgIBKjAKBggqhkjOPQQDAjApMRQwEgYDVQQLEwtlbmdpbmVl\n"
++        + "cmluZzERMA8GA1UEAxMIY2FzaC5hcHAwHhcNNzAwMTAxMDAwMDA1WhcNNzAwMTAx\n"
++        + "MDAwMDEwWjApMRQwEgYDVQQLEwtlbmdpbmVlcmluZzERMA8GA1UEAxMIY2FzaC5h\n"
++        + "cHAwWTATBgcqhkjOPQIBBggqhkjOPQMBBwNCAASda8ChkQXxGELnrV/oBnIAx3dD\n"
++        + "ocUOJfdz4pOJTP6dVQB9U3UBiW5uSX/MoOD0LL5zG3bVyL3Y6pDwKuYvfLNhoyAw\n"
++        + "HjAcBgNVHREBAf8EEjAQhwQBAQEBgghjYXNoLmFwcDAKBggqhkjOPQQDAgNIADBF\n"
++        + "AiAyHHg1N6YDDQiY920+cnI5XSZwEGhAtb9PYWO8bLmkcQIhAI2CfEZf3V/obmdT\n"
++        + "yyaoEufLKVXhrTQhRfodTeigi4RX\n"
++        + "-----END CERTIFICATE-----\n";
++    String pkcs8Pem = ""
++        + "-----BEGIN PRIVATE KEY-----\n"
++        + "MEECAQAwEwYHKoZIzj0CAQYIKoZIzj0DAQcEJzAlAgEBBCA7ODT0xhGSNn4ESj6J\n"
++        + "lu/GJQZoU9lDrCPeUcQ28tzOWw==\n"
++        + "-----END PRIVATE KEY-----\n";
++
++    try {
++      HeldCertificate.decode(certificatePem);
++      fail();
++    } catch (IllegalArgumentException expected) {
++      assertThat(expected).hasMessage("string does not include a private key");
++    }
++
++    try {
++      HeldCertificate.decode(pkcs8Pem);
++      fail();
++    } catch (IllegalArgumentException expected) {
++      assertThat(expected).hasMessage("string does not include a certificate");
++    }
++
++    try {
++      HeldCertificate.decode(certificatePem + pkcs8Pem + certificatePem);
++      fail();
++    } catch (IllegalArgumentException expected) {
++      assertThat(expected).hasMessage("string includes multiple certificates");
++    }
++
++    try {
++      HeldCertificate.decode(pkcs8Pem + certificatePem + pkcs8Pem);
++      fail();
++    } catch (IllegalArgumentException expected) {
++      assertThat(expected).hasMessage("string includes multiple private keys");
++    }
++  }
++
++  @Test public void decodeWrongType() {
++    try {
++      HeldCertificate.decode(""
++          + "-----BEGIN CERTIFICATE-----\n"
++          + "MIIBmjCCAQOgAwIBAgIBATANBgkqhkiG9w0BAQsFADATMREwDwYDVQQDEwhjYXNo\n"
++          + "-----END CERTIFICATE-----\n"
++          + "-----BEGIN RSA PRIVATE KEY-----\n"
++          + "sXPVYAsGD1wizrXX+wFaL3chtF1oG1Fx/jcsSsG6BA==\n"
++          + "-----END RSA PRIVATE KEY-----\n");
++      fail();
++    } catch (IllegalArgumentException expected) {
++      assertThat(expected).hasMessage("unexpected type: RSA PRIVATE KEY");
++    }
++  }
++
++  @Test public void decodeMalformed() {
++    try {
++      HeldCertificate.decode(""
++          + "-----BEGIN CERTIFICATE-----\n"
++          + "MIIBYTCCAQegAwIBAgIBKjAKBggqhkjOPQQDAjApMRQwEgYDVQQLEwtlbmdpbmVl\n"
++          + "-----END CERTIFICATE-----\n"
++          + "-----BEGIN PRIVATE KEY-----\n"
++          + "MEECAQAwEwYHKoZIzj0CAQYIKoZIzj0DAQcEJzAlAgEBBCA7ODT0xhGSNn4ESj6J\n"
++          + "lu/GJQZoU9lDrCPeUcQ28tzOWw==\n"
++          + "-----END PRIVATE KEY-----\n");
++      fail();
++    } catch (IllegalArgumentException expected) {
++      assertThat(expected).hasMessage("failed to decode certificate");
++    }
++    try {
++      HeldCertificate.decode(""
++          + "-----BEGIN CERTIFICATE-----\n"
++          + "MIIBYTCCAQegAwIBAgIBKjAKBggqhkjOPQQDAjApMRQwEgYDVQQLEwtlbmdpbmVl\n"
++          + "cmluZzERMA8GA1UEAxMIY2FzaC5hcHAwHhcNNzAwMTAxMDAwMDA1WhcNNzAwMTAx\n"
++          + "MDAwMDEwWjApMRQwEgYDVQQLEwtlbmdpbmVlcmluZzERMA8GA1UEAxMIY2FzaC5h\n"
++          + "cHAwWTATBgcqhkjOPQIBBggqhkjOPQMBBwNCAASda8ChkQXxGELnrV/oBnIAx3dD\n"
++          + "ocUOJfdz4pOJTP6dVQB9U3UBiW5uSX/MoOD0LL5zG3bVyL3Y6pDwKuYvfLNhoyAw\n"
++          + "HjAcBgNVHREBAf8EEjAQhwQBAQEBgghjYXNoLmFwcDAKBggqhkjOPQQDAgNIADBF\n"
++          + "AiAyHHg1N6YDDQiY920+cnI5XSZwEGhAtb9PYWO8bLmkcQIhAI2CfEZf3V/obmdT\n"
++          + "yyaoEufLKVXhrTQhRfodTeigi4RX\n"
++          + "-----END CERTIFICATE-----\n"
++          + "-----BEGIN PRIVATE KEY-----\n"
++          + "MEECAQAwEwYHKoZIzj0CAQYIKoZIzj0DAQcEJzAlAgEBBCA7ODT0xhGSNn4ESj6J\n"
++          + "-----END PRIVATE KEY-----\n");
++      fail();
++    } catch (IllegalArgumentException expected) {
++      assertThat(expected).hasMessage("failed to decode private key");
++    }
++  }
+ }

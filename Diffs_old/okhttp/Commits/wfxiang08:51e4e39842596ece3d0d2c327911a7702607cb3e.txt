@@ -1,0 +1,180 @@
+diff --git a/okhttp-tests/src/test/java/okhttp3/CallTest.java b/okhttp-tests/src/test/java/okhttp3/CallTest.java
+index d17ddfeb93..c097fb6bbe 100644
+--- a/okhttp-tests/src/test/java/okhttp3/CallTest.java
++++ b/okhttp-tests/src/test/java/okhttp3/CallTest.java
+@@ -27,6 +27,7 @@
+ import java.net.ProtocolException;
+ import java.net.Proxy;
+ import java.net.ServerSocket;
++import java.net.SocketTimeoutException;
+ import java.net.UnknownHostException;
+ import java.net.UnknownServiceException;
+ import java.security.cert.Certificate;
+@@ -761,10 +762,36 @@ private void postBodyRetransmittedAfterAuthorizationFail(String body) throws Exc
+   }
+ 
+   /**
+-   * Make a request with two routes. The first route will time out because it's connecting via a
+-   * null proxy server. The second will succeed.
++   * Make a request with two routes. The first route will time out because it's connecting to a
++   * special address that never connects. The automatic retry will succeed.
+    */
+   @Test public void connectTimeoutsAttemptsAlternateRoute() throws Exception {
++    InetSocketAddress unreachableAddress = new InetSocketAddress("10.255.255.1", 8080);
++
++    RecordingProxySelector proxySelector = new RecordingProxySelector();
++    proxySelector.proxies.add(new Proxy(Proxy.Type.HTTP, unreachableAddress));
++    proxySelector.proxies.add(server.toProxyAddress());
++
++    server.enqueue(new MockResponse()
++        .setBody("success!"));
++
++    client = client.newBuilder()
++        .proxySelector(proxySelector)
++        .readTimeout(100, TimeUnit.MILLISECONDS)
++        .connectTimeout(100, TimeUnit.MILLISECONDS)
++        .build();
++
++    Request request = new Request.Builder().url("http://android.com/").build();
++    executeSynchronously(request)
++        .assertCode(200)
++        .assertBody("success!");
++  }
++
++  /**
++   * Make a request with two routes. The first route will fail because the null server connects but
++   * never responds. The manual retry will succeed.
++   */
++  @Test public void readTimeoutFails() throws Exception {
+     InetSocketAddress nullServerAddress = startNullServer();
+ 
+     RecordingProxySelector proxySelector = new RecordingProxySelector();
+@@ -780,6 +807,8 @@ private void postBodyRetransmittedAfterAuthorizationFail(String body) throws Exc
+         .build();
+ 
+     Request request = new Request.Builder().url("http://android.com/").build();
++    executeSynchronously(request)
++        .assertFailure(SocketTimeoutException.class);
+     executeSynchronously(request)
+         .assertCode(200)
+         .assertBody("success!");
+diff --git a/okhttp-urlconnection/src/main/java/okhttp3/internal/huc/HttpURLConnectionImpl.java b/okhttp-urlconnection/src/main/java/okhttp3/internal/huc/HttpURLConnectionImpl.java
+index 7bf248f58b..65ca6ae400 100644
+--- a/okhttp-urlconnection/src/main/java/okhttp3/internal/huc/HttpURLConnectionImpl.java
++++ b/okhttp-urlconnection/src/main/java/okhttp3/internal/huc/HttpURLConnectionImpl.java
+@@ -490,7 +490,7 @@ private boolean execute(boolean readResponse) throws IOException {
+       throw toThrow;
+     } catch (RouteException e) {
+       // The attempt to connect via a route failed. The request will not have been sent.
+-      HttpEngine retryEngine = httpEngine.recover(e.getLastConnectException());
++      HttpEngine retryEngine = httpEngine.recover(e.getLastConnectException(), true);
+       if (retryEngine != null) {
+         releaseConnection = false;
+         httpEngine = retryEngine;
+@@ -503,7 +503,7 @@ private boolean execute(boolean readResponse) throws IOException {
+       throw toThrow;
+     } catch (IOException e) {
+       // An attempt to communicate with a server failed. The request may have been sent.
+-      HttpEngine retryEngine = httpEngine.recover(e);
++      HttpEngine retryEngine = httpEngine.recover(e, false);
+       if (retryEngine != null) {
+         releaseConnection = false;
+         httpEngine = retryEngine;
+diff --git a/okhttp/src/main/java/okhttp3/RealCall.java b/okhttp/src/main/java/okhttp3/RealCall.java
+index 16cb67cdc4..58814d53f8 100644
+--- a/okhttp/src/main/java/okhttp3/RealCall.java
++++ b/okhttp/src/main/java/okhttp3/RealCall.java
+@@ -245,7 +245,7 @@ Response getResponse(Request request, boolean forWebSocket) throws IOException {
+         throw e.getCause();
+       } catch (RouteException e) {
+         // The attempt to connect via a route failed. The request will not have been sent.
+-        HttpEngine retryEngine = engine.recover(e.getLastConnectException(), null);
++        HttpEngine retryEngine = engine.recover(e.getLastConnectException(), true, null);
+         if (retryEngine != null) {
+           releaseConnection = false;
+           engine = retryEngine;
+@@ -255,7 +255,7 @@ Response getResponse(Request request, boolean forWebSocket) throws IOException {
+         throw e.getLastConnectException();
+       } catch (IOException e) {
+         // An attempt to communicate with a server failed. The request may have been sent.
+-        HttpEngine retryEngine = engine.recover(e, null);
++        HttpEngine retryEngine = engine.recover(e, false, null);
+         if (retryEngine != null) {
+           releaseConnection = false;
+           engine = retryEngine;
+diff --git a/okhttp/src/main/java/okhttp3/internal/http/HttpEngine.java b/okhttp/src/main/java/okhttp3/internal/http/HttpEngine.java
+index 514ee65eb6..9643cbc594 100644
+--- a/okhttp/src/main/java/okhttp3/internal/http/HttpEngine.java
++++ b/okhttp/src/main/java/okhttp3/internal/http/HttpEngine.java
+@@ -185,7 +185,7 @@ public HttpEngine(OkHttpClient client, Request request, boolean bufferRequestBod
+    * @throws RouteException if the was a problem during connection via a specific route. Sometimes
+    * recoverable. See {@link #recover}.
+    * @throws IOException if there was a problem while making a request. Sometimes recoverable. See
+-   * {@link #recover(IOException)}.
++   * {@link #recover(IOException, boolean)}.
+    */
+   public void sendRequest() throws RequestException, RouteException, IOException {
+     if (cacheStrategy != null) return; // Already sent.
+@@ -349,8 +349,8 @@ public Connection getConnection() {
+    * engine that should be used for the retry if {@code e} is recoverable, or null if the failure is
+    * permanent. Requests with a body can only be recovered if the body is buffered.
+    */
+-  public HttpEngine recover(IOException e, Sink requestBodyOut) {
+-    if (!streamAllocation.recover(e, requestBodyOut)) {
++  public HttpEngine recover(IOException e, boolean routeException, Sink requestBodyOut) {
++    if (!streamAllocation.recover(e, routeException, requestBodyOut)) {
+       return null;
+     }
+ 
+@@ -365,8 +365,8 @@ public HttpEngine recover(IOException e, Sink requestBodyOut) {
+         forWebSocket, streamAllocation, (RetryableSink) requestBodyOut, priorResponse);
+   }
+ 
+-  public HttpEngine recover(IOException e) {
+-    return recover(e, requestBodyOut);
++  public HttpEngine recover(IOException e, boolean routeException) {
++    return recover(e, routeException, requestBodyOut);
+   }
+ 
+   private void maybeCache() throws IOException {
+diff --git a/okhttp/src/main/java/okhttp3/internal/http/StreamAllocation.java b/okhttp/src/main/java/okhttp3/internal/http/StreamAllocation.java
+index bd9abecaae..385dc2b2ac 100644
+--- a/okhttp/src/main/java/okhttp3/internal/http/StreamAllocation.java
++++ b/okhttp/src/main/java/okhttp3/internal/http/StreamAllocation.java
+@@ -309,14 +309,14 @@ private void release(RealConnection connection) {
+     throw new IllegalStateException();
+   }
+ 
+-  public boolean recover(IOException e, Sink requestBodyOut) {
++  public boolean recover(IOException e, boolean routeException, Sink requestBodyOut) {
+     if (connection != null) {
+       connectionFailed(e);
+     }
+ 
+     boolean canRetryRequestBody = requestBodyOut == null || requestBodyOut instanceof RetryableSink;
+     if ((routeSelector != null && !routeSelector.hasNext()) // No more routes to attempt.
+-        || !isRecoverable(e)
++        || !isRecoverable(e, routeException)
+         || !canRetryRequestBody) {
+       return false;
+     }
+@@ -324,16 +324,16 @@ public boolean recover(IOException e, Sink requestBodyOut) {
+     return true;
+   }
+ 
+-  private boolean isRecoverable(IOException e) {
++  private boolean isRecoverable(IOException e, boolean routeException) {
+     // If there was a protocol problem, don't recover.
+     if (e instanceof ProtocolException) {
+       return false;
+     }
+ 
+-    // If there was an interruption don't recover, but if there was a timeout
++    // If there was an interruption don't recover, but if there was a timeout connecting to a route
+     // we should try the next route (if there is one).
+     if (e instanceof InterruptedIOException) {
+-      return e instanceof SocketTimeoutException;
++      return e instanceof SocketTimeoutException && routeException;
+     }
+ 
+     // Look for known client-side or negotiation errors that are unlikely to be fixed by trying

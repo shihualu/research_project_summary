@@ -1,0 +1,3169 @@
+diff --git a/.gitignore b/.gitignore
+index 1d32dc0b8..2ae0b7459 100644
+--- a/.gitignore
++++ b/.gitignore
+@@ -41,6 +41,17 @@ proguard/
+ .gradle
+ build
+ 
++# Buck
++/buck-cache/
++/buck-out/
++/.buckconfig.local
++/.buckd
++/.nobuckcheck
++/.bucktestselectors
++
++# vim temp files
++*.swp
++
+ *~
+ *.DS_Store
+ *java#
+diff --git a/facebook/src/com/facebook/AppEventsLogger.java b/facebook/src/com/facebook/AppEventsLogger.java
+index 20e4c24a8..e35789a62 100644
+--- a/facebook/src/com/facebook/AppEventsLogger.java
++++ b/facebook/src/com/facebook/AppEventsLogger.java
+@@ -269,6 +269,7 @@ public static void setLimitEventUsage(Context context, boolean limitEventUsage)
+      * @param context   Used to access the applicationId and the attributionId for non-authenticated users.
+      */
+     public static void activateApp(Context context) {
++        Settings.sdkInitialize(context);
+         activateApp(context, Utility.getMetadataApplicationId(context));
+     }
+ 
+@@ -288,7 +289,7 @@ public static void activateApp(Context context, String applicationId) {
+ 
+         // activateApp supercedes publishInstall in the public API, so we need to explicitly invoke it, since the server
+         // can't reliably infer install state for all conditions of an app activate.
+-        Settings.publishInstallAsync(context, applicationId);
++        Settings.publishInstallAsync(context, applicationId, null);
+ 
+         AppEventsLogger logger = new AppEventsLogger(context, applicationId, null);
+         logger.logEvent(AppEventsConstants.EVENT_NAME_ACTIVATED_APP);
+@@ -565,9 +566,13 @@ private AppEventsLogger(Context context, String applicationId, Session session)
+             session = Session.getActiveSession();
+         }
+ 
+-        if (session != null) {
++        // If we have a session and the appId passed is null or matches the session's app ID:
++        if (session != null &&
++            (applicationId == null || applicationId.equals(session.getApplicationId()))
++          ) {
+             accessTokenAppId = new AccessTokenAppIdPair(session);
+         } else {
++            // If no app ID passed, get it from the manifest:
+             if (applicationId == null) {
+                 applicationId = Utility.getMetadataApplicationId(context);
+             }
+@@ -630,7 +635,7 @@ public void run() {
+ 
+     private void logEvent(String eventName, Double valueToSum, Bundle parameters, boolean isImplicitlyLogged) {
+ 
+-        AppEvent event = new AppEvent(eventName, valueToSum, parameters, isImplicitlyLogged);
++        AppEvent event = new AppEvent(this.context, eventName, valueToSum, parameters, isImplicitlyLogged);
+         logEvent(context, event, accessTokenAppId);
+     }
+ 
+@@ -1025,6 +1030,15 @@ private void populateRequest(Request request, int numSkipped, JSONArray events,
+                         hashedDeviceAndAppId, limitEventUsage);
+             }
+ 
++            // The code to get all the Extended info is safe but just in case we can wrap the whole
++            // call in its own try/catch block since some of the things it does might cause
++            // unexpected exceptions on rooted/funky devices:
++            try {
++              Utility.setAppEventExtendedDeviceInfoParameters(publishParams, applicationContext);
++            } catch (Exception e) {
++              // Swallow
++            }
++
+             publishParams.setProperty("application_package_name", packageName);
+ 
+             request.setGraphObject(publishParams);
+@@ -1062,7 +1076,13 @@ private void populateRequest(Request request, int numSkipped, JSONArray events,
+         private static final HashSet<String> validatedIdentifiers = new HashSet<String>();
+         private String name;
+ 
+-        public AppEvent(String eventName, Double valueToSum, Bundle parameters, boolean isImplicitlyLogged) {
++        public AppEvent(
++            Context context,
++            String eventName,
++            Double valueToSum,
++            Bundle parameters,
++            boolean isImplicitlyLogged
++        ) {
+ 
+             validateIdentifier(eventName);
+ 
+@@ -1072,9 +1092,9 @@ public AppEvent(String eventName, Double valueToSum, Bundle parameters, boolean
+             jsonObject = new JSONObject();
+ 
+             try {
+-
+                 jsonObject.put("_eventName", eventName);
+                 jsonObject.put("_logTime", System.currentTimeMillis() / 1000);
++                jsonObject.put("_ui", Utility.getActivityName(context));
+ 
+                 if (valueToSum != null) {
+                     jsonObject.put("_valueToSum", valueToSum.doubleValue());
+diff --git a/facebook/src/com/facebook/AuthorizationClient.java b/facebook/src/com/facebook/AuthorizationClient.java
+index 70ac8a103..f0f31f35b 100644
+--- a/facebook/src/com/facebook/AuthorizationClient.java
++++ b/facebook/src/com/facebook/AuthorizationClient.java
+@@ -445,7 +445,7 @@ Request createGetProfileIdRequest(String accessToken) {
+     }
+ 
+     private AppEventsLogger getAppEventsLogger() {
+-        if (appEventsLogger == null || appEventsLogger.getApplicationId() != pendingRequest.getApplicationId()) {
++        if (appEventsLogger == null || !appEventsLogger.getApplicationId().equals(pendingRequest.getApplicationId())) {
+             appEventsLogger = AppEventsLogger.newLogger(context, pendingRequest.getApplicationId());
+         }
+         return appEventsLogger;
+diff --git a/facebook/src/com/facebook/BoltsMeasurementEventListener.java b/facebook/src/com/facebook/BoltsMeasurementEventListener.java
+new file mode 100644
+index 000000000..8a1eaca0c
+--- /dev/null
++++ b/facebook/src/com/facebook/BoltsMeasurementEventListener.java
+@@ -0,0 +1,57 @@
++package com.facebook;
++
++import android.content.BroadcastReceiver;
++import android.content.Context;
++import android.content.Intent;
++import android.content.IntentFilter;
++import android.os.Bundle;
++import android.support.v4.content.LocalBroadcastManager;
++
++public class BoltsMeasurementEventListener extends BroadcastReceiver {
++    private static BoltsMeasurementEventListener _instance;
++
++    private final static String MEASUREMENT_EVENT_NOTIFICATION_NAME = "com.parse.bolts.measurement_event";
++    private final static String MEASUREMENT_EVENT_NAME_KEY = "event_name";
++    private final static String MEASUREMENT_EVENT_ARGS_KEY = "event_args";
++    private final static String BOLTS_MEASUREMENT_EVENT_PREFIX = "bf_";
++
++    private Context applicationContext;
++
++    private BoltsMeasurementEventListener(Context context) {
++        applicationContext = context.getApplicationContext();
++    }
++
++    private void open() {
++      LocalBroadcastManager broadcastManager = LocalBroadcastManager.getInstance(applicationContext);
++      broadcastManager.registerReceiver(this, new IntentFilter(MEASUREMENT_EVENT_NOTIFICATION_NAME));
++    }
++
++    private void close() {
++      LocalBroadcastManager broadcastManager = LocalBroadcastManager.getInstance(applicationContext);
++      broadcastManager.unregisterReceiver(this);
++    }
++
++    static BoltsMeasurementEventListener getInstance(Context context) {
++        if (_instance != null) {
++            return _instance;
++        }
++        _instance = new BoltsMeasurementEventListener(context);
++        _instance.open();
++        return _instance;
++    }
++
++    protected void finalize() throws Throwable {
++        try {
++            close();
++        } finally {
++            super.finalize();
++        }
++    }
++
++    @Override
++    public void onReceive(Context context, Intent intent) {
++        AppEventsLogger appEventsLogger = AppEventsLogger.newLogger(context);
++        String eventName = BOLTS_MEASUREMENT_EVENT_PREFIX + intent.getStringExtra(MEASUREMENT_EVENT_NAME_KEY);
++        appEventsLogger.logEvent(eventName, intent.getBundleExtra(MEASUREMENT_EVENT_ARGS_KEY));
++    }
++}
+diff --git a/facebook/src/com/facebook/FacebookSdkVersion.java b/facebook/src/com/facebook/FacebookSdkVersion.java
+index 7525134b4..4e0e5ea63 100644
+--- a/facebook/src/com/facebook/FacebookSdkVersion.java
++++ b/facebook/src/com/facebook/FacebookSdkVersion.java
+@@ -17,5 +17,5 @@
+ package com.facebook;
+ 
+ final class FacebookSdkVersion {
+-    public static final String BUILD = "3.15.0";
++    public static final String BUILD = "3.16.0";
+ }
+diff --git a/facebook/src/com/facebook/Request.java b/facebook/src/com/facebook/Request.java
+index e604a44a3..1bf5bc9fa 100644
+--- a/facebook/src/com/facebook/Request.java
++++ b/facebook/src/com/facebook/Request.java
+@@ -111,7 +111,8 @@
+ 
+     private static String defaultBatchApplicationId;
+ 
+-    private static Pattern versionPattern = Pattern.compile("^v\\d+\\.\\d+/.*");
++    // Group 1 in the pattern is the path without the version info
++    private static Pattern versionPattern = Pattern.compile("^/?v\\d+\\.\\d+/(.*)");
+ 
+     private Session session;
+     private HttpMethod httpMethod;
+@@ -2060,6 +2061,18 @@ private static void processRequest(RequestBatch requests, Logger logger, int num
+         }
+     }
+ 
++    private static boolean isMeRequest(String path) {
++        Matcher matcher = versionPattern.matcher(path);
++        if (matcher.matches()) {
++            // Group 1 contains the path aside from version
++            path = matcher.group(1);
++        }
++        if (path.startsWith("me/") || path.startsWith("/me/")) {
++            return true;
++        }
++        return false;
++    }
++
+     private static void processGraphObject(GraphObject graphObject, String path, KeyValueSerializer serializer)
+             throws IOException {
+         // In general, graph objects are passed by reference (ID/URL). But if this is an OG Action,
+@@ -2069,7 +2082,7 @@ private static void processGraphObject(GraphObject graphObject, String path, Key
+         // but passing the OG Action type as a substituted parameter is unlikely.
+         // It looks like an OG Action if it's posted to me/namespace:action[?other=stuff].
+         boolean isOGAction = false;
+-        if (path.startsWith("me/") || path.startsWith("/me/")) {
++        if (isMeRequest(path)) {
+             int colonLocation = path.indexOf(":");
+             int questionMarkLocation = path.indexOf("?");
+             isOGAction = colonLocation > 3 && (questionMarkLocation == -1 || colonLocation < questionMarkLocation);
+@@ -2111,6 +2124,8 @@ private static void processGraphObjectProperty(String key, Object value, KeyValu
+                     processGraphObjectProperty(key, jsonObject.optString("id"), serializer, passByValue);
+                 } else if (jsonObject.has("url")) {
+                     processGraphObjectProperty(key, jsonObject.optString("url"), serializer, passByValue);
++                } else if (jsonObject.has(NativeProtocol.OPEN_GRAPH_CREATE_OBJECT_KEY)) {
++                    processGraphObjectProperty(key, jsonObject.toString(), serializer, passByValue);
+                 }
+             }
+         } else if (JSONArray.class.isAssignableFrom(valueClass)) {
+diff --git a/facebook/src/com/facebook/Settings.java b/facebook/src/com/facebook/Settings.java
+index cc1eb033b..b4608a4f1 100644
+--- a/facebook/src/com/facebook/Settings.java
++++ b/facebook/src/com/facebook/Settings.java
+@@ -97,6 +97,21 @@ public Thread newThread(Runnable runnable) {
+      */
+     public static final String CLIENT_TOKEN_PROPERTY = "com.facebook.sdk.ClientToken";
+ 
++    private static Boolean sdkInitialized = false;
++
++    /**
++     * Initialize SDK
++     * This function will be called once in the application, it is tried to be called as early as possible;
++     * This is the place to register broadcast listeners.
++     */
++    public static synchronized void sdkInitialize(Context context) {
++        if (sdkInitialized == true) {
++          return;
++        }
++        BoltsMeasurementEventListener.getInstance(context.getApplicationContext());
++        sdkInitialized = true;
++    }
++
+     /**
+      * Certain logging behaviors are available for debugging beyond those that should be
+      * enabled in production.
+@@ -255,37 +270,14 @@ private static Executor getAsyncTaskExecutor() {
+         return (Executor) executorObject;
+     }
+ 
+-    /**
+-     * Manually publish install attribution to the Facebook graph.  Internally handles tracking repeat calls to prevent
+-     * multiple installs being published to the graph.
+-     * @param context the current Context
+-     * @param applicationId the fb application being published.
+-     *
+-     * This method is deprecated.  See {@link AppEventsLogger#activateApp(Context, String)} for more info.
+-     */
+-    @Deprecated
+-    public static void publishInstallAsync(final Context context, final String applicationId) {
+-       publishInstallAsync(context, applicationId, null);
+-    }
+-
+-    /**
+-     * Manually publish install attribution to the Facebook graph.  Internally handles tracking repeat calls to prevent
+-     * multiple installs being published to the graph.
+-     * @param context the current Context
+-     * @param applicationId the fb application being published.
+-     * @param callback a callback to invoke with a Response object, carrying the server response, or an error.
+-     *
+-     * This method is deprecated.  See {@link AppEventsLogger#activateApp(Context, String)} for more info.
+-     */
+-    @Deprecated
+-    public static void publishInstallAsync(final Context context, final String applicationId,
++    static void publishInstallAsync(final Context context, final String applicationId,
+         final Request.Callback callback) {
+         // grab the application context ahead of time, since we will return to the caller immediately.
+         final Context applicationContext = context.getApplicationContext();
+         Settings.getExecutor().execute(new Runnable() {
+             @Override
+             public void run() {
+-                final Response response = Settings.publishInstallAndWaitForResponse(applicationContext, applicationId);
++                final Response response = Settings.publishInstallAndWaitForResponse(applicationContext, applicationId, false);
+                 if (callback != null) {
+                     // invoke the callback on the main thread.
+                     Handler handler = new Handler(Looper.getMainLooper());
+@@ -324,36 +316,6 @@ public static boolean getShouldAutoPublishInstall() {
+         return shouldAutoPublishInstall;
+     }
+ 
+-    /**
+-     * Manually publish install attribution to the Facebook graph.  Internally handles tracking repeat calls to prevent
+-     * multiple installs being published to the graph.
+-     * @param context the current Context
+-     * @param applicationId the fb application being published.
+-     * @return returns false on error.  Applications should retry until true is returned.  Safe to call again after
+-     * true is returned.
+-     *
+-     * This method is deprecated.  See {@link AppEventsLogger#activateApp(Context, String)} for more info.
+-     */
+-    @Deprecated
+-    public static boolean publishInstallAndWait(final Context context, final String applicationId) {
+-        Response response = publishInstallAndWaitForResponse(context, applicationId);
+-        return response != null && response.getError() == null;
+-    }
+-
+-    /**
+-     * Manually publish install attribution to the Facebook graph.  Internally handles caching repeat calls to prevent
+-     * multiple installs being published to the graph.
+-     * @param context the current Context
+-     * @param applicationId the fb application being published.
+-     * @return returns a Response object, carrying the server response, or an error.
+-     *
+-     * This method is deprecated.  See {@link AppEventsLogger#activateApp(Context, String)} for more info.
+-     */
+-    @Deprecated
+-    public static Response publishInstallAndWaitForResponse(final Context context, final String applicationId) {
+-        return publishInstallAndWaitForResponse(context, applicationId, false);
+-    }
+-
+     static Response publishInstallAndWaitForResponse(
+             final Context context,
+             final String applicationId,
+diff --git a/facebook/src/com/facebook/UiLifecycleHelper.java b/facebook/src/com/facebook/UiLifecycleHelper.java
+index 7b68c16fa..d1656b5d6 100644
+--- a/facebook/src/com/facebook/UiLifecycleHelper.java
++++ b/facebook/src/com/facebook/UiLifecycleHelper.java
+@@ -66,11 +66,13 @@ public UiLifecycleHelper(Activity activity, Session.StatusCallback callback) {
+         if (activity == null) {
+             throw new IllegalArgumentException(ACTIVITY_NULL_MESSAGE);
+         }
++
+         this.activity = activity;
+         this.callback = callback;
+         this.receiver = new ActiveSessionBroadcastReceiver();
+         this.broadcastManager = LocalBroadcastManager.getInstance(activity);
+-
++        // initialize SDK
++        Settings.sdkInitialize(activity);
+         // Make sure we've loaded default settings if we haven't already.
+         Settings.loadDefaultsFromMetadataIfNeeded(activity);
+     }
+diff --git a/facebook/src/com/facebook/android/Facebook.java b/facebook/src/com/facebook/android/Facebook.java
+index 83cdabe9b..4680f364d 100644
+--- a/facebook/src/com/facebook/android/Facebook.java
++++ b/facebook/src/com/facebook/android/Facebook.java
+@@ -1223,23 +1223,6 @@ public void setShouldAutoPublishInstall(boolean value) {
+         Settings.setShouldAutoPublishInstall(value);
+     }
+ 
+-    /**
+-     * Manually publish install attribution to the Facebook graph.  Internally handles tracking repeat calls to prevent
+-     * multiple installs being published to the graph.
+-     * <p/>
+-     * This method is deprecated.  See {@link Facebook} and {@link Settings} for more info.
+-     *
+-     * @param context the current Android context
+-     * @return Always false.  Earlier versions of the API returned true if it was no longer necessary to call.
+-     * Apps should ignore this value, but for compatibility we will return false to ensure repeat calls (and the
+-     * underlying code will prevent duplicate network traffic).
+-     */
+-    @Deprecated
+-    public boolean publishInstall(final Context context) {
+-        Settings.publishInstallAsync(context, mAppId);
+-        return false;
+-    }
+-
+     /**
+      * Callback interface for dialog requests.
+      * <p/>
+diff --git a/facebook/src/com/facebook/internal/Utility.java b/facebook/src/com/facebook/internal/Utility.java
+index 7289c1477..41fd4e3b6 100644
+--- a/facebook/src/com/facebook/internal/Utility.java
++++ b/facebook/src/com/facebook/internal/Utility.java
+@@ -17,12 +17,24 @@
+ package com.facebook.internal;
+ 
+ import android.content.Context;
++import android.content.Intent;
++import android.content.IntentFilter;
++import android.content.pm.PackageInfo;
++import android.content.pm.PackageManager;
+ import android.net.Uri;
++import android.os.BatteryManager;
++import android.os.Build;
+ import android.os.Bundle;
++import android.os.Environment;
+ import android.os.Parcelable;
++import android.os.StatFs;
+ import android.provider.Settings.Secure;
++import android.telephony.TelephonyManager;
+ import android.text.TextUtils;
++import android.util.DisplayMetrics;
+ import android.util.Log;
++import android.view.Display;
++import android.view.WindowManager;
+ import android.webkit.CookieManager;
+ import android.webkit.CookieSyncManager;
+ import com.facebook.*;
+@@ -57,6 +69,7 @@
+     private static final String SUPPORTS_IMPLICIT_SDK_LOGGING = "supports_implicit_sdk_logging";
+     private static final String NUX_CONTENT = "gdpv4_nux_content";
+     private static final String NUX_ENABLED = "gdpv4_nux_enabled";
++    private static final String EXTRA_APP_EVENTS_INFO_FORMAT_VERSION = "a1";
+ 
+     private static final String [] APP_SETTING_FIELDS = new String[] {
+             SUPPORTS_ATTRIBUTION,
+@@ -72,7 +85,13 @@
+     private static Map<String, FetchedAppSettings> fetchedAppSettings =
+             new ConcurrentHashMap<String, FetchedAppSettings>();
+ 
+-    public static class FetchedAppSettings {
++    private static int sNumCPUCores = 0;
++    private static long sTotalExternalStorageBytes = -1;
++    private static long sAvailableExternalStorageBytes = -1;
++    private static String sCarrierName = null;
++
++
++  public static class FetchedAppSettings {
+         private boolean supportsAttribution;
+         private boolean supportsImplicitLogging;
+         private String nuxContent;
+@@ -472,6 +491,39 @@ public static void setAppEventAttributionParameters(GraphObject params,
+         params.setProperty("application_tracking_enabled", !limitEventUsage);
+     }
+ 
++    public static void setAppEventExtendedDeviceInfoParameters(GraphObject params, Context appContext) {
++      JSONArray extraInfoArray = new JSONArray();
++      extraInfoArray.put(EXTRA_APP_EVENTS_INFO_FORMAT_VERSION);
++
++      // Application Manifest info:
++      String pkgName = appContext.getPackageName();
++      int versionCode = -1;
++      String versionName = "";
++
++      try {
++        PackageInfo pi = appContext.getPackageManager().getPackageInfo(pkgName, 0);
++        versionCode = pi.versionCode;
++        versionName = pi.versionName;
++      } catch (PackageManager.NameNotFoundException e) {
++        // Swallow
++      }
++
++      // Application Manifest info:
++      extraInfoArray.put(pkgName);
++      extraInfoArray.put(versionCode);
++      extraInfoArray.put(versionName);
++
++      params.setProperty("extinfo", extraInfoArray.toString());
++    }
++
++  private static <T> void silentJSONObjectPut(JSONObject object, String key, T data) {
++      try {
++        object.put(key, data);
++      } catch (JSONException e) {
++        // Swallow
++      }
++    }
++
+     public static Method getMethodQuietly(Class<?> clazz, String methodName, Class<?>... parameterTypes) {
+         try {
+             return clazz.getMethod(methodName, parameterTypes);
+@@ -498,4 +550,17 @@ public static Object invokeMethodQuietly(Object receiver, Method method, Object.
+             return null;
+         }
+     }
++
++  /**
++   * Returns the name of the current activity if the context is an activity, otherwise return "unknown"
++   */
++  public static String getActivityName(Context context) {
++    if (context == null) {
++      return "null";
++    } else if (context == context.getApplicationContext()) {
++      return "unknown";
++    } else {
++      return context.getClass().getSimpleName();
++    }
++  }
+ }
+diff --git a/facebook/src/com/facebook/widget/FriendPickerFragment.java b/facebook/src/com/facebook/widget/FriendPickerFragment.java
+index b657ec567..6f05df64b 100644
+--- a/facebook/src/com/facebook/widget/FriendPickerFragment.java
++++ b/facebook/src/com/facebook/widget/FriendPickerFragment.java
+@@ -47,6 +47,33 @@
+      * picker should allow more than one friend to be selected or not.
+      */
+     public static final String MULTI_SELECT_BUNDLE_KEY = "com.facebook.widget.FriendPickerFragment.MultiSelect";
++    /**
++     * The key for a String parameter in the fragment's Intent bundle to indicate the type of friend picker to use.
++     * This value is case sensitive, and must match the enum @{link FriendPickerType}
++     */
++    public static final String FRIEND_PICKER_TYPE_KEY = "com.facebook.widget.FriendPickerFragment.FriendPickerType";
++
++    public enum FriendPickerType {
++        FRIENDS("/friends", true),
++        TAGGABLE_FRIENDS("/taggable_friends", false),
++        INVITABLE_FRIENDS("/invitable_friends", false);
++
++        private final String requestPath;
++        private final boolean requestIsCacheable;
++
++        FriendPickerType(String path, boolean cacheable) {
++            this.requestPath = path;
++            this.requestIsCacheable = cacheable;
++        }
++
++        String getRequestPath() {
++            return requestPath;
++        }
++
++        boolean isCacheable() {
++            return requestIsCacheable;
++        }
++    }
+ 
+     private static final String ID = "id";
+     private static final String NAME = "name";
+@@ -55,6 +82,9 @@
+ 
+     private boolean multiSelect = true;
+ 
++    // default to Friends for backwards compatibility
++    private FriendPickerType friendPickerType = FriendPickerType.FRIENDS;
++
+     private List<String> preSelectedFriendIds = new ArrayList<String>();
+ 
+     /**
+@@ -112,6 +142,14 @@ public void setMultiSelect(boolean multiSelect) {
+         }
+     }
+ 
++    /**
++     * Sets the friend picker type for this fragment.
++     * @param type the type of friend picker to use.
++     */
++    public void setFriendPickerType(FriendPickerType type) {
++        this.friendPickerType = type;
++    }
++
+     /**
+      * Sets the list of friends for pre selection. These friends will be selected by default.
+      * @param userIds list of friends as ids
+@@ -250,7 +288,7 @@ public void loadData(boolean forceReload) {
+     }
+ 
+     private Request createRequest(String userID, Set<String> extraFields, Session session) {
+-        Request request = Request.newGraphPathRequest(session, userID + "/friends", null);
++        Request request = Request.newGraphPathRequest(session, userID + friendPickerType.getRequestPath(), null);
+ 
+         Set<String> fields = new HashSet<String>(extraFields);
+         String[] requiredFields = new String[]{
+@@ -278,6 +316,13 @@ private void setFriendPickerSettingsFromBundle(Bundle inState) {
+                 setUserId(inState.getString(USER_ID_BUNDLE_KEY));
+             }
+             setMultiSelect(inState.getBoolean(MULTI_SELECT_BUNDLE_KEY, multiSelect));
++            if (inState.containsKey(FRIEND_PICKER_TYPE_KEY)) {
++                try {
++                    friendPickerType = FriendPickerType.valueOf(inState.getString(FRIEND_PICKER_TYPE_KEY));
++                } catch (Exception e) {
++                    // NOOP
++                }
++            }
+         }
+     }
+ 
+@@ -308,6 +353,11 @@ protected void onLoadFinished(GraphObjectPagingLoader<GraphUser> loader,
+             }
+         }
+ 
++        @Override
++        protected boolean canSkipRoundTripIfCached() {
++            return friendPickerType.isCacheable();
++        }
++
+         private void followNextLink() {
+             // This may look redundant, but this causes the circle to be alpha-dimmed if we have results.
+             displayActivityCircle();
+diff --git a/facebook/src/com/facebook/widget/GraphObjectAdapter.java b/facebook/src/com/facebook/widget/GraphObjectAdapter.java
+index 552474933..285ddeec2 100644
+--- a/facebook/src/com/facebook/widget/GraphObjectAdapter.java
++++ b/facebook/src/com/facebook/widget/GraphObjectAdapter.java
+@@ -635,7 +635,11 @@ public long getItemId(int position) {
+         if (sectionAndItem != null && sectionAndItem.graphObject != null) {
+             String id = getIdOfGraphObject(sectionAndItem.graphObject);
+             if (id != null) {
+-                return Long.parseLong(id);
++                try {
++                    return Long.parseLong(id);
++                } catch (NumberFormatException e) {
++                    // NOOP
++                }
+             }
+         }
+         return 0;
+diff --git a/facebook/src/com/facebook/widget/GraphObjectPagingLoader.java b/facebook/src/com/facebook/widget/GraphObjectPagingLoader.java
+index 26b33c99d..17d6cb674 100644
+--- a/facebook/src/com/facebook/widget/GraphObjectPagingLoader.java
++++ b/facebook/src/com/facebook/widget/GraphObjectPagingLoader.java
+@@ -201,7 +201,11 @@ private void addResults(Response response) {
+             nextRequest = response.getRequestForPagedResults(Response.PagingDirection.NEXT);
+ 
+             cursorToModify.addGraphObjects(data, fromCache);
+-            cursorToModify.setMoreObjectsAvailable(true);
++            if (nextRequest != null) {
++                cursorToModify.setMoreObjectsAvailable(true);
++            } else {
++                cursorToModify.setMoreObjectsAvailable(false);
++            }
+         }
+ 
+         if (!haveData) {
+diff --git a/facebook/src/com/facebook/widget/PickerFragment.java b/facebook/src/com/facebook/widget/PickerFragment.java
+index 7718a0c26..780fdfa9f 100644
+--- a/facebook/src/com/facebook/widget/PickerFragment.java
++++ b/facebook/src/com/facebook/widget/PickerFragment.java
+@@ -903,7 +903,7 @@ public void clearResults() {
+ 
+         public void startLoading(Request request) {
+             if (loader != null) {
+-                loader.startLoading(request, true);
++                loader.startLoading(request, canSkipRoundTripIfCached());
+                 onStartLoading(loader, request);
+             }
+         }
+@@ -927,6 +927,10 @@ protected void onLoadReset(GraphObjectPagingLoader<T> loader) {
+         protected void onLoadFinished(GraphObjectPagingLoader<T> loader, SimpleGraphObjectCursor<T> data) {
+             updateAdapter(data);
+         }
++
++        protected boolean canSkipRoundTripIfCached() {
++            return true;
++        }
+     }
+ 
+     abstract class SelectionStrategy {
+diff --git a/gradle.properties b/gradle.properties
+index 87cbf0481..108d7588e 100644
+--- a/gradle.properties
++++ b/gradle.properties
+@@ -2,4 +2,4 @@ ANDROID_BUILD_MIN_SDK_VERSION=8
+ ANDROID_BUILD_TARGET_SDK_VERSION=19
+ ANDROID_BUILD_TOOLS_VERSION=19.1.0
+ ANDROID_BUILD_SDK_VERSION=19
+-TEST_GOOGLE_PLAY=true
+\ No newline at end of file
++TEST_GOOGLE_PLAY=true
+diff --git a/gradle/wrapper/gradle-wrapper.properties b/gradle/wrapper/gradle-wrapper.properties
+index 56c0deed9..23bdf0c69 100644
+--- a/gradle/wrapper/gradle-wrapper.properties
++++ b/gradle/wrapper/gradle-wrapper.properties
+@@ -1,6 +1,6 @@
+-#Tue Apr 22 14:47:00 PDT 2014
++#Tue Jun 17 21:31:41 PDT 2014
+ distributionBase=GRADLE_USER_HOME
+ distributionPath=wrapper/dists
+ zipStoreBase=GRADLE_USER_HOME
+ zipStorePath=wrapper/dists
+-distributionUrl=http\://services.gradle.org/distributions/gradle-1.11-all.zip
++distributionUrl=http\://services.gradle.org/distributions/gradle-1.12-all.zip
+diff --git a/libs/android-support-v4.jar b/libs/android-support-v4.jar
+index 9056828a0..c31cede47 100644
+Binary files a/libs/android-support-v4.jar and b/libs/android-support-v4.jar differ
+diff --git a/samples/GraphApiSample/.classpath b/samples/GraphApiSample/.classpath
+deleted file mode 100644
+index 6ef980d36..000000000
+--- a/samples/GraphApiSample/.classpath
++++ /dev/null
+@@ -1,9 +0,0 @@
+-<?xml version="1.0" encoding="UTF-8"?>
+-<classpath>
+-	<classpathentry kind="src" path="src"/>
+-	<classpathentry kind="con" path="com.android.ide.eclipse.adt.ANDROID_FRAMEWORK"/>
+-	<classpathentry exported="true" kind="con" path="com.android.ide.eclipse.adt.LIBRARIES"/>
+-	<classpathentry kind="src" path="gen"/>
+-	<classpathentry exported="true" kind="con" path="com.android.ide.eclipse.adt.DEPENDENCIES"/>
+-	<classpathentry kind="output" path="bin/classes"/>
+-</classpath>
+diff --git a/samples/GraphApiSample/.project b/samples/GraphApiSample/.project
+deleted file mode 100644
+index ff735cf87..000000000
+--- a/samples/GraphApiSample/.project
++++ /dev/null
+@@ -1,40 +0,0 @@
+-<?xml version="1.0" encoding="UTF-8"?>
+-<projectDescription>
+-	<name>GraphApiSample</name>
+-	<comment></comment>
+-	<projects>
+-	</projects>
+-	<buildSpec>
+-		<buildCommand>
+-			<name>com.android.ide.eclipse.adt.ResourceManagerBuilder</name>
+-			<arguments>
+-			</arguments>
+-		</buildCommand>
+-		<buildCommand>
+-			<name>com.android.ide.eclipse.adt.PreCompilerBuilder</name>
+-			<arguments>
+-			</arguments>
+-		</buildCommand>
+-		<buildCommand>
+-			<name>org.eclipse.jdt.core.javabuilder</name>
+-			<arguments>
+-			</arguments>
+-		</buildCommand>
+-		<buildCommand>
+-			<name>com.android.ide.eclipse.adt.ApkBuilder</name>
+-			<arguments>
+-			</arguments>
+-		</buildCommand>
+-	</buildSpec>
+-	<natures>
+-		<nature>com.android.ide.eclipse.adt.AndroidNature</nature>
+-		<nature>org.eclipse.jdt.core.javanature</nature>
+-	</natures>
+-        <linkedResources>
+-                <link>
+-                        <name>libs</name>
+-                        <type>2</type>
+-                        <locationURI>PARENT-2-PROJECT_LOC/libs</locationURI>
+-                </link>
+-        </linkedResources>
+-</projectDescription>
+diff --git a/samples/GraphApiSample/AndroidManifest.xml b/samples/GraphApiSample/AndroidManifest.xml
+deleted file mode 100644
+index 3647ce9a0..000000000
+--- a/samples/GraphApiSample/AndroidManifest.xml
++++ /dev/null
+@@ -1,28 +0,0 @@
+-<?xml version="1.0" encoding="utf-8"?>
+-<manifest xmlns:android="http://schemas.android.com/apk/res/android"
+-    package="com.facebook.samples.graphapi"
+-    android:versionCode="1"
+-    android:versionName="1.0" >
+-
+-    <uses-sdk android:minSdkVersion="8" />
+-    <uses-permission android:name="android.permission.INTERNET"/>
+-
+-    <application
+-        android:icon="@drawable/icon"
+-        android:label="@string/app_name" >
+-        <activity
+-            android:name=".GraphApiSampleActivity"
+-            android:label="@string/app_name"
+-            android:windowSoftInputMode="adjustResize">
+-            <intent-filter>
+-                <action android:name="android.intent.action.MAIN" />
+-
+-                <category android:name="android.intent.category.LAUNCHER" />
+-            </intent-filter>
+-        </activity>
+-        <activity android:name="com.facebook.LoginActivity"
+-                  android:theme="@android:style/Theme.Translucent.NoTitleBar"
+-                  android:label="@string/app_name" />
+-    </application>
+-
+-</manifest>
+diff --git a/samples/GraphApiSample/ant.properties b/samples/GraphApiSample/ant.properties
+deleted file mode 100644
+index 939105d52..000000000
+--- a/samples/GraphApiSample/ant.properties
++++ /dev/null
+@@ -1,18 +0,0 @@
+-# This file is used to override default values used by the Ant build system.
+-#
+-# This file must be checked into Version Control Systems, as it is
+-# integral to the build system of your project.
+-
+-# This file is only used by the Ant script.
+-
+-# You can use this to override default values such as
+-#  'source.dir' for the location of your java source folder and
+-#  'out.dir' for the location of your output folder.
+-
+-# You can also use it define how the release builds are signed by declaring
+-# the following properties:
+-#  'key.store' for the location of your keystore and
+-#  'key.alias' for the name of the key to use.
+-# The password will be asked during the build when you use the 'release' target.
+-
+-java.compilerargs=-Xlint -Werror
+diff --git a/samples/GraphApiSample/build.gradle b/samples/GraphApiSample/build.gradle
+deleted file mode 100644
+index b76fed903..000000000
+--- a/samples/GraphApiSample/build.gradle
++++ /dev/null
+@@ -1,27 +0,0 @@
+-apply plugin: 'android'
+-
+-dependencies {
+-    compile project(':facebook')
+-}
+-
+-android {
+-    compileSdkVersion Integer.parseInt(project.ANDROID_BUILD_SDK_VERSION)
+-    buildToolsVersion project.ANDROID_BUILD_TOOLS_VERSION
+-
+-    defaultConfig {
+-        minSdkVersion Integer.parseInt(project.ANDROID_BUILD_MIN_SDK_VERSION)
+-        targetSdkVersion Integer.parseInt(project.ANDROID_BUILD_TARGET_SDK_VERSION)
+-    }
+-
+-    lintOptions {
+-        abortOnError false
+-    }
+-
+-    sourceSets {
+-        main {
+-            manifest.srcFile 'AndroidManifest.xml'
+-            java.srcDirs = ['src']
+-            res.srcDirs = ['res']
+-        }
+-    }
+-}
+diff --git a/samples/GraphApiSample/build.xml b/samples/GraphApiSample/build.xml
+deleted file mode 100644
+index b2456a58c..000000000
+--- a/samples/GraphApiSample/build.xml
++++ /dev/null
+@@ -1,92 +0,0 @@
+-<?xml version="1.0" encoding="UTF-8"?>
+-<project name="GraphApiSample" default="help">
+-
+-    <!-- The local.properties file is created and updated by the 'android' tool.
+-         It contains the path to the SDK. It should *NOT* be checked into
+-         Version Control Systems. -->
+-    <property file="local.properties" />
+-
+-    <!-- The ant.properties file can be created by you. It is only edited by the
+-         'android' tool to add properties to it.
+-         This is the place to change some Ant specific build properties.
+-         Here are some properties you may want to change/update:
+-
+-         source.dir
+-             The name of the source directory. Default is 'src'.
+-         out.dir
+-             The name of the output directory. Default is 'bin'.
+-
+-         For other overridable properties, look at the beginning of the rules
+-         files in the SDK, at tools/ant/build.xml
+-
+-         Properties related to the SDK location or the project target should
+-         be updated using the 'android' tool with the 'update' action.
+-
+-         This file is an integral part of the build system for your
+-         application and should be checked into Version Control Systems.
+-
+-         -->
+-    <property file="ant.properties" />
+-
+-    <!-- if sdk.dir was not set from one of the property file, then
+-         get it from the ANDROID_HOME env var.
+-         This must be done before we load project.properties since
+-         the proguard config can use sdk.dir -->
+-    <property environment="env" />
+-    <condition property="sdk.dir" value="${env.ANDROID_HOME}">
+-        <isset property="env.ANDROID_HOME" />
+-    </condition>
+-
+-    <!-- The project.properties file is created and updated by the 'android'
+-         tool, as well as ADT.
+-
+-         This contains project specific properties such as project target, and library
+-         dependencies. Lower level build properties are stored in ant.properties
+-         (or in .classpath for Eclipse projects).
+-
+-         This file is an integral part of the build system for your
+-         application and should be checked into Version Control Systems. -->
+-    <loadproperties srcFile="project.properties" />
+-
+-    <!-- quick check on sdk.dir -->
+-    <fail
+-            message="sdk.dir is missing. Make sure to generate local.properties using 'android update project' or to inject it through the ANDROID_HOME environment variable."
+-            unless="sdk.dir"
+-    />
+-
+-    <!--
+-        Import per project custom build rules if present at the root of the project.
+-        This is the place to put custom intermediary targets such as:
+-            -pre-build
+-            -pre-compile
+-            -post-compile (This is typically used for code obfuscation.
+-                           Compiled code location: ${out.classes.absolute.dir}
+-                           If this is not done in place, override ${out.dex.input.absolute.dir})
+-            -post-package
+-            -post-build
+-            -pre-clean
+-    -->
+-    <import file="custom_rules.xml" optional="true" />
+-
+-    <!-- Import the actual build file.
+-
+-         To customize existing targets, there are two options:
+-         - Customize only one target:
+-             - copy/paste the target into this file, *before* the
+-               <import> task.
+-             - customize it to your needs.
+-         - Customize the whole content of build.xml
+-             - copy/paste the content of the rules files (minus the top node)
+-               into this file, replacing the <import> task.
+-             - customize to your needs.
+-
+-         ***********************
+-         ****** IMPORTANT ******
+-         ***********************
+-         In all cases you must update the value of version-tag below to read 'custom' instead of an integer,
+-         in order to avoid having your file be overridden by tools such as "android update project"
+-    -->
+-    <!-- version-tag: 1 -->
+-    <import file="${sdk.dir}/tools/ant/build.xml" />
+-
+-</project>
+diff --git a/samples/GraphApiSample/proguard-project.txt b/samples/GraphApiSample/proguard-project.txt
+deleted file mode 100644
+index f2fe1559a..000000000
+--- a/samples/GraphApiSample/proguard-project.txt
++++ /dev/null
+@@ -1,20 +0,0 @@
+-# To enable ProGuard in your project, edit project.properties
+-# to define the proguard.config property as described in that file.
+-#
+-# Add project specific ProGuard rules here.
+-# By default, the flags in this file are appended to flags specified
+-# in ${sdk.dir}/tools/proguard/proguard-android.txt
+-# You can edit the include path and order by changing the ProGuard
+-# include property in project.properties.
+-#
+-# For more details, see
+-#   http://developer.android.com/guide/developing/tools/proguard.html
+-
+-# Add any project specific keep options here:
+-
+-# If your project uses WebView with JS, uncomment the following
+-# and specify the fully qualified class name to the JavaScript interface
+-# class:
+-#-keepclassmembers class fqcn.of.javascript.interface.for.webview {
+-#   public *;
+-#}
+diff --git a/samples/GraphApiSample/project.properties b/samples/GraphApiSample/project.properties
+deleted file mode 100644
+index cee0509c6..000000000
+--- a/samples/GraphApiSample/project.properties
++++ /dev/null
+@@ -1,15 +0,0 @@
+-# This file is automatically generated by Android Tools.
+-# Do not modify this file -- YOUR CHANGES WILL BE ERASED!
+-#
+-# This file must be checked in Version Control Systems.
+-#
+-# To customize properties used by the Ant build system edit
+-# "ant.properties", and override values to adapt the script to your
+-# project structure.
+-#
+-# To enable ProGuard to shrink and obfuscate your code, uncomment this (available properties: sdk.dir, user.home):
+-#proguard.config=${sdk.dir}/tools/proguard/proguard-android.txt:proguard-project.txt
+-
+-# Project target.
+-target=android-8
+-android.library.reference.1=../../facebook
+diff --git a/samples/GraphApiSample/res/drawable-hdpi/icon.png b/samples/GraphApiSample/res/drawable-hdpi/icon.png
+deleted file mode 100644
+index a888af1c6..000000000
+Binary files a/samples/GraphApiSample/res/drawable-hdpi/icon.png and /dev/null differ
+diff --git a/samples/GraphApiSample/res/drawable-mdpi/icon.png b/samples/GraphApiSample/res/drawable-mdpi/icon.png
+deleted file mode 100644
+index 2275c8571..000000000
+Binary files a/samples/GraphApiSample/res/drawable-mdpi/icon.png and /dev/null differ
+diff --git a/samples/GraphApiSample/res/drawable-xhdpi/icon.png b/samples/GraphApiSample/res/drawable-xhdpi/icon.png
+deleted file mode 100644
+index 31201f160..000000000
+Binary files a/samples/GraphApiSample/res/drawable-xhdpi/icon.png and /dev/null differ
+diff --git a/samples/GraphApiSample/res/drawable/icon.png b/samples/GraphApiSample/res/drawable/icon.png
+deleted file mode 100644
+index 2275c8571..000000000
+Binary files a/samples/GraphApiSample/res/drawable/icon.png and /dev/null differ
+diff --git a/samples/GraphApiSample/res/layout/main.xml b/samples/GraphApiSample/res/layout/main.xml
+deleted file mode 100644
+index 8ebf7e229..000000000
+--- a/samples/GraphApiSample/res/layout/main.xml
++++ /dev/null
+@@ -1,44 +0,0 @@
+-<?xml version="1.0" encoding="utf-8"?>
+-<!--
+-    Copyright 2010-present Facebook.
+-
+-    Licensed under the Apache License, Version 2.0 (the "License");
+-    you may not use this file except in compliance with the License.
+-    You may obtain a copy of the License at
+-
+-       http://www.apache.org/licenses/LICENSE-2.0
+-
+-    Unless required by applicable law or agreed to in writing, software
+-    distributed under the License is distributed on an "AS IS" BASIS,
+-    WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+-    See the License for the specific language governing permissions and
+-    limitations under the License.
+--->
+-
+-<LinearLayout xmlns:android="http://schemas.android.com/apk/res/android"
+-    android:layout_width="fill_parent"
+-    android:layout_height="fill_parent"
+-    android:orientation="vertical" >
+-
+-    <EditText
+-        android:id="@+id/editRequests"
+-        android:layout_width="match_parent"
+-        android:layout_height="wrap_content"
+-        android:ems="10" >
+-
+-        <requestFocus />
+-    </EditText>
+-
+-    <Button
+-        android:id="@+id/buttonRequest"
+-        android:layout_width="122dp"
+-        android:layout_height="wrap_content"
+-        android:text="@string/request" />
+-
+-    <TextView
+-        android:id="@+id/textViewResults"
+-        android:layout_width="match_parent"
+-        android:layout_height="match_parent"
+-        android:textAppearance="?android:attr/textAppearanceLarge" />
+-
+-</LinearLayout>
+diff --git a/samples/GraphApiSample/res/values/strings.xml b/samples/GraphApiSample/res/values/strings.xml
+deleted file mode 100644
+index 025d17499..000000000
+--- a/samples/GraphApiSample/res/values/strings.xml
++++ /dev/null
+@@ -1,28 +0,0 @@
+-<?xml version="1.0" encoding="utf-8"?>
+-<!--
+-    Copyright 2010-present Facebook.
+-
+-    Licensed under the Apache License, Version 2.0 (the "License");
+-    you may not use this file except in compliance with the License.
+-    You may obtain a copy of the License at
+-
+-       http://www.apache.org/licenses/LICENSE-2.0
+-
+-    Unless required by applicable law or agreed to in writing, software
+-    distributed under the License is distributed on an "AS IS" BASIS,
+-    WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+-    See the License for the specific language governing permissions and
+-    limitations under the License.
+--->
+-
+-<resources>
+-
+-    <string name="hello">Hello World, GraphApiSampleActivity!</string>
+-    <string name="app_name">GraphApiSample</string>
+-    <string name="request">Request</string>
+-    <string name="instructions">Login to create a link to fetch account data</string>
+-    <string name="logout">Log out</string>
+-    <string name="login_failed_dialog_title">Login failed</string>
+-    <string name="ok_button">OK</string>
+-
+-</resources>
+diff --git a/samples/GraphApiSample/src/com/facebook/samples/graphapi/GraphApiSampleActivity.java b/samples/GraphApiSample/src/com/facebook/samples/graphapi/GraphApiSampleActivity.java
+deleted file mode 100644
+index dfb0cbd69..000000000
+--- a/samples/GraphApiSample/src/com/facebook/samples/graphapi/GraphApiSampleActivity.java
++++ /dev/null
+@@ -1,155 +0,0 @@
+-/**
+- * Copyright 2010-present Facebook.
+- *
+- * Licensed under the Apache License, Version 2.0 (the "License");
+- * you may not use this file except in compliance with the License.
+- * You may obtain a copy of the License at
+- *
+- *    http://www.apache.org/licenses/LICENSE-2.0
+- *
+- * Unless required by applicable law or agreed to in writing, software
+- * distributed under the License is distributed on an "AS IS" BASIS,
+- * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+- * See the License for the specific language governing permissions and
+- * limitations under the License.
+- */
+-
+-package com.facebook.samples.graphapi;
+-
+-import android.app.Activity;
+-import android.app.AlertDialog;
+-import android.content.Intent;
+-import android.os.Bundle;
+-import android.view.View;
+-import android.view.View.OnClickListener;
+-import android.widget.Button;
+-import android.widget.EditText;
+-import android.widget.TextView;
+-import com.facebook.*;
+-import com.facebook.Session.StatusCallback;
+-import com.facebook.model.GraphObject;
+-
+-import java.util.ArrayList;
+-import java.util.List;
+-
+-public class GraphApiSampleActivity extends Activity {
+-    static final String APP_ID = "307234779396415";
+-    static final String PENDING_REQUEST_BUNDLE_KEY = "com.facebook.samples.graphapi:PendingRequest";
+-
+-    Button buttonRequest;
+-    EditText editRequests;
+-    TextView textViewResults;
+-    Session session;
+-    boolean pendingRequest;
+-
+-    @Override
+-    public void onCreate(Bundle savedInstanceState) {
+-        super.onCreate(savedInstanceState);
+-        setContentView(R.layout.main);
+-        this.buttonRequest = (Button) findViewById(R.id.buttonRequest);
+-        this.buttonRequest.setOnClickListener(new OnClickListener() {
+-            public void onClick(View view) {
+-                onClickRequest();
+-            }
+-        });
+-        this.editRequests = (EditText) findViewById(R.id.editRequests);
+-        this.textViewResults = (TextView) findViewById(R.id.textViewResults);
+-
+-        this.session = createSession();
+-        Settings.addLoggingBehavior(LoggingBehavior.INCLUDE_ACCESS_TOKENS);
+-    }
+-
+-    public void onActivityResult(int requestCode, int resultCode, Intent data) {
+-        if (this.session.onActivityResult(this, requestCode, resultCode, data) &&
+-                pendingRequest &&
+-                this.session.getState().isOpened()) {
+-            sendRequests();
+-        }
+-    }
+-
+-    @Override
+-    protected void onResume() {
+-        super.onResume();
+-
+-        // Call the 'activateApp' method to log an app event for use in analytics and advertising reporting.  Do so in
+-        // the onResume methods of the primary Activities that an app may be launched into.
+-        AppEventsLogger.activateApp(this, APP_ID);
+-    }
+-
+-    @Override
+-    protected void onRestoreInstanceState(Bundle savedInstanceState) {
+-        super.onRestoreInstanceState(savedInstanceState);
+-
+-        pendingRequest = savedInstanceState.getBoolean(PENDING_REQUEST_BUNDLE_KEY, pendingRequest);
+-    }
+-
+-    @Override
+-    protected void onSaveInstanceState(Bundle outState) {
+-        super.onSaveInstanceState(outState);
+-
+-        outState.putBoolean(PENDING_REQUEST_BUNDLE_KEY, pendingRequest);
+-    }
+-
+-    private void onClickRequest() {
+-        if (this.session.isOpened()) {
+-            sendRequests();
+-        } else {
+-            StatusCallback callback = new StatusCallback() {
+-                public void call(Session session, SessionState state, Exception exception) {
+-                    if (exception != null) {
+-                        new AlertDialog.Builder(GraphApiSampleActivity.this)
+-                                .setTitle(R.string.login_failed_dialog_title)
+-                                .setMessage(exception.getMessage())
+-                                .setPositiveButton(R.string.ok_button, null)
+-                                .show();
+-                        GraphApiSampleActivity.this.session = createSession();
+-                    } else if (session.isOpened()) {
+-                        sendRequests();
+-                    }
+-                }
+-            };
+-            pendingRequest = true;
+-            this.session.openForRead(new Session.OpenRequest(this).setCallback(callback));
+-        }
+-    }
+-
+-    private void sendRequests() {
+-        textViewResults.setText("");
+-
+-        String requestIdsText = editRequests.getText().toString();
+-        String[] requestIds = requestIdsText.split(",");
+-
+-        List<Request> requests = new ArrayList<Request>();
+-        for (final String requestId : requestIds) {
+-            requests.add(new Request(session, requestId, null, null, new Request.Callback() {
+-                public void onCompleted(Response response) {
+-                    GraphObject graphObject = response.getGraphObject();
+-                    FacebookRequestError error = response.getError();
+-                    String s = textViewResults.getText().toString();
+-                    if (graphObject != null) {
+-                        if (graphObject.getProperty("id") != null) {
+-                            s = s + String.format("%s: %s\n", graphObject.getProperty("id"), graphObject.getProperty(
+-                                    "name"));
+-                        } else {
+-                            s = s + String.format("%s: <no such id>\n", requestId);
+-                        }
+-                    } else if (error != null) {
+-                        s = s + String.format("Error: %s", error.getErrorMessage());
+-                    }
+-                    textViewResults.setText(s);
+-                }
+-            }));
+-        }
+-        pendingRequest = false;
+-        Request.executeBatchAsync(requests);
+-    }
+-
+-    private Session createSession() {
+-        Session activeSession = Session.getActiveSession();
+-        if (activeSession == null || activeSession.getState().isClosed()) {
+-            activeSession = new Session.Builder(this).setApplicationId(APP_ID).build();
+-            Session.setActiveSession(activeSession);
+-        }
+-        return activeSession;
+-    }
+-}
+diff --git a/samples/ProfilePictureSample/.classpath b/samples/ProfilePictureSample/.classpath
+deleted file mode 100644
+index 6ef980d36..000000000
+--- a/samples/ProfilePictureSample/.classpath
++++ /dev/null
+@@ -1,9 +0,0 @@
+-<?xml version="1.0" encoding="UTF-8"?>
+-<classpath>
+-	<classpathentry kind="src" path="src"/>
+-	<classpathentry kind="con" path="com.android.ide.eclipse.adt.ANDROID_FRAMEWORK"/>
+-	<classpathentry exported="true" kind="con" path="com.android.ide.eclipse.adt.LIBRARIES"/>
+-	<classpathentry kind="src" path="gen"/>
+-	<classpathentry exported="true" kind="con" path="com.android.ide.eclipse.adt.DEPENDENCIES"/>
+-	<classpathentry kind="output" path="bin/classes"/>
+-</classpath>
+diff --git a/samples/ProfilePictureSample/.project b/samples/ProfilePictureSample/.project
+deleted file mode 100644
+index 2b2339321..000000000
+--- a/samples/ProfilePictureSample/.project
++++ /dev/null
+@@ -1,40 +0,0 @@
+-<?xml version="1.0" encoding="UTF-8"?>
+-<projectDescription>
+-	<name>ProfilePictureSample</name>
+-	<comment></comment>
+-	<projects>
+-	</projects>
+-	<buildSpec>
+-		<buildCommand>
+-			<name>com.android.ide.eclipse.adt.ResourceManagerBuilder</name>
+-			<arguments>
+-			</arguments>
+-		</buildCommand>
+-		<buildCommand>
+-			<name>com.android.ide.eclipse.adt.PreCompilerBuilder</name>
+-			<arguments>
+-			</arguments>
+-		</buildCommand>
+-		<buildCommand>
+-			<name>org.eclipse.jdt.core.javabuilder</name>
+-			<arguments>
+-			</arguments>
+-		</buildCommand>
+-		<buildCommand>
+-			<name>com.android.ide.eclipse.adt.ApkBuilder</name>
+-			<arguments>
+-			</arguments>
+-		</buildCommand>
+-	</buildSpec>
+-	<natures>
+-		<nature>com.android.ide.eclipse.adt.AndroidNature</nature>
+-		<nature>org.eclipse.jdt.core.javanature</nature>
+-	</natures>
+-        <linkedResources>
+-                <link>
+-                        <name>libs</name>
+-                        <type>2</type>
+-                        <locationURI>PARENT-2-PROJECT_LOC/libs</locationURI>
+-                </link>
+-        </linkedResources>
+-</projectDescription>
+diff --git a/samples/ProfilePictureSample/AndroidManifest.xml b/samples/ProfilePictureSample/AndroidManifest.xml
+deleted file mode 100644
+index 907d05754..000000000
+--- a/samples/ProfilePictureSample/AndroidManifest.xml
++++ /dev/null
+@@ -1,21 +0,0 @@
+-<?xml version="1.0" encoding="utf-8"?>
+-<manifest xmlns:android="http://schemas.android.com/apk/res/android"
+-          package="com.facebook.samples.profilepicture"
+-          android:versionCode="1"
+-          android:versionName="1.0">
+-    <uses-sdk android:minSdkVersion="8"/>
+-    <uses-permission android:name="android.permission.INTERNET"/>
+-    <application android:label="@string/app_name"
+-                 android:icon="@drawable/icon" >
+-        <activity
+-                android:name=".ProfilePictureSampleActivity"
+-                android:label="@string/app_name"
+-                android:windowSoftInputMode="adjustResize">
+-            <intent-filter>
+-                <action android:name="android.intent.action.MAIN" />
+-
+-                <category android:name="android.intent.category.LAUNCHER" />
+-            </intent-filter>
+-        </activity>
+-    </application>
+-</manifest> 
+diff --git a/samples/ProfilePictureSample/ant.properties b/samples/ProfilePictureSample/ant.properties
+deleted file mode 100644
+index 939105d52..000000000
+--- a/samples/ProfilePictureSample/ant.properties
++++ /dev/null
+@@ -1,18 +0,0 @@
+-# This file is used to override default values used by the Ant build system.
+-#
+-# This file must be checked into Version Control Systems, as it is
+-# integral to the build system of your project.
+-
+-# This file is only used by the Ant script.
+-
+-# You can use this to override default values such as
+-#  'source.dir' for the location of your java source folder and
+-#  'out.dir' for the location of your output folder.
+-
+-# You can also use it define how the release builds are signed by declaring
+-# the following properties:
+-#  'key.store' for the location of your keystore and
+-#  'key.alias' for the name of the key to use.
+-# The password will be asked during the build when you use the 'release' target.
+-
+-java.compilerargs=-Xlint -Werror
+diff --git a/samples/ProfilePictureSample/build.gradle b/samples/ProfilePictureSample/build.gradle
+deleted file mode 100644
+index b76fed903..000000000
+--- a/samples/ProfilePictureSample/build.gradle
++++ /dev/null
+@@ -1,27 +0,0 @@
+-apply plugin: 'android'
+-
+-dependencies {
+-    compile project(':facebook')
+-}
+-
+-android {
+-    compileSdkVersion Integer.parseInt(project.ANDROID_BUILD_SDK_VERSION)
+-    buildToolsVersion project.ANDROID_BUILD_TOOLS_VERSION
+-
+-    defaultConfig {
+-        minSdkVersion Integer.parseInt(project.ANDROID_BUILD_MIN_SDK_VERSION)
+-        targetSdkVersion Integer.parseInt(project.ANDROID_BUILD_TARGET_SDK_VERSION)
+-    }
+-
+-    lintOptions {
+-        abortOnError false
+-    }
+-
+-    sourceSets {
+-        main {
+-            manifest.srcFile 'AndroidManifest.xml'
+-            java.srcDirs = ['src']
+-            res.srcDirs = ['res']
+-        }
+-    }
+-}
+diff --git a/samples/ProfilePictureSample/build.xml b/samples/ProfilePictureSample/build.xml
+deleted file mode 100644
+index 3454adc93..000000000
+--- a/samples/ProfilePictureSample/build.xml
++++ /dev/null
+@@ -1,92 +0,0 @@
+-<?xml version="1.0" encoding="UTF-8"?>
+-<project name="ProfilePictureSample" default="help">
+-
+-    <!-- The local.properties file is created and updated by the 'android' tool.
+-         It contains the path to the SDK. It should *NOT* be checked into
+-         Version Control Systems. -->
+-    <property file="local.properties"/>
+-
+-    <!-- The ant.properties file can be created by you. It is only edited by the
+-         'android' tool to add properties to it.
+-         This is the place to change some Ant specific build properties.
+-         Here are some properties you may want to change/update:
+-
+-         source.dir
+-             The name of the source directory. Default is 'src'.
+-         out.dir
+-             The name of the output directory. Default is 'bin'.
+-
+-         For other overridable properties, look at the beginning of the rules
+-         files in the SDK, at tools/ant/build.xml
+-
+-         Properties related to the SDK location or the project target should
+-         be updated using the 'android' tool with the 'update' action.
+-
+-         This file is an integral part of the build system for your
+-         application and should be checked into Version Control Systems.
+-
+-         -->
+-    <property file="ant.properties"/>
+-
+-    <!-- if sdk.dir was not set from one of the property file, then
+-         get it from the ANDROID_HOME env var.
+-         This must be done before we load project.properties since
+-         the proguard config can use sdk.dir -->
+-    <property environment="env"/>
+-    <condition property="sdk.dir" value="${env.ANDROID_HOME}">
+-        <isset property="env.ANDROID_HOME"/>
+-    </condition>
+-
+-    <!-- The project.properties file is created and updated by the 'android'
+-         tool, as well as ADT.
+-
+-         This contains project specific properties such as project target, and library
+-         dependencies. Lower level build properties are stored in ant.properties
+-         (or in .classpath for Eclipse projects).
+-
+-         This file is an integral part of the build system for your
+-         application and should be checked into Version Control Systems. -->
+-    <loadproperties srcFile="project.properties"/>
+-
+-    <!-- quick check on sdk.dir -->
+-    <fail
+-            message="sdk.dir is missing. Make sure to generate local.properties using 'android update project' or to inject it through the ANDROID_HOME environment variable."
+-            unless="sdk.dir"
+-            />
+-
+-    <!--
+-        Import per project custom build rules if present at the root of the project.
+-        This is the place to put custom intermediary targets such as:
+-            -pre-build
+-            -pre-compile
+-            -post-compile (This is typically used for code obfuscation.
+-                           Compiled code location: ${out.classes.absolute.dir}
+-                           If this is not done in place, override ${out.dex.input.absolute.dir})
+-            -post-package
+-            -post-build
+-            -pre-clean
+-    -->
+-    <import file="custom_rules.xml" optional="true"/>
+-
+-    <!-- Import the actual build file.
+-
+-         To customize existing targets, there are two options:
+-         - Customize only one target:
+-             - copy/paste the target into this file, *before* the
+-               <import> task.
+-             - customize it to your needs.
+-         - Customize the whole content of build.xml
+-             - copy/paste the content of the rules files (minus the top node)
+-               into this file, replacing the <import> task.
+-             - customize to your needs.
+-
+-         ***********************
+-         ****** IMPORTANT ******
+-         ***********************
+-         In all cases you must update the value of version-tag below to read 'custom' instead of an integer,
+-         in order to avoid having your file be overridden by tools such as "android update project"
+-    -->
+-    <!-- version-tag: 1 -->
+-    <import file="${sdk.dir}/tools/ant/build.xml"/>
+-
+-</project>
+diff --git a/samples/ProfilePictureSample/proguard-project.txt b/samples/ProfilePictureSample/proguard-project.txt
+deleted file mode 100644
+index f2fe1559a..000000000
+--- a/samples/ProfilePictureSample/proguard-project.txt
++++ /dev/null
+@@ -1,20 +0,0 @@
+-# To enable ProGuard in your project, edit project.properties
+-# to define the proguard.config property as described in that file.
+-#
+-# Add project specific ProGuard rules here.
+-# By default, the flags in this file are appended to flags specified
+-# in ${sdk.dir}/tools/proguard/proguard-android.txt
+-# You can edit the include path and order by changing the ProGuard
+-# include property in project.properties.
+-#
+-# For more details, see
+-#   http://developer.android.com/guide/developing/tools/proguard.html
+-
+-# Add any project specific keep options here:
+-
+-# If your project uses WebView with JS, uncomment the following
+-# and specify the fully qualified class name to the JavaScript interface
+-# class:
+-#-keepclassmembers class fqcn.of.javascript.interface.for.webview {
+-#   public *;
+-#}
+diff --git a/samples/ProfilePictureSample/project.properties b/samples/ProfilePictureSample/project.properties
+deleted file mode 100644
+index cee0509c6..000000000
+--- a/samples/ProfilePictureSample/project.properties
++++ /dev/null
+@@ -1,15 +0,0 @@
+-# This file is automatically generated by Android Tools.
+-# Do not modify this file -- YOUR CHANGES WILL BE ERASED!
+-#
+-# This file must be checked in Version Control Systems.
+-#
+-# To customize properties used by the Ant build system edit
+-# "ant.properties", and override values to adapt the script to your
+-# project structure.
+-#
+-# To enable ProGuard to shrink and obfuscate your code, uncomment this (available properties: sdk.dir, user.home):
+-#proguard.config=${sdk.dir}/tools/proguard/proguard-android.txt:proguard-project.txt
+-
+-# Project target.
+-target=android-8
+-android.library.reference.1=../../facebook
+diff --git a/samples/ProfilePictureSample/res/drawable-hdpi/icon.png b/samples/ProfilePictureSample/res/drawable-hdpi/icon.png
+deleted file mode 100644
+index 1bc72b1bf..000000000
+Binary files a/samples/ProfilePictureSample/res/drawable-hdpi/icon.png and /dev/null differ
+diff --git a/samples/ProfilePictureSample/res/drawable-mdpi/icon.png b/samples/ProfilePictureSample/res/drawable-mdpi/icon.png
+deleted file mode 100644
+index e0de1a4ba..000000000
+Binary files a/samples/ProfilePictureSample/res/drawable-mdpi/icon.png and /dev/null differ
+diff --git a/samples/ProfilePictureSample/res/drawable-xhdpi/icon.png b/samples/ProfilePictureSample/res/drawable-xhdpi/icon.png
+deleted file mode 100644
+index 1bc4b231d..000000000
+Binary files a/samples/ProfilePictureSample/res/drawable-xhdpi/icon.png and /dev/null differ
+diff --git a/samples/ProfilePictureSample/res/drawable/icon.png b/samples/ProfilePictureSample/res/drawable/icon.png
+deleted file mode 100644
+index e0de1a4ba..000000000
+Binary files a/samples/ProfilePictureSample/res/drawable/icon.png and /dev/null differ
+diff --git a/samples/ProfilePictureSample/res/layout/activity_profile_picture_sample.xml b/samples/ProfilePictureSample/res/layout/activity_profile_picture_sample.xml
+deleted file mode 100644
+index 8797e28be..000000000
+--- a/samples/ProfilePictureSample/res/layout/activity_profile_picture_sample.xml
++++ /dev/null
+@@ -1,23 +0,0 @@
+-<?xml version="1.0" encoding="utf-8"?>
+-<!--
+-    Copyright 2010-present Facebook.
+-
+-    Licensed under the Apache License, Version 2.0 (the "License");
+-    you may not use this file except in compliance with the License.
+-    You may obtain a copy of the License at
+-
+-       http://www.apache.org/licenses/LICENSE-2.0
+-
+-    Unless required by applicable law or agreed to in writing, software
+-    distributed under the License is distributed on an "AS IS" BASIS,
+-    WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+-    See the License for the specific language governing permissions and
+-    limitations under the License.
+--->
+-
+-<fragment xmlns:android="http://schemas.android.com/apk/res/android"
+-          android:id="@+id/profilePictureSampleFragment"
+-          android:layout_width="match_parent"
+-          android:layout_height="match_parent"
+-          android:name="com.facebook.samples.profilepicture.ProfilePictureSampleFragment"
+-        />
+diff --git a/samples/ProfilePictureSample/res/layout/fragment_profile_picture_sample.xml b/samples/ProfilePictureSample/res/layout/fragment_profile_picture_sample.xml
+deleted file mode 100644
+index 8bb4921c5..000000000
+--- a/samples/ProfilePictureSample/res/layout/fragment_profile_picture_sample.xml
++++ /dev/null
+@@ -1,152 +0,0 @@
+-<?xml version="1.0" encoding="utf-8"?>
+-<!--
+-    Copyright 2010-present Facebook.
+-
+-    Licensed under the Apache License, Version 2.0 (the "License");
+-    you may not use this file except in compliance with the License.
+-    You may obtain a copy of the License at
+-
+-       http://www.apache.org/licenses/LICENSE-2.0
+-
+-    Unless required by applicable law or agreed to in writing, software
+-    distributed under the License is distributed on an "AS IS" BASIS,
+-    WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+-    See the License for the specific language governing permissions and
+-    limitations under the License.
+--->
+-
+-<ScrollView xmlns:android="http://schemas.android.com/apk/res/android"
+-            xmlns:app="http://schemas.android.com/apk/res-auto"
+-        android:layout_width="match_parent"
+-        android:layout_height="match_parent"
+-        >
+-<LinearLayout
+-              android:orientation="vertical"
+-              android:layout_width="match_parent"
+-              android:layout_height="match_parent"
+-        >
+-    <TextView
+-            android:layout_width="match_parent"
+-            android:layout_height="wrap_content"
+-            android:text="@string/description"
+-            android:layout_marginBottom="15dp"
+-            />
+-    <LinearLayout
+-            android:layout_height="wrap_content"
+-            android:layout_width="match_parent"
+-            android:layout_marginBottom="15dp"
+-            android:orientation="horizontal">
+-        <LinearLayout
+-                android:id="@+id/presetSizeView"
+-                android:layout_height="wrap_content"
+-                android:layout_width="0dp"
+-                android:layout_weight="1"
+-                android:orientation="horizontal"
+-                >
+-            <Button
+-                    android:id="@+id/smallerButton"
+-                    android:layout_height="40dp"
+-                    android:layout_width="40dp"
+-                    android:layout_weight="0"
+-                    android:text="@string/smaller_button_text"
+-                    android:textSize="18dp"
+-                    />
+-            <Button
+-                    android:id="@+id/largerButton"
+-                    android:layout_height="40dp"
+-                    android:layout_width="40dp"
+-                    android:layout_weight="0"
+-                    android:text="@string/larger_button_text"
+-                    android:textSize="18dp"
+-                    android:enabled="false"
+-                    />
+-            <TextView
+-                    android:id="@+id/sizeLabel"
+-                    android:layout_height="40dp"
+-                    android:layout_width="0dp"
+-                    android:layout_weight="1"
+-                    android:paddingLeft="10dp"
+-                    android:text="@string/large_image_size"
+-                    android:textSize="18dp"
+-                    />
+-        </LinearLayout>
+-        <SeekBar
+-                android:id="@+id/customSizeView"
+-                android:layout_height="wrap_content"
+-                android:layout_width="0dp"
+-                android:layout_weight="1"
+-                android:orientation="horizontal"
+-                android:visibility="gone"
+-                />
+-        <Button
+-                android:id="@+id/sizeToggle"
+-                android:layout_width="wrap_content"
+-                android:layout_height="wrap_content"
+-                android:layout_marginLeft="10dp"
+-                android:text="@string/custom_size_button_text"
+-                />
+-    </LinearLayout>
+-    <LinearLayout
+-            android:orientation="horizontal"
+-            android:layout_width="match_parent"
+-            android:layout_height="wrap_content"
+-            android:layout_marginTop="10dp"
+-            android:layout_marginBottom="10dp"
+-            >
+-        <com.facebook.widget.ProfilePictureView
+-                android:id="@+id/profilepic"
+-                android:layout_height="wrap_content"
+-                android:layout_width="0dp"
+-                android:layout_weight="1"
+-                app:preset_size="large"
+-                app:is_cropped="true"
+-                />
+-        <LinearLayout
+-                android:id="@+id/userbuttoncontainer"
+-                android:orientation="vertical"
+-                android:layout_width="wrap_content"
+-                android:layout_height="wrap_content"
+-                android:layout_gravity="right"
+-                >
+-            <Button
+-                    android:layout_width="match_parent"
+-                    android:layout_height="wrap_content"
+-                    android:text="@string/user_chris_name"
+-                    android:tag="chris.lang.92123"
+-                    />
+-            <Button
+-                    android:layout_width="match_parent"
+-                    android:layout_height="wrap_content"
+-                    android:text="@string/user_ming_name"
+-                    android:tag="mingfli"
+-                    />
+-            <Button
+-                    android:layout_width="match_parent"
+-                    android:layout_height="wrap_content"
+-                    android:text="@string/user_karthik_name"
+-                    android:tag="ksubraman"
+-                    />
+-            <Button
+-                    android:layout_width="match_parent"
+-                    android:layout_height="wrap_content"
+-                    android:text="@string/user_random_name"
+-                    />
+-
+-            <Button
+-                    android:layout_width="match_parent"
+-                    android:layout_height="wrap_content"
+-                    android:text="@string/user_none_name"
+-                    android:tag=""
+-                    />
+-        </LinearLayout>
+-    </LinearLayout>
+-
+-    <CheckBox
+-            android:id="@+id/squareCropToggle"
+-            android:layout_width="wrap_content"
+-            android:layout_height="wrap_content"
+-            android:text="@string/cropping_label"
+-            android:checked="true"
+-            />
+-</LinearLayout>
+-</ScrollView>
+diff --git a/samples/ProfilePictureSample/res/values/strings.xml b/samples/ProfilePictureSample/res/values/strings.xml
+deleted file mode 100644
+index bde7903ad..000000000
+--- a/samples/ProfilePictureSample/res/values/strings.xml
++++ /dev/null
+@@ -1,36 +0,0 @@
+-<?xml version="1.0" encoding="utf-8"?>
+-<!--
+-    Copyright 2010-present Facebook.
+-
+-    Licensed under the Apache License, Version 2.0 (the "License");
+-    you may not use this file except in compliance with the License.
+-    You may obtain a copy of the License at
+-
+-       http://www.apache.org/licenses/LICENSE-2.0
+-
+-    Unless required by applicable law or agreed to in writing, software
+-    distributed under the License is distributed on an "AS IS" BASIS,
+-    WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+-    See the License for the specific language governing permissions and
+-    limitations under the License.
+--->
+-
+-<resources>
+-    <string name="app_name">ProfilePictureSample</string>
+-    <string name="description">Sample app demonstrating the use of ProfilePictureView</string>
+-    <string name="cropping_label">Show cropped version</string>
+-    <string name="crop_original_button_text">Original</string>
+-    <string name="crop_square_button_text">Square</string>
+-    <string name="user_chris_name">Chris</string>
+-    <string name="user_ming_name">Ming</string>
+-    <string name="user_karthik_name">Karthik</string>
+-    <string name="user_random_name">Random</string>
+-    <string name="user_none_name">None</string>
+-    <string name="smaller_button_text">-</string>
+-    <string name="larger_button_text">+</string>
+-    <string name="large_image_size">Large</string>
+-    <string name="normal_image_size">Normal</string>
+-    <string name="small_image_size">Small</string>
+-    <string name="preset_size_button_text">Use preset size</string>
+-    <string name="custom_size_button_text">Use custom size</string>
+-</resources>
+diff --git a/samples/ProfilePictureSample/src/com/facebook/samples/profilepicture/ProfilePictureSampleActivity.java b/samples/ProfilePictureSample/src/com/facebook/samples/profilepicture/ProfilePictureSampleActivity.java
+deleted file mode 100644
+index dc2b12efa..000000000
+--- a/samples/ProfilePictureSample/src/com/facebook/samples/profilepicture/ProfilePictureSampleActivity.java
++++ /dev/null
+@@ -1,28 +0,0 @@
+-/**
+- * Copyright 2010-present Facebook.
+- *
+- * Licensed under the Apache License, Version 2.0 (the "License");
+- * you may not use this file except in compliance with the License.
+- * You may obtain a copy of the License at
+- *
+- *    http://www.apache.org/licenses/LICENSE-2.0
+- *
+- * Unless required by applicable law or agreed to in writing, software
+- * distributed under the License is distributed on an "AS IS" BASIS,
+- * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+- * See the License for the specific language governing permissions and
+- * limitations under the License.
+- */
+-
+-package com.facebook.samples.profilepicture;
+-
+-import android.os.Bundle;
+-import android.support.v4.app.FragmentActivity;
+-
+-public class ProfilePictureSampleActivity extends FragmentActivity {
+-    @Override
+-    public void onCreate(Bundle savedInstanceState) {
+-        super.onCreate(savedInstanceState);
+-        setContentView(R.layout.activity_profile_picture_sample);
+-    }
+-}
+diff --git a/samples/ProfilePictureSample/src/com/facebook/samples/profilepicture/ProfilePictureSampleFragment.java b/samples/ProfilePictureSample/src/com/facebook/samples/profilepicture/ProfilePictureSampleFragment.java
+deleted file mode 100644
+index b80ca2eff..000000000
+--- a/samples/ProfilePictureSample/src/com/facebook/samples/profilepicture/ProfilePictureSampleFragment.java
++++ /dev/null
+@@ -1,314 +0,0 @@
+-/**
+- * Copyright 2010-present Facebook.
+- *
+- * Licensed under the Apache License, Version 2.0 (the "License");
+- * you may not use this file except in compliance with the License.
+- * You may obtain a copy of the License at
+- *
+- *    http://www.apache.org/licenses/LICENSE-2.0
+- *
+- * Unless required by applicable law or agreed to in writing, software
+- * distributed under the License is distributed on an "AS IS" BASIS,
+- * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+- * See the License for the specific language governing permissions and
+- * limitations under the License.
+- */
+-
+-package com.facebook.samples.profilepicture;
+-
+-import android.os.Bundle;
+-import android.support.v4.app.Fragment;
+-import android.view.LayoutInflater;
+-import android.view.View;
+-import android.view.ViewGroup;
+-import android.widget.*;
+-import com.facebook.widget.ProfilePictureView;
+-
+-import java.util.Date;
+-import java.util.Random;
+-
+-public class ProfilePictureSampleFragment extends Fragment {
+-
+-    // Keeping the number of custom sizes low to prevent excessive network chatter.
+-    private static final int MAX_CUSTOM_SIZES = 6;
+-    private static final int DEFAULT_SIZE_INCREMENT = MAX_CUSTOM_SIZES / 2;
+-    private static final String PICTURE_SIZE_TYPE_KEY = "PictureSizeType";
+-
+-    private static final String[] INTERESTING_IDS = {
+-        "zuck",
+-        // Recent Presidents and nominees
+-        "barackobama",
+-        "mittromney",
+-        "johnmccain",
+-        "johnkerry",
+-        "georgewbush",
+-        "algore",
+-        // Places too!
+-        "Disneyland",
+-        "SpaceNeedle",
+-        "TourEiffel",
+-        "sydneyoperahouse",
+-        // A selection of 1986 Mets
+-        "166020963458360",
+-        "108084865880237",
+-        "140447466087679",
+-        "111825495501392",
+-        // The cast of Saved by the Bell
+-        "108168249210849",
+-        "TiffaniThiessen",
+-        "108126672542534",
+-        "112886105391693",
+-        "MarioLopezExtra",
+-        "108504145837165",
+-        "dennishaskins",
+-        // Eighties bands that have been to Moscow
+-        "7220821999",
+-        "31938132882",
+-        "108023262558391",
+-        "209263392372",
+-        "104132506290482",
+-        "9721897972",
+-        "5461947317",
+-        "57084011597",
+-        // Three people that have never been in my kitchen
+-        "24408579964",
+-        "111980872152571",
+-        "112427772106500",
+-        // Trusted anchormen
+-        "113415525338717",
+-        "105628452803615",
+-        "105533779480538",
+-    };
+-
+-    private int pictureSizeType = ProfilePictureView.CUSTOM;
+-    private String firstUserId;
+-    private Random randomGenerator;
+-
+-    private ProfilePictureView profilePic;
+-    private Button smallerButton;
+-    private Button largerButton;
+-    private TextView sizeLabel;
+-    private View presetSizeView;
+-    private SeekBar customSizeView;
+-    private CheckBox cropToggle;
+-
+-    @Override
+-    public View onCreateView(LayoutInflater inflater, ViewGroup parent, Bundle savedInstanceState) {
+-        View fragmentView = inflater.inflate(R.layout.fragment_profile_picture_sample, parent, false);
+-
+-        randomGenerator = new Random((new Date()).getTime());
+-
+-        profilePic = (ProfilePictureView) fragmentView.findViewById(R.id.profilepic);
+-        smallerButton = (Button) fragmentView.findViewById(R.id.smallerButton);
+-        largerButton = (Button) fragmentView.findViewById(R.id.largerButton);
+-        sizeLabel = (TextView) fragmentView.findViewById(R.id.sizeLabel);
+-        presetSizeView = fragmentView.findViewById(R.id.presetSizeView);
+-        customSizeView = (SeekBar) fragmentView.findViewById(R.id.customSizeView);
+-        cropToggle = (CheckBox) fragmentView.findViewById(R.id.squareCropToggle);
+-
+-        LinearLayout container = (LinearLayout) fragmentView.findViewById(R.id.userbuttoncontainer);
+-        int numChildren = container.getChildCount();
+-        for (int i = 0; i < numChildren; i++) {
+-            View childView = container.getChildAt(i);
+-            Object tag = childView.getTag();
+-            if (childView instanceof Button) {
+-                setupUserButton((Button)childView);
+-                if (i == 0) {
+-                    // Initialize the image to the first user
+-                    firstUserId = tag.toString();
+-                }
+-            }
+-        }
+-
+-        cropToggle.setOnCheckedChangeListener(new CheckBox.OnCheckedChangeListener() {
+-            @Override
+-            public void onCheckedChanged(CompoundButton checkbox, boolean checked) {
+-                profilePic.setCropped(checked);
+-            }
+-        });
+-
+-        final Button sizeToggle = (Button) fragmentView.findViewById(R.id.sizeToggle);
+-        sizeToggle.setOnClickListener(new View.OnClickListener() {
+-            @Override
+-            public void onClick(View view) {
+-                if (pictureSizeType != ProfilePictureView.CUSTOM) {
+-                    sizeToggle.setText(R.string.preset_size_button_text);
+-                    switchToCustomSize();
+-                } else {
+-                    sizeToggle.setText(R.string.custom_size_button_text);
+-                    switchToPresetSize(ProfilePictureView.LARGE);
+-                }
+-            }
+-        });
+-
+-        smallerButton.setOnClickListener(new View.OnClickListener() {
+-            @Override
+-            public void onClick(View view) {
+-                switch(profilePic.getPresetSize()) {
+-                    case ProfilePictureView.LARGE:
+-                        switchToPresetSize(ProfilePictureView.NORMAL);
+-                        break;
+-                    case ProfilePictureView.NORMAL:
+-                        switchToPresetSize(ProfilePictureView.SMALL);
+-                        break;
+-                }
+-            }
+-        });
+-
+-        largerButton.setOnClickListener(new View.OnClickListener() {
+-            @Override
+-            public void onClick(View view) {
+-                switch(profilePic.getPresetSize()) {
+-                    case ProfilePictureView.NORMAL:
+-                        switchToPresetSize(ProfilePictureView.LARGE);
+-                        break;
+-                    case ProfilePictureView.SMALL:
+-                        switchToPresetSize(ProfilePictureView.NORMAL);
+-                        break;
+-                }
+-            }
+-        });
+-
+-        // We will fetch a new image for each change in the SeekBar. So keeping the count low
+-        // to prevent too much network chatter. SeekBar reports 0-max, so we will get max+1
+-        // notifications of change.
+-        customSizeView.setMax(MAX_CUSTOM_SIZES);
+-        customSizeView.setOnSeekBarChangeListener(new SeekBar.OnSeekBarChangeListener() {
+-            @Override
+-            public void onProgressChanged(SeekBar seekBar, int i, boolean b) {
+-                updateProfilePicForCustomSizeIncrement(i);
+-            }
+-
+-            @Override
+-            public void onStartTrackingTouch(SeekBar seekBar) {
+-                // NO-OP
+-            }
+-
+-            @Override
+-            public void onStopTrackingTouch(SeekBar seekBar) {
+-                // NO-OP
+-            }
+-        });
+-
+-        restoreState(savedInstanceState);
+-
+-        return fragmentView;
+-    }
+-
+-    @Override
+-    public void onSaveInstanceState(Bundle outState) {
+-        super.onSaveInstanceState(outState);
+-
+-        // Store the size type since we will use that to switch the Fragment's UI
+-        // between CUSTOM & PRESET modes
+-        // Other state (userId & isCropped) will be saved/restored directly by
+-        // ProfilePictureView
+-        outState.putInt(PICTURE_SIZE_TYPE_KEY, pictureSizeType);
+-    }
+-
+-    private void restoreState(Bundle savedInstanceState) {
+-        if (savedInstanceState != null) {
+-            // Is we have saved state, restore the Fragment to it.
+-            // UserId & isCropped will be restored directly by ProfilePictureView
+-            pictureSizeType = savedInstanceState.getInt(
+-                    PICTURE_SIZE_TYPE_KEY, ProfilePictureView.LARGE);
+-
+-            if (pictureSizeType == ProfilePictureView.CUSTOM) {
+-                switchToCustomSize();
+-            } else {
+-                switchToPresetSize(pictureSizeType);
+-            }
+-        } else {
+-            // No saved state. Let's go to a default state
+-            switchToPresetSize(ProfilePictureView.LARGE);
+-            profilePic.setCropped(cropToggle.isChecked());
+-
+-            // Setting userId last so that only one network request is sent
+-            profilePic.setProfileId(firstUserId);
+-        }
+-    }
+-
+-    private void setupUserButton(Button b) {
+-        b.setOnClickListener(new Button.OnClickListener() {
+-            @Override
+-            public void onClick(View v) {
+-                Object tag = v.getTag();
+-                String userId = null;
+-                if (tag != null) {
+-                    userId = tag.toString();
+-                } else {
+-                    // Random id.
+-                    userId = INTERESTING_IDS[randomGenerator.nextInt(INTERESTING_IDS.length)];
+-                }
+-                profilePic.setProfileId(userId);
+-            }
+-        });
+-    }
+-
+-    private void switchToCustomSize() {
+-        pictureSizeType = ProfilePictureView.CUSTOM;
+-        presetSizeView.setVisibility(View.GONE);
+-        customSizeView.setVisibility(View.VISIBLE);
+-
+-        profilePic.setPresetSize(pictureSizeType);
+-
+-        customSizeView.setProgress(DEFAULT_SIZE_INCREMENT);
+-        updateProfilePicForCustomSizeIncrement(DEFAULT_SIZE_INCREMENT);
+-    }
+-
+-    private void switchToPresetSize(int sizeType) {
+-        customSizeView.setVisibility(View.GONE);
+-        presetSizeView.setVisibility(View.VISIBLE);
+-
+-        switch(sizeType) {
+-            case ProfilePictureView.SMALL:
+-                largerButton.setEnabled(true);
+-                smallerButton.setEnabled(false);
+-                sizeLabel.setText(R.string.small_image_size);
+-                pictureSizeType = sizeType;
+-                break;
+-            case ProfilePictureView.NORMAL:
+-                largerButton.setEnabled(true);
+-                smallerButton.setEnabled(true);
+-                sizeLabel.setText(R.string.normal_image_size);
+-                pictureSizeType = sizeType;
+-                break;
+-            case ProfilePictureView.LARGE:
+-            default:
+-                largerButton.setEnabled(false);
+-                smallerButton.setEnabled(true);
+-                sizeLabel.setText(R.string.large_image_size);
+-                pictureSizeType = ProfilePictureView.LARGE;
+-                break;
+-        }
+-
+-        LinearLayout.LayoutParams params = new LinearLayout.LayoutParams(
+-                0,
+-                ViewGroup.LayoutParams.WRAP_CONTENT,
+-                1
+-        );
+-
+-        profilePic.setLayoutParams(params);
+-        profilePic.setPresetSize(pictureSizeType);
+-    }
+-
+-    private void updateProfilePicForCustomSizeIncrement(int i) {
+-        if (pictureSizeType != ProfilePictureView.CUSTOM) {
+-            return;
+-        }
+-
+-        // This will ensure a minimum size of 51x68 and will scale the image at
+-        // a ratio of 3:4 (w:h) as the SeekBar is moved.
+-        //
+-        // Completely arbitrary
+-        //
+-        // NOTE: The numbers are in dips.
+-        float width = (i * 21) + 51;
+-        float height = (i * 28) + 68;
+-
+-        LinearLayout.LayoutParams params = new LinearLayout.LayoutParams(
+-                (int)(width * getResources().getDisplayMetrics().density),
+-                (int)(height * getResources().getDisplayMetrics().density));
+-        profilePic.setLayoutParams(params);
+-    }
+-}
+diff --git a/samples/Scrumptious/src/com/facebook/scrumptious/PickerActivity.java b/samples/Scrumptious/src/com/facebook/scrumptious/PickerActivity.java
+index f4e2d48d4..3522da5b2 100644
+--- a/samples/Scrumptious/src/com/facebook/scrumptious/PickerActivity.java
++++ b/samples/Scrumptious/src/com/facebook/scrumptious/PickerActivity.java
+@@ -72,6 +72,7 @@ public void onCreate(Bundle savedInstanceState) {
+         if (FRIEND_PICKER.equals(intentUri)) {
+             if (savedInstanceState == null) {
+                 friendPickerFragment = new FriendPickerFragment(args);
++                friendPickerFragment.setFriendPickerType(FriendPickerFragment.FriendPickerType.TAGGABLE_FRIENDS);
+             } else {
+                 friendPickerFragment = (FriendPickerFragment) manager.findFragmentById(R.id.picker_fragment);;
+             }
+diff --git a/samples/SessionLoginSample/.classpath b/samples/SessionLoginSample/.classpath
+deleted file mode 100644
+index 6ef980d36..000000000
+--- a/samples/SessionLoginSample/.classpath
++++ /dev/null
+@@ -1,9 +0,0 @@
+-<?xml version="1.0" encoding="UTF-8"?>
+-<classpath>
+-	<classpathentry kind="src" path="src"/>
+-	<classpathentry kind="con" path="com.android.ide.eclipse.adt.ANDROID_FRAMEWORK"/>
+-	<classpathentry exported="true" kind="con" path="com.android.ide.eclipse.adt.LIBRARIES"/>
+-	<classpathentry kind="src" path="gen"/>
+-	<classpathentry exported="true" kind="con" path="com.android.ide.eclipse.adt.DEPENDENCIES"/>
+-	<classpathentry kind="output" path="bin/classes"/>
+-</classpath>
+diff --git a/samples/SessionLoginSample/.project b/samples/SessionLoginSample/.project
+deleted file mode 100644
+index a6c125972..000000000
+--- a/samples/SessionLoginSample/.project
++++ /dev/null
+@@ -1,40 +0,0 @@
+-<?xml version="1.0" encoding="UTF-8"?>
+-<projectDescription>
+-	<name>SessionLoginSample</name>
+-	<comment></comment>
+-	<projects>
+-	</projects>
+-	<buildSpec>
+-		<buildCommand>
+-			<name>com.android.ide.eclipse.adt.ResourceManagerBuilder</name>
+-			<arguments>
+-			</arguments>
+-		</buildCommand>
+-		<buildCommand>
+-			<name>com.android.ide.eclipse.adt.PreCompilerBuilder</name>
+-			<arguments>
+-			</arguments>
+-		</buildCommand>
+-		<buildCommand>
+-			<name>org.eclipse.jdt.core.javabuilder</name>
+-			<arguments>
+-			</arguments>
+-		</buildCommand>
+-		<buildCommand>
+-			<name>com.android.ide.eclipse.adt.ApkBuilder</name>
+-			<arguments>
+-			</arguments>
+-		</buildCommand>
+-	</buildSpec>
+-	<natures>
+-		<nature>com.android.ide.eclipse.adt.AndroidNature</nature>
+-		<nature>org.eclipse.jdt.core.javanature</nature>
+-	</natures>
+-        <linkedResources>
+-                <link>
+-                        <name>libs</name>
+-                        <type>2</type>
+-                        <locationURI>PARENT-2-PROJECT_LOC/libs</locationURI>
+-                </link>
+-        </linkedResources>
+-</projectDescription>
+diff --git a/samples/SessionLoginSample/AndroidManifest.xml b/samples/SessionLoginSample/AndroidManifest.xml
+deleted file mode 100644
+index be2beb9be..000000000
+--- a/samples/SessionLoginSample/AndroidManifest.xml
++++ /dev/null
+@@ -1,36 +0,0 @@
+-<?xml version="1.0" encoding="utf-8"?>
+-<manifest xmlns:android="http://schemas.android.com/apk/res/android"
+-    package="com.facebook.samples.sessionlogin"
+-    android:versionCode="1"
+-    android:versionName="1.0" >
+-
+-    <uses-sdk android:minSdkVersion="8" />
+-    <uses-permission android:name="android.permission.INTERNET"/>
+-
+-    <application
+-        android:icon="@drawable/icon"
+-        android:label="@string/app_name" >
+-        <activity
+-            android:name=".SessionLoginSampleActivity"
+-            android:label="@string/app_name"
+-            android:windowSoftInputMode="adjustResize">
+-            <intent-filter>
+-                <action android:name="android.intent.action.MAIN" />
+-
+-                <category android:name="android.intent.category.LAUNCHER" />
+-            </intent-filter>
+-        </activity>
+-        <activity
+-                android:name=".LoginUsingActivityActivity">
+-        </activity>
+-        <activity
+-                android:name=".LoginUsingCustomFragmentActivity">
+-        </activity>
+-        <activity android:name="com.facebook.LoginActivity"
+-                  android:theme="@android:style/Theme.Translucent.NoTitleBar"
+-                  android:label="@string/app_name" />
+-        <activity android:name=".LoginUsingLoginFragmentActivity"/>
+-        <meta-data android:name="com.facebook.sdk.ApplicationId" android:value="@string/app_id" />
+-    </application>
+-
+-</manifest>
+diff --git a/samples/SessionLoginSample/ant.properties b/samples/SessionLoginSample/ant.properties
+deleted file mode 100644
+index 939105d52..000000000
+--- a/samples/SessionLoginSample/ant.properties
++++ /dev/null
+@@ -1,18 +0,0 @@
+-# This file is used to override default values used by the Ant build system.
+-#
+-# This file must be checked into Version Control Systems, as it is
+-# integral to the build system of your project.
+-
+-# This file is only used by the Ant script.
+-
+-# You can use this to override default values such as
+-#  'source.dir' for the location of your java source folder and
+-#  'out.dir' for the location of your output folder.
+-
+-# You can also use it define how the release builds are signed by declaring
+-# the following properties:
+-#  'key.store' for the location of your keystore and
+-#  'key.alias' for the name of the key to use.
+-# The password will be asked during the build when you use the 'release' target.
+-
+-java.compilerargs=-Xlint -Werror
+diff --git a/samples/SessionLoginSample/build.gradle b/samples/SessionLoginSample/build.gradle
+deleted file mode 100644
+index b76fed903..000000000
+--- a/samples/SessionLoginSample/build.gradle
++++ /dev/null
+@@ -1,27 +0,0 @@
+-apply plugin: 'android'
+-
+-dependencies {
+-    compile project(':facebook')
+-}
+-
+-android {
+-    compileSdkVersion Integer.parseInt(project.ANDROID_BUILD_SDK_VERSION)
+-    buildToolsVersion project.ANDROID_BUILD_TOOLS_VERSION
+-
+-    defaultConfig {
+-        minSdkVersion Integer.parseInt(project.ANDROID_BUILD_MIN_SDK_VERSION)
+-        targetSdkVersion Integer.parseInt(project.ANDROID_BUILD_TARGET_SDK_VERSION)
+-    }
+-
+-    lintOptions {
+-        abortOnError false
+-    }
+-
+-    sourceSets {
+-        main {
+-            manifest.srcFile 'AndroidManifest.xml'
+-            java.srcDirs = ['src']
+-            res.srcDirs = ['res']
+-        }
+-    }
+-}
+diff --git a/samples/SessionLoginSample/build.xml b/samples/SessionLoginSample/build.xml
+deleted file mode 100644
+index 4f044bbee..000000000
+--- a/samples/SessionLoginSample/build.xml
++++ /dev/null
+@@ -1,92 +0,0 @@
+-<?xml version="1.0" encoding="UTF-8"?>
+-<project name="SessionLoginSample" default="help">
+-
+-    <!-- The local.properties file is created and updated by the 'android' tool.
+-         It contains the path to the SDK. It should *NOT* be checked into
+-         Version Control Systems. -->
+-    <property file="local.properties" />
+-
+-    <!-- The ant.properties file can be created by you. It is only edited by the
+-         'android' tool to add properties to it.
+-         This is the place to change some Ant specific build properties.
+-         Here are some properties you may want to change/update:
+-
+-         source.dir
+-             The name of the source directory. Default is 'src'.
+-         out.dir
+-             The name of the output directory. Default is 'bin'.
+-
+-         For other overridable properties, look at the beginning of the rules
+-         files in the SDK, at tools/ant/build.xml
+-
+-         Properties related to the SDK location or the project target should
+-         be updated using the 'android' tool with the 'update' action.
+-
+-         This file is an integral part of the build system for your
+-         application and should be checked into Version Control Systems.
+-
+-         -->
+-    <property file="ant.properties" />
+-
+-    <!-- if sdk.dir was not set from one of the property file, then
+-         get it from the ANDROID_HOME env var.
+-         This must be done before we load project.properties since
+-         the proguard config can use sdk.dir -->
+-    <property environment="env" />
+-    <condition property="sdk.dir" value="${env.ANDROID_HOME}">
+-        <isset property="env.ANDROID_HOME" />
+-    </condition>
+-
+-    <!-- The project.properties file is created and updated by the 'android'
+-         tool, as well as ADT.
+-
+-         This contains project specific properties such as project target, and library
+-         dependencies. Lower level build properties are stored in ant.properties
+-         (or in .classpath for Eclipse projects).
+-
+-         This file is an integral part of the build system for your
+-         application and should be checked into Version Control Systems. -->
+-    <loadproperties srcFile="project.properties" />
+-
+-    <!-- quick check on sdk.dir -->
+-    <fail
+-            message="sdk.dir is missing. Make sure to generate local.properties using 'android update project' or to inject it through the ANDROID_HOME environment variable."
+-            unless="sdk.dir"
+-    />
+-
+-    <!--
+-        Import per project custom build rules if present at the root of the project.
+-        This is the place to put custom intermediary targets such as:
+-            -pre-build
+-            -pre-compile
+-            -post-compile (This is typically used for code obfuscation.
+-                           Compiled code location: ${out.classes.absolute.dir}
+-                           If this is not done in place, override ${out.dex.input.absolute.dir})
+-            -post-package
+-            -post-build
+-            -pre-clean
+-    -->
+-    <import file="custom_rules.xml" optional="true" />
+-
+-    <!-- Import the actual build file.
+-
+-         To customize existing targets, there are two options:
+-         - Customize only one target:
+-             - copy/paste the target into this file, *before* the
+-               <import> task.
+-             - customize it to your needs.
+-         - Customize the whole content of build.xml
+-             - copy/paste the content of the rules files (minus the top node)
+-               into this file, replacing the <import> task.
+-             - customize to your needs.
+-
+-         ***********************
+-         ****** IMPORTANT ******
+-         ***********************
+-         In all cases you must update the value of version-tag below to read 'custom' instead of an integer,
+-         in order to avoid having your file be overridden by tools such as "android update project"
+-    -->
+-    <!-- version-tag: 1 -->
+-    <import file="${sdk.dir}/tools/ant/build.xml" />
+-
+-</project>
+diff --git a/samples/SessionLoginSample/proguard-project.txt b/samples/SessionLoginSample/proguard-project.txt
+deleted file mode 100644
+index f2fe1559a..000000000
+--- a/samples/SessionLoginSample/proguard-project.txt
++++ /dev/null
+@@ -1,20 +0,0 @@
+-# To enable ProGuard in your project, edit project.properties
+-# to define the proguard.config property as described in that file.
+-#
+-# Add project specific ProGuard rules here.
+-# By default, the flags in this file are appended to flags specified
+-# in ${sdk.dir}/tools/proguard/proguard-android.txt
+-# You can edit the include path and order by changing the ProGuard
+-# include property in project.properties.
+-#
+-# For more details, see
+-#   http://developer.android.com/guide/developing/tools/proguard.html
+-
+-# Add any project specific keep options here:
+-
+-# If your project uses WebView with JS, uncomment the following
+-# and specify the fully qualified class name to the JavaScript interface
+-# class:
+-#-keepclassmembers class fqcn.of.javascript.interface.for.webview {
+-#   public *;
+-#}
+diff --git a/samples/SessionLoginSample/project.properties b/samples/SessionLoginSample/project.properties
+deleted file mode 100644
+index cee0509c6..000000000
+--- a/samples/SessionLoginSample/project.properties
++++ /dev/null
+@@ -1,15 +0,0 @@
+-# This file is automatically generated by Android Tools.
+-# Do not modify this file -- YOUR CHANGES WILL BE ERASED!
+-#
+-# This file must be checked in Version Control Systems.
+-#
+-# To customize properties used by the Ant build system edit
+-# "ant.properties", and override values to adapt the script to your
+-# project structure.
+-#
+-# To enable ProGuard to shrink and obfuscate your code, uncomment this (available properties: sdk.dir, user.home):
+-#proguard.config=${sdk.dir}/tools/proguard/proguard-android.txt:proguard-project.txt
+-
+-# Project target.
+-target=android-8
+-android.library.reference.1=../../facebook
+diff --git a/samples/SessionLoginSample/res/drawable-hdpi/icon.png b/samples/SessionLoginSample/res/drawable-hdpi/icon.png
+deleted file mode 100644
+index 78d41ad5f..000000000
+Binary files a/samples/SessionLoginSample/res/drawable-hdpi/icon.png and /dev/null differ
+diff --git a/samples/SessionLoginSample/res/drawable-mdpi/icon.png b/samples/SessionLoginSample/res/drawable-mdpi/icon.png
+deleted file mode 100644
+index 22598aa33..000000000
+Binary files a/samples/SessionLoginSample/res/drawable-mdpi/icon.png and /dev/null differ
+diff --git a/samples/SessionLoginSample/res/drawable-xhdpi/icon.png b/samples/SessionLoginSample/res/drawable-xhdpi/icon.png
+deleted file mode 100644
+index a2c3cb4b2..000000000
+Binary files a/samples/SessionLoginSample/res/drawable-xhdpi/icon.png and /dev/null differ
+diff --git a/samples/SessionLoginSample/res/drawable/icon.png b/samples/SessionLoginSample/res/drawable/icon.png
+deleted file mode 100644
+index 22598aa33..000000000
+Binary files a/samples/SessionLoginSample/res/drawable/icon.png and /dev/null differ
+diff --git a/samples/SessionLoginSample/res/layout/activity.xml b/samples/SessionLoginSample/res/layout/activity.xml
+deleted file mode 100644
+index 52ca3daf9..000000000
+--- a/samples/SessionLoginSample/res/layout/activity.xml
++++ /dev/null
+@@ -1,38 +0,0 @@
+-<?xml version="1.0" encoding="utf-8"?>
+-<!--
+-    Copyright 2010-present Facebook.
+-
+-    Licensed under the Apache License, Version 2.0 (the "License");
+-    you may not use this file except in compliance with the License.
+-    You may obtain a copy of the License at
+-
+-       http://www.apache.org/licenses/LICENSE-2.0
+-
+-    Unless required by applicable law or agreed to in writing, software
+-    distributed under the License is distributed on an "AS IS" BASIS,
+-    WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+-    See the License for the specific language governing permissions and
+-    limitations under the License.
+--->
+-
+-<LinearLayout xmlns:android="http://schemas.android.com/apk/res/android"
+-    android:layout_width="fill_parent"
+-    android:layout_height="fill_parent"
+-    android:orientation="vertical" >
+-
+-    <TextView
+-        android:id="@+id/instructionsOrLink"
+-        android:layout_width="match_parent"
+-        android:layout_height="wrap_content"
+-        android:text="@string/instructions"
+-        android:autoLink="web"
+-        android:linksClickable="true"
+-        android:textAppearance="?android:attr/textAppearanceMedium" />
+-
+-    <Button
+-        android:id="@+id/buttonLoginLogout"
+-        android:layout_width="match_parent"
+-        android:layout_height="wrap_content"
+-        android:text="@string/login" />
+-
+-</LinearLayout>
+diff --git a/samples/SessionLoginSample/res/layout/custom_fragment_activity.xml b/samples/SessionLoginSample/res/layout/custom_fragment_activity.xml
+deleted file mode 100644
+index 09e8eb440..000000000
+--- a/samples/SessionLoginSample/res/layout/custom_fragment_activity.xml
++++ /dev/null
+@@ -1,28 +0,0 @@
+-<?xml version="1.0" encoding="utf-8"?>
+-<!--
+-    Copyright 2010-present Facebook.
+-
+-    Licensed under the Apache License, Version 2.0 (the "License");
+-    you may not use this file except in compliance with the License.
+-    You may obtain a copy of the License at
+-
+-       http://www.apache.org/licenses/LICENSE-2.0
+-
+-    Unless required by applicable law or agreed to in writing, software
+-    distributed under the License is distributed on an "AS IS" BASIS,
+-    WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+-    See the License for the specific language governing permissions and
+-    limitations under the License.
+--->
+-
+-<LinearLayout xmlns:android="http://schemas.android.com/apk/res/android"
+-    android:layout_width="fill_parent"
+-    android:layout_height="fill_parent"
+-    android:orientation="vertical" >
+-
+-    <fragment android:layout_height="fill_parent"
+-              android:layout_width="fill_parent"
+-              android:id="@+id/fragment"
+-              android:name="com.facebook.samples.sessionlogin.SessionLoginFragment" />
+-
+-</LinearLayout>
+diff --git a/samples/SessionLoginSample/res/layout/fragment.xml b/samples/SessionLoginSample/res/layout/fragment.xml
+deleted file mode 100644
+index 8b3bbf7db..000000000
+--- a/samples/SessionLoginSample/res/layout/fragment.xml
++++ /dev/null
+@@ -1,38 +0,0 @@
+-<?xml version="1.0" encoding="utf-8"?>
+-<!--
+-    Copyright 2010-present Facebook.
+-
+-    Licensed under the Apache License, Version 2.0 (the "License");
+-    you may not use this file except in compliance with the License.
+-    You may obtain a copy of the License at
+-
+-       http://www.apache.org/licenses/LICENSE-2.0
+-
+-    Unless required by applicable law or agreed to in writing, software
+-    distributed under the License is distributed on an "AS IS" BASIS,
+-    WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+-    See the License for the specific language governing permissions and
+-    limitations under the License.
+--->
+-
+-<LinearLayout xmlns:android="http://schemas.android.com/apk/res/android"
+-              android:layout_width="fill_parent"
+-              android:layout_height="fill_parent"
+-              android:orientation="vertical">
+-
+-<TextView
+-            android:id="@+id/instructionsOrLink"
+-            android:layout_width="match_parent"
+-            android:layout_height="wrap_content"
+-            android:text="@string/instructions"
+-            android:autoLink="web"
+-            android:linksClickable="true"
+-            android:textAppearance="?android:attr/textAppearanceMedium" />
+-
+-    <Button
+-            android:id="@+id/buttonLoginLogout"
+-            android:layout_width="match_parent"
+-            android:layout_height="wrap_content"
+-            android:text="@string/login" />
+-
+-</LinearLayout>
+diff --git a/samples/SessionLoginSample/res/layout/login_fragment_activity.xml b/samples/SessionLoginSample/res/layout/login_fragment_activity.xml
+deleted file mode 100644
+index 8ad44a93c..000000000
+--- a/samples/SessionLoginSample/res/layout/login_fragment_activity.xml
++++ /dev/null
+@@ -1,12 +0,0 @@
+-<?xml version="1.0" encoding="utf-8"?>
+-
+-<LinearLayout xmlns:android="http://schemas.android.com/apk/res/android"
+-              android:layout_width="fill_parent"
+-              android:layout_height="fill_parent">
+-
+-    <fragment android:layout_height="fill_parent"
+-              android:layout_width="fill_parent"
+-              android:id="@+id/login_fragment"
+-              android:name="com.facebook.widget.UserSettingsFragment" />
+-
+-</LinearLayout>
+diff --git a/samples/SessionLoginSample/res/layout/main.xml b/samples/SessionLoginSample/res/layout/main.xml
+deleted file mode 100644
+index a8042a2c1..000000000
+--- a/samples/SessionLoginSample/res/layout/main.xml
++++ /dev/null
+@@ -1,41 +0,0 @@
+-<?xml version="1.0" encoding="utf-8"?>
+-<!--
+-    Copyright 2010-present Facebook.
+-
+-    Licensed under the Apache License, Version 2.0 (the "License");
+-    you may not use this file except in compliance with the License.
+-    You may obtain a copy of the License at
+-
+-       http://www.apache.org/licenses/LICENSE-2.0
+-
+-    Unless required by applicable law or agreed to in writing, software
+-    distributed under the License is distributed on an "AS IS" BASIS,
+-    WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+-    See the License for the specific language governing permissions and
+-    limitations under the License.
+--->
+-
+-<LinearLayout xmlns:android="http://schemas.android.com/apk/res/android"
+-    android:layout_width="fill_parent"
+-    android:layout_height="fill_parent"
+-    android:orientation="vertical" >
+-
+-    <Button
+-        android:id="@+id/buttonLoginActivity"
+-        android:layout_width="match_parent"
+-        android:layout_height="wrap_content"
+-        android:text="@string/login_using_activity" />
+-
+-    <Button
+-            android:id="@+id/buttonLoginCustomFragment"
+-            android:layout_width="match_parent"
+-            android:layout_height="wrap_content"
+-            android:text="@string/login_using_custom_fragment" />
+-
+-    <Button
+-            android:id="@+id/buttonLoginFragment"
+-            android:layout_width="match_parent"
+-            android:layout_height="wrap_content"
+-            android:text="@string/login_using_usersettingsfragment" />
+-
+-</LinearLayout>
+diff --git a/samples/SessionLoginSample/res/values/strings.xml b/samples/SessionLoginSample/res/values/strings.xml
+deleted file mode 100644
+index bcece0ad1..000000000
+--- a/samples/SessionLoginSample/res/values/strings.xml
++++ /dev/null
+@@ -1,30 +0,0 @@
+-<?xml version="1.0" encoding="utf-8"?>
+-<!--
+-    Copyright 2010-present Facebook.
+-
+-    Licensed under the Apache License, Version 2.0 (the "License");
+-    you may not use this file except in compliance with the License.
+-    You may obtain a copy of the License at
+-
+-       http://www.apache.org/licenses/LICENSE-2.0
+-
+-    Unless required by applicable law or agreed to in writing, software
+-    distributed under the License is distributed on an "AS IS" BASIS,
+-    WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+-    See the License for the specific language governing permissions and
+-    limitations under the License.
+--->
+-
+-<resources>
+-
+-    <string name="login_using_activity">Login using Activity</string>
+-    <string name="login_using_custom_fragment">Login using Custom Fragment</string>
+-    <string name="login_using_usersettingsfragment">Login using UserSettingsFragment</string>
+-    <string name="hello">Hello World, SessionLoginSampleActivity!</string>
+-    <string name="app_name">SessionLoginSample</string>
+-    <string name="login">Login</string>
+-    <string name="instructions">Login to create a link to fetch account data</string>
+-    <string name="logout">Log out</string>
+-    <string name="app_id">380615018626574</string>
+-
+-</resources>
+diff --git a/samples/SessionLoginSample/src/com/facebook/samples/sessionlogin/LoginUsingActivityActivity.java b/samples/SessionLoginSample/src/com/facebook/samples/sessionlogin/LoginUsingActivityActivity.java
+deleted file mode 100644
+index df4049f65..000000000
+--- a/samples/SessionLoginSample/src/com/facebook/samples/sessionlogin/LoginUsingActivityActivity.java
++++ /dev/null
+@@ -1,128 +0,0 @@
+-/**
+- * Copyright 2010-present Facebook.
+- *
+- * Licensed under the Apache License, Version 2.0 (the "License");
+- * you may not use this file except in compliance with the License.
+- * You may obtain a copy of the License at
+- *
+- *    http://www.apache.org/licenses/LICENSE-2.0
+- *
+- * Unless required by applicable law or agreed to in writing, software
+- * distributed under the License is distributed on an "AS IS" BASIS,
+- * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+- * See the License for the specific language governing permissions and
+- * limitations under the License.
+- */
+-
+-package com.facebook.samples.sessionlogin;
+-
+-import android.app.Activity;
+-import android.content.Intent;
+-import android.os.Bundle;
+-import android.view.View;
+-import android.view.View.OnClickListener;
+-import android.widget.Button;
+-import android.widget.TextView;
+-import com.facebook.LoggingBehavior;
+-import com.facebook.Session;
+-import com.facebook.SessionState;
+-import com.facebook.Settings;
+-
+-public class LoginUsingActivityActivity extends Activity {
+-    private static final String URL_PREFIX_FRIENDS = "https://graph.facebook.com/me/friends?access_token=";
+-
+-    private TextView textInstructionsOrLink;
+-    private Button buttonLoginLogout;
+-    private Session.StatusCallback statusCallback = new SessionStatusCallback();
+-
+-    @Override
+-    public void onCreate(Bundle savedInstanceState) {
+-        super.onCreate(savedInstanceState);
+-        setContentView(R.layout.activity);
+-        buttonLoginLogout = (Button)findViewById(R.id.buttonLoginLogout);
+-        textInstructionsOrLink = (TextView)findViewById(R.id.instructionsOrLink);
+-
+-        Settings.addLoggingBehavior(LoggingBehavior.INCLUDE_ACCESS_TOKENS);
+-
+-        Session session = Session.getActiveSession();
+-        if (session == null) {
+-            if (savedInstanceState != null) {
+-                session = Session.restoreSession(this, null, statusCallback, savedInstanceState);
+-            }
+-            if (session == null) {
+-                session = new Session(this);
+-            }
+-            Session.setActiveSession(session);
+-            if (session.getState().equals(SessionState.CREATED_TOKEN_LOADED)) {
+-                session.openForRead(new Session.OpenRequest(this).setCallback(statusCallback));
+-            }
+-        }
+-
+-        updateView();
+-    }
+-
+-    @Override
+-    public void onStart() {
+-        super.onStart();
+-        Session.getActiveSession().addCallback(statusCallback);
+-    }
+-
+-    @Override
+-    public void onStop() {
+-        super.onStop();
+-        Session.getActiveSession().removeCallback(statusCallback);
+-    }
+-
+-    @Override
+-    public void onActivityResult(int requestCode, int resultCode, Intent data) {
+-        super.onActivityResult(requestCode, resultCode, data);
+-        Session.getActiveSession().onActivityResult(this, requestCode, resultCode, data);
+-    }
+-
+-    @Override
+-    protected void onSaveInstanceState(Bundle outState) {
+-        super.onSaveInstanceState(outState);
+-        Session session = Session.getActiveSession();
+-        Session.saveSession(session, outState);
+-    }
+-
+-    private void updateView() {
+-        Session session = Session.getActiveSession();
+-        if (session.isOpened()) {
+-            textInstructionsOrLink.setText(URL_PREFIX_FRIENDS + session.getAccessToken());
+-            buttonLoginLogout.setText(R.string.logout);
+-            buttonLoginLogout.setOnClickListener(new OnClickListener() {
+-                public void onClick(View view) { onClickLogout(); }
+-            });
+-        } else {
+-            textInstructionsOrLink.setText(R.string.instructions);
+-            buttonLoginLogout.setText(R.string.login);
+-            buttonLoginLogout.setOnClickListener(new OnClickListener() {
+-                public void onClick(View view) { onClickLogin(); }
+-            });
+-        }
+-    }
+-
+-    private void onClickLogin() {
+-        Session session = Session.getActiveSession();
+-        if (!session.isOpened() && !session.isClosed()) {
+-            session.openForRead(new Session.OpenRequest(this).setCallback(statusCallback));
+-        } else {
+-            Session.openActiveSession(this, true, statusCallback);
+-        }
+-    }
+-
+-    private void onClickLogout() {
+-        Session session = Session.getActiveSession();
+-        if (!session.isClosed()) {
+-            session.closeAndClearTokenInformation();
+-        }
+-    }
+-
+-    private class SessionStatusCallback implements Session.StatusCallback {
+-        @Override
+-        public void call(Session session, SessionState state, Exception exception) {
+-            updateView();
+-        }
+-    }
+-}
+diff --git a/samples/SessionLoginSample/src/com/facebook/samples/sessionlogin/LoginUsingCustomFragmentActivity.java b/samples/SessionLoginSample/src/com/facebook/samples/sessionlogin/LoginUsingCustomFragmentActivity.java
+deleted file mode 100644
+index 1e06f6999..000000000
+--- a/samples/SessionLoginSample/src/com/facebook/samples/sessionlogin/LoginUsingCustomFragmentActivity.java
++++ /dev/null
+@@ -1,28 +0,0 @@
+-/**
+- * Copyright 2010-present Facebook.
+- *
+- * Licensed under the Apache License, Version 2.0 (the "License");
+- * you may not use this file except in compliance with the License.
+- * You may obtain a copy of the License at
+- *
+- *    http://www.apache.org/licenses/LICENSE-2.0
+- *
+- * Unless required by applicable law or agreed to in writing, software
+- * distributed under the License is distributed on an "AS IS" BASIS,
+- * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+- * See the License for the specific language governing permissions and
+- * limitations under the License.
+- */
+-
+-package com.facebook.samples.sessionlogin;
+-
+-import android.os.Bundle;
+-import android.support.v4.app.FragmentActivity;
+-
+-public class LoginUsingCustomFragmentActivity extends FragmentActivity {
+-
+-    public void onCreate(Bundle savedInstanceState) {
+-        super.onCreate(savedInstanceState);
+-        setContentView(R.layout.custom_fragment_activity);
+-    }
+-}
+diff --git a/samples/SessionLoginSample/src/com/facebook/samples/sessionlogin/LoginUsingLoginFragmentActivity.java b/samples/SessionLoginSample/src/com/facebook/samples/sessionlogin/LoginUsingLoginFragmentActivity.java
+deleted file mode 100644
+index 59f54c603..000000000
+--- a/samples/SessionLoginSample/src/com/facebook/samples/sessionlogin/LoginUsingLoginFragmentActivity.java
++++ /dev/null
+@@ -1,52 +0,0 @@
+-/**
+- * Copyright 2010-present Facebook.
+- *
+- * Licensed under the Apache License, Version 2.0 (the "License");
+- * you may not use this file except in compliance with the License.
+- * You may obtain a copy of the License at
+- *
+- *    http://www.apache.org/licenses/LICENSE-2.0
+- *
+- * Unless required by applicable law or agreed to in writing, software
+- * distributed under the License is distributed on an "AS IS" BASIS,
+- * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+- * See the License for the specific language governing permissions and
+- * limitations under the License.
+- */
+-
+-package com.facebook.samples.sessionlogin;
+-
+-import android.content.Intent;
+-import android.os.Bundle;
+-import android.support.v4.app.FragmentActivity;
+-import android.support.v4.app.FragmentManager;
+-import android.util.Log;
+-import com.facebook.Session;
+-import com.facebook.SessionState;
+-import com.facebook.widget.UserSettingsFragment;
+-
+-public class LoginUsingLoginFragmentActivity extends FragmentActivity {
+-    private UserSettingsFragment userSettingsFragment;
+-
+-    public void onCreate(Bundle savedInstanceState) {
+-        super.onCreate(savedInstanceState);
+-
+-        setContentView(R.layout.login_fragment_activity);
+-
+-        FragmentManager fragmentManager = getSupportFragmentManager();
+-        userSettingsFragment = (UserSettingsFragment) fragmentManager.findFragmentById(R.id.login_fragment);
+-        userSettingsFragment.setSessionStatusCallback(new Session.StatusCallback() {
+-            @Override
+-            public void call(Session session, SessionState state, Exception exception) {
+-                Log.d("LoginUsingLoginFragmentActivity", String.format("New session state: %s", state.toString()));
+-            }
+-        });
+-    }
+-
+-    @Override
+-    public void onActivityResult(int requestCode, int resultCode, Intent data) {
+-        userSettingsFragment.onActivityResult(requestCode, resultCode, data);
+-        super.onActivityResult(requestCode, resultCode, data);
+-    }
+-
+-}
+diff --git a/samples/SessionLoginSample/src/com/facebook/samples/sessionlogin/SessionLoginFragment.java b/samples/SessionLoginSample/src/com/facebook/samples/sessionlogin/SessionLoginFragment.java
+deleted file mode 100644
+index 18ec1b098..000000000
+--- a/samples/SessionLoginSample/src/com/facebook/samples/sessionlogin/SessionLoginFragment.java
++++ /dev/null
+@@ -1,131 +0,0 @@
+-/**
+- * Copyright 2010-present Facebook.
+- *
+- * Licensed under the Apache License, Version 2.0 (the "License");
+- * you may not use this file except in compliance with the License.
+- * You may obtain a copy of the License at
+- *
+- *    http://www.apache.org/licenses/LICENSE-2.0
+- *
+- * Unless required by applicable law or agreed to in writing, software
+- * distributed under the License is distributed on an "AS IS" BASIS,
+- * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+- * See the License for the specific language governing permissions and
+- * limitations under the License.
+- */
+-
+-package com.facebook.samples.sessionlogin;
+-
+-import android.content.Intent;
+-import android.os.Bundle;
+-import android.support.v4.app.Fragment;
+-import android.view.LayoutInflater;
+-import android.view.View;
+-import android.view.ViewGroup;
+-import android.widget.Button;
+-import android.widget.TextView;
+-import com.facebook.LoggingBehavior;
+-import com.facebook.Session;
+-import com.facebook.SessionState;
+-import com.facebook.Settings;
+-
+-public class SessionLoginFragment extends Fragment {
+-    private static final String URL_PREFIX_FRIENDS = "https://graph.facebook.com/me/friends?access_token=";
+-
+-    private TextView textInstructionsOrLink;
+-    private Button buttonLoginLogout;
+-    private Session.StatusCallback statusCallback = new SessionStatusCallback();
+-
+-    @Override
+-    public View onCreateView(LayoutInflater inflater, ViewGroup container, Bundle savedInstanceState) {
+-        View view = inflater.inflate(R.layout.fragment, container, false);
+-
+-        buttonLoginLogout = (Button) view.findViewById(R.id.buttonLoginLogout);
+-        textInstructionsOrLink = (TextView) view.findViewById(R.id.instructionsOrLink);
+-
+-        Settings.addLoggingBehavior(LoggingBehavior.INCLUDE_ACCESS_TOKENS);
+-
+-        Session session = Session.getActiveSession();
+-        if (session == null) {
+-            if (savedInstanceState != null) {
+-                session = Session.restoreSession(getActivity(), null, statusCallback, savedInstanceState);
+-            }
+-            if (session == null) {
+-                session = new Session(getActivity());
+-            }
+-            Session.setActiveSession(session);
+-            if (session.getState().equals(SessionState.CREATED_TOKEN_LOADED)) {
+-                session.openForRead(new Session.OpenRequest(this).setCallback(statusCallback));
+-            }
+-        }
+-
+-        updateView();
+-
+-        return view;
+-    }
+-
+-    @Override
+-    public void onStart() {
+-        super.onStart();
+-        Session.getActiveSession().addCallback(statusCallback);
+-    }
+-
+-    @Override
+-    public void onStop() {
+-        super.onStop();
+-        Session.getActiveSession().removeCallback(statusCallback);
+-    }
+-
+-    @Override
+-    public void onActivityResult(int requestCode, int resultCode, Intent data) {
+-        super.onActivityResult(requestCode, resultCode, data);
+-        Session.getActiveSession().onActivityResult(getActivity(), requestCode, resultCode, data);
+-    }
+-
+-    @Override
+-    public void onSaveInstanceState(Bundle outState) {
+-        super.onSaveInstanceState(outState);
+-        Session session = Session.getActiveSession();
+-        Session.saveSession(session, outState);
+-    }
+-
+-    private void updateView() {
+-        Session session = Session.getActiveSession();
+-        if (session.isOpened()) {
+-            textInstructionsOrLink.setText(URL_PREFIX_FRIENDS + session.getAccessToken());
+-            buttonLoginLogout.setText(R.string.logout);
+-            buttonLoginLogout.setOnClickListener(new View.OnClickListener() {
+-                public void onClick(View view) { onClickLogout(); }
+-            });
+-        } else {
+-            textInstructionsOrLink.setText(R.string.instructions);
+-            buttonLoginLogout.setText(R.string.login);
+-            buttonLoginLogout.setOnClickListener(new View.OnClickListener() {
+-                public void onClick(View view) { onClickLogin(); }
+-            });
+-        }
+-    }
+-
+-    private void onClickLogin() {
+-        Session session = Session.getActiveSession();
+-        if (!session.isOpened() && !session.isClosed()) {
+-            session.openForRead(new Session.OpenRequest(this).setCallback(statusCallback));
+-        } else {
+-            Session.openActiveSession(getActivity(), this, true, statusCallback);
+-        }
+-    }
+-
+-    private void onClickLogout() {
+-        Session session = Session.getActiveSession();
+-        if (!session.isClosed()) {
+-            session.closeAndClearTokenInformation();
+-        }
+-    }
+-
+-    private class SessionStatusCallback implements Session.StatusCallback {
+-        @Override
+-        public void call(Session session, SessionState state, Exception exception) {
+-            updateView();
+-        }
+-    }
+-}
+diff --git a/samples/SessionLoginSample/src/com/facebook/samples/sessionlogin/SessionLoginSampleActivity.java b/samples/SessionLoginSample/src/com/facebook/samples/sessionlogin/SessionLoginSampleActivity.java
+deleted file mode 100644
+index 9c64116da..000000000
+--- a/samples/SessionLoginSample/src/com/facebook/samples/sessionlogin/SessionLoginSampleActivity.java
++++ /dev/null
+@@ -1,82 +0,0 @@
+-/**
+- * Copyright 2010-present Facebook.
+- *
+- * Licensed under the Apache License, Version 2.0 (the "License");
+- * you may not use this file except in compliance with the License.
+- * You may obtain a copy of the License at
+- *
+- *    http://www.apache.org/licenses/LICENSE-2.0
+- *
+- * Unless required by applicable law or agreed to in writing, software
+- * distributed under the License is distributed on an "AS IS" BASIS,
+- * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+- * See the License for the specific language governing permissions and
+- * limitations under the License.
+- */
+-
+-package com.facebook.samples.sessionlogin;
+-
+-import android.app.Activity;
+-import android.content.Intent;
+-import android.os.Bundle;
+-import android.view.View;
+-import android.widget.Button;
+-import com.facebook.AppEventsLogger;
+-
+-public class SessionLoginSampleActivity extends Activity {
+-
+-    private Button buttonLoginActivity;
+-    private Button buttonCustomFragment;
+-    private Button buttonLoginFragment;
+-
+-    public void onCreate(Bundle savedInstanceState) {
+-        super.onCreate(savedInstanceState);
+-
+-        setContentView(R.layout.main);
+-
+-        // We demonstrate three different ways of managing session login/logout behavior:
+-        // 1) LoginUsingActivityActivity implements an Activity that handles all of its own
+-        //    session management.
+-        // 2) LoginUsingCustomFragmentActivity uses a Fragment that handles session management;
+-        //    this Fragment could be composed as part of a more complex Activity, although in this
+-        //    case it is the only UI that the Activity displays.
+-        // 3) LoginUsingLoginFragmentActivity is similar to LoginUsingCustomFragmentActivity, but
+-        //    uses the UserSettingsFragment class provided by the SDK to handle session management. As
+-        //    in (2), this Fragment could be composed as part of a more complex Activity in a real app.
+-        buttonLoginActivity = (Button) findViewById(R.id.buttonLoginActivity);
+-        buttonLoginActivity.setOnClickListener(new View.OnClickListener() {
+-            @Override
+-            public void onClick(View v) {
+-                Intent intent = new Intent(SessionLoginSampleActivity.this, LoginUsingActivityActivity.class);
+-                startActivity(intent);
+-            }
+-        });
+-
+-        buttonCustomFragment = (Button) findViewById(R.id.buttonLoginCustomFragment);
+-        buttonCustomFragment.setOnClickListener(new View.OnClickListener() {
+-            @Override
+-            public void onClick(View v) {
+-                Intent intent = new Intent(SessionLoginSampleActivity.this, LoginUsingCustomFragmentActivity.class);
+-                startActivity(intent);
+-            }
+-        });
+-
+-        buttonLoginFragment = (Button) findViewById(R.id.buttonLoginFragment);
+-        buttonLoginFragment.setOnClickListener(new View.OnClickListener() {
+-            @Override
+-            public void onClick(View v) {
+-                Intent intent = new Intent(SessionLoginSampleActivity.this, LoginUsingLoginFragmentActivity.class);
+-                startActivity(intent);
+-            }
+-        });
+-    }
+-
+-    @Override
+-    protected void onResume() {
+-        super.onResume();
+-
+-        // Call the 'activateApp' method to log an app event for use in analytics and advertising reporting.  Do so in
+-        // the onResume methods of the primary Activities that an app may be launched into.
+-        AppEventsLogger.activateApp(this);
+-    }
+-}
+diff --git a/settings.gradle b/settings.gradle
+index 6ca4d0965..09b84aeee 100644
+--- a/settings.gradle
++++ b/settings.gradle
+@@ -10,20 +10,14 @@ project(':tests').projectDir = new File('facebook/tests')
+ // Samples
+ include 'FriendPickerSample'
+ project(':FriendPickerSample').projectDir = new File('samples/FriendPickerSample')
+-include 'GraphApiSample'
+-project(':GraphApiSample').projectDir = new File('samples/GraphApiSample')
+ include 'HelloFacebookSample'
+ project(':HelloFacebookSample').projectDir = new File('samples/HelloFacebookSample')
+ include 'PlacePickerSample'
+ project(':PlacePickerSample').projectDir = new File('samples/PlacePickerSample')
+-include 'ProfilePictureSample'
+-project(':ProfilePictureSample').projectDir = new File('samples/ProfilePictureSample')
+ include 'RPSSample'
+ project(':RPSSample').projectDir = new File('samples/RPSSample')
+ include 'Scrumptious'
+ project(':Scrumptious').projectDir = new File('samples/Scrumptious')
+-include 'SessionLoginSample'
+-project(':SessionLoginSample').projectDir = new File('samples/SessionLoginSample')
+ include 'SwitchUserSample'
+ project(':SwitchUserSample').projectDir = new File('samples/SwitchUserSample')
+ 

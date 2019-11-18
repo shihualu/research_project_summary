@@ -1,0 +1,255 @@
+diff --git a/CHANGELOG.md b/CHANGELOG.md
+index ec7bacb..602cc8e 100644
+--- a/CHANGELOG.md
++++ b/CHANGELOG.md
+@@ -1,5 +1,6 @@
+ ## 1.2.1
+ * Add option to override the default background executor, see #292
++* Don't keep a strong reference to finished jobs to allow freeing memory, see #299
+ 
+ ## 1.2.0 (2017-10-05)
+ 
+diff --git a/library/src/main/java/com/evernote/android/job/JobExecutor.java b/library/src/main/java/com/evernote/android/job/JobExecutor.java
+index 5d0895b..19ea602 100644
+--- a/library/src/main/java/com/evernote/android/job/JobExecutor.java
++++ b/library/src/main/java/com/evernote/android/job/JobExecutor.java
+@@ -25,11 +25,13 @@
+  */
+ package com.evernote.android.job;
+ 
++import android.annotation.SuppressLint;
+ import android.content.Context;
+ import android.os.Bundle;
+ import android.os.PowerManager;
+ import android.support.annotation.NonNull;
+ import android.support.annotation.Nullable;
++import android.support.annotation.VisibleForTesting;
+ import android.util.LruCache;
+ import android.util.SparseArray;
+ 
+@@ -37,6 +39,8 @@
+ 
+ import net.vrallev.android.cat.CatLog;
+ 
++import java.lang.ref.WeakReference;
++import java.util.HashMap;
+ import java.util.HashSet;
+ import java.util.Locale;
+ import java.util.Map;
+@@ -55,13 +59,15 @@
+     private static final long WAKE_LOCK_TIMEOUT = TimeUnit.MINUTES.toMillis(3);
+ 
+     private final SparseArray<Job> mJobs; // only cached in memory, that's fine
+-    private final LruCache<Integer, Job> mFinishedJobsCache;
++    private final LruCache<Integer, WeakReference<Job>> mFinishedJobsCache;
++    private final SparseArray<Job.Result> mFinishedJobResults;
+ 
+     private final Set<JobRequest> mStartingRequests;
+ 
+     public JobExecutor() {
+         mJobs = new SparseArray<>();
+         mFinishedJobsCache = new LruCache<>(20);
++        mFinishedJobResults = new SparseArray<>();
+         mStartingRequests = new HashSet<>();
+     }
+ 
+@@ -85,7 +91,11 @@ public JobExecutor() {
+ 
+     public synchronized Job getJob(int jobId) {
+         Job job = mJobs.get(jobId);
+-        return job != null ? job : mFinishedJobsCache.get(jobId);
++        if (job != null) {
++            return job;
++        }
++        WeakReference<Job> reference = mFinishedJobsCache.get(jobId);
++        return reference != null ? reference.get() : null;
+     }
+ 
+     public synchronized Set<Job> getAllJobs() {
+@@ -101,8 +111,13 @@ public synchronized Job getJob(int jobId) {
+             }
+         }
+ 
+-        Map<Integer, Job> snapshot = mFinishedJobsCache.snapshot();
+-        for (Job job : snapshot.values()) {
++        Map<Integer, WeakReference<Job>> snapshot = mFinishedJobsCache.snapshot();
++        for (WeakReference<Job> reference : snapshot.values()) {
++            Job job = reference.get();
++            if (job == null) {
++                continue;
++            }
++
+             if (tag == null || tag.equals(job.getParams().getTag())) {
+                 result.add(job);
+             }
+@@ -111,6 +126,10 @@ public synchronized Job getJob(int jobId) {
+         return result;
+     }
+ 
++    public SparseArray<Job.Result> getAllJobResults() {
++        return mFinishedJobResults.clone();
++    }
++
+     public synchronized void markJobRequestStarting(@NonNull JobRequest request) {
+         mStartingRequests.add(request);
+     }
+@@ -119,10 +138,24 @@ public synchronized boolean isRequestStarting(JobRequest request) {
+         return request != null && mStartingRequests.contains(request);
+     }
+ 
+-    private synchronized void markJobAsFinished(Job job) {
++    @VisibleForTesting
++    /*package*/ synchronized void markJobAsFinished(Job job) {
+         int id = job.getParams().getId();
+         mJobs.remove(id);
+-        mFinishedJobsCache.put(id, job);
++        cleanUpRoutine(mFinishedJobsCache);
++        mFinishedJobResults.put(id, job.getResult());
++        mFinishedJobsCache.put(id, new WeakReference<>(job));
++    }
++
++    @VisibleForTesting
++    @SuppressLint("UseSparseArrays")
++    /*package*/ void cleanUpRoutine(LruCache<Integer, WeakReference<Job>> cache) {
++        Map<Integer, WeakReference<Job>> snapshot = new HashMap<>(cache.snapshot());
++        for (Integer key : snapshot.keySet()) {
++            if (snapshot.get(key) == null || snapshot.get(key).get() == null) {
++                cache.remove(key);
++            }
++        }
+     }
+ 
+     private final class JobCallable implements Callable<Job.Result> {
+diff --git a/library/src/main/java/com/evernote/android/job/JobManager.java b/library/src/main/java/com/evernote/android/job/JobManager.java
+index 73f54b5..5788f94 100644
+--- a/library/src/main/java/com/evernote/android/job/JobManager.java
++++ b/library/src/main/java/com/evernote/android/job/JobManager.java
+@@ -36,6 +36,7 @@
+ import android.support.annotation.NonNull;
+ import android.support.annotation.Nullable;
+ import android.text.TextUtils;
++import android.util.SparseArray;
+ 
+ import com.evernote.android.job.util.JobCat;
+ import com.evernote.android.job.util.JobPreconditions;
+@@ -44,6 +45,7 @@
+ 
+ import net.vrallev.android.cat.CatLog;
+ 
++import java.lang.ref.WeakReference;
+ import java.util.Collections;
+ import java.util.Iterator;
+ import java.util.List;
+@@ -304,7 +306,9 @@ public JobRequest getJobRequest(int jobId) {
+ 
+     /**
+      * Jobs are cached in memory even if they already have finished. But finished jobs are never
+-     * restored after the app has launched.
++     * restored after the app has launched. Since finished jobs could cause memory leaks, they wrapped
++     * inside of a {@link WeakReference} and can be removed from memory. If you need to know the results
++     * of finished jobs or whether a job has been run, you can call {@link #getAllJobResults()}.
+      *
+      * @param jobId The unique ID of the running or finished {@link Job}.
+      * @return The {@link Job} if it's running or has been finished and is still cached. Returns
+@@ -316,7 +320,9 @@ public Job getJob(int jobId) {
+ 
+     /**
+      * Jobs are cached in memory even if they already have finished. But finished jobs are never
+-     * restored after the app has relaunched.
++     * restored after the app has relaunched. Since finished jobs could cause memory leaks, they wrapped
++     * inside of a {@link WeakReference} and can be removed from memory. If you need to know the results
++     * of finished jobs or whether a job has been run, you can call {@link #getAllJobResults()}.
+      *
+      * @return A duplicate {@link Set} containing all running and cached finished jobs or an empty set.
+      * Never returns {@code null}. The set may be modified without direct effects to the actual
+@@ -329,7 +335,9 @@ public Job getJob(int jobId) {
+ 
+     /**
+      * Jobs are cached in memory even if they already have finished. But finished jobs are never
+-     * restored after the app has relaunched.
++     * restored after the app has relaunched. Since finished jobs could cause memory leaks, they wrapped
++     * inside of a {@link WeakReference} and can be removed from memory. If you need to know the results
++     * of finished jobs or whether a job has been run, you can call {@link #getAllJobResults()}.
+      *
+      * @param tag The tag of the running or finished jobs.
+      * @return A duplicate {@link Set} containing all running and cached finished jobs associated with
+@@ -341,6 +349,18 @@ public Job getJob(int jobId) {
+         return mJobExecutor.getAllJobsForTag(tag);
+     }
+ 
++    /**
++     * Finished jobs are kept in memory until the garbage collector cleans them up. This method returns
++     * the results of all finished jobs even after they have been cleaned up. However, neither finished jobs
++     * nor their results are restored after the has been relaunched.
++     *
++     * @return The results of all finished jobs. They key is the corresponding job ID.
++     */
++    @NonNull
++    public SparseArray<Job.Result> getAllJobResults() {
++        return mJobExecutor.getAllJobResults();
++    }
++
+     /**
+      * Cancel either the pending {@link JobRequest} or the running {@link Job}.
+      *
+diff --git a/library/src/test/java/com/evernote/android/job/JobExecutorTest.java b/library/src/test/java/com/evernote/android/job/JobExecutorTest.java
+new file mode 100644
+index 0000000..6189663
+--- /dev/null
++++ b/library/src/test/java/com/evernote/android/job/JobExecutorTest.java
+@@ -0,0 +1,55 @@
++package com.evernote.android.job;
++
++import android.util.LruCache;
++
++import com.evernote.android.job.test.JobRobolectricTestRunner;
++
++import org.junit.FixMethodOrder;
++import org.junit.Test;
++import org.junit.runner.RunWith;
++import org.junit.runners.MethodSorters;
++
++import java.lang.ref.WeakReference;
++
++import static org.assertj.core.api.Assertions.assertThat;
++import static org.mockito.Mockito.mock;
++import static org.mockito.Mockito.when;
++
++/**
++ * @author rwondratschek
++ */
++@FixMethodOrder(MethodSorters.JVM)
++@RunWith(JobRobolectricTestRunner.class)
++public class JobExecutorTest {
++
++    @Test
++    public void verifyGetAllJobResultsReturnsAllResults() {
++        JobExecutor executor = new JobExecutor();
++
++        executor.markJobAsFinished(createJobMock(1));
++        executor.markJobAsFinished(createJobMock(2));
++
++        assertThat(executor.getAllJobs()).hasSize(2);
++        assertThat(executor.getAllJobResults().size()).isEqualTo(2);
++    }
++
++    @Test
++    public void verifyCleanUpRoutine() {
++        LruCache<Integer, WeakReference<Job>> cache = new LruCache<>(20);
++        cache.put(1, new WeakReference<>(createJobMock(1)));
++        cache.put(2, new WeakReference<Job>(null));
++
++        new JobExecutor().cleanUpRoutine(cache);
++
++        assertThat(cache.size()).isEqualTo(1);
++    }
++
++    private Job createJobMock(int id) {
++        Job.Params params = mock(Job.Params.class);
++        when(params.getId()).thenReturn(id);
++
++        Job job = mock(Job.class);
++        when(job.getParams()).thenReturn(params);
++        return job;
++    }
++}

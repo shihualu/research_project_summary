@@ -1,0 +1,220 @@
+diff --git a/RELEASENOTES.md b/RELEASENOTES.md
+index 9d66a6f800..3382f01e8a 100644
+--- a/RELEASENOTES.md
++++ b/RELEASENOTES.md
+@@ -24,6 +24,7 @@
+ * Set `compileSdkVersion` to 29 to use Android Q APIs.
+ * Add `enable` and `disable` methods to `MediaSource` to improve resource
+   management in playlists.
++* Fix issue where initial seek positions get ignored when playing a preroll ad.
+ 
+ ### 2.10.3 ###
+ 
+diff --git a/library/core/src/main/java/com/google/android/exoplayer2/ExoPlayerImpl.java b/library/core/src/main/java/com/google/android/exoplayer2/ExoPlayerImpl.java
+index 73107aa98e..f380af968c 100644
+--- a/library/core/src/main/java/com/google/android/exoplayer2/ExoPlayerImpl.java
++++ b/library/core/src/main/java/com/google/android/exoplayer2/ExoPlayerImpl.java
+@@ -493,7 +493,9 @@ public int getCurrentAdIndexInAdGroup() {
+   public long getContentPosition() {
+     if (isPlayingAd()) {
+       playbackInfo.timeline.getPeriodByUid(playbackInfo.periodId.periodUid, period);
+-      return period.getPositionInWindowMs() + C.usToMs(playbackInfo.contentPositionUs);
++      return playbackInfo.contentPositionUs == C.TIME_UNSET
++          ? playbackInfo.timeline.getWindow(getCurrentWindowIndex(), window).getDefaultPositionMs()
++          : period.getPositionInWindowMs() + C.usToMs(playbackInfo.contentPositionUs);
+     } else {
+       return getCurrentPosition();
+     }
+diff --git a/library/core/src/main/java/com/google/android/exoplayer2/ExoPlayerImplInternal.java b/library/core/src/main/java/com/google/android/exoplayer2/ExoPlayerImplInternal.java
+index 0fc7242279..38cdb57fc8 100644
+--- a/library/core/src/main/java/com/google/android/exoplayer2/ExoPlayerImplInternal.java
++++ b/library/core/src/main/java/com/google/android/exoplayer2/ExoPlayerImplInternal.java
+@@ -1303,8 +1303,11 @@ private void handleSourceInfoRefreshed(MediaSourceRefreshInfo sourceRefreshInfo)
+       Pair<Object, Long> defaultPosition =
+           getPeriodPosition(
+               timeline, timeline.getFirstWindowIndex(shuffleModeEnabled), C.TIME_UNSET);
+-      newContentPositionUs = defaultPosition.second;
+-      newPeriodId = queue.resolveMediaPeriodIdForAds(defaultPosition.first, newContentPositionUs);
++      newPeriodId = queue.resolveMediaPeriodIdForAds(defaultPosition.first, defaultPosition.second);
++      if (!newPeriodId.isAd()) {
++        // Keep unset start position if we need to play an ad first.
++        newContentPositionUs = defaultPosition.second;
++      }
+     } else if (timeline.getIndexOfPeriod(newPeriodId.periodUid) == C.INDEX_UNSET) {
+       // The current period isn't in the new timeline. Attempt to resolve a subsequent period whose
+       // window we can restart from.
+diff --git a/library/core/src/main/java/com/google/android/exoplayer2/MediaPeriodInfo.java b/library/core/src/main/java/com/google/android/exoplayer2/MediaPeriodInfo.java
+index bc1ea7b1e1..2733df7ba6 100644
+--- a/library/core/src/main/java/com/google/android/exoplayer2/MediaPeriodInfo.java
++++ b/library/core/src/main/java/com/google/android/exoplayer2/MediaPeriodInfo.java
+@@ -29,7 +29,8 @@
+   public final long startPositionUs;
+   /**
+    * If this is an ad, the position to play in the next content media period. {@link C#TIME_UNSET}
+-   * otherwise.
++   * if this is not an ad or the next content media period should be played from its default
++   * position.
+    */
+   public final long contentPositionUs;
+   /**
+diff --git a/library/core/src/main/java/com/google/android/exoplayer2/MediaPeriodQueue.java b/library/core/src/main/java/com/google/android/exoplayer2/MediaPeriodQueue.java
+index e47d8af381..0dacd4df30 100644
+--- a/library/core/src/main/java/com/google/android/exoplayer2/MediaPeriodQueue.java
++++ b/library/core/src/main/java/com/google/android/exoplayer2/MediaPeriodQueue.java
+@@ -144,7 +144,9 @@ public MediaPeriod enqueueNextMediaPeriod(
+       MediaPeriodInfo info) {
+     long rendererPositionOffsetUs =
+         loading == null
+-            ? (info.id.isAd() ? info.contentPositionUs : 0)
++            ? (info.id.isAd() && info.contentPositionUs != C.TIME_UNSET
++                ? info.contentPositionUs
++                : 0)
+             : (loading.getRendererOffset() + loading.info.durationUs - info.startPositionUs);
+     MediaPeriodHolder newPeriodHolder =
+         new MediaPeriodHolder(
+@@ -560,6 +562,7 @@ private MediaPeriodInfo getFirstMediaPeriodInfo(PlaybackInfo playbackInfo) {
+       }
+ 
+       long startPositionUs;
++      long contentPositionUs;
+       int nextWindowIndex =
+           timeline.getPeriod(nextPeriodIndex, period, /* setIds= */ true).windowIndex;
+       Object nextPeriodUid = period.uid;
+@@ -568,6 +571,7 @@ private MediaPeriodInfo getFirstMediaPeriodInfo(PlaybackInfo playbackInfo) {
+         // We're starting to buffer a new window. When playback transitions to this window we'll
+         // want it to be from its default start position, so project the default start position
+         // forward by the duration of the buffer, and start buffering from this point.
++        contentPositionUs = C.TIME_UNSET;
+         Pair<Object, Long> defaultPosition =
+             timeline.getPeriodPosition(
+                 window,
+@@ -587,12 +591,13 @@ private MediaPeriodInfo getFirstMediaPeriodInfo(PlaybackInfo playbackInfo) {
+           windowSequenceNumber = nextWindowSequenceNumber++;
+         }
+       } else {
++        // We're starting to buffer a new period within the same window.
+         startPositionUs = 0;
++        contentPositionUs = 0;
+       }
+       MediaPeriodId periodId =
+           resolveMediaPeriodIdForAds(nextPeriodUid, startPositionUs, windowSequenceNumber);
+-      return getMediaPeriodInfo(
+-          periodId, /* contentPositionUs= */ startPositionUs, startPositionUs);
++      return getMediaPeriodInfo(periodId, contentPositionUs, startPositionUs);
+     }
+ 
+     MediaPeriodId currentPeriodId = mediaPeriodInfo.id;
+@@ -616,13 +621,11 @@ private MediaPeriodInfo getFirstMediaPeriodInfo(PlaybackInfo playbackInfo) {
+                 mediaPeriodInfo.contentPositionUs,
+                 currentPeriodId.windowSequenceNumber);
+       } else {
+-        // Play content from the ad group position. As a special case, if we're transitioning from a
+-        // preroll ad group to content and there are no other ad groups, project the start position
+-        // forward as if this were a transition to a new window. No attempt is made to handle
+-        // midrolls in live streams, as it's unclear what content position should play after an ad
+-        // (server-side dynamic ad insertion is more appropriate for this use case).
++        // Play content from the ad group position.
+         long startPositionUs = mediaPeriodInfo.contentPositionUs;
+-        if (period.getAdGroupCount() == 1 && period.getAdGroupTimeUs(0) == 0) {
++        if (startPositionUs == C.TIME_UNSET) {
++          // If we're transitioning from an ad group to content starting from its default position,
++          // project the start position forward as if this were a transition to a new window.
+           Pair<Object, Long> defaultPosition =
+               timeline.getPeriodPosition(
+                   window,
+diff --git a/library/core/src/main/java/com/google/android/exoplayer2/PlaybackInfo.java b/library/core/src/main/java/com/google/android/exoplayer2/PlaybackInfo.java
+index 1eedae08b6..669f41ca13 100644
+--- a/library/core/src/main/java/com/google/android/exoplayer2/PlaybackInfo.java
++++ b/library/core/src/main/java/com/google/android/exoplayer2/PlaybackInfo.java
+@@ -45,7 +45,8 @@
+   /**
+    * If {@link #periodId} refers to an ad, the position of the suspended content relative to the
+    * start of the associated period in the {@link #timeline}, in microseconds. {@link C#TIME_UNSET}
+-   * if {@link #periodId} does not refer to an ad.
++   * if {@link #periodId} does not refer to an ad or if the suspended content should be played from
++   * its default position.
+    */
+   public final long contentPositionUs;
+   /** The current playback state. One of the {@link Player}.STATE_ constants. */
+diff --git a/library/core/src/test/java/com/google/android/exoplayer2/ExoPlayerTest.java b/library/core/src/test/java/com/google/android/exoplayer2/ExoPlayerTest.java
+index 61b8418411..39046b52ce 100644
+--- a/library/core/src/test/java/com/google/android/exoplayer2/ExoPlayerTest.java
++++ b/library/core/src/test/java/com/google/android/exoplayer2/ExoPlayerTest.java
+@@ -20,6 +20,7 @@
+ 
+ import android.content.Context;
+ import android.graphics.SurfaceTexture;
++import android.net.Uri;
+ import androidx.annotation.Nullable;
+ import android.view.Surface;
+ import androidx.test.core.app.ApplicationProvider;
+@@ -2590,6 +2591,56 @@ public void run(SimpleExoPlayer player) {
+     assertThat(bufferedPositionAtFirstDiscontinuityMs.get()).isEqualTo(C.usToMs(windowDurationUs));
+   }
+ 
++  @Test
++  public void contentWithInitialSeekPositionAfterPrerollAdStartsAtSeekPosition() throws Exception {
++    AdPlaybackState adPlaybackState =
++        FakeTimeline.createAdPlaybackState(/* adsPerAdGroup= */ 3, /* adGroupTimesUs= */ 0)
++            .withAdUri(/* adGroupIndex= */ 0, /* adIndexInAdGroup= */ 0, Uri.parse("https://ad1"))
++            .withAdUri(/* adGroupIndex= */ 0, /* adIndexInAdGroup= */ 1, Uri.parse("https://ad2"))
++            .withAdUri(/* adGroupIndex= */ 0, /* adIndexInAdGroup= */ 2, Uri.parse("https://ad3"));
++    Timeline fakeTimeline =
++        new FakeTimeline(
++            new TimelineWindowDefinition(
++                /* periodCount= */ 1,
++                /* id= */ 0,
++                /* isSeekable= */ true,
++                /* isDynamic= */ false,
++                /* durationUs= */ 10_000_000,
++                adPlaybackState));
++    final FakeMediaSource fakeMediaSource = new FakeMediaSource(fakeTimeline);
++    AtomicReference<Player> playerReference = new AtomicReference<>();
++    AtomicLong contentStartPositionMs = new AtomicLong(C.TIME_UNSET);
++    EventListener eventListener =
++        new EventListener() {
++          @Override
++          public void onPositionDiscontinuity(@DiscontinuityReason int reason) {
++            if (reason == Player.DISCONTINUITY_REASON_AD_INSERTION) {
++              contentStartPositionMs.set(playerReference.get().getContentPosition());
++            }
++          }
++        };
++    ActionSchedule actionSchedule =
++        new ActionSchedule.Builder("contentWithInitialSeekAfterPrerollAd")
++            .executeRunnable(
++                new PlayerRunnable() {
++                  @Override
++                  public void run(SimpleExoPlayer player) {
++                    playerReference.set(player);
++                    player.addListener(eventListener);
++                  }
++                })
++            .seek(5_000)
++            .build();
++    new ExoPlayerTestRunner.Builder()
++        .setMediaSource(fakeMediaSource)
++        .setActionSchedule(actionSchedule)
++        .build(context)
++        .start()
++        .blockUntilEnded(TIMEOUT_MS);
++
++    assertThat(contentStartPositionMs.get()).isAtLeast(5_000L);
++  }
++
+   // Internal methods.
+ 
+   private static ActionSchedule.Builder addSurfaceSwitch(ActionSchedule.Builder builder) {
+diff --git a/testutils/src/main/java/com/google/android/exoplayer2/testutil/ExoPlayerTestRunner.java b/testutils/src/main/java/com/google/android/exoplayer2/testutil/ExoPlayerTestRunner.java
+index f7c6694409..b61c5f9b2c 100644
+--- a/testutils/src/main/java/com/google/android/exoplayer2/testutil/ExoPlayerTestRunner.java
++++ b/testutils/src/main/java/com/google/android/exoplayer2/testutil/ExoPlayerTestRunner.java
+@@ -416,7 +416,7 @@ public ExoPlayerTestRunner start() {
+             if (actionSchedule != null) {
+               actionSchedule.start(player, trackSelector, null, handler, ExoPlayerTestRunner.this);
+             }
+-            player.prepare(mediaSource);
++            player.prepare(mediaSource, /* resetPosition= */ false, /* resetState= */ false);
+           } catch (Exception e) {
+             handleException(e);
+           }

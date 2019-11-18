@@ -1,0 +1,148 @@
+diff --git a/CHANGELOG.md b/CHANGELOG.md
+index 23322140..23ea1752 100644
+--- a/CHANGELOG.md
++++ b/CHANGELOG.md
+@@ -3,7 +3,8 @@
+ Bug Fixes:
+  - Suppress error log on ScanState deserialization if file does not exist yet.
+    (#570, David G. Young)
+-
++ - Turn off scanning after unbind, which was previously left on forever in some cases.
++  (#569, David G. Young)
+ 
+ ### 2.12.1 / 2017-08-16
+ 
+diff --git a/gradle/publishing.gradle b/gradle/publishing.gradle
+index 6b94dd81..72962328 100644
+--- a/gradle/publishing.gradle
++++ b/gradle/publishing.gradle
+@@ -14,10 +14,10 @@ publishing {
+             version project.version
+             artifact "${project.buildDir}/outputs/aar/${project.name}-release.aar"
+             artifact androidJavadocsJar {
+-                classifier 'source'
++                classifier 'javadoc'
+             }
+             artifact androidSourcesJar {
+-                classifier 'javadoc'
++                classifier 'source'
+             }
+ 
+             pom.withXml {
+diff --git a/src/main/java/org/altbeacon/beacon/BeaconManager.java b/src/main/java/org/altbeacon/beacon/BeaconManager.java
+index 18f74e08..ea265428 100644
+--- a/src/main/java/org/altbeacon/beacon/BeaconManager.java
++++ b/src/main/java/org/altbeacon/beacon/BeaconManager.java
+@@ -405,11 +405,6 @@ public void bind(@NonNull BeaconConsumer consumer) {
+             LogManager.w(TAG, "This device does not support bluetooth LE.  Will not start beacon scanning.");
+             return;
+         }
+-        if (mScheduledScanJobsEnabled) {
+-            LogManager.d(TAG, "Not starting beacon scanning service. Using scheduled jobs");
+-            consumer.onBeaconServiceConnect();
+-            return;
+-        }
+         synchronized (consumers) {
+             ConsumerInfo newConsumerInfo = new ConsumerInfo();
+             ConsumerInfo alreadyBoundConsumerInfo = consumers.putIfAbsent(consumer, newConsumerInfo);
+@@ -417,9 +412,16 @@ public void bind(@NonNull BeaconConsumer consumer) {
+                 LogManager.d(TAG, "This consumer is already bound");
+             }
+             else {
+-                LogManager.d(TAG, "This consumer is not bound.  binding: %s", consumer);
+-                Intent intent = new Intent(consumer.getApplicationContext(), BeaconService.class);
+-                consumer.bindService(intent, newConsumerInfo.beaconServiceConnection, Context.BIND_AUTO_CREATE);
++                LogManager.d(TAG, "This consumer is not bound.  Binding now: %s", consumer);
++                if (mScheduledScanJobsEnabled) {
++                    LogManager.d(TAG, "Not starting beacon scanning service. Using scheduled jobs");
++                    consumer.onBeaconServiceConnect();
++                }
++                else {
++                    LogManager.d(TAG, "Binding to service");
++                    Intent intent = new Intent(consumer.getApplicationContext(), BeaconService.class);
++                    consumer.bindService(intent, newConsumerInfo.beaconServiceConnection, Context.BIND_AUTO_CREATE);
++                }
+                 LogManager.d(TAG, "consumer count is now: %s", consumers.size());
+             }
+         }
+@@ -439,7 +441,12 @@ public void unbind(@NonNull BeaconConsumer consumer) {
+         synchronized (consumers) {
+             if (consumers.containsKey(consumer)) {
+                 LogManager.d(TAG, "Unbinding");
+-                consumer.unbindService(consumers.get(consumer).beaconServiceConnection);
++                if (mScheduledScanJobsEnabled) {
++                    LogManager.d(TAG, "Not unbinding from scanning service as we are using scan jobs.");
++                }
++                else {
++                    consumer.unbindService(consumers.get(consumer).beaconServiceConnection);
++                }
+                 consumers.remove(consumer);
+                 if (consumers.size() == 0) {
+                     // If this is the last consumer to disconnect, the service will exit
+@@ -449,6 +456,11 @@ public void unbind(@NonNull BeaconConsumer consumer) {
+                     // This way when we restart ranging or monitoring it will always be in
+                     // foreground mode
+                     mBackgroundMode = false;
++                    // If we are using scan jobs, we cancel the active scan job
++                    if (mScheduledScanJobsEnabled) {
++                        // TODO: Cancel the active scan job.  Without this is keeps scanning as if
++                        // a consumer is bound.
++                    }
+                 }
+             }
+             else {
+diff --git a/src/main/java/org/altbeacon/beacon/service/scanner/CycledLeScanner.java b/src/main/java/org/altbeacon/beacon/service/scanner/CycledLeScanner.java
+index 89351cc1..0089b18e 100644
+--- a/src/main/java/org/altbeacon/beacon/service/scanner/CycledLeScanner.java
++++ b/src/main/java/org/altbeacon/beacon/service/scanner/CycledLeScanner.java
+@@ -48,6 +48,10 @@
+     private boolean mScanningEnabled = false;
+     protected final Context mContext;
+     private long mScanPeriod;
++    // indicates that we decided not to turn scanning off at the end of a scan cycle (e.g. to
++    // avoid doing too many scans in a limited time on Android 7.0 or because we are capable of
++    // multiple detections.  If true, it indicates scanning needs to be stopped when we finish.
++    private boolean mScanningLeftOn = false;
+ 
+     protected long mBetweenScanPeriod;
+ 
+@@ -224,6 +228,17 @@ public void stop() {
+         mScanningEnabled = false;
+         if (mScanCyclerStarted) {
+             scanLeDevice(false);
++            // If we have left scanning on between scan periods, now is the time to shut it off.
++            if (mScanningLeftOn) {
++                LogManager.d(TAG, "Stopping scanning previously left on.");
++                mScanningLeftOn = false;
++                try {
++                    LogManager.d(TAG, "stopping bluetooth le scan");
++                    finishScan();
++                } catch (Exception e) {
++                    LogManager.w(e, TAG, "Internal Android exception scanning for beacons");
++                }
++            }
+         } else {
+             LogManager.d(TAG, "scanning already stopped");
+         }
+@@ -397,11 +412,13 @@ private void finishScanCycle() {
+                                 LogManager.d(TAG, "Not stopping scan because this is Android N and we" +
+                                         " keep scanning for a minimum of 6 seconds at a time. "+
+                                         "We will stop in "+(ANDROID_N_MIN_SCAN_CYCLE_MILLIS-(now-mLastScanCycleStartTime))+" millisconds.");
++                                mScanningLeftOn = true;
+                             }
+                             else {
+                                 try {
+                                     LogManager.d(TAG, "stopping bluetooth le scan");
+                                     finishScan();
++                                    mScanningLeftOn = false;
+                                 } catch (Exception e) {
+                                     LogManager.w(e, TAG, "Internal Android exception scanning for beacons");
+                                 }
+@@ -409,6 +426,7 @@ private void finishScanCycle() {
+                         }
+                         else {
+                             LogManager.d(TAG, "Not stopping scanning.  Device capable of multiple indistinct detections per scan.");
++                            mScanningLeftOn = true;
+                         }
+ 
+                         mLastScanCycleEndTime = SystemClock.elapsedRealtime();

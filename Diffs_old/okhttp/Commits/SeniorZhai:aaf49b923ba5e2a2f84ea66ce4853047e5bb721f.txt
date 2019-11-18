@@ -1,0 +1,264 @@
+diff --git a/okhttp/src/main/java/okhttp3/OkHttpClient.java b/okhttp/src/main/java/okhttp3/OkHttpClient.java
+index b8f05eaf3d..c29cba1123 100644
+--- a/okhttp/src/main/java/okhttp3/OkHttpClient.java
++++ b/okhttp/src/main/java/okhttp3/OkHttpClient.java
+@@ -197,6 +197,7 @@ public void apply(ConnectionSpec tlsConfiguration, SSLSocket sslSocket, boolean
+   final int readTimeout;
+   final int writeTimeout;
+   final int pingInterval;
++  final SessionProvider sessionProvider;
+ 
+   public OkHttpClient() {
+     this(new Builder());
+@@ -215,6 +216,7 @@ public OkHttpClient() {
+     this.cache = builder.cache;
+     this.internalCache = builder.internalCache;
+     this.socketFactory = builder.socketFactory;
++    this.sessionProvider = builder.sessionProvider;
+ 
+     boolean isTLS = false;
+     for (ConnectionSpec spec : connectionSpecs) {
+@@ -443,6 +445,7 @@ public Builder newBuilder() {
+     int readTimeout;
+     int writeTimeout;
+     int pingInterval;
++    SessionProvider sessionProvider;
+ 
+     public Builder() {
+       dispatcher = new Dispatcher();
+@@ -469,6 +472,7 @@ public Builder() {
+       readTimeout = 10_000;
+       writeTimeout = 10_000;
+       pingInterval = 0;
++      sessionProvider = null;
+     }
+ 
+     Builder(OkHttpClient okHttpClient) {
+@@ -500,6 +504,7 @@ public Builder() {
+       this.readTimeout = okHttpClient.readTimeout;
+       this.writeTimeout = okHttpClient.writeTimeout;
+       this.pingInterval = okHttpClient.pingInterval;
++      this.sessionProvider = okHttpClient.sessionProvider;
+     }
+ 
+     /**
+@@ -1011,6 +1016,14 @@ public Builder eventListenerFactory(EventListener.Factory eventListenerFactory)
+       return this;
+     }
+ 
++    public Builder sessionProvider(SessionProvider sessionProvider){
++      if (sessionProvider == null) {
++        throw new NullPointerException("sessionProvider == null");
++      }
++      this.sessionProvider = sessionProvider;
++      return this;
++    }
++
+     public OkHttpClient build() {
+       return new OkHttpClient(this);
+     }
+diff --git a/okhttp/src/main/java/okhttp3/RealCall.java b/okhttp/src/main/java/okhttp3/RealCall.java
+index bb108764da..e218cd7425 100644
+--- a/okhttp/src/main/java/okhttp3/RealCall.java
++++ b/okhttp/src/main/java/okhttp3/RealCall.java
+@@ -210,7 +210,7 @@ Response getResponseWithInterceptorChain() throws IOException {
+     if (!forWebSocket) {
+       interceptors.addAll(client.networkInterceptors());
+     }
+-    interceptors.add(new CallServerInterceptor(forWebSocket));
++    interceptors.add(new CallServerInterceptor(forWebSocket, client.sessionProvider));
+ 
+     Interceptor.Chain chain = new RealInterceptorChain(interceptors, transmitter, null, 0,
+         originalRequest, this, client.connectTimeoutMillis(),
+diff --git a/okhttp/src/main/java/okhttp3/SessionProvider.java b/okhttp/src/main/java/okhttp3/SessionProvider.java
+new file mode 100644
+index 0000000000..93a0176d97
+--- /dev/null
++++ b/okhttp/src/main/java/okhttp3/SessionProvider.java
+@@ -0,0 +1,10 @@
++package okhttp3;
++
++import okhttp3.internal.http2.Header;
++
++public interface SessionProvider {
++
++  String getSession(Request request);
++
++  Header getSessionHeader(Request request);
++}
+diff --git a/okhttp/src/main/java/okhttp3/internal/connection/Exchange.java b/okhttp/src/main/java/okhttp3/internal/connection/Exchange.java
+index a5c59fda4a..8e9b654d80 100644
+--- a/okhttp/src/main/java/okhttp3/internal/connection/Exchange.java
++++ b/okhttp/src/main/java/okhttp3/internal/connection/Exchange.java
+@@ -25,6 +25,7 @@
+ import okhttp3.Request;
+ import okhttp3.Response;
+ import okhttp3.ResponseBody;
++import okhttp3.SessionProvider;
+ import okhttp3.internal.Internal;
+ import okhttp3.internal.http.ExchangeCodec;
+ import okhttp3.internal.http.RealResponseBody;
+@@ -78,6 +79,18 @@ public void writeRequestHeaders(Request request) throws IOException {
+     }
+   }
+ 
++  public void writeRequestHeaders(Request request, SessionProvider sessionProvider) throws IOException {
++    try {
++      eventListener.requestHeadersStart(call);
++      codec.writeRequestHeaders(request, sessionProvider);
++      eventListener.requestHeadersEnd(call, request);
++    } catch (IOException e) {
++      eventListener.requestFailed(call, e);
++      trackFailure(e);
++      throw e;
++    }
++  }
++
+   public Sink createRequestBody(Request request, boolean duplex) throws IOException {
+     this.duplex = duplex;
+     long contentLength = request.body().contentLength();
+diff --git a/okhttp/src/main/java/okhttp3/internal/http/CallServerInterceptor.java b/okhttp/src/main/java/okhttp3/internal/http/CallServerInterceptor.java
+index c3d21611fb..da3e88676f 100644
+--- a/okhttp/src/main/java/okhttp3/internal/http/CallServerInterceptor.java
++++ b/okhttp/src/main/java/okhttp3/internal/http/CallServerInterceptor.java
+@@ -20,6 +20,7 @@
+ import okhttp3.Interceptor;
+ import okhttp3.Request;
+ import okhttp3.Response;
++import okhttp3.SessionProvider;
+ import okhttp3.internal.Util;
+ import okhttp3.internal.connection.Exchange;
+ import okio.BufferedSink;
+@@ -28,9 +29,16 @@
+ /** This is the last interceptor in the chain. It makes a network call to the server. */
+ public final class CallServerInterceptor implements Interceptor {
+   private final boolean forWebSocket;
++  private final SessionProvider sessionProvider;
+ 
+   public CallServerInterceptor(boolean forWebSocket) {
+     this.forWebSocket = forWebSocket;
++    sessionProvider = null;
++  }
++
++  public CallServerInterceptor(boolean forWebSocket, SessionProvider sessionProvider) {
++    this.forWebSocket = forWebSocket;
++    this.sessionProvider = sessionProvider;
+   }
+ 
+   @Override public Response intercept(Chain chain) throws IOException {
+@@ -40,7 +48,11 @@ public CallServerInterceptor(boolean forWebSocket) {
+ 
+     long sentRequestMillis = System.currentTimeMillis();
+ 
+-    exchange.writeRequestHeaders(request);
++    if (sessionProvider != null) {
++      exchange.writeRequestHeaders(request, sessionProvider);
++    } else {
++      exchange.writeRequestHeaders(request);
++    }
+ 
+     boolean responseHeadersStarted = false;
+     Response.Builder responseBuilder = null;
+diff --git a/okhttp/src/main/java/okhttp3/internal/http/ExchangeCodec.java b/okhttp/src/main/java/okhttp3/internal/http/ExchangeCodec.java
+index 071fa2b4f6..0e499d7498 100644
+--- a/okhttp/src/main/java/okhttp3/internal/http/ExchangeCodec.java
++++ b/okhttp/src/main/java/okhttp3/internal/http/ExchangeCodec.java
+@@ -21,6 +21,7 @@
+ import okhttp3.Request;
+ import okhttp3.Response;
+ import okhttp3.internal.connection.RealConnection;
++import okhttp3.SessionProvider;
+ import okio.Sink;
+ import okio.Source;
+ 
+@@ -42,6 +43,8 @@
+   /** This should update the HTTP engine's sentRequestMillis field. */
+   void writeRequestHeaders(Request request) throws IOException;
+ 
++  void writeRequestHeaders(Request request, SessionProvider provider) throws IOException;
++
+   /** Flush the request to the underlying socket. */
+   void flushRequest() throws IOException;
+ 
+diff --git a/okhttp/src/main/java/okhttp3/internal/http1/Http1ExchangeCodec.java b/okhttp/src/main/java/okhttp3/internal/http1/Http1ExchangeCodec.java
+index a5c34cfa0c..0480926d9c 100644
+--- a/okhttp/src/main/java/okhttp3/internal/http1/Http1ExchangeCodec.java
++++ b/okhttp/src/main/java/okhttp3/internal/http1/Http1ExchangeCodec.java
+@@ -24,6 +24,7 @@
+ import okhttp3.OkHttpClient;
+ import okhttp3.Request;
+ import okhttp3.Response;
++import okhttp3.SessionProvider;
+ import okhttp3.internal.Internal;
+ import okhttp3.internal.Util;
+ import okhttp3.internal.connection.RealConnection;
+@@ -141,6 +142,12 @@ public Http1ExchangeCodec(OkHttpClient client, RealConnection realConnection,
+     writeRequest(request.headers(), requestLine);
+   }
+ 
++  @Override public void writeRequestHeaders(Request request, SessionProvider sessionProvider)
++      throws IOException {
++    String requestLine = RequestLine.get(request, realConnection.route().proxy().type());
++    writeRequestWithSession(request.headers(), requestLine, sessionProvider.getSession(request));
++  }
++
+   @Override public long reportedContentLength(Response response) {
+     if (!HttpHeaders.hasBody(response)) {
+       return 0L;
+@@ -195,10 +202,21 @@ public void writeRequest(Headers headers, String requestLine) throws IOException
+     if (state != STATE_IDLE) throw new IllegalStateException("state: " + state);
+     sink.writeUtf8(requestLine).writeUtf8("\r\n");
+     for (int i = 0, size = headers.size(); i < size; i++) {
+-      sink.writeUtf8(headers.name(i))
+-          .writeUtf8(": ")
+-          .writeUtf8(headers.value(i))
+-          .writeUtf8("\r\n");
++      sink.writeUtf8(headers.name(i)).writeUtf8(": ").writeUtf8(headers.value(i)).writeUtf8("\r\n");
++    }
++    sink.writeUtf8("\r\n");
++    state = STATE_OPEN_REQUEST_BODY;
++  }
++
++  public void writeRequestWithSession(Headers headers, String requestLine, String session)
++      throws IOException {
++    if (state != STATE_IDLE) throw new IllegalStateException("state: " + state);
++    sink.writeUtf8(requestLine).writeUtf8("\r\n");
++    for (int i = 0, size = headers.size(); i < size; i++) {
++      sink.writeUtf8(headers.name(i)).writeUtf8(": ").writeUtf8(headers.value(i)).writeUtf8("\r\n");
++    }
++    if (session != null) {
++      sink.writeUtf8(session).writeUtf8("\r\n");
+     }
+     sink.writeUtf8("\r\n");
+     state = STATE_OPEN_REQUEST_BODY;
+diff --git a/okhttp/src/main/java/okhttp3/internal/http2/Http2ExchangeCodec.java b/okhttp/src/main/java/okhttp3/internal/http2/Http2ExchangeCodec.java
+index 8d6f2ecdc7..6c73d9fc99 100644
+--- a/okhttp/src/main/java/okhttp3/internal/http2/Http2ExchangeCodec.java
++++ b/okhttp/src/main/java/okhttp3/internal/http2/Http2ExchangeCodec.java
+@@ -22,6 +22,7 @@
+ import java.util.Locale;
+ import java.util.concurrent.TimeUnit;
+ import okhttp3.Headers;
++import okhttp3.SessionProvider;
+ import okhttp3.Interceptor;
+ import okhttp3.OkHttpClient;
+ import okhttp3.Protocol;
+@@ -124,6 +125,18 @@ public Http2ExchangeCodec(OkHttpClient client, RealConnection realConnection,
+     stream.writeTimeout().timeout(chain.writeTimeoutMillis(), TimeUnit.MILLISECONDS);
+   }
+ 
++  @Override public void writeRequestHeaders(Request request, SessionProvider provider) throws IOException {
++    if (stream != null) return;
++
++    boolean hasRequestBody = request.body() != null;
++    ArrayList<Header> requestHeaders = new ArrayList<Header>();
++    requestHeaders.addAll(http2HeadersList(request));
++    requestHeaders.add(provider.getSessionHeader(request));
++    stream = connection.newStream(requestHeaders, hasRequestBody);
++    stream.readTimeout().timeout(chain.readTimeoutMillis(), TimeUnit.MILLISECONDS);
++    stream.writeTimeout().timeout(chain.writeTimeoutMillis(), TimeUnit.MILLISECONDS);
++  }
++
+   @Override public void flushRequest() throws IOException {
+     connection.flush();
+   }

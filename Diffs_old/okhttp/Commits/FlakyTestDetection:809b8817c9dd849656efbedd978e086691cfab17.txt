@@ -1,0 +1,154 @@
+diff --git a/okhttp-tests/src/test/java/okhttp3/CallTest.java b/okhttp-tests/src/test/java/okhttp3/CallTest.java
+index 52aefda9cc..31f5062305 100644
+--- a/okhttp-tests/src/test/java/okhttp3/CallTest.java
++++ b/okhttp-tests/src/test/java/okhttp3/CallTest.java
+@@ -1871,6 +1871,25 @@ private void postBodyRetransmittedAfterAuthorizationFail(String body) throws Exc
+         .assertFailure("HTTP 205 had non-zero Content-Length: 39");
+   }
+ 
++  @Test public void httpWithExcessiveHeaders() throws IOException {
++    String longLine = "HTTP/1.1 200 " + stringFill('O', 256 * 1024) + "K";
++
++    server.setProtocols(Collections.singletonList(Protocol.HTTP_1_1));
++
++    server.enqueue(new MockResponse()
++        .setStatus(longLine)
++        .setBody("I'm not even supposed to be here today."));
++
++    executeSynchronously("/")
++        .assertFailureMatches(".*unexpected end of stream on Connection.*");
++  }
++
++  private String stringFill(char fillChar, int length) {
++    char[] value = new char[length];
++    Arrays.fill(value, fillChar);
++    return new String(value);
++  }
++
+   @Test public void canceledBeforeExecute() throws Exception {
+     Call call = client.newCall(new Request.Builder().url(server.url("/a")).build());
+     call.cancel();
+diff --git a/okhttp-tests/src/test/java/okhttp3/RecordedResponse.java b/okhttp-tests/src/test/java/okhttp3/RecordedResponse.java
+index af750fadc3..d34380cc4f 100644
+--- a/okhttp-tests/src/test/java/okhttp3/RecordedResponse.java
++++ b/okhttp-tests/src/test/java/okhttp3/RecordedResponse.java
+@@ -157,7 +157,7 @@ public RecordedResponse assertFailure(Class<?>... allowedExceptionTypes) {
+   }
+ 
+   public RecordedResponse assertFailure(String... messages) {
+-    assertNotNull(failure);
++    assertNotNull("No failure found", failure);
+     assertTrue(failure.getMessage(), Arrays.asList(messages).contains(failure.getMessage()));
+     return this;
+   }
+diff --git a/okhttp/src/main/java/okhttp3/OkHttpClient.java b/okhttp/src/main/java/okhttp3/OkHttpClient.java
+index 0b7605b3b1..f69cab89ba 100644
+--- a/okhttp/src/main/java/okhttp3/OkHttpClient.java
++++ b/okhttp/src/main/java/okhttp3/OkHttpClient.java
+@@ -648,13 +648,8 @@ public Builder socketFactory(SocketFactory socketFactory) {
+      */
+     public Builder sslSocketFactory(SSLSocketFactory sslSocketFactory) {
+       if (sslSocketFactory == null) throw new NullPointerException("sslSocketFactory == null");
+-      X509TrustManager trustManager = Platform.get().trustManager(sslSocketFactory);
+-      if (trustManager == null) {
+-        throw new IllegalStateException("Unable to extract the trust manager on " + Platform.get()
+-            + ", sslSocketFactory is " + sslSocketFactory.getClass());
+-      }
+       this.sslSocketFactory = sslSocketFactory;
+-      this.certificateChainCleaner = CertificateChainCleaner.get(trustManager);
++      this.certificateChainCleaner = Platform.get().buildCertificateChainCleaner(sslSocketFactory);
+       return this;
+     }
+ 
+diff --git a/okhttp/src/main/java/okhttp3/internal/http1/Http1Codec.java b/okhttp/src/main/java/okhttp3/internal/http1/Http1Codec.java
+index 3919b93df3..79531fa042 100644
+--- a/okhttp/src/main/java/okhttp3/internal/http1/Http1Codec.java
++++ b/okhttp/src/main/java/okhttp3/internal/http1/Http1Codec.java
+@@ -74,6 +74,7 @@
+   private static final int STATE_OPEN_RESPONSE_BODY = 4;
+   private static final int STATE_READING_RESPONSE_BODY = 5;
+   private static final int STATE_CLOSED = 6;
++  private static final int HEADER_LIMIT = Integer.getInteger("okhttp.headerlimit", 256 * 1024);
+ 
+   /** The client that configures this stream. May be null for HTTPS proxy tunnels. */
+   final OkHttpClient client;
+@@ -83,6 +84,7 @@
+   final BufferedSource source;
+   final BufferedSink sink;
+   int state = STATE_IDLE;
++  private long headerLimit = HEADER_LIMIT;
+ 
+   public Http1Codec(OkHttpClient client, StreamAllocation streamAllocation, BufferedSource source,
+       BufferedSink sink) {
+@@ -184,7 +186,7 @@ public void writeRequest(Headers headers, String requestLine) throws IOException
+     }
+ 
+     try {
+-      StatusLine statusLine = StatusLine.parse(source.readUtf8LineStrict());
++      StatusLine statusLine = StatusLine.parse(readHeaderLine());
+ 
+       Response.Builder responseBuilder = new Response.Builder()
+           .protocol(statusLine.protocol)
+@@ -206,11 +208,17 @@ public void writeRequest(Headers headers, String requestLine) throws IOException
+     }
+   }
+ 
++  private String readHeaderLine() throws IOException {
++    String line = source.readUtf8LineStrict(headerLimit);
++    headerLimit -= line.length();
++    return line;
++  }
++
+   /** Reads headers or trailers. */
+   public Headers readHeaders() throws IOException {
+     Headers.Builder headers = new Headers.Builder();
+     // parse the result headers until the first blank line
+-    for (String line; (line = source.readUtf8LineStrict()).length() != 0; ) {
++    for (String line; (line = readHeaderLine()).length() != 0; ) {
+       Internal.instance.addLenient(headers, line);
+     }
+     return headers.build();
+diff --git a/okhttp/src/main/java/okhttp3/internal/platform/AndroidPlatform.java b/okhttp/src/main/java/okhttp3/internal/platform/AndroidPlatform.java
+index e220fe9d82..346513e63b 100644
+--- a/okhttp/src/main/java/okhttp3/internal/platform/AndroidPlatform.java
++++ b/okhttp/src/main/java/okhttp3/internal/platform/AndroidPlatform.java
+@@ -79,7 +79,7 @@
+     }
+   }
+ 
+-  @Override public X509TrustManager trustManager(SSLSocketFactory sslSocketFactory) {
++  @Override protected X509TrustManager trustManager(SSLSocketFactory sslSocketFactory) {
+     Object context = readFieldOrNull(sslSocketFactory, sslParametersClass, "sslParameters");
+     if (context == null) {
+       // If that didn't work, try the Google Play Services SSL provider before giving up. This
+diff --git a/okhttp/src/main/java/okhttp3/internal/platform/Platform.java b/okhttp/src/main/java/okhttp3/internal/platform/Platform.java
+index 7ff1c717c3..c4e12b4b38 100644
+--- a/okhttp/src/main/java/okhttp3/internal/platform/Platform.java
++++ b/okhttp/src/main/java/okhttp3/internal/platform/Platform.java
+@@ -85,7 +85,7 @@ public String getPrefix() {
+     return "OkHttp";
+   }
+ 
+-  public X509TrustManager trustManager(SSLSocketFactory sslSocketFactory) {
++  protected X509TrustManager trustManager(SSLSocketFactory sslSocketFactory) {
+     // Attempt to get the trust manager from an OpenJDK socket factory. We attempt this on all
+     // platforms in order to support Robolectric, which mixes classes from both Android and the
+     // Oracle JDK. Note that we don't support HTTP/2 or other nice features on Robolectric.
+@@ -168,6 +168,17 @@ public CertificateChainCleaner buildCertificateChainCleaner(X509TrustManager tru
+     return new BasicCertificateChainCleaner(buildTrustRootIndex(trustManager));
+   }
+ 
++  public CertificateChainCleaner buildCertificateChainCleaner(SSLSocketFactory sslSocketFactory) {
++    X509TrustManager trustManager = trustManager(sslSocketFactory);
++
++    if (trustManager == null) {
++      throw new IllegalStateException("Unable to extract the trust manager on " + Platform.get()
++          + ", sslSocketFactory is " + sslSocketFactory.getClass());
++    }
++
++    return buildCertificateChainCleaner(trustManager);
++  }
++
+   /** Attempt to match the host runtime to a capable Platform implementation. */
+   private static Platform findPlatform() {
+     Platform android = AndroidPlatform.buildIfSupported();

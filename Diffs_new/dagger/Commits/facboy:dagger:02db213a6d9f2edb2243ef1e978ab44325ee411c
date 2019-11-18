@@ -1,0 +1,1531 @@
+diff --git a/java/dagger/internal/codegen/AbstractComponentWriter.java b/java/dagger/internal/codegen/AbstractComponentWriter.java
+index f091823d8..f75ba1ed2 100644
+--- a/java/dagger/internal/codegen/AbstractComponentWriter.java
++++ b/java/dagger/internal/codegen/AbstractComponentWriter.java
+@@ -29,9 +29,10 @@
+ import static javax.lang.model.element.Modifier.PRIVATE;
+ 
+ import com.google.auto.common.MoreTypes;
++import com.google.common.collect.ImmutableListMultimap;
+ import com.google.common.collect.ImmutableMap;
+ import com.google.common.collect.Lists;
+-import com.google.common.collect.Sets;
++import com.google.common.collect.Multimaps;
+ import com.squareup.javapoet.ClassName;
+ import com.squareup.javapoet.CodeBlock;
+ import com.squareup.javapoet.FieldSpec;
+@@ -39,10 +40,6 @@
+ import com.squareup.javapoet.TypeSpec;
+ import dagger.internal.codegen.ComponentDescriptor.ComponentMethodDescriptor;
+ import java.util.List;
+-import java.util.Set;
+-import javax.lang.model.element.ExecutableElement;
+-import javax.lang.model.type.DeclaredType;
+-import javax.lang.model.type.ExecutableType;
+ import javax.lang.model.util.Elements;
+ 
+ /** Creates the implementation class for a component or subcomponent. */
+@@ -183,29 +180,23 @@ private void createComponentRequirementFields() {
+   }
+ 
+   private void addInterfaceMethods() {
+-    Set<MethodSignature> interfaceMethodSignatures = Sets.newHashSet();
+-    DeclaredType componentType = MoreTypes.asDeclared(graph.componentType().asType());
+-    for (ComponentMethodDescriptor componentMethod :
+-        graph.componentDescriptor().componentMethods()) {
+-      if (componentMethod.dependencyRequest().isPresent()) {
+-        ExecutableElement methodElement = componentMethod.methodElement();
+-        ExecutableType requestType =
+-            MoreTypes.asExecutable(types.asMemberOf(componentType, methodElement));
+-        MethodSignature signature =
+-            MethodSignature.fromExecutableType(
+-                methodElement.getSimpleName().toString(), requestType);
+-        if (interfaceMethodSignatures.add(signature)) {
+-          MethodSpec.Builder interfaceMethod =
+-              MethodSpec.overriding(methodElement, componentType, types);
+-          interfaceMethod.addCode(
+-              bindingExpressions.getComponentMethodImplementation(
+-                  componentMethod, generatedComponentModel.name()));
+-          generatedComponentModel.addMethod(COMPONENT_METHOD, interfaceMethod.build());
+-        }
+-      }
++    /* Each component method may have been declared by several supertypes. We want to implement only
++     * one method for each distinct signature.*/
++    ImmutableListMultimap<MethodSignature, ComponentMethodDescriptor> componentMethodsBySignature =
++        Multimaps.index(graph.componentDescriptor().entryPointMethods(), this::getMethodSignature);
++    for (List<ComponentMethodDescriptor> methodsWithSameSignature :
++        Multimaps.asMap(componentMethodsBySignature).values()) {
++      ComponentMethodDescriptor anyOneMethod = methodsWithSameSignature.stream().findAny().get();
++      generatedComponentModel.addMethod(
++          COMPONENT_METHOD, bindingExpressions.getComponentMethod(anyOneMethod));
+     }
+   }
+ 
++  private MethodSignature getMethodSignature(ComponentMethodDescriptor method) {
++    return MethodSignature.forComponentMethod(
++        method, MoreTypes.asDeclared(graph.componentType().asType()), types);
++  }
++
+   private void addSubcomponents() {
+     for (BindingGraph subgraph : graph.subgraphs()) {
+       generatedComponentModel.addType(
+diff --git a/java/dagger/internal/codegen/AndroidModeBindingMethodImplementation.java b/java/dagger/internal/codegen/AndroidModeBindingMethodImplementation.java
+new file mode 100644
+index 000000000..f2ecb5b56
+--- /dev/null
++++ b/java/dagger/internal/codegen/AndroidModeBindingMethodImplementation.java
+@@ -0,0 +1,161 @@
++/*
++ * Copyright (C) 2017 The Dagger Authors.
++ *
++ * Licensed under the Apache License, Version 2.0 (the "License");
++ * you may not use this file except in compliance with the License.
++ * You may obtain a copy of the License at
++ *
++ * http://www.apache.org/licenses/LICENSE-2.0
++ *
++ * Unless required by applicable law or agreed to in writing, software
++ * distributed under the License is distributed on an "AS IS" BASIS,
++ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++ * See the License for the specific language governing permissions and
++ * limitations under the License.
++ */
++
++package dagger.internal.codegen;
++
++import static com.google.common.base.Preconditions.checkNotNull;
++import static dagger.internal.codegen.CodeBlocks.anonymousProvider;
++import static dagger.internal.codegen.ContributionBinding.FactoryCreationStrategy.SINGLETON_INSTANCE;
++import static dagger.internal.codegen.GeneratedComponentModel.FieldSpecKind.PRIVATE_METHOD_SCOPED_FIELD;
++import static javax.lang.model.element.Modifier.PRIVATE;
++import static javax.lang.model.element.Modifier.VOLATILE;
++
++import com.google.common.base.Supplier;
++import com.google.common.base.Suppliers;
++import com.squareup.javapoet.ClassName;
++import com.squareup.javapoet.CodeBlock;
++import com.squareup.javapoet.FieldSpec;
++import com.squareup.javapoet.TypeName;
++import com.squareup.javapoet.TypeSpec;
++import dagger.internal.MemoizedSentinel;
++import dagger.model.RequestKind;
++import dagger.model.Scope;
++import javax.lang.model.util.Elements;
++
++/**
++ * Defines a method body and return type for a given {@link BindingExpression} in Android mode,
++ * which optionally inlines provider and locking optimizations.
++ */
++final class AndroidModeBindingMethodImplementation extends BindingMethodImplementation {
++  private final GeneratedComponentModel generatedComponentModel;
++  private final ComponentBindingExpressions componentBindingExpressions;
++  private final BindingExpression delegate;
++  private final ContributionBinding binding;
++  private final ReferenceReleasingManagerFields referenceReleasingManagerFields;
++  private final ClassName componentName;
++  private final Supplier<String> fieldName = Suppliers.memoize(this::createField);
++
++  AndroidModeBindingMethodImplementation(
++      BindingExpression delegate,
++      DaggerTypes types,
++      Elements elements,
++      GeneratedComponentModel generatedComponentModel,
++      ComponentBindingExpressions componentBindingExpressions,
++      ReferenceReleasingManagerFields referenceReleasingManagerFields) {
++    super(delegate, generatedComponentModel.name(), types, elements);
++    this.generatedComponentModel = generatedComponentModel;
++    this.componentName = generatedComponentModel.name();
++    this.componentBindingExpressions = checkNotNull(componentBindingExpressions);
++    this.delegate = delegate;
++    this.binding = delegate.resolvedBindings().contributionBinding();
++    this.referenceReleasingManagerFields = checkNotNull(referenceReleasingManagerFields);
++  }
++
++  @Override
++  CodeBlock body(ClassName requestingClass) {
++    // TODO(user): split this class into 1 class for each request?
++    switch (requestKind()) {
++      case PROVIDER:
++        if (shouldInlineProvider()) {
++          // TODO(user): Cache provider field instead of recreating each time.
++          return CodeBlock.of("return $L;", anonymousProviderClass());
++        }
++        break;
++      case INSTANCE:
++        if (binding.scope().isPresent()) {
++          Scope scope = binding.scope().get();
++          if (shouldInlineScope(scope)) {
++            return scope.isReusable() ? singleCheck() : doubleCheck();
++          }
++        }
++        break;
++      default:
++        break;
++    }
++    return super.body(requestingClass);
++  }
++
++  /**
++   * Providers should be inlined if:
++   *
++   * <ul>
++   *   <li>the binding is scoped, or
++   *   <li>the binding is not scoped and a singleton factory class does not exist for it. If a
++   *       singleton factory class exists for a non-scoped binding, we use that instead since it's
++   *       more efficient than potentially classloading another anonymous provider class.
++   * </ul>
++   */
++  private boolean shouldInlineProvider() {
++    return binding.scope().isPresent()
++        || !binding.factoryCreationStrategy().equals(SINGLETON_INSTANCE);
++  }
++
++  private boolean shouldInlineScope(Scope scope) {
++    // TODO(user): enable for releasable references.
++    return !referenceReleasingManagerFields.requiresReleasableReferences(scope);
++  }
++
++  private CodeBlock singleCheck() {
++    return CodeBlock.builder()
++        .beginControlFlow("if ($N instanceof $T)", fieldName.get(), MemoizedSentinel.class)
++        .addStatement(
++            "$N = $L", fieldName.get(), delegate.getDependencyExpression(componentName).codeBlock())
++        .endControlFlow()
++        .addStatement("return ($T) $N", returnType(), fieldName.get())
++        .build();
++  }
++
++  private CodeBlock doubleCheck() {
++    String fieldExpression =
++        fieldName.get().equals("local") ? "this." + fieldName.get() : fieldName.get();
++    return CodeBlock.builder()
++        .addStatement("$T local = $L", TypeName.OBJECT, fieldExpression)
++        .beginControlFlow("if (local instanceof $T)", MemoizedSentinel.class)
++        .beginControlFlow("synchronized (local)")
++        // TODO(user): benchmark to see if this is really faster than instanceof check?
++        .beginControlFlow("if (local == $L)", fieldExpression)
++        .addStatement(
++            "$L = $L", fieldExpression, delegate.getDependencyExpression(componentName).codeBlock())
++        .endControlFlow()
++        .addStatement("local = $L", fieldExpression)
++        .endControlFlow()
++        .endControlFlow()
++        .addStatement("return ($T) local", returnType())
++        .build();
++  }
++
++  private String createField() {
++    String name = generatedComponentModel.getUniqueFieldName(BindingVariableNamer.name(binding));
++    generatedComponentModel.addField(
++        PRIVATE_METHOD_SCOPED_FIELD,
++        FieldSpec.builder(TypeName.OBJECT, name, PRIVATE, VOLATILE)
++            .initializer("new $T()", MemoizedSentinel.class)
++            .build());
++    return name;
++  }
++
++  /** Returns a {@link TypeSpec} for an anonymous provider class. */
++  private CodeBlock anonymousProviderClass() {
++    // TODO(user): For scoped bindings that have already been created, use InstanceFactory?
++    return anonymousProvider(
++        TypeName.get(accessibleType(binding.contributedType())),
++        CodeBlock.of(
++            "return $L;",
++            componentBindingExpressions
++                .getDependencyExpression(key(), RequestKind.INSTANCE, componentName)
++                .codeBlock()));
++  }
++}
+diff --git a/java/dagger/internal/codegen/BUILD b/java/dagger/internal/codegen/BUILD
+index 66d6117ca..60db476d3 100644
+--- a/java/dagger/internal/codegen/BUILD
++++ b/java/dagger/internal/codegen/BUILD
+@@ -78,7 +78,6 @@ java_library(
+         "Keys.java",
+         "MapKeyAccessibility.java",
+         "MapType.java",
+-        "MethodSignature.java",
+         "MoreAnnotationMirrors.java",
+         "MoreAnnotationValues.java",
+         "MultibindingAnnotations.java",
+@@ -133,6 +132,7 @@ java_library(
+         "KeyFactory.java",
+         "MapKeys.java",
+         "MembersInjectionBinding.java",
++        "MethodSignature.java",
+         "ModuleDescriptor.java",
+         "MultibindingDeclaration.java",
+         "OptionalBindingDeclaration.java",
+@@ -190,12 +190,15 @@ java_library(
+     name = "writing",
+     srcs = [
+         "AbstractComponentWriter.java",
++        "AndroidModeBindingMethodImplementation.java",
+         "AnnotationCreatorGenerator.java",
+         "BindingExpression.java",
++        "BindingMethodImplementation.java",
+         "ComponentBindingExpressions.java",
+         "ComponentBuilder.java",
+         "ComponentGenerator.java",
+         "ComponentInstanceBindingExpression.java",
++        "ComponentMethodBindingExpression.java",
+         "ComponentProvisionBindingExpression.java",
+         "ComponentRequirementBindingExpression.java",
+         "ComponentRequirementField.java",
+diff --git a/java/dagger/internal/codegen/BindingMethodImplementation.java b/java/dagger/internal/codegen/BindingMethodImplementation.java
+new file mode 100644
+index 000000000..43a5d9079
+--- /dev/null
++++ b/java/dagger/internal/codegen/BindingMethodImplementation.java
+@@ -0,0 +1,101 @@
++/*
++ * Copyright (C) 2017 The Dagger Authors.
++ *
++ * Licensed under the Apache License, Version 2.0 (the "License");
++ * you may not use this file except in compliance with the License.
++ * You may obtain a copy of the License at
++ *
++ * http://www.apache.org/licenses/LICENSE-2.0
++ *
++ * Unless required by applicable law or agreed to in writing, software
++ * distributed under the License is distributed on an "AS IS" BASIS,
++ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++ * See the License for the specific language governing permissions and
++ * limitations under the License.
++ */
++
++package dagger.internal.codegen;
++
++import static com.google.common.base.Preconditions.checkNotNull;
++import static dagger.internal.codegen.RequestKinds.requestType;
++
++import com.google.auto.common.MoreTypes;
++import com.squareup.javapoet.ClassName;
++import com.squareup.javapoet.CodeBlock;
++import dagger.model.Key;
++import dagger.model.RequestKind;
++import javax.lang.model.type.TypeKind;
++import javax.lang.model.type.TypeMirror;
++import javax.lang.model.util.Elements;
++
++/** Defines a method body and return type for a given {@link BindingExpression}. */
++class BindingMethodImplementation {
++  private final BindingExpression bindingExpression;
++  private final ClassName componentName;
++  private final ResolvedBindings resolvedBindings;
++  private final RequestKind requestKind;
++  private final DaggerTypes types;
++  private final Elements elements;
++
++  BindingMethodImplementation(
++      BindingExpression bindingExpression,
++      ClassName componentName,
++      DaggerTypes types,
++      Elements elements) {
++    this.bindingExpression = checkNotNull(bindingExpression);
++    this.componentName = checkNotNull(componentName);
++    this.types = checkNotNull(types);
++    this.elements = checkNotNull(elements);
++    this.resolvedBindings = bindingExpression.resolvedBindings();
++    this.requestKind = bindingExpression.requestKind();
++  }
++
++  /**
++   * Returns the method body, which contains zero or more statements (including semicolons).
++   *
++   * <p>If the implementation has a non-void return type, the body will also include the {@code
++   * return} statement.
++   */
++  CodeBlock body(ClassName requestingClass) {
++    return CodeBlock.of(
++        "return $L;", bindingExpression.getDependencyExpression(requestingClass).codeBlock());
++  }
++
++  /** Returns the return type for the dependency request. */
++  final TypeMirror returnType() {
++    ContributionBinding binding = resolvedBindings.contributionBinding();
++    if (requestKind.equals(RequestKind.INSTANCE)
++        && binding.contributedPrimitiveType().isPresent()) {
++      return binding.contributedPrimitiveType().get();
++    }
++    return accessibleType(requestType(requestKind, binding.contributedType(), types));
++  }
++
++  /** Returns the {@linkplain Key} for this expression. */
++  protected final Key key() {
++    return resolvedBindings.key();
++  }
++
++  /** Returns the {#linkplain RequestKind request kind} handled by this expression. */
++  protected final RequestKind requestKind() {
++    return requestKind;
++  }
++
++  /** The binding this instance uses to fulfill requests. */
++  protected final ResolvedBindings resolvedBindings() {
++    return resolvedBindings;
++  }
++
++  // TODO(user): Move this to Accessibility.java or DaggerTypes.java?
++  /** Returns a {@link TypeMirror} for the binding that is accessible to the component. */
++  protected final TypeMirror accessibleType(TypeMirror type) {
++    if (Accessibility.isTypeAccessibleFrom(type, componentName.packageName())) {
++      return type;
++    } else if (type.getKind().equals(TypeKind.DECLARED)
++        && Accessibility.isRawTypeAccessible(type, componentName.packageName())) {
++      return types.getDeclaredType(MoreTypes.asTypeElement(type));
++    } else {
++      return elements.getTypeElement(Object.class.getName()).asType();
++    }
++  }
++}
+diff --git a/java/dagger/internal/codegen/ComponentBindingExpressions.java b/java/dagger/internal/codegen/ComponentBindingExpressions.java
+index cb0790d96..8027d57bb 100644
+--- a/java/dagger/internal/codegen/ComponentBindingExpressions.java
++++ b/java/dagger/internal/codegen/ComponentBindingExpressions.java
+@@ -23,6 +23,7 @@
+ import static dagger.internal.codegen.Accessibility.isTypeAccessibleFrom;
+ import static dagger.internal.codegen.BindingType.MEMBERS_INJECTION;
+ import static dagger.internal.codegen.CodeBlocks.makeParametersCodeBlock;
++import static dagger.internal.codegen.ContributionBinding.FactoryCreationStrategy.SINGLETON_INSTANCE;
+ import static dagger.internal.codegen.DaggerStreams.toImmutableList;
+ import static dagger.internal.codegen.MemberSelect.staticMemberSelect;
+ import static dagger.internal.codegen.SourceFiles.membersInjectorNameForType;
+@@ -43,6 +44,7 @@
+ import com.google.common.collect.Table;
+ import com.squareup.javapoet.ClassName;
+ import com.squareup.javapoet.CodeBlock;
++import com.squareup.javapoet.MethodSpec;
+ import dagger.internal.InstanceFactory;
+ import dagger.internal.MembersInjectors;
+ import dagger.internal.codegen.ComponentDescriptor.ComponentMethodDescriptor;
+@@ -66,6 +68,7 @@
+ 
+   private final Optional<ComponentBindingExpressions> parent;
+   private final BindingGraph graph;
++  private final GeneratedComponentModel generatedComponentModel;
+   private final DaggerTypes types;
+   private final BindingExpressionFactory bindingExpressionFactory;
+   private final Table<Key, RequestKind, BindingExpression> expressions = HashBasedTable.create();
+@@ -105,6 +108,7 @@ private ComponentBindingExpressions(
+       CompilerOptions compilerOptions) {
+     this.parent = parent;
+     this.graph = graph;
++    this.generatedComponentModel = generatedComponentModel;
+     this.types = types;
+     this.bindingExpressionFactory =
+         new BindingExpressionFactory(
+@@ -215,18 +219,18 @@ Expression getDependencyArgumentExpression(
+     return dependencyExpression;
+   }
+ 
+-  /**
+-   * Returns an expression for the implementation of a component method with the given request.
+-   *
+-   * @throws IllegalStateException if there is no binding expression that satisfies the dependency
+-   *     request
+-   */
+-  CodeBlock getComponentMethodImplementation(
+-      ComponentMethodDescriptor componentMethod, ClassName requestingClass) {
+-    return getBindingExpression(
+-            componentMethod.dependencyRequest().get().key(),
+-            componentMethod.dependencyRequest().get().kind())
+-        .getComponentMethodImplementation(componentMethod, requestingClass);
++  /** Returns the implementation of a component method. */
++  MethodSpec getComponentMethod(ComponentMethodDescriptor componentMethod) {
++    checkArgument(componentMethod.dependencyRequest().isPresent());
++    DependencyRequest dependencyRequest = componentMethod.dependencyRequest().get();
++    return MethodSpec.overriding(
++            componentMethod.methodElement(),
++            MoreTypes.asDeclared(graph.componentType().asType()),
++            types)
++        .addCode(
++            getBindingExpression(dependencyRequest.key(), dependencyRequest.kind())
++                .getComponentMethodImplementation(componentMethod, generatedComponentModel.name()))
++        .build();
+   }
+ 
+   private BindingExpression getBindingExpression(Key key, RequestKind requestKind) {
+@@ -478,20 +482,109 @@ private BindingExpression provisionBindingExpression(
+       BindingExpression inlineBindingExpression =
+           inlineProvisionBindingExpression(frameworkInstanceBindingExpression);
+ 
+-      if (usePrivateMethod(resolvedBindings.contributionBinding())) {
++      Optional<ComponentMethodDescriptor> componentMethod =
++          findMatchingComponentMethod(resolvedBindings.key(), requestKind);
++      BindingKind bindingKind = resolvedBindings.contributionBinding().kind();
++      if (componentMethod.isPresent()
++          // Requests for a component or a component field should access the component or field
++          // directly, even if a component method exists.
++          && !bindingKind.equals(COMPONENT)
++          && !bindingKind.equals(COMPONENT_DEPENDENCY)) {
++        return new ComponentMethodBindingExpression(
++            resolvedBindings,
++            requestKind,
++            methodImplementation(inlineBindingExpression),
++            generatedComponentModel.name(),
++            componentMethod.get(),
++            componentBindingExpressions);
++      } else if (shouldUsePrivateMethod(resolvedBindings.contributionBinding(), requestKind)) {
+         return new PrivateMethodBindingExpression(
+-            generatedComponentModel,
+-            componentBindingExpressions,
+-            inlineBindingExpression,
+-            referenceReleasingManagerFields,
+-            compilerOptions,
+-            types,
+-            elements);
++            resolvedBindings,
++            requestKind,
++            methodImplementation(inlineBindingExpression),
++            generatedComponentModel);
+       }
+ 
+       return inlineBindingExpression;
+     }
+ 
++    private BindingMethodImplementation methodImplementation(BindingExpression bindingExpression) {
++      return compilerOptions.experimentalAndroidMode()
++          ? new AndroidModeBindingMethodImplementation(
++              bindingExpression,
++              types,
++              elements,
++              generatedComponentModel,
++              componentBindingExpressions,
++              referenceReleasingManagerFields)
++          : new BindingMethodImplementation(
++              bindingExpression, generatedComponentModel.name(), types, elements);
++    }
++
++    /**
++     * Returns true if requesters should call a no-arg, private method.
++     *
++     * <p>In default mode, private methods are used for unscoped {@code INSTANCE} and {@code FUTURE}
++     * requests that require at least one dependency. (Those with no dependencies can simply use
++     * their factory class's single instance.)
++     *
++     * <p>In Android mode, private methods are used for all provision bindings unless the request:
++     *
++     * <ul>
++     *   <li>has releasable reference scope; TODO(user): enable for releasable reference scope
++     *   <li>is for an unscoped framework type (Provider, Lazy, ProviderOfLazy) that can use the
++     *       singleton instance of the factory class.
++     *   <li>is for an unscoped non-framework type that has no dependencies, which means users can
++     *       call a nullary method anyway.
++     * </ul>
++     */
++    private boolean shouldUsePrivateMethod(ContributionBinding binding, RequestKind requestKind) {
++      // TODO(user): enable for releasable references.
++      Optional<Scope> releasableReferenceScope =
++          binding.scope().filter(referenceReleasingManagerFields::requiresReleasableReferences);
++      if (!PRIVATE_METHOD_KINDS.contains(binding.kind()) || releasableReferenceScope.isPresent()) {
++        return false;
++      }
++      if (compilerOptions.experimentalAndroidMode()) {
++        switch (requestKind) {
++          case PROVIDER:
++          case LAZY:
++          case PROVIDER_OF_LAZY:
++            return binding.scope().isPresent()
++                || !binding.factoryCreationStrategy().equals(SINGLETON_INSTANCE);
++          default:
++            return binding.scope().isPresent() || !binding.dependencies().isEmpty();
++        }
++      } else {
++        return (requestKind.equals(RequestKind.INSTANCE) || requestKind.equals(RequestKind.FUTURE))
++            && !binding.scope().isPresent()
++            && !binding.dependencies().isEmpty();
++      }
++    }
++
++    /** Returns the first component method associated with this request kind, if one exists. */
++    private Optional<ComponentMethodDescriptor> findMatchingComponentMethod(
++        Key key, RequestKind requestKind) {
++      Optional<ComponentMethodDescriptor> componentMethod =
++          graph
++              .componentDescriptor()
++              .componentMethods()
++              .stream()
++              .filter(method -> doesComponentMethodMatch(method, key, requestKind))
++              .findFirst();
++      return componentMethod;
++    }
++
++    /** Returns true if the component method matches the dependency request binding key and kind. */
++    private boolean doesComponentMethodMatch(
++        ComponentMethodDescriptor componentMethod, Key key, RequestKind requestKind) {
++      return componentMethod
++          .dependencyRequest()
++          .filter(request -> request.key().equals(key))
++          .filter(request -> request.kind().equals(requestKind))
++          .isPresent();
++    }
++
+     /**
+      * Returns a binding expression that uses a {@link dagger.producers.Producer} field for a
+      * provision binding.
+@@ -600,11 +693,6 @@ private BindingExpression inlineProvisionBindingExpression(
+       }
+     }
+ 
+-    private boolean usePrivateMethod(ContributionBinding binding) {
+-      return (!binding.scope().isPresent() || compilerOptions.experimentalAndroidMode())
+-          && PRIVATE_METHOD_KINDS.contains(binding.kind());
+-    }
+-
+     private boolean canUseSimpleMethod(ContributionBinding binding) {
+       // Use the inlined form when in experimentalAndroidMode, as PrivateMethodBindingExpression
+       // implements scoping directly
+diff --git a/java/dagger/internal/codegen/ComponentHjarProcessingStep.java b/java/dagger/internal/codegen/ComponentHjarProcessingStep.java
+index 4d9851667..7313784ba 100644
+--- a/java/dagger/internal/codegen/ComponentHjarProcessingStep.java
++++ b/java/dagger/internal/codegen/ComponentHjarProcessingStep.java
+@@ -43,7 +43,6 @@
+ import com.squareup.javapoet.TypeSpec;
+ import dagger.BindsInstance;
+ import dagger.Component;
+-import dagger.internal.codegen.ComponentDescriptor.ComponentMethodDescriptor;
+ import dagger.internal.codegen.ComponentDescriptor.Factory;
+ import dagger.internal.codegen.ComponentValidator.ComponentValidationReport;
+ import dagger.producers.ProductionComponent;
+@@ -58,7 +57,6 @@
+ import javax.lang.model.element.ExecutableElement;
+ import javax.lang.model.element.TypeElement;
+ import javax.lang.model.type.DeclaredType;
+-import javax.lang.model.type.ExecutableType;
+ import javax.lang.model.util.Elements;
+ import javax.lang.model.util.Types;
+ 
+@@ -157,7 +155,8 @@ ClassName nameGeneratedType(ComponentDescriptor input) {
+           TypeSpec.classBuilder(generatedTypeName)
+               .addModifiers(PUBLIC, FINAL)
+               .addMethod(privateConstructor());
+-      addSupertype(generatedComponent, componentDescriptor.componentDefinitionType());
++      TypeElement componentElement = componentDescriptor.componentDefinitionType();
++      addSupertype(generatedComponent, componentElement);
+ 
+       TypeName builderMethodReturnType;
+       if (componentDescriptor.builderSpec().isPresent()) {
+@@ -185,34 +184,27 @@ ClassName nameGeneratedType(ComponentDescriptor input) {
+         generatedComponent.addMethod(createMethod(componentDescriptor));
+       }
+ 
++      DeclaredType componentType = MoreTypes.asDeclared(componentElement.asType());
+       // TODO(ronshapiro): unify with AbstractComponentWriter
+       Set<MethodSignature> methodSignatures =
+           Sets.newHashSetWithExpectedSize(componentDescriptor.componentMethods().size());
+       componentDescriptor
+           .componentMethods()
+           .stream()
+-          .filter(method -> methodSignatures.add(methodSignature(componentDescriptor, method)))
++          .filter(
++              method -> {
++                return methodSignatures.add(
++                    MethodSignature.forComponentMethod(method, componentType, types));
++              })
+           .forEach(
+               method ->
+                   generatedComponent.addMethod(
+-                      emptyComponentMethod(
+-                          componentDescriptor.componentDefinitionType(), method.methodElement())));
++                      emptyComponentMethod(componentElement, method.methodElement())));
+ 
+       return Optional.of(generatedComponent);
+     }
+   }
+ 
+-  // TODO(ronshapiro): unify with AbstractComponentWriter
+-  private MethodSignature methodSignature(
+-      ComponentDescriptor component, ComponentMethodDescriptor method) {
+-    DeclaredType componentType = MoreTypes.asDeclared(component.componentDefinitionType().asType());
+-    ExecutableType requestType =
+-        MoreTypes.asExecutable(types.asMemberOf(componentType, method.methodElement()));
+-    return
+-        MethodSignature.fromExecutableType(
+-            method.methodElement().getSimpleName().toString(), requestType);
+-  }
+-
+   private MethodSpec emptyComponentMethod(TypeElement typeElement, ExecutableElement baseMethod) {
+     return MethodSpec.overriding(baseMethod, MoreTypes.asDeclared(typeElement.asType()), types)
+         .build();
+diff --git a/java/dagger/internal/codegen/ComponentMethodBindingExpression.java b/java/dagger/internal/codegen/ComponentMethodBindingExpression.java
+new file mode 100644
+index 000000000..9c734d28d
+--- /dev/null
++++ b/java/dagger/internal/codegen/ComponentMethodBindingExpression.java
+@@ -0,0 +1,71 @@
++/*
++ * Copyright (C) 2017 The Dagger Authors.
++ *
++ * Licensed under the Apache License, Version 2.0 (the "License");
++ * you may not use this file except in compliance with the License.
++ * You may obtain a copy of the License at
++ *
++ * http://www.apache.org/licenses/LICENSE-2.0
++ *
++ * Unless required by applicable law or agreed to in writing, software
++ * distributed under the License is distributed on an "AS IS" BASIS,
++ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++ * See the License for the specific language governing permissions and
++ * limitations under the License.
++ */
++
++package dagger.internal.codegen;
++
++import static com.google.common.base.Preconditions.checkNotNull;
++
++import com.squareup.javapoet.ClassName;
++import com.squareup.javapoet.CodeBlock;
++import com.squareup.javapoet.MethodSpec;
++import dagger.internal.codegen.ComponentDescriptor.ComponentMethodDescriptor;
++import dagger.model.RequestKind;
++
++/**
++ * A binding expression that implements and uses a component method.
++ *
++ * <p>Dependents of this binding expression will just call the component method.
++ */
++final class ComponentMethodBindingExpression extends BindingExpression {
++  private final BindingMethodImplementation methodImplementation;
++  private final ClassName componentName;
++  private final ComponentMethodDescriptor componentMethod;
++  private final ComponentBindingExpressions componentBindingExpressions;
++
++  ComponentMethodBindingExpression(
++      ResolvedBindings resolvedBindings,
++      RequestKind requestKind,
++      BindingMethodImplementation methodImplementation,
++      ClassName componentName,
++      ComponentMethodDescriptor componentMethod,
++      ComponentBindingExpressions componentBindingExpressions) {
++    super(resolvedBindings, requestKind);
++    this.methodImplementation = checkNotNull(methodImplementation);
++    this.componentName = checkNotNull(componentName);
++    this.componentMethod = checkNotNull(componentMethod);
++    this.componentBindingExpressions = checkNotNull(componentBindingExpressions);
++  }
++
++  @Override
++  protected CodeBlock doGetComponentMethodImplementation(
++      ComponentMethodDescriptor componentMethod, ClassName requestingClass) {
++    // There could be multiple component methods with the same request key and kind. We designate
++    // the component method passed into the constructor to contain the implementation code.
++    return this.componentMethod.equals(componentMethod)
++        ? methodImplementation.body(requestingClass)
++        : super.doGetComponentMethodImplementation(componentMethod, requestingClass);
++  }
++
++  @Override
++  Expression getDependencyExpression(ClassName requestingClass) {
++    MethodSpec implementedMethod = componentBindingExpressions.getComponentMethod(componentMethod);
++    return Expression.create(
++        methodImplementation.returnType(),
++        componentName.equals(requestingClass)
++            ? CodeBlock.of("$N()", implementedMethod)
++            : CodeBlock.of("$T.this.$N()", componentName, implementedMethod));
++  }
++}
+diff --git a/java/dagger/internal/codegen/ContributionBinding.java b/java/dagger/internal/codegen/ContributionBinding.java
+index 01a8ef7ec..e573c72ea 100644
+--- a/java/dagger/internal/codegen/ContributionBinding.java
++++ b/java/dagger/internal/codegen/ContributionBinding.java
+@@ -40,6 +40,7 @@
+ import javax.lang.model.element.AnnotationMirror;
+ import javax.lang.model.element.AnnotationValue;
+ import javax.lang.model.element.Element;
++import javax.lang.model.element.ExecutableElement;
+ import javax.lang.model.element.Modifier;
+ import javax.lang.model.element.TypeElement;
+ import javax.lang.model.type.DeclaredType;
+@@ -78,6 +79,7 @@ boolean requiresModuleInstance() {
+   /** If {@link #bindingElement()} is a method that returns a primitive type, returns that type. */
+   Optional<TypeMirror> contributedPrimitiveType() {
+     return bindingElement()
++        .filter(bindingElement -> bindingElement instanceof ExecutableElement)
+         .map(bindingElement -> MoreElements.asExecutable(bindingElement).getReturnType())
+         .filter(type -> type.getKind().isPrimitive());
+   }
+diff --git a/java/dagger/internal/codegen/MethodSignature.java b/java/dagger/internal/codegen/MethodSignature.java
+index 0c1fae7f6..c44453651 100644
+--- a/java/dagger/internal/codegen/MethodSignature.java
++++ b/java/dagger/internal/codegen/MethodSignature.java
+@@ -16,34 +16,40 @@
+ 
+ package dagger.internal.codegen;
+ 
+-import static com.google.common.base.Preconditions.checkNotNull;
++import static dagger.internal.codegen.DaggerStreams.toImmutableList;
+ 
+ import com.google.auto.common.MoreTypes;
+ import com.google.auto.value.AutoValue;
+ import com.google.common.base.Equivalence;
+ import com.google.common.collect.ImmutableList;
++import dagger.internal.codegen.ComponentDescriptor.ComponentMethodDescriptor;
++import java.util.List;
++import javax.lang.model.type.DeclaredType;
+ import javax.lang.model.type.ExecutableType;
+ import javax.lang.model.type.TypeMirror;
++import javax.lang.model.util.Types;
+ 
+ @AutoValue
+ abstract class MethodSignature {
++
+   abstract String name();
+-  abstract ImmutableList<Equivalence.Wrapper<TypeMirror>> parameterTypes();
+-  abstract ImmutableList<Equivalence.Wrapper<TypeMirror>> thrownTypes();
+-
+-  static MethodSignature fromExecutableType(String methodName, ExecutableType methodType) {
+-    checkNotNull(methodType);
+-    ImmutableList.Builder<Equivalence.Wrapper<TypeMirror>> parameters = ImmutableList.builder();
+-    ImmutableList.Builder<Equivalence.Wrapper<TypeMirror>> thrownTypes = ImmutableList.builder();
+-    for (TypeMirror parameter : methodType.getParameterTypes()) {
+-      parameters.add(MoreTypes.equivalence().wrap(parameter));
+-    }
+-    for (TypeMirror thrownType : methodType.getThrownTypes()) {
+-      thrownTypes.add(MoreTypes.equivalence().wrap(thrownType));
+-    }
++
++  abstract ImmutableList<? extends Equivalence.Wrapper<? extends TypeMirror>> parameterTypes();
++
++  abstract ImmutableList<? extends Equivalence.Wrapper<? extends TypeMirror>> thrownTypes();
++
++  static MethodSignature forComponentMethod(
++      ComponentMethodDescriptor componentMethod, DeclaredType componentType, Types types) {
++    ExecutableType methodType =
++        MoreTypes.asExecutable(types.asMemberOf(componentType, componentMethod.methodElement()));
+     return new AutoValue_MethodSignature(
+-        methodName,
+-        parameters.build(),
+-        thrownTypes.build());
++        componentMethod.methodElement().getSimpleName().toString(),
++        wrapInEquivalence(methodType.getParameterTypes()),
++        wrapInEquivalence(methodType.getThrownTypes()));
++  }
++
++  private static ImmutableList<? extends Equivalence.Wrapper<? extends TypeMirror>>
++      wrapInEquivalence(List<? extends TypeMirror> types) {
++    return types.stream().map(MoreTypes.equivalence()::wrap).collect(toImmutableList());
+   }
+ }
+diff --git a/java/dagger/internal/codegen/PrivateMethodBindingExpression.java b/java/dagger/internal/codegen/PrivateMethodBindingExpression.java
+index c84b4ca91..506fe5910 100644
+--- a/java/dagger/internal/codegen/PrivateMethodBindingExpression.java
++++ b/java/dagger/internal/codegen/PrivateMethodBindingExpression.java
+@@ -19,259 +19,66 @@
+ import static com.google.common.base.CaseFormat.LOWER_CAMEL;
+ import static com.google.common.base.CaseFormat.UPPER_CAMEL;
+ import static com.google.common.base.CaseFormat.UPPER_UNDERSCORE;
++import static com.google.common.base.Preconditions.checkNotNull;
+ import static com.squareup.javapoet.MethodSpec.methodBuilder;
+-import static dagger.internal.codegen.CodeBlocks.anonymousProvider;
+-import static dagger.internal.codegen.ContributionBinding.FactoryCreationStrategy.SINGLETON_INSTANCE;
+-import static dagger.internal.codegen.GeneratedComponentModel.FieldSpecKind.PRIVATE_METHOD_SCOPED_FIELD;
+ import static dagger.internal.codegen.GeneratedComponentModel.MethodSpecKind.PRIVATE_METHOD;
+-import static dagger.internal.codegen.RequestKinds.requestType;
+ import static javax.lang.model.element.Modifier.PRIVATE;
+-import static javax.lang.model.element.Modifier.VOLATILE;
+ 
+-import com.google.auto.common.MoreTypes;
+ import com.squareup.javapoet.ClassName;
+ import com.squareup.javapoet.CodeBlock;
+-import com.squareup.javapoet.FieldSpec;
+ import com.squareup.javapoet.TypeName;
+-import com.squareup.javapoet.TypeSpec;
+-import dagger.internal.MemoizedSentinel;
+-import dagger.internal.codegen.ComponentDescriptor.ComponentMethodDescriptor;
+ import dagger.model.RequestKind;
+-import dagger.model.Scope;
+-import java.util.EnumMap;
+-import java.util.Map;
+-import java.util.Optional;
+-import javax.lang.model.type.TypeKind;
+-import javax.lang.model.type.TypeMirror;
+-import javax.lang.model.util.Elements;
+ 
+ /**
+  * A binding expression that wraps the dependency expressions in a private, no-arg method.
+  *
+- * <p>Dependents of this binding expression will just called the no-arg method.
++ * <p>Dependents of this binding expression will just call the no-arg private method.
+  */
+ final class PrivateMethodBindingExpression extends BindingExpression {
++  private final BindingMethodImplementation methodImplementation;
+   private final GeneratedComponentModel generatedComponentModel;
+-  private final ComponentBindingExpressions componentBindingExpressions;
+-  private final BindingExpression delegate;
+-  // TODO(user): No need for a map. Each PMBE instance only handles 1 request kind now.
+-  private final Map<RequestKind, String> methodNames = new EnumMap<>(RequestKind.class);
+-  private final Map<RequestKind, String> fieldNames = new EnumMap<>(RequestKind.class);
+-  private final ContributionBinding binding;
+-  private final CompilerOptions compilerOptions;
+-  private final ReferenceReleasingManagerFields referenceReleasingManagerFields;
+-  private final DaggerTypes types;
+-  private final Elements elements;
++  private String methodName;
+ 
+   PrivateMethodBindingExpression(
+-      GeneratedComponentModel generatedComponentModel,
+-      ComponentBindingExpressions componentBindingExpressions,
+-      BindingExpression delegate,
+-      ReferenceReleasingManagerFields referenceReleasingManagerFields,
+-      CompilerOptions compilerOptions,
+-      DaggerTypes types,
+-      Elements elements) {
+-    super(delegate.resolvedBindings(), delegate.requestKind());
+-    this.generatedComponentModel = generatedComponentModel;
+-    this.componentBindingExpressions = componentBindingExpressions;
+-    this.delegate = delegate;
+-    this.binding = resolvedBindings().contributionBinding();
+-    this.referenceReleasingManagerFields = referenceReleasingManagerFields;
+-    this.compilerOptions = compilerOptions;
+-    this.types = types;
+-    this.elements = elements;
+-  }
+-
+-  @Override
+-  protected CodeBlock doGetComponentMethodImplementation(
+-      ComponentMethodDescriptor componentMethod, ClassName requestingClass) {
+-    if (!canInlineScope() && ignorePrivateMethodStrategy()) {
+-      return delegate.getComponentMethodImplementation(componentMethod, requestingClass);
+-    }
+-
+-    return findComponentMethod().map(method -> method.equals(componentMethod)).orElse(false)
+-        ? methodBody()
+-        : super.doGetComponentMethodImplementation(componentMethod, requestingClass);
++      ResolvedBindings resolvedBindings,
++      RequestKind requestKind,
++      BindingMethodImplementation methodImplementation,
++      GeneratedComponentModel generatedComponentModel) {
++    super(resolvedBindings, requestKind);
++    this.methodImplementation = checkNotNull(methodImplementation);
++    this.generatedComponentModel = checkNotNull(generatedComponentModel);
+   }
+ 
+   @Override
+   Expression getDependencyExpression(ClassName requestingClass) {
+-    if (!canInlineScope() && (ignorePrivateMethodStrategy() || isNullaryProvisionMethod())) {
+-      return delegate.getDependencyExpression(requestingClass);
+-    }
+-
+-    if (!methodNames.containsKey(requestKind())) {
+-      Optional<ComponentMethodDescriptor> componentMethod = findComponentMethod();
+-      String name =
+-          componentMethod.isPresent()
+-              ? componentMethod.get().methodElement().getSimpleName().toString()
+-              : generatedComponentModel.getUniqueMethodName(methodName());
+-      methodNames.put(requestKind(), name);
+-      if (!componentMethod.isPresent()) {
+-        createMethod(name);
+-      }
++    if (methodName == null) {
++      // Have to set methodName field before implementing the method in order to handle recursion.
++      methodName = generatedComponentModel.getUniqueMethodName(methodName());
++      createMethod(methodName, requestingClass);
+     }
+ 
++    // TODO(user): This logic is repeated in multiple places. Can we extract it somewhere?
++    ClassName componentName = generatedComponentModel.name();
+     CodeBlock invocation =
+-        componentName().equals(requestingClass)
+-            ? CodeBlock.of("$N()", methodNames.get(requestKind()))
+-            : CodeBlock.of("$T.this.$N()", componentName(), methodNames.get(requestKind()));
+-    return Expression.create(returnType(), invocation);
+-  }
+-
+-  private ClassName componentName() {
+-    return generatedComponentModel.name();
+-  }
+-
+-  // TODO(user): Invert this method to return true if we are using the private method strategy.
+-  private boolean ignorePrivateMethodStrategy() {
+-    // TODO(user): move experimental android logic out of this class
+-    switch (requestKind()) {
+-      case INSTANCE:
+-      case FUTURE:
+-        return false;
+-      case PROVIDER:
+-      case LAZY:
+-      case PROVIDER_OF_LAZY:
+-        return !compilerOptions.experimentalAndroidMode()
+-            || (binding.scope().isPresent() && !canInlineScope())
+-            || binding.factoryCreationStrategy().equals(SINGLETON_INSTANCE);
+-      default:
+-        return !compilerOptions.experimentalAndroidMode();
+-    }
+-  }
+-
+-  private boolean isNullaryProvisionMethod() {
+-    return (requestKind().equals(RequestKind.INSTANCE) || requestKind().equals(RequestKind.FUTURE))
+-        && binding.dependencies().isEmpty()
+-        && !findComponentMethod().isPresent();
+-  }
+-
+-  private boolean canInlineScope() {
+-    // TODO(user): Enable for releasable references
+-    return compilerOptions.experimentalAndroidMode()
+-        && binding.scope().isPresent()
+-        && !referenceReleasingManagerFields.requiresReleasableReferences(binding.scope().get());
+-  }
+-
+-  /** Returns the first component method associated with this request kind, if one exists. */
+-  private Optional<ComponentMethodDescriptor> findComponentMethod() {
+-    // There could be multiple component methods with the same request key and kind.
+-    // We arbitrarily choose the first one, and designate it to contain the implementation code.
+-    return resolvedBindings()
+-        .owningComponent()
+-        .componentMethods()
+-        .stream()
+-        .filter(this::componentMethodMatchesRequestKeyAndKind)
+-        .findFirst();
+-  }
+-
+-  /** Returns true if the component method matches the dependency request key and kind. */
+-  private boolean componentMethodMatchesRequestKeyAndKind(
+-      ComponentMethodDescriptor componentMethod) {
+-    return componentMethod
+-        .dependencyRequest()
+-        .filter(request -> request.key().equals(key()))
+-        .filter(request -> request.kind().equals(requestKind()))
+-        .isPresent();
++        componentName.equals(requestingClass)
++            ? CodeBlock.of("$N()", methodName)
++            : CodeBlock.of("$T.this.$N()", componentName, methodName);
++    return Expression.create(methodImplementation.returnType(), invocation);
+   }
+ 
+   /** Creates the no-arg method used for dependency expressions. */
+-  private void createMethod(String name) {
++  private void createMethod(String name, ClassName requestingClass) {
+     // TODO(user): Consider when we can make this method static.
+     // TODO(user): Fix the order that these generated methods are written to the component.
+     generatedComponentModel.addMethod(
+         PRIVATE_METHOD,
+         methodBuilder(name)
+             .addModifiers(PRIVATE)
+-            .returns(TypeName.get(returnType()))
+-            .addCode(methodBody())
++            .returns(TypeName.get(methodImplementation.returnType()))
++            .addCode(methodImplementation.body(requestingClass))
+             .build());
+   }
+ 
+-  /** Returns the return type for the dependency request. */
+-  private TypeMirror returnType() {
+-    if (requestKind().equals(RequestKind.INSTANCE)
+-        && binding.contributedPrimitiveType().isPresent()) {
+-      return binding.contributedPrimitiveType().get();
+-    }
+-    return accessibleType(requestType(requestKind(), binding.contributedType(), types));
+-  }
+-
+-  /** Returns the method body for the dependency request. */
+-  private CodeBlock methodBody() {
+-    switch (requestKind()) {
+-      case PROVIDER:
+-        // TODO(user): Cache provider field instead of recreating each time.
+-        return CodeBlock.of("return $L;", providerTypeSpec());
+-      case INSTANCE:
+-        if (canInlineScope()) {
+-          Scope scope = resolvedBindings().scope().get();
+-          return scope.isReusable() ? singleCheck() : doubleCheck();
+-        }
+-        // fall through
+-      default:
+-        return CodeBlock.of(
+-            "return $L;", delegate.getDependencyExpression(componentName()).codeBlock());
+-    }
+-  }
+-
+-  private CodeBlock singleCheck() {
+-    String fieldName = getMemoizedFieldName();
+-    return CodeBlock.builder()
+-        .beginControlFlow("if ($N instanceof $T)", fieldName, MemoizedSentinel.class)
+-        .addStatement(
+-            "$N = $L", fieldName, delegate.getDependencyExpression(componentName()).codeBlock())
+-        .endControlFlow()
+-        .addStatement("return ($T) $N", returnType(), fieldName)
+-        .build();
+-  }
+-
+-  private CodeBlock doubleCheck() {
+-    String fieldName = getMemoizedFieldName();
+-    // add "this." if the fieldName clashes with the local variable name.
+-    fieldName = fieldName.contentEquals("local") ? "this." + fieldName : fieldName;
+-    return CodeBlock.builder()
+-        .addStatement("$T local = $L", TypeName.OBJECT, fieldName)
+-        .beginControlFlow("if (local instanceof $T)", MemoizedSentinel.class)
+-        .beginControlFlow("synchronized (local)")
+-        // TODO(user): benchmark to see if this is really faster than instanceof check?
+-        .beginControlFlow("if (local == $L)", fieldName)
+-        .addStatement(
+-            "$L = $L", fieldName, delegate.getDependencyExpression(componentName()).codeBlock())
+-        .endControlFlow()
+-        .addStatement("local = $L", fieldName)
+-        .endControlFlow()
+-        .endControlFlow()
+-        .addStatement("return ($T) local", returnType())
+-        .build();
+-  }
+-
+-  private String getMemoizedFieldName() {
+-    if (!fieldNames.containsKey(requestKind())) {
+-      String name = generatedComponentModel.getUniqueFieldName(BindingVariableNamer.name(binding));
+-      generatedComponentModel.addField(
+-          PRIVATE_METHOD_SCOPED_FIELD,
+-          FieldSpec.builder(TypeName.OBJECT, name, PRIVATE, VOLATILE)
+-              .initializer("new $T()", MemoizedSentinel.class)
+-              .build());
+-      fieldNames.put(requestKind(), name);
+-    }
+-    return fieldNames.get(requestKind());
+-  }
+-
+-  /** Returns a {@link TypeSpec} for an anonymous provider class. */
+-  private CodeBlock providerTypeSpec() {
+-    // TODO(user): For scoped bindings that have already been created, use InstanceFactory?
+-    return anonymousProvider(
+-        TypeName.get(accessibleType(binding.contributedType())),
+-        CodeBlock.of(
+-            "return $L;",
+-            componentBindingExpressions
+-                .getDependencyExpression(key(), RequestKind.INSTANCE, componentName())
+-                .codeBlock()));
+-  }
+-
+   /** Returns the canonical name for a no-arg dependency expression method. */
+   private String methodName() {
+     // TODO(user): Use a better name for @MapKey binding instances.
+@@ -284,6 +91,7 @@ private String methodName() {
+ 
+   /** Returns the canonical name for the {@link Binding}. */
+   private String bindingName() {
++    ContributionBinding binding = resolvedBindings().contributionBinding();
+     return LOWER_CAMEL.to(UPPER_CAMEL, BindingVariableNamer.name(binding));
+   }
+ 
+@@ -291,16 +99,4 @@ private String bindingName() {
+   private static String dependencyKindName(RequestKind kind) {
+     return UPPER_UNDERSCORE.to(UPPER_CAMEL, kind.name());
+   }
+-
+-  /** Returns a {@link TypeName} for the binding that is accessible to the component. */
+-  private TypeMirror accessibleType(TypeMirror typeMirror) {
+-    if (Accessibility.isTypeAccessibleFrom(typeMirror, componentName().packageName())) {
+-      return typeMirror;
+-    } else if (Accessibility.isRawTypeAccessible(typeMirror, componentName().packageName())
+-        && typeMirror.getKind().equals(TypeKind.DECLARED)) {
+-      return types.getDeclaredType(MoreTypes.asTypeElement(typeMirror));
+-    } else {
+-      return elements.getTypeElement(Object.class.getCanonicalName()).asType();
+-    }
+-  }
+ }
+diff --git a/javatests/dagger/functional/BasicComponent.java b/javatests/dagger/functional/BasicComponent.java
+index ac5f098eb..295c1e13d 100644
+--- a/javatests/dagger/functional/BasicComponent.java
++++ b/javatests/dagger/functional/BasicComponent.java
+@@ -23,7 +23,12 @@
+ import javax.inject.Provider;
+ 
+ @Component(modules = {PrimitivesModule.class, NullableModule.class})
+-interface BasicComponent extends Injector<Thing> {
++interface BasicComponent
++    extends Injector<Thing>,
++        // Implements two types that define the same method, not overridden here, to test that the
++        // method is implemented only once.
++        ComponentSupertypeOne,
++        ComponentSupertypeTwo {
+   byte getByte();
+   char getChar();
+   short getShort();
+diff --git a/javatests/dagger/functional/ComponentMethodTest.java b/javatests/dagger/functional/ComponentMethodTest.java
+new file mode 100644
+index 000000000..5e53ea417
+--- /dev/null
++++ b/javatests/dagger/functional/ComponentMethodTest.java
+@@ -0,0 +1,82 @@
++/*
++ * Copyright (C) 2018 The Dagger Authors.
++ *
++ * Licensed under the Apache License, Version 2.0 (the "License");
++ * you may not use this file except in compliance with the License.
++ * You may obtain a copy of the License at
++ *
++ * http://www.apache.org/licenses/LICENSE-2.0
++ *
++ * Unless required by applicable law or agreed to in writing, software
++ * distributed under the License is distributed on an "AS IS" BASIS,
++ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++ * See the License for the specific language governing permissions and
++ * limitations under the License.
++ */
++
++package dagger.functional;
++
++import dagger.Component;
++import javax.inject.Inject;
++import javax.inject.Provider;
++import org.junit.Test;
++import org.junit.runner.RunWith;
++import org.junit.runners.JUnit4;
++
++/**
++ * This is a regression test that makes sure component method order does not affect initialization
++ * order.
++ */
++@RunWith(JUnit4.class)
++public final class ComponentMethodTest {
++
++  static final class Dep1 {
++
++    @Inject
++    Dep1(Dep2 dep2) {}
++  }
++
++  static final class Dep2 {
++
++    @Inject
++    Dep2(Dep3 dep3) {}
++  }
++
++  static final class Dep3 {
++
++    @Inject
++    Dep3() {}
++  }
++
++  @Component
++  interface NonTopologicalOrderComponent {
++
++    Provider<Dep1> dep1Provider();
++
++    Provider<Dep2> dep2Provider();
++  }
++
++  @Component
++  interface TopologicalOrderComponent {
++
++    Provider<Dep2> dep2Provider();
++
++    Provider<Dep1> dep1Provider();
++  }
++
++  @Test
++  public void testNonTopologicalOrderComponent() throws Exception {
++    NonTopologicalOrderComponent component =
++        DaggerComponentMethodTest_NonTopologicalOrderComponent.create();
++    component.dep1Provider().get();
++    component.dep2Provider().get();
++  }
++
++  @Test
++  public void testTopologicalOrderComponent() throws Exception {
++    TopologicalOrderComponent component =
++        DaggerComponentMethodTest_TopologicalOrderComponent.create();
++    component.dep1Provider().get();
++    component.dep2Provider().get();
++  }
++}
+diff --git a/javatests/dagger/functional/ComponentSupertypeOne.java b/javatests/dagger/functional/ComponentSupertypeOne.java
+new file mode 100644
+index 000000000..c63d1daac
+--- /dev/null
++++ b/javatests/dagger/functional/ComponentSupertypeOne.java
+@@ -0,0 +1,21 @@
++/*
++ * Copyright (C) 2018 The Dagger Authors.
++ *
++ * Licensed under the Apache License, Version 2.0 (the "License");
++ * you may not use this file except in compliance with the License.
++ * You may obtain a copy of the License at
++ *
++ * http://www.apache.org/licenses/LICENSE-2.0
++ *
++ * Unless required by applicable law or agreed to in writing, software
++ * distributed under the License is distributed on an "AS IS" BASIS,
++ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++ * See the License for the specific language governing permissions and
++ * limitations under the License.
++ */
++
++package dagger.functional;
++
++public interface ComponentSupertypeOne {
++  Thing inheritedThing();
++}
+diff --git a/javatests/dagger/functional/ComponentSupertypeTwo.java b/javatests/dagger/functional/ComponentSupertypeTwo.java
+new file mode 100644
+index 000000000..3c8312baa
+--- /dev/null
++++ b/javatests/dagger/functional/ComponentSupertypeTwo.java
+@@ -0,0 +1,21 @@
++/*
++ * Copyright (C) 2018 The Dagger Authors.
++ *
++ * Licensed under the Apache License, Version 2.0 (the "License");
++ * you may not use this file except in compliance with the License.
++ * You may obtain a copy of the License at
++ *
++ * http://www.apache.org/licenses/LICENSE-2.0
++ *
++ * Unless required by applicable law or agreed to in writing, software
++ * distributed under the License is distributed on an "AS IS" BASIS,
++ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++ * See the License for the specific language governing permissions and
++ * limitations under the License.
++ */
++
++package dagger.functional;
++
++public interface ComponentSupertypeTwo {
++  Thing inheritedThing();
++}
+diff --git a/javatests/dagger/internal/codegen/ComponentProcessorTest.java b/javatests/dagger/internal/codegen/ComponentProcessorTest.java
+index 7822ab719..fba229d1f 100644
+--- a/javatests/dagger/internal/codegen/ComponentProcessorTest.java
++++ b/javatests/dagger/internal/codegen/ComponentProcessorTest.java
+@@ -307,7 +307,7 @@ public void componentWithInvalidModule() {
+                 "",
+                 "  @Override",
+                 "  public Lazy<SomeInjectableType> lazySomeInjectableType() {",
+-                "    return DoubleCheck.lazy(SomeInjectableType_Factory.create());",
++                "    return DoubleCheck.lazy(someInjectableTypeProvider());",
+                 "  }",
+                 "",
+                 "  @Override",
+@@ -383,7 +383,7 @@ public void componentWithInvalidModule() {
+                 "  }",
+                 "")
+             .addLines(
+-                "  @Override",
++                "  @Override", //
+                 "  public SomeInjectableType someInjectableType() {")
+             .addLinesIn(
+                 EXPERIMENTAL_ANDROID_MODE,
+@@ -399,19 +399,17 @@ public void componentWithInvalidModule() {
+                 "    return (SomeInjectableType) local;")
+             .addLinesIn(
+                 DEFAULT_MODE,
+-                "    return someInjectableTypeProvider.get();")
++                // TODO(ronshapiro): It's a little weird that the component method is used instead
++                // of the instance. This only really happens because the same key is scoped and
++                // exposed as a component method for both an instance and a Provider, so probably
++                // not so common. Are there any other cases where this might come up?
++                "    return someInjectableTypeProvider().get();")
+             .addLines(
+                 "  }",
+                 "",
+                 "  @Override",
+-                "  public Lazy<SomeInjectableType> lazySomeInjectableType() {")
+-            .addLinesIn(
+-                EXPERIMENTAL_ANDROID_MODE,
+-                "    return DoubleCheck.lazy(someInjectableTypeProvider());")
+-            .addLinesIn(
+-                DEFAULT_MODE,
+-                "    return DoubleCheck.lazy(someInjectableTypeProvider);")
+-            .addLines(
++                "  public Lazy<SomeInjectableType> lazySomeInjectableType() {",
++                "    return DoubleCheck.lazy(someInjectableTypeProvider());",
+                 "  }",
+                 "",
+                 "  @Override",
+@@ -425,10 +423,10 @@ public void componentWithInvalidModule() {
+                 "      }",
+                 "    };")
+             .addLinesIn(
+-                DEFAULT_MODE,
++                DEFAULT_MODE, //
+                 "    return someInjectableTypeProvider;")
+             .addLines(
+-                "  }",
++                "  }", //
+                 "}")
+             .build();
+     Compilation compilation =
+diff --git a/javatests/dagger/internal/codegen/DelegateBindingExpressionTest.java b/javatests/dagger/internal/codegen/DelegateBindingExpressionTest.java
+index 1372ccaed..f901df2c1 100644
+--- a/javatests/dagger/internal/codegen/DelegateBindingExpressionTest.java
++++ b/javatests/dagger/internal/codegen/DelegateBindingExpressionTest.java
+@@ -669,7 +669,6 @@ public void castedToRawType() {
+             "import dagger.Module;",
+             "import dagger.Provides;",
+             "import javax.inject.Named;",
+-            "import javax.inject.Singleton;",
+             "",
+             "@Module",
+             "interface TestModule {",
+@@ -680,9 +679,6 @@ public void castedToRawType() {
+             "  CharSequence charSequence(String string);",
+             "",
+             "  @Binds",
+-            "  Object object(CharSequence charSequence);",
+-            "",
+-            "  @Binds",
+             "  @Named(\"named\")",
+             "  String namedString(String string);",
+             "}");
+@@ -698,7 +694,6 @@ public void castedToRawType() {
+             "@Component(modules = TestModule.class)",
+             "interface TestComponent {",
+             "  Provider<CharSequence> charSequence();",
+-            "  Provider<Object> object();",
+             "",
+             "  @Named(\"named\") Provider<String> namedString();",
+             "}");
+@@ -721,14 +716,68 @@ public void castedToRawType() {
+                 "  }",
+                 "",
+                 "  @Override",
+-                "  public Provider<Object> object() {",
+-                //   @Binds used twice, but no need to cast (Provider) (Provider)
+-                "    return (Provider) TestModule_ProvideStringFactory.create();",
++                "  public Provider<String> namedString() {",
++                "    return TestModule_ProvideStringFactory.create();",
+                 "  }",
++                "}"));
++  }
++
++  @Test
++  public void doubleBinds() {
++    JavaFileObject module =
++        JavaFileObjects.forSourceLines(
++            "test.TestModule",
++            "package test;",
++            "",
++            "import dagger.Binds;",
++            "import dagger.Module;",
++            "import dagger.Provides;",
++            "",
++            "@Module",
++            "interface TestModule {",
++            "  @Provides",
++            "  static String provideString() { return new String(); }",
++            "",
++            "  @Binds",
++            "  CharSequence charSequence(String string);",
++            "",
++            "  @Binds",
++            "  Object object(CharSequence charSequence);",
++            "}");
++    JavaFileObject component =
++        JavaFileObjects.forSourceLines(
++            "test.TestComponent",
++            "package test;",
++            "",
++            "import dagger.Component;",
++            "import javax.inject.Named;",
++            "import javax.inject.Provider;",
++            "",
++            "@Component(modules = TestModule.class)",
++            "interface TestComponent {",
++            "  Provider<CharSequence> charSequence();",
++            "  Provider<Object> object();",
++            "}");
++
++    Compilation compilation = daggerCompiler().compile(module, component);
++    assertThat(compilation).succeeded();
++    assertThat(compilation)
++        .generatedSourceFile("test.DaggerTestComponent")
++        .containsElementsIn(
++            JavaFileObjects.forSourceLines(
++                "test.DaggerTestComponent",
++                "",
++                "package test;",
+                 "",
++                GENERATED_ANNOTATION,
++                "public final class DaggerTestComponent implements TestComponent {",
+                 "  @Override",
+-                "  public Provider<String> namedString() {",
+-                "    return TestModule_ProvideStringFactory.create();",
++                "  public Provider<CharSequence> charSequence() {",
++                "    return (Provider) TestModule_ProvideStringFactory.create();",
++                "  }",
++                "  @Override",
++                "  public Provider<Object> object() {",
++                "    return (Provider) charSequence();",
+                 "  }",
+                 "}"));
+   }
+diff --git a/javatests/dagger/internal/codegen/SubcomponentBuilderRequestFulfillmentTest.java b/javatests/dagger/internal/codegen/SubcomponentBuilderRequestFulfillmentTest.java
+index d391622b8..f33eaa967 100644
+--- a/javatests/dagger/internal/codegen/SubcomponentBuilderRequestFulfillmentTest.java
++++ b/javatests/dagger/internal/codegen/SubcomponentBuilderRequestFulfillmentTest.java
+@@ -108,7 +108,8 @@ public void testInlinedSubcomponentBuilders_componentMethod() {
+             "",
+             "  @Override",
+             "  public UsesSubcomponent usesSubcomponent() {",
+-            "    return new UsesSubcomponent(new SubBuilder());",
++            // TODO(ronshapiro): Should component methods not be used when deps == 0?
++            "    return new UsesSubcomponent(sBuilder());",
+             "  }",
+             "",
+             "  public static final class Builder {",
+diff --git a/javatests/dagger/internal/codegen/SubcomponentValidationTest.java b/javatests/dagger/internal/codegen/SubcomponentValidationTest.java
+index 8524944b8..8beb5ea74 100644
+--- a/javatests/dagger/internal/codegen/SubcomponentValidationTest.java
++++ b/javatests/dagger/internal/codegen/SubcomponentValidationTest.java
+@@ -406,7 +406,7 @@ public void delegateFactoryNotCreatedForSubcomponentWhenProviderExistsInParent()
+                 "  }",
+                 "")
+             .addLines(
+-                "  @Override",
++                "  @Override", //
+                 "  public Dep1 getDep1() {")
+             .addLinesIn(
+                 EXPERIMENTAL_ANDROID_MODE,
+@@ -421,10 +421,10 @@ public void delegateFactoryNotCreatedForSubcomponentWhenProviderExistsInParent()
+                 "    }",
+                 "    return (Dep1) local;")
+             .addLinesIn(
+-                DEFAULT_MODE,
++                DEFAULT_MODE, //
+                 "    return dep1Provider.get();")
+             .addLines(
+-                "  }",
++                "  }", //
+                 "",
+                 "  @Override",
+                 "  public Dep2 getDep2() {")
+@@ -441,7 +441,7 @@ public void delegateFactoryNotCreatedForSubcomponentWhenProviderExistsInParent()
+                 "    }",
+                 "    return (Dep2) local;")
+             .addLinesIn(
+-                DEFAULT_MODE,
++                DEFAULT_MODE, //
+                 "    return dep2Provider.get();")
+             .addLines(
+                 "  }",
+@@ -473,29 +473,16 @@ public void delegateFactoryNotCreatedForSubcomponentWhenProviderExistsInParent()
+                 "      this.childModule = new ChildModule();",
+                 "    }",
+                 "",
+-                "    private NeedsDep1 getNeedsDep1() {")
+-            .addLinesIn(
+-                EXPERIMENTAL_ANDROID_MODE,
+-                "      return new NeedsDep1(DaggerParentComponent.this.getDep1());")
+-            .addLinesIn(
+-                DEFAULT_MODE,
+-                "      return new NeedsDep1(DaggerParentComponent.this.dep1Provider.get());")
+-            .addLines(
++                "    private NeedsDep1 getNeedsDep1() {",
++                "      return new NeedsDep1(DaggerParentComponent.this.getDep1());",
+                 "    }",
+                 "",
+                 "    private A getA() {",
+                 "      return injectA(",
+                 "          A_Factory.newA(",
+-                "              getNeedsDep1(),")
+-            .addLinesIn(
+-                EXPERIMENTAL_ANDROID_MODE,
++                "              getNeedsDep1(),",
+                 "              DaggerParentComponent.this.getDep1(),",
+-                "              DaggerParentComponent.this.getDep2()));")
+-            .addLinesIn(
+-                DEFAULT_MODE,
+-                "              DaggerParentComponent.this.dep1Provider.get(),",
+-                "              DaggerParentComponent.this.dep2Provider.get()));")
+-            .addLines(
++                "              DaggerParentComponent.this.getDep2()));",
+                 "    }",
+                 "",
+                 "    @Override",

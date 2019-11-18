@@ -1,0 +1,253 @@
+diff --git a/demos/main/src/main/java/com/google/android/exoplayer2/demo/PlayerActivity.java b/demos/main/src/main/java/com/google/android/exoplayer2/demo/PlayerActivity.java
+index 3ade9173c6..249223bff5 100644
+--- a/demos/main/src/main/java/com/google/android/exoplayer2/demo/PlayerActivity.java
++++ b/demos/main/src/main/java/com/google/android/exoplayer2/demo/PlayerActivity.java
+@@ -486,7 +486,9 @@ private MediaSource buildMediaSource(
+       case C.TYPE_HLS:
+         return new HlsMediaSource.Factory(dataSourceFactory).createMediaSource(uri);
+       case C.TYPE_OTHER:
+-        return new ProgressiveMediaSource.Factory(dataSourceFactory).createMediaSource(uri);
++        return new ProgressiveMediaSource.Factory(dataSourceFactory)
++            .setDrmSessionManager(drmSessionManager)
++            .createMediaSource(uri);
+       default:
+         throw new IllegalStateException("Unsupported type: " + type);
+     }
+diff --git a/library/core/src/main/java/com/google/android/exoplayer2/source/ExtractorMediaSource.java b/library/core/src/main/java/com/google/android/exoplayer2/source/ExtractorMediaSource.java
+index 7332ed74e0..9e7da87766 100644
+--- a/library/core/src/main/java/com/google/android/exoplayer2/source/ExtractorMediaSource.java
++++ b/library/core/src/main/java/com/google/android/exoplayer2/source/ExtractorMediaSource.java
+@@ -21,6 +21,7 @@
+ import com.google.android.exoplayer2.C;
+ import com.google.android.exoplayer2.Player;
+ import com.google.android.exoplayer2.Timeline;
++import com.google.android.exoplayer2.drm.DrmSessionManager;
+ import com.google.android.exoplayer2.extractor.DefaultExtractorsFactory;
+ import com.google.android.exoplayer2.extractor.Extractor;
+ import com.google.android.exoplayer2.extractor.ExtractorsFactory;
+@@ -325,6 +326,7 @@ private ExtractorMediaSource(
+             uri,
+             dataSourceFactory,
+             extractorsFactory,
++            DrmSessionManager.getDummyDrmSessionManager(),
+             loadableLoadErrorHandlingPolicy,
+             customCacheKey,
+             continueLoadingCheckIntervalBytes,
+diff --git a/library/core/src/main/java/com/google/android/exoplayer2/source/ProgressiveMediaPeriod.java b/library/core/src/main/java/com/google/android/exoplayer2/source/ProgressiveMediaPeriod.java
+index a56d14083e..83145d04b0 100644
+--- a/library/core/src/main/java/com/google/android/exoplayer2/source/ProgressiveMediaPeriod.java
++++ b/library/core/src/main/java/com/google/android/exoplayer2/source/ProgressiveMediaPeriod.java
+@@ -24,6 +24,7 @@
+ import com.google.android.exoplayer2.ParserException;
+ import com.google.android.exoplayer2.SeekParameters;
+ import com.google.android.exoplayer2.decoder.DecoderInputBuffer;
++import com.google.android.exoplayer2.drm.DrmSessionManager;
+ import com.google.android.exoplayer2.extractor.DefaultExtractorInput;
+ import com.google.android.exoplayer2.extractor.Extractor;
+ import com.google.android.exoplayer2.extractor.ExtractorInput;
+@@ -90,6 +91,7 @@
+ 
+   private final Uri uri;
+   private final DataSource dataSource;
++  private final DrmSessionManager<?> drmSessionManager;
+   private final LoadErrorHandlingPolicy loadErrorHandlingPolicy;
+   private final EventDispatcher eventDispatcher;
+   private final Listener listener;
+@@ -107,6 +109,7 @@
+   @Nullable private SeekMap seekMap;
+   @Nullable private IcyHeaders icyHeaders;
+   private SampleQueue[] sampleQueues;
++  private DecryptableSampleQueueReader[] sampleQueueReaders;
+   private TrackId[] sampleQueueTrackIds;
+   private boolean sampleQueuesBuilt;
+   private boolean prepared;
+@@ -152,6 +155,7 @@ public ProgressiveMediaPeriod(
+       Uri uri,
+       DataSource dataSource,
+       Extractor[] extractors,
++      DrmSessionManager<?> drmSessionManager,
+       LoadErrorHandlingPolicy loadErrorHandlingPolicy,
+       EventDispatcher eventDispatcher,
+       Listener listener,
+@@ -160,6 +164,7 @@ public ProgressiveMediaPeriod(
+       int continueLoadingCheckIntervalBytes) {
+     this.uri = uri;
+     this.dataSource = dataSource;
++    this.drmSessionManager = drmSessionManager;
+     this.loadErrorHandlingPolicy = loadErrorHandlingPolicy;
+     this.eventDispatcher = eventDispatcher;
+     this.listener = listener;
+@@ -180,6 +185,7 @@ public ProgressiveMediaPeriod(
+     handler = new Handler();
+     sampleQueueTrackIds = new TrackId[0];
+     sampleQueues = new SampleQueue[0];
++    sampleQueueReaders = new DecryptableSampleQueueReader[0];
+     pendingResetPositionUs = C.TIME_UNSET;
+     length = C.LENGTH_UNSET;
+     durationUs = C.TIME_UNSET;
+@@ -195,6 +201,9 @@ public void release() {
+         sampleQueue.discardToEnd();
+       }
+     }
++    for (DecryptableSampleQueueReader reader : sampleQueueReaders) {
++      reader.release();
++    }
+     loader.release(/* callback= */ this);
+     handler.removeCallbacksAndMessages(null);
+     callback = null;
+@@ -432,29 +441,32 @@ public long getAdjustedSeekPositionUs(long positionUs, SeekParameters seekParame
+   // SampleStream methods.
+ 
+   /* package */ boolean isReady(int track) {
+-    return !suppressRead() && (loadingFinished || sampleQueues[track].hasNextSample());
++    return !suppressRead() && sampleQueueReaders[track].isReady(loadingFinished);
++  }
++
++  /* package */ void maybeThrowError(int sampleQueueIndex) throws IOException {
++    sampleQueueReaders[sampleQueueIndex].maybeThrowError();
++    maybeThrowError();
+   }
+ 
+   /* package */ void maybeThrowError() throws IOException {
+     loader.maybeThrowError(loadErrorHandlingPolicy.getMinimumLoadableRetryCount(dataType));
+   }
+ 
+-  /* package */ int readData(int track, FormatHolder formatHolder, DecoderInputBuffer buffer,
++  /* package */ int readData(
++      int sampleQueueIndex,
++      FormatHolder formatHolder,
++      DecoderInputBuffer buffer,
+       boolean formatRequired) {
+     if (suppressRead()) {
+       return C.RESULT_NOTHING_READ;
+     }
+-    maybeNotifyDownstreamFormat(track);
++    maybeNotifyDownstreamFormat(sampleQueueIndex);
+     int result =
+-        sampleQueues[track].read(
+-            formatHolder,
+-            buffer,
+-            formatRequired,
+-            /* allowOnlyClearBuffers= */ false,
+-            loadingFinished,
+-            lastSeekPositionUs);
++        sampleQueueReaders[sampleQueueIndex].read(
++            formatHolder, buffer, formatRequired, loadingFinished, lastSeekPositionUs);
+     if (result == C.RESULT_NOTHING_READ) {
+-      maybeStartDeferredRetry(track);
++      maybeStartDeferredRetry(sampleQueueIndex);
+     }
+     return result;
+   }
+@@ -667,6 +679,12 @@ private TrackOutput prepareTrackOutput(TrackId id) {
+     @NullableType SampleQueue[] sampleQueues = Arrays.copyOf(this.sampleQueues, trackCount + 1);
+     sampleQueues[trackCount] = trackOutput;
+     this.sampleQueues = Util.castNonNullTypeArray(sampleQueues);
++    @NullableType
++    DecryptableSampleQueueReader[] sampleQueueReaders =
++        Arrays.copyOf(this.sampleQueueReaders, trackCount + 1);
++    sampleQueueReaders[trackCount] =
++        new DecryptableSampleQueueReader(this.sampleQueues[trackCount], drmSessionManager);
++    this.sampleQueueReaders = Util.castNonNullTypeArray(sampleQueueReaders);
+     return trackOutput;
+   }
+ 
+@@ -868,7 +886,7 @@ public boolean isReady() {
+ 
+     @Override
+     public void maybeThrowError() throws IOException {
+-      ProgressiveMediaPeriod.this.maybeThrowError();
++      ProgressiveMediaPeriod.this.maybeThrowError(track);
+     }
+ 
+     @Override
+diff --git a/library/core/src/main/java/com/google/android/exoplayer2/source/ProgressiveMediaSource.java b/library/core/src/main/java/com/google/android/exoplayer2/source/ProgressiveMediaSource.java
+index 42ec237b3e..bd32587bdd 100644
+--- a/library/core/src/main/java/com/google/android/exoplayer2/source/ProgressiveMediaSource.java
++++ b/library/core/src/main/java/com/google/android/exoplayer2/source/ProgressiveMediaSource.java
+@@ -18,6 +18,8 @@
+ import android.net.Uri;
+ import androidx.annotation.Nullable;
+ import com.google.android.exoplayer2.C;
++import com.google.android.exoplayer2.drm.DrmSession;
++import com.google.android.exoplayer2.drm.DrmSessionManager;
+ import com.google.android.exoplayer2.extractor.DefaultExtractorsFactory;
+ import com.google.android.exoplayer2.extractor.Extractor;
+ import com.google.android.exoplayer2.extractor.ExtractorsFactory;
+@@ -51,6 +53,7 @@
+     private ExtractorsFactory extractorsFactory;
+     @Nullable private String customCacheKey;
+     @Nullable private Object tag;
++    private DrmSessionManager<?> drmSessionManager;
+     private LoadErrorHandlingPolicy loadErrorHandlingPolicy;
+     private int continueLoadingCheckIntervalBytes;
+     private boolean isCreateCalled;
+@@ -74,6 +77,7 @@ public Factory(DataSource.Factory dataSourceFactory) {
+     public Factory(DataSource.Factory dataSourceFactory, ExtractorsFactory extractorsFactory) {
+       this.dataSourceFactory = dataSourceFactory;
+       this.extractorsFactory = extractorsFactory;
++      drmSessionManager = DrmSessionManager.getDummyDrmSessionManager();
+       loadErrorHandlingPolicy = new DefaultLoadErrorHandlingPolicy();
+       continueLoadingCheckIntervalBytes = DEFAULT_LOADING_CHECK_INTERVAL_BYTES;
+     }
+@@ -128,6 +132,20 @@ public Factory setTag(Object tag) {
+       return this;
+     }
+ 
++    /**
++     * Sets the {@link DrmSessionManager} to use for acquiring {@link DrmSession DrmSessions}. The
++     * default value is {@link DrmSessionManager#DUMMY}.
++     *
++     * @param drmSessionManager The {@link DrmSessionManager}.
++     * @return This factory, for convenience.
++     * @throws IllegalStateException If one of the {@code create} methods has already been called.
++     */
++    public Factory setDrmSessionManager(DrmSessionManager<?> drmSessionManager) {
++      Assertions.checkState(!isCreateCalled);
++      this.drmSessionManager = drmSessionManager;
++      return this;
++    }
++
+     /**
+      * Sets the {@link LoadErrorHandlingPolicy}. The default value is created by calling {@link
+      * DefaultLoadErrorHandlingPolicy#DefaultLoadErrorHandlingPolicy()}.
+@@ -172,6 +190,7 @@ public ProgressiveMediaSource createMediaSource(Uri uri) {
+           uri,
+           dataSourceFactory,
+           extractorsFactory,
++          drmSessionManager,
+           loadErrorHandlingPolicy,
+           customCacheKey,
+           continueLoadingCheckIntervalBytes,
+@@ -193,6 +212,7 @@ public ProgressiveMediaSource createMediaSource(Uri uri) {
+   private final Uri uri;
+   private final DataSource.Factory dataSourceFactory;
+   private final ExtractorsFactory extractorsFactory;
++  private final DrmSessionManager<?> drmSessionManager;
+   private final LoadErrorHandlingPolicy loadableLoadErrorHandlingPolicy;
+   @Nullable private final String customCacheKey;
+   private final int continueLoadingCheckIntervalBytes;
+@@ -207,6 +227,7 @@ public ProgressiveMediaSource createMediaSource(Uri uri) {
+       Uri uri,
+       DataSource.Factory dataSourceFactory,
+       ExtractorsFactory extractorsFactory,
++      DrmSessionManager<?> drmSessionManager,
+       LoadErrorHandlingPolicy loadableLoadErrorHandlingPolicy,
+       @Nullable String customCacheKey,
+       int continueLoadingCheckIntervalBytes,
+@@ -214,6 +235,7 @@ public ProgressiveMediaSource createMediaSource(Uri uri) {
+     this.uri = uri;
+     this.dataSourceFactory = dataSourceFactory;
+     this.extractorsFactory = extractorsFactory;
++    this.drmSessionManager = drmSessionManager;
+     this.loadableLoadErrorHandlingPolicy = loadableLoadErrorHandlingPolicy;
+     this.customCacheKey = customCacheKey;
+     this.continueLoadingCheckIntervalBytes = continueLoadingCheckIntervalBytes;
+@@ -248,6 +270,7 @@ public MediaPeriod createPeriod(MediaPeriodId id, Allocator allocator, long star
+         uri,
+         dataSource,
+         extractorsFactory.createExtractors(),
++        drmSessionManager,
+         loadableLoadErrorHandlingPolicy,
+         createEventDispatcher(id),
+         this,

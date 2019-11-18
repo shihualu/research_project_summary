@@ -1,0 +1,338 @@
+diff --git a/okhttp/src/main/java/okhttp3/internal/concurrent/Task.kt b/okhttp/src/main/java/okhttp3/internal/concurrent/Task.kt
+index 22d7f3316e..05fa3fd16e 100644
+--- a/okhttp/src/main/java/okhttp3/internal/concurrent/Task.kt
++++ b/okhttp/src/main/java/okhttp3/internal/concurrent/Task.kt
+@@ -67,20 +67,30 @@ abstract class Task(
+     this.queue = queue
+ 
+     this.runRunnable = Runnable {
++      val currentThread = Thread.currentThread()
++      val oldName = currentThread.name
++      currentThread.name = name
++
+       var delayNanos = -1L
+       try {
+         delayNanos = runOnce()
+       } finally {
+         queue.runCompleted(this, delayNanos)
++        currentThread.name = oldName
+       }
+     }
+ 
+     this.cancelRunnable = Runnable {
++      val currentThread = Thread.currentThread()
++      val oldName = currentThread.name
++      currentThread.name = name
++
+       var skipExecution = false
+       try {
+         skipExecution = tryCancel()
+       } finally {
+         queue.tryCancelCompleted(this, skipExecution)
++        currentThread.name = oldName
+       }
+     }
+   }
+diff --git a/okhttp/src/main/java/okhttp3/internal/concurrent/TaskRunner.kt b/okhttp/src/main/java/okhttp3/internal/concurrent/TaskRunner.kt
+index 494f12b7d2..3807d5d8a9 100644
+--- a/okhttp/src/main/java/okhttp3/internal/concurrent/TaskRunner.kt
++++ b/okhttp/src/main/java/okhttp3/internal/concurrent/TaskRunner.kt
+@@ -19,7 +19,6 @@ import okhttp3.internal.addIfAbsent
+ import okhttp3.internal.notify
+ import okhttp3.internal.objectWaitNanos
+ import okhttp3.internal.threadFactory
+-import java.util.concurrent.Executor
+ import java.util.concurrent.SynchronousQueue
+ import java.util.concurrent.ThreadPoolExecutor
+ import java.util.concurrent.TimeUnit
+@@ -128,7 +127,7 @@ class TaskRunner(
+   }
+ 
+   class RealBackend : Backend {
+-    private val coordinatorExecutor: Executor = ThreadPoolExecutor(
++    private val coordinatorExecutor = ThreadPoolExecutor(
+         0, // corePoolSize.
+         1, // maximumPoolSize.
+         60L, TimeUnit.SECONDS, // keepAliveTime.
+@@ -136,7 +135,7 @@ class TaskRunner(
+         threadFactory("OkHttp Task Coordinator", false)
+     )
+ 
+-    private val taskExecutor: Executor = ThreadPoolExecutor(
++    private val taskExecutor = ThreadPoolExecutor(
+         0, // corePoolSize.
+         Int.MAX_VALUE, // maximumPoolSize.
+         60L, TimeUnit.SECONDS, // keepAliveTime.
+@@ -161,5 +160,10 @@ class TaskRunner(
+     override fun coordinatorWait(taskRunner: TaskRunner, nanos: Long) {
+       taskRunner.objectWaitNanos(nanos)
+     }
++
++    fun shutDown() {
++      coordinatorExecutor.shutdown()
++      taskExecutor.shutdown()
++    }
+   }
+ }
+diff --git a/okhttp/src/test/java/okhttp3/internal/concurrent/TaskRunnerRealBackendTest.kt b/okhttp/src/test/java/okhttp3/internal/concurrent/TaskRunnerRealBackendTest.kt
+new file mode 100644
+index 0000000000..2ac7b13c39
+--- /dev/null
++++ b/okhttp/src/test/java/okhttp3/internal/concurrent/TaskRunnerRealBackendTest.kt
+@@ -0,0 +1,58 @@
++/*
++ * Copyright (C) 2019 Square, Inc.
++ *
++ * Licensed under the Apache License, Version 2.0 (the "License");
++ * you may not use this file except in compliance with the License.
++ * You may obtain a copy of the License at
++ *
++ *      http://www.apache.org/licenses/LICENSE-2.0
++ *
++ * Unless required by applicable law or agreed to in writing, software
++ * distributed under the License is distributed on an "AS IS" BASIS,
++ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++ * See the License for the specific language governing permissions and
++ * limitations under the License.
++ */
++package okhttp3.internal.concurrent
++
++import org.assertj.core.api.Assertions.assertThat
++import org.assertj.core.data.Offset
++import org.junit.Test
++import java.util.concurrent.LinkedBlockingDeque
++import java.util.concurrent.TimeUnit
++
++/**
++ * Integration test to confirm that [TaskRunner] works with a real backend. Business logic is all
++ * exercised by [TaskRunnerTest].
++ *
++ * This test is doing real sleeping with tolerances of 250 ms. Hopefully that's enough for even the
++ * busiest of CI servers.
++ */
++class TaskRunnerRealBackendTest {
++  private val backend = TaskRunner.RealBackend()
++  private val taskRunner = TaskRunner(backend)
++  private val queue = taskRunner.newQueue("queue")
++  private val log = LinkedBlockingDeque<String>()
++
++  @Test fun test() {
++    val t1 = System.nanoTime() / 1e6
++
++    queue.schedule(object : Task("task", false) {
++      val delays = mutableListOf(TimeUnit.MILLISECONDS.toNanos(1000), -1L)
++      override fun runOnce(): Long {
++        log.put("runOnce delays.size=${delays.size}")
++        return delays.removeAt(0)
++      }
++    }, TimeUnit.MILLISECONDS.toNanos(750))
++
++    assertThat(log.take()).isEqualTo("runOnce delays.size=2")
++    val t2 = System.nanoTime() / 1e6 - t1
++    assertThat(t2).isCloseTo(750.0, Offset.offset(250.0))
++
++    assertThat(log.take()).isEqualTo("runOnce delays.size=1")
++    val t3 = System.nanoTime() / 1e6 - t1
++    assertThat(t3).isCloseTo(1750.0, Offset.offset(250.0))
++
++    backend.shutDown()
++  }
++}
+diff --git a/okhttp/src/test/java/okhttp3/internal/concurrent/TaskRunnerTest.kt b/okhttp/src/test/java/okhttp3/internal/concurrent/TaskRunnerTest.kt
+index 5fb285cfcf..346f2d3765 100644
+--- a/okhttp/src/test/java/okhttp3/internal/concurrent/TaskRunnerTest.kt
++++ b/okhttp/src/test/java/okhttp3/internal/concurrent/TaskRunnerTest.kt
+@@ -17,14 +17,9 @@ package okhttp3.internal.concurrent
+ 
+ import okhttp3.internal.concurrent.TaskRunnerTest.FakeBackend
+ import okhttp3.internal.notify
+-import okhttp3.internal.threadFactory
+ import okhttp3.internal.wait
+ import org.assertj.core.api.Assertions.assertThat
+ import org.junit.Test
+-import java.util.concurrent.Executor
+-import java.util.concurrent.SynchronousQueue
+-import java.util.concurrent.ThreadPoolExecutor
+-import java.util.concurrent.TimeUnit
+ 
+ /**
+  * This test uses [FakeBackend] so that everything is sequential and deterministic.
+@@ -241,6 +236,57 @@ class TaskRunnerTest {
+     backend.assertNoMoreTasks()
+   }
+ 
++  @Test fun interruptingCoordinatorAttemptsToCancelsAndSucceeds() {
++    redQueue.schedule(object : Task("task", false) {
++      override fun runOnce(): Long {
++        log += "run@${backend.nanoTime()}"
++        return -1L
++      }
++
++      override fun tryCancel(): Boolean {
++        log += "cancel@${backend.nanoTime()}"
++        return true
++      }
++    }, 100L)
++
++    backend.advanceUntil(0L)
++    assertThat(log).isEmpty()
++
++    backend.interruptCoordinatorThread()
++
++    backend.advanceUntil(0L)
++    assertThat(log).containsExactly("cancel@0")
++
++    backend.assertNoMoreTasks()
++  }
++
++  @Test fun interruptingCoordinatorAttemptsToCancelsAndFails() {
++    redQueue.schedule(object : Task("task", false) {
++      override fun runOnce(): Long {
++        log += "run@${backend.nanoTime()}"
++        return -1L
++      }
++
++      override fun tryCancel(): Boolean {
++        log += "cancel@${backend.nanoTime()}"
++        return false
++      }
++    }, 100L)
++
++    backend.advanceUntil(0L)
++    assertThat(log).isEmpty()
++
++    backend.interruptCoordinatorThread()
++
++    backend.advanceUntil(0L)
++    assertThat(log).containsExactly("cancel@0")
++
++    backend.advanceUntil(100L)
++    assertThat(log).containsExactly("cancel@0", "run@100")
++
++    backend.assertNoMoreTasks()
++  }
++
+   /** Inspect how many runnables have been enqueued. If none then we're truly sequential. */
+   @Test fun singleQueueIsSerial() {
+     redQueue.schedule(object : Task("task one", false) {
+@@ -404,15 +450,49 @@ class TaskRunnerTest {
+     backend.assertNoMoreTasks()
+   }
+ 
++  @Test fun taskNameIsUsedForThreadNameWhenRunning() {
++    redQueue.schedule(object : Task("lucky task", false) {
++      override fun runOnce(): Long {
++        log += "run threadName:${Thread.currentThread().name}"
++        return -1L
++      }
++    }, 0L)
++
++    backend.advanceUntil(0L)
++    assertThat(log).containsExactly("run threadName:lucky task")
++
++    backend.assertNoMoreTasks()
++  }
++
++  @Test fun taskNameIsUsedForThreadNameWhenCanceling() {
++    redQueue.schedule(object : Task("lucky task", false) {
++      override fun tryCancel(): Boolean {
++        log += "cancel threadName:${Thread.currentThread().name}"
++        return true
++      }
++
++      override fun runOnce() = -1L
++    }, 100L)
++
++    backend.advanceUntil(0L)
++    assertThat(log).isEmpty()
++
++    redQueue.cancelAll()
++
++    backend.advanceUntil(0L)
++    assertThat(log).containsExactly("cancel threadName:lucky task")
++
++    backend.assertNoMoreTasks()
++  }
++
+   class FakeBackend : TaskRunner.Backend {
+-    private val coordinatorExecutor: Executor = ThreadPoolExecutor(
+-        0, // corePoolSize.
+-        1, // maximumPoolSize.
+-        100, TimeUnit.MILLISECONDS, // keepAliveTime.
+-        SynchronousQueue(),
+-        threadFactory("TaskRunner.FakeBackend", true)
+-    )
+-    private var coordinatorToExecute: Runnable? = null
++    /** Null unless there's a coordinator runnable that needs to be started. */
++    private var coordinatorToRun: Runnable? = null
++
++    /** Null unless there's a coordinator thread currently executing. */
++    var coordinatorThread: Thread? = null
++
++    /** Tasks to be executed by the test thread. */
+     private val tasks = mutableListOf<Runnable>()
+ 
+     /** How many tasks can be executed immediately. */
+@@ -428,14 +508,8 @@ class TaskRunnerTest {
+     private var coordinatorWaitingUntilTime = Long.MAX_VALUE
+ 
+     override fun executeCoordinator(runnable: Runnable) {
+-      check(coordinatorToExecute == null)
+-      coordinatorToExecute = Runnable {
+-        runnable.run()
+-        synchronized(taskRunner) {
+-          coordinatorWaitingUntilTime = Long.MAX_VALUE
+-          taskRunner.notify() // Release the waiting advanceUntil() or runRunnables() call.
+-        }
+-      }
++      check(coordinatorToRun == null)
++      coordinatorToRun = runnable
+     }
+ 
+     override fun executeTask(runnable: Runnable) {
+@@ -488,9 +562,22 @@ class TaskRunnerTest {
+ 
+     /** Returns true if anything was executed. */
+     private fun runRunnables() {
+-      if (coordinatorToExecute != null) {
+-        coordinatorExecutor.execute(coordinatorToExecute!!)
+-        coordinatorToExecute = null
++      check(Thread.holdsLock(taskRunner))
++
++      if (coordinatorToRun != null) {
++        coordinatorThread = object : Thread() {
++          val runnable = coordinatorToRun!!
++          override fun run() {
++            runnable.run()
++            synchronized(taskRunner) {
++              coordinatorThread = null
++              coordinatorWaitingUntilTime = Long.MAX_VALUE
++              taskRunner.notify() // Release the waiting advanceUntil() or runRunnables() call.
++            }
++          }
++        }
++        coordinatorThread!!.start()
++        coordinatorToRun = null
+         taskRunner.wait() // Wait for the coordinator to stall.
+       }
+ 
+@@ -501,9 +588,18 @@ class TaskRunnerTest {
+     }
+ 
+     fun assertNoMoreTasks() {
+-      assertThat(coordinatorToExecute).isNull()
++      assertThat(coordinatorToRun).isNull()
+       assertThat(tasks).isEmpty()
+       assertThat(coordinatorWaitingUntilTime).isEqualTo(Long.MAX_VALUE)
+     }
++
++    fun interruptCoordinatorThread() {
++      check(!Thread.holdsLock(taskRunner))
++
++      synchronized(taskRunner) {
++        coordinatorThread!!.interrupt()
++        taskRunner.wait() // Wait for the coordinator to stall.
++      }
++    }
+   }
+ }

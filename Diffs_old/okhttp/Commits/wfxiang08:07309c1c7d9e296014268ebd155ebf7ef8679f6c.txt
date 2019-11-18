@@ -1,0 +1,245 @@
+diff --git a/okhttp-tests/src/test/java/okhttp3/URLConnectionTest.java b/okhttp-tests/src/test/java/okhttp3/URLConnectionTest.java
+index 7782e38d34..adbf091782 100644
+--- a/okhttp-tests/src/test/java/okhttp3/URLConnectionTest.java
++++ b/okhttp-tests/src/test/java/okhttp3/URLConnectionTest.java
+@@ -3556,7 +3556,6 @@ private void zeroLengthPayload(String method)
+     assertEquals(0, dispatcher.runningCallsCount());
+   }
+ 
+-  @Ignore // TODO: recover gracefully when a connection is shutdown.
+   @Test public void streamedBodyIsRetriedOnHttp2Shutdown() throws Exception {
+     enableProtocol(Protocol.HTTP_2);
+     server.enqueue(new MockResponse()
+@@ -3574,6 +3573,9 @@ private void zeroLengthPayload(String method)
+     HttpURLConnection connection2 = urlFactory.open(server.url("/").url());
+     assertContent("abc", connection2);
+ 
++    // Ensure the GOAWAY frame has time to be read and processed.
++    Thread.sleep(500);
++
+     OutputStream os = connection1.getOutputStream();
+     os.write(new byte[] { '1', '2', '3' });
+     os.close();
+diff --git a/okhttp-tests/src/test/java/okhttp3/internal/http2/Http2ConnectionTest.java b/okhttp-tests/src/test/java/okhttp3/internal/http2/Http2ConnectionTest.java
+index 610e0898ec..a782691f7d 100644
+--- a/okhttp-tests/src/test/java/okhttp3/internal/http2/Http2ConnectionTest.java
++++ b/okhttp-tests/src/test/java/okhttp3/internal/http2/Http2ConnectionTest.java
+@@ -245,8 +245,7 @@
+     try {
+       connection.newStream(headerEntries("c", "cola"), true);
+       fail();
+-    } catch (IOException expected) {
+-      assertEquals("shutdown", expected.getMessage());
++    } catch (ConnectionShutdownException expected) {
+     }
+     assertTrue(stream1.isOpen());
+     assertFalse(stream2.isOpen());
+@@ -1009,8 +1008,7 @@
+     try {
+       connection.newStream(headerEntries("c", "cola"), false);
+       fail();
+-    } catch (IOException expected) {
+-      assertEquals("shutdown", expected.getMessage());
++    } catch (ConnectionShutdownException expected) {
+     }
+     assertTrue(stream1.isOpen());
+     assertFalse(stream2.isOpen());
+@@ -1068,8 +1066,7 @@
+     try {
+       connection.ping();
+       fail();
+-    } catch (IOException expected) {
+-      assertEquals("shutdown", expected.getMessage());
++    } catch (ConnectionShutdownException expected) {
+     }
+ 
+     // verify the peer received what was expected
+@@ -1094,8 +1091,7 @@
+     try {
+       connection.newStream(headerEntries("b", "banana"), false);
+       fail();
+-    } catch (IOException expected) {
+-      assertEquals("shutdown", expected.getMessage());
++    } catch (ConnectionShutdownException expected) {
+     }
+     BufferedSink sink = Okio.buffer(stream.getSink());
+     try {
+diff --git a/okhttp-tests/src/test/java/okhttp3/internal/http2/HttpOverHttp2Test.java b/okhttp-tests/src/test/java/okhttp3/internal/http2/HttpOverHttp2Test.java
+index 41aa761c1f..4c2e05844b 100644
+--- a/okhttp-tests/src/test/java/okhttp3/internal/http2/HttpOverHttp2Test.java
++++ b/okhttp-tests/src/test/java/okhttp3/internal/http2/HttpOverHttp2Test.java
+@@ -43,6 +43,7 @@
+ import okhttp3.internal.RecordingOkAuthenticator;
+ import okhttp3.internal.SingleInetAddressDns;
+ import okhttp3.internal.Util;
++import okhttp3.internal.connection.RealConnection;
+ import okhttp3.internal.tls.SslClient;
+ import okhttp3.mockwebserver.MockResponse;
+ import okhttp3.mockwebserver.MockWebServer;
+@@ -854,6 +855,9 @@ private void noRecoveryFromErrorWithRetryDisabled(ErrorCode errorCode) throws Ex
+                   .build());
+               Response response = call.execute();
+               assertEquals("ABC", response.body().string());
++              // Wait until the GOAWAY has been processed.
++              RealConnection connection = (RealConnection) chain.connection();
++              while (connection.isHealthy(false)) ;
+             }
+             return chain.proceed(chain.request());
+           }
+diff --git a/okhttp/src/main/java/okhttp3/internal/connection/StreamAllocation.java b/okhttp/src/main/java/okhttp3/internal/connection/StreamAllocation.java
+index 73b2506f62..b78e3c54b1 100644
+--- a/okhttp/src/main/java/okhttp3/internal/connection/StreamAllocation.java
++++ b/okhttp/src/main/java/okhttp3/internal/connection/StreamAllocation.java
+@@ -28,6 +28,7 @@
+ import okhttp3.internal.http1.Http1Codec;
+ import okhttp3.internal.http2.ErrorCode;
+ import okhttp3.internal.http2.Http2Codec;
++import okhttp3.internal.http2.ConnectionShutdownException;
+ import okhttp3.internal.http2.StreamResetException;
+ 
+ import static java.util.concurrent.TimeUnit.MILLISECONDS;
+@@ -298,7 +299,8 @@ public void streamFailed(IOException e) {
+           noNewStreams = true;
+           route = null;
+         }
+-      } else if (connection != null && !connection.isMultiplexed()) {
++      } else if (connection != null && !connection.isMultiplexed()
++          || e instanceof ConnectionShutdownException) {
+         noNewStreams = true;
+ 
+         // If this route hasn't completed a call, avoid it for new connections.
+diff --git a/okhttp/src/main/java/okhttp3/internal/http/RetryAndFollowUpInterceptor.java b/okhttp/src/main/java/okhttp3/internal/http/RetryAndFollowUpInterceptor.java
+index 2a7cd13822..792ddc9299 100644
+--- a/okhttp/src/main/java/okhttp3/internal/http/RetryAndFollowUpInterceptor.java
++++ b/okhttp/src/main/java/okhttp3/internal/http/RetryAndFollowUpInterceptor.java
+@@ -38,6 +38,7 @@
+ import okhttp3.Route;
+ import okhttp3.internal.connection.RouteException;
+ import okhttp3.internal.connection.StreamAllocation;
++import okhttp3.internal.http2.ConnectionShutdownException;
+ 
+ import static java.net.HttpURLConnection.HTTP_CLIENT_TIMEOUT;
+ import static java.net.HttpURLConnection.HTTP_MOVED_PERM;
+@@ -120,12 +121,15 @@ public StreamAllocation streamAllocation() {
+         releaseConnection = false;
+       } catch (RouteException e) {
+         // The attempt to connect via a route failed. The request will not have been sent.
+-        if (!recover(e.getLastConnectException(), true, request)) throw e.getLastConnectException();
++        if (!recover(e.getLastConnectException(), false, request)) {
++          throw e.getLastConnectException();
++        }
+         releaseConnection = false;
+         continue;
+       } catch (IOException e) {
+         // An attempt to communicate with a server failed. The request may have been sent.
+-        if (!recover(e, false, request)) throw e;
++        boolean requestSendStarted = !(e instanceof ConnectionShutdownException);
++        if (!recover(e, requestSendStarted, request)) throw e;
+         releaseConnection = false;
+         continue;
+       } finally {
+@@ -198,19 +202,20 @@ private Address createAddress(HttpUrl url) {
+   /**
+    * Report and attempt to recover from a failure to communicate with a server. Returns true if
+    * {@code e} is recoverable, or false if the failure is permanent. Requests with a body can only
+-   * be recovered if the body is buffered.
++   * be recovered if the body is buffered or if the failure occurred before the request has been
++   * sent.
+    */
+-  private boolean recover(IOException e, boolean routeException, Request userRequest) {
++  private boolean recover(IOException e, boolean requestSendStarted, Request userRequest) {
+     streamAllocation.streamFailed(e);
+ 
+     // The application layer has forbidden retries.
+     if (!client.retryOnConnectionFailure()) return false;
+ 
+     // We can't send the request body again.
+-    if (!routeException && userRequest.body() instanceof UnrepeatableRequestBody) return false;
++    if (requestSendStarted && userRequest.body() instanceof UnrepeatableRequestBody) return false;
+ 
+     // This exception is fatal.
+-    if (!isRecoverable(e, routeException)) return false;
++    if (!isRecoverable(e, requestSendStarted)) return false;
+ 
+     // No more routes to attempt.
+     if (!streamAllocation.hasMoreRoutes()) return false;
+@@ -219,7 +224,7 @@ private boolean recover(IOException e, boolean routeException, Request userReque
+     return true;
+   }
+ 
+-  private boolean isRecoverable(IOException e, boolean routeException) {
++  private boolean isRecoverable(IOException e, boolean requestSendStarted) {
+     // If there was a protocol problem, don't recover.
+     if (e instanceof ProtocolException) {
+       return false;
+@@ -228,7 +233,7 @@ private boolean isRecoverable(IOException e, boolean routeException) {
+     // If there was an interruption don't recover, but if there was a timeout connecting to a route
+     // we should try the next route (if there is one).
+     if (e instanceof InterruptedIOException) {
+-      return e instanceof SocketTimeoutException && routeException;
++      return e instanceof SocketTimeoutException && !requestSendStarted;
+     }
+ 
+     // Look for known client-side or negotiation errors that are unlikely to be fixed by trying
+diff --git a/okhttp/src/main/java/okhttp3/internal/http2/ConnectionShutdownException.java b/okhttp/src/main/java/okhttp3/internal/http2/ConnectionShutdownException.java
+new file mode 100644
+index 0000000000..00c4f2441c
+--- /dev/null
++++ b/okhttp/src/main/java/okhttp3/internal/http2/ConnectionShutdownException.java
+@@ -0,0 +1,25 @@
++/*
++ * Copyright (C) 2016 Square, Inc.
++ *
++ * Licensed under the Apache License, Version 2.0 (the "License");
++ * you may not use this file except in compliance with the License.
++ * You may obtain a copy of the License at
++ *
++ *      http://www.apache.org/licenses/LICENSE-2.0
++ *
++ * Unless required by applicable law or agreed to in writing, software
++ * distributed under the License is distributed on an "AS IS" BASIS,
++ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++ * See the License for the specific language governing permissions and
++ * limitations under the License.
++ */
++package okhttp3.internal.http2;
++
++import java.io.IOException;
++
++/**
++ * Thrown when an HTTP/2 connection is shutdown (either explicitly or if the peer has sent a GOAWAY
++ * frame) and an attempt is made to use the connection.
++ */
++public final class ConnectionShutdownException extends IOException {
++}
+diff --git a/okhttp/src/main/java/okhttp3/internal/http2/Http2Connection.java b/okhttp/src/main/java/okhttp3/internal/http2/Http2Connection.java
+index daf1b78671..2ca5e0cbac 100644
+--- a/okhttp/src/main/java/okhttp3/internal/http2/Http2Connection.java
++++ b/okhttp/src/main/java/okhttp3/internal/http2/Http2Connection.java
+@@ -216,7 +216,7 @@ private Http2Stream newStream(
+     synchronized (writer) {
+       synchronized (this) {
+         if (shutdown) {
+-          throw new IOException("shutdown");
++          throw new ConnectionShutdownException();
+         }
+         streamId = nextStreamId;
+         nextStreamId += 2;
+@@ -335,7 +335,7 @@ public Ping ping() throws IOException {
+     int pingId;
+     synchronized (this) {
+       if (shutdown) {
+-        throw new IOException("shutdown");
++        throw new ConnectionShutdownException();
+       }
+       pingId = nextPingId;
+       nextPingId += 2;
+@@ -488,7 +488,7 @@ public void setSettings(Settings settings) throws IOException {
+     synchronized (writer) {
+       synchronized (this) {
+         if (shutdown) {
+-          throw new IOException("shutdown");
++          throw new ConnectionShutdownException();
+         }
+         okHttpSettings.merge(settings);
+         writer.settings(settings);

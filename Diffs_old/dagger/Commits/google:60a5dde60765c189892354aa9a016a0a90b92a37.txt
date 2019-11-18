@@ -1,0 +1,1386 @@
+diff --git a/java/dagger/internal/codegen/BUILD b/java/dagger/internal/codegen/BUILD
+index 02d28043b..25b7b720a 100644
+--- a/java/dagger/internal/codegen/BUILD
++++ b/java/dagger/internal/codegen/BUILD
+@@ -124,6 +124,7 @@ java_library(
+         "BindingFactory.java",
+         "BindingGraph.java",
+         "BindingNodeImpl.java",
++        "BindingRequest.java",
+         "BindingType.java",
+         "BindingVariableNamer.java",  # needed by FrameworkField
+         "BindsTypeChecker.java",
+diff --git a/java/dagger/internal/codegen/BindingGraph.java b/java/dagger/internal/codegen/BindingGraph.java
+index 2edd63d1b..9ec4d2aea 100644
+--- a/java/dagger/internal/codegen/BindingGraph.java
++++ b/java/dagger/internal/codegen/BindingGraph.java
+@@ -62,15 +62,16 @@
+   abstract ImmutableMap<Key, ResolvedBindings> membersInjectionBindings();
+ 
+   /**
+-   * Returns the {@link ResolvedBindings resolved bindings} instance for {@code key}. If {@code
+-   * requestKind} is {@link RequestKind#MEMBERS_INJECTION}, a {@link ResolvedBindings} with
+-   * {@linkplain #membersInjectionBindings() members injection bindings} will be returned, otherwise
+-   * a {@link ResolvedBindings} with {@link #contributionBindings()} will be returned.
++   * Returns the {@link ResolvedBindings resolved bindings} instance for {@code
++   * bindingExpressionKey}. If the bindings will be used for members injection, a {@link
++   * ResolvedBindings} with {@linkplain #membersInjectionBindings() members injection bindings} will
++   * be returned, otherwise a {@link ResolvedBindings} with {@link #contributionBindings()} will be
++   * returned.
+    */
+-  final ResolvedBindings resolvedBindings(RequestKind requestKind, Key key) {
+-    return requestKind.equals(RequestKind.MEMBERS_INJECTION)
+-        ? membersInjectionBindings().get(key)
+-        : contributionBindings().get(key);
++  final ResolvedBindings resolvedBindings(BindingRequest request) {
++    return request.isRequestKind(RequestKind.MEMBERS_INJECTION)
++        ? membersInjectionBindings().get(request.key())
++        : contributionBindings().get(request.key());
+   }
+ 
+   @Memoized
+diff --git a/java/dagger/internal/codegen/BindingGraphConverter.java b/java/dagger/internal/codegen/BindingGraphConverter.java
+index d60087ee1..b1e942bec 100644
+--- a/java/dagger/internal/codegen/BindingGraphConverter.java
++++ b/java/dagger/internal/codegen/BindingGraphConverter.java
+@@ -175,7 +175,7 @@ private ResolvedBindings resolvedDependencies(
+       return componentTreePath()
+           .pathFromRootToAncestor(source.componentPath().currentComponent())
+           .currentGraph()
+-          .resolvedBindings(dependencyRequest.kind(), dependencyRequest.key());
++          .resolvedBindings(BindingRequest.forDependencyRequest(dependencyRequest));
+     }
+ 
+     /** Adds a binding node and edges for all its dependencies. */
+diff --git a/java/dagger/internal/codegen/BindingMethodImplementation.java b/java/dagger/internal/codegen/BindingMethodImplementation.java
+index b1d8aaae0..a3d9b3220 100644
+--- a/java/dagger/internal/codegen/BindingMethodImplementation.java
++++ b/java/dagger/internal/codegen/BindingMethodImplementation.java
+@@ -27,19 +27,19 @@
+ /** Defines a method body and return type for a given {@link BindingExpression}. */
+ class BindingMethodImplementation {
+   private final ContributionBinding binding;
+-  private final RequestKind requestKind;
++  private final BindingRequest request;
+   private final BindingExpression bindingExpression;
+   private final ClassName componentName;
+   private final DaggerTypes types;
+ 
+   BindingMethodImplementation(
+       ResolvedBindings resolvedBindings,
+-      RequestKind requestKind,
++      BindingRequest request,
+       BindingExpression bindingExpression,
+       ClassName componentName,
+       DaggerTypes types) {
+     this.binding = resolvedBindings.contributionBinding();
+-    this.requestKind = checkNotNull(requestKind);
++    this.request = checkNotNull(request);
+     this.bindingExpression = checkNotNull(bindingExpression);
+     this.componentName = checkNotNull(componentName);
+     this.types = checkNotNull(types);
+@@ -62,11 +62,18 @@ protected final CodeBlock simpleBindingExpression() {
+ 
+   /** Returns the return type for the dependency request. */
+   final TypeMirror returnType() {
+-    if (requestKind.equals(RequestKind.INSTANCE)
++    if (request.isRequestKind(RequestKind.INSTANCE)
+         && binding.contributedPrimitiveType().isPresent()) {
+       return binding.contributedPrimitiveType().get();
+     }
+-    return types.accessibleType(
+-        requestType(requestKind, binding.contributedType(), types), componentName);
++    return types.accessibleType(requestedType(), componentName);
++  }
++
++  private TypeMirror requestedType() {
++    if (request.requestKind().isPresent()) {
++      return requestType(request.requestKind().get(), binding.contributedType(), types);
++    }
++    return types.wrapType(
++        binding.contributedType(), request.frameworkType().get().frameworkClass());
+   }
+ }
+diff --git a/java/dagger/internal/codegen/BindingRequest.java b/java/dagger/internal/codegen/BindingRequest.java
+new file mode 100644
+index 000000000..d15683e79
+--- /dev/null
++++ b/java/dagger/internal/codegen/BindingRequest.java
+@@ -0,0 +1,101 @@
++/*
++ * Copyright (C) 2018 The Dagger Authors.
++ *
++ * Licensed under the Apache License, Version 2.0 (the "License");
++ * you may not use this file except in compliance with the License.
++ * You may obtain a copy of the License at
++ *
++ * http://www.apache.org/licenses/LICENSE-2.0
++ *
++ * Unless required by applicable law or agreed to in writing, software
++ * distributed under the License is distributed on an "AS IS" BASIS,
++ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++ * See the License for the specific language governing permissions and
++ * limitations under the License.
++ */
++
++package dagger.internal.codegen;
++
++import static dagger.internal.codegen.RequestKinds.requestTypeName;
++
++import com.google.auto.value.AutoValue;
++import com.squareup.javapoet.TypeName;
++import dagger.model.DependencyRequest;
++import dagger.model.Key;
++import dagger.model.RequestKind;
++import java.util.Optional;
++
++/**
++ * A request for a binding, which may be in the form of a request for a dependency to pass to a
++ * constructor or module method ({@link RequestKind}) or an internal request for a framework
++ * instance ({@link FrameworkType}).
++ */
++@AutoValue
++abstract class BindingRequest {
++
++  /** Creates a {@link BindingRequest} for the given {@link DependencyRequest}. */
++  static BindingRequest forDependencyRequest(DependencyRequest dependencyRequest) {
++    return forDependencyRequest(dependencyRequest.key(), dependencyRequest.kind());
++  }
++
++  /**
++   * Creates a {@link BindingRequest} for a normal dependency request for the given {@link Key} and
++   * {@link RequestKind}.
++   */
++  static BindingRequest forDependencyRequest(Key key, RequestKind requestKind) {
++    // When there's a request that has a 1:1 mapping to a FrameworkType, the request should be
++    // associated with that FrameworkType as well, because we want to ensure that if a request
++    // comes in for that as a dependency first and as a framework instance later, they resolve to
++    // the same binding expression.
++    // TODO(cgdecker): Instead of doing this, make ComponentBindingExpressions create a
++    // BindingExpression for the RequestKind that simply delegates to the BindingExpression for the
++    // FrameworkType. Then there are separate BindingExpressions, but we don't end up doing weird
++    // things like creating two fields when there should only be one.
++    return new AutoValue_BindingRequest(
++        key, Optional.of(requestKind), FrameworkType.forRequestKind(requestKind));
++  }
++
++  /**
++   * Creates a {@link BindingRequest} for a request for a framework instance for the given {@link
++   * Key} with the given {@link FrameworkType}.
++   */
++  static BindingRequest forFrameworkDependency(Key key, FrameworkType frameworkType) {
++    return new AutoValue_BindingRequest(
++        key, Optional.of(frameworkType.requestKind()), Optional.of(frameworkType));
++  }
++
++  /** Creates a {@link BindingRequest} for the given {@link FrameworkDependency}. */
++  static BindingRequest forFrameworkDependency(FrameworkDependency frameworkDependency) {
++    return forFrameworkDependency(frameworkDependency.key(), frameworkDependency.frameworkType());
++  }
++
++  /** Returns the {@link Key} for the requested binding. */
++  abstract Key key();
++
++  /** Returns the request kind associated with this request, if any. */
++  abstract Optional<RequestKind> requestKind();
++
++  /** Returns the framework type associated with this request, if any. */
++  abstract Optional<FrameworkType> frameworkType();
++
++  /** Returns whether this request is of the given kind. */
++  final boolean isRequestKind(RequestKind requestKind) {
++    return requestKind.equals(requestKind().orElse(null));
++  }
++
++  /** Returns the type name for the requested type. */
++  final TypeName typeName() {
++    TypeName keyTypeName = TypeName.get(key().type());
++    if (requestKind().isPresent()) {
++      return requestTypeName(requestKind().get(), keyTypeName);
++    }
++    return frameworkType().get().frameworkClassOf(keyTypeName);
++  }
++
++  /** Returns a name that can be used for the kind of request this is. */
++  final String kindName() {
++    Object requestKindObject =
++        requestKind().isPresent() ? requestKind().get() : frameworkType().get();
++    return requestKindObject.toString();
++  }
++}
+diff --git a/java/dagger/internal/codegen/ComponentBindingExpressions.java b/java/dagger/internal/codegen/ComponentBindingExpressions.java
+index beed699d3..24ad87e3f 100644
+--- a/java/dagger/internal/codegen/ComponentBindingExpressions.java
++++ b/java/dagger/internal/codegen/ComponentBindingExpressions.java
+@@ -31,12 +31,11 @@
+ import static dagger.model.BindingKind.DELEGATE;
+ import static dagger.model.BindingKind.MULTIBOUND_MAP;
+ import static dagger.model.BindingKind.MULTIBOUND_SET;
++import static java.util.function.Predicate.isEqual;
+ import static javax.lang.model.element.Modifier.PUBLIC;
+ 
+ import com.google.auto.common.MoreTypes;
+-import com.google.common.collect.HashBasedTable;
+ import com.google.common.collect.ImmutableList;
+-import com.google.common.collect.Table;
+ import com.squareup.javapoet.ClassName;
+ import com.squareup.javapoet.CodeBlock;
+ import com.squareup.javapoet.MethodSpec;
+@@ -47,6 +46,8 @@
+ import dagger.model.DependencyRequest;
+ import dagger.model.Key;
+ import dagger.model.RequestKind;
++import java.util.HashMap;
++import java.util.Map;
+ import java.util.Optional;
+ import javax.inject.Provider;
+ import javax.lang.model.type.TypeMirror;
+@@ -71,7 +72,8 @@
+   private final MembersInjectionMethods membersInjectionMethods;
+   private final InnerSwitchingProviders innerSwitchingProviders;
+   private final StaticSwitchingProviders staticSwitchingProviders;
+-  private final Table<Key, RequestKind, BindingExpression> expressions = HashBasedTable.create();
++
++  private final Map<BindingRequest, BindingExpression> expressions = new HashMap<>();
+ 
+   ComponentBindingExpressions(
+       BindingGraph graph,
+@@ -155,7 +157,8 @@ ComponentBindingExpressions forChildComponent(
+    *     request
+    */
+   Expression getDependencyExpression(Key key, RequestKind requestKind, ClassName requestingClass) {
+-    return getBindingExpression(key, requestKind).getDependencyExpression(requestingClass);
++    return getDependencyExpression(
++        BindingRequest.forDependencyRequest(key, requestKind), requestingClass);
+   }
+ 
+   /**
+@@ -167,7 +170,7 @@ Expression getDependencyExpression(Key key, RequestKind requestKind, ClassName r
+    *     request
+    */
+   Expression getDependencyExpression(DependencyRequest request, ClassName requestingClass) {
+-    return getDependencyExpression(request.key(), request.kind(), requestingClass);
++    return getDependencyExpression(BindingRequest.forDependencyRequest(request), requestingClass);
+   }
+ 
+   /**
+@@ -181,9 +184,25 @@ Expression getDependencyExpression(DependencyRequest request, ClassName requesti
+   Expression getDependencyExpression(
+       FrameworkDependency frameworkDependency, ClassName requestingClass) {
+     return getDependencyExpression(
+-        frameworkDependency.key(),
+-        frameworkDependency.frameworkType().requestKind(),
+-        requestingClass);
++        BindingRequest.forFrameworkDependency(frameworkDependency), requestingClass);
++  }
++
++  /**
++   * Returns an expression that evaluates to the value of a framework request for a binding owned by
++   * this component or an ancestor.
++   *
++   * @param requestingClass the class that will contain the expression
++   * @throws IllegalStateException if there is no binding expression that satisfies the framework
++   *     request
++   */
++  Expression getDependencyExpression(
++      Key key, FrameworkType frameworkType, ClassName requestingClass) {
++    return getDependencyExpression(
++        BindingRequest.forFrameworkDependency(key, frameworkType), requestingClass);
++  }
++
++  private Expression getDependencyExpression(BindingRequest request, ClassName requestingClass) {
++    return getBindingExpression(request).getDependencyExpression(requestingClass);
+   }
+ 
+   /**
+@@ -246,27 +265,25 @@ Expression getDependencyArgumentExpression(
+    */
+   Optional<MethodSpec> getComponentMethod(ComponentMethodDescriptor componentMethod) {
+     checkArgument(componentMethod.dependencyRequest().isPresent());
+-    DependencyRequest dependencyRequest = componentMethod.dependencyRequest().get();
++    BindingRequest request =
++        BindingRequest.forDependencyRequest(componentMethod.dependencyRequest().get());
+     MethodSpec method =
+         MethodSpec.overriding(
+                 componentMethod.methodElement(),
+                 MoreTypes.asDeclared(graph.componentType().asType()),
+                 types)
+             .addCode(
+-                getBindingExpression(dependencyRequest.key(), dependencyRequest.kind())
++                getBindingExpression(request)
+                     .getComponentMethodImplementation(componentMethod, generatedComponentModel))
+             .build();
+ 
+-    ModifiableBindingType modifiableBindingType =
+-        getModifiableBindingType(dependencyRequest.key(), dependencyRequest.kind());
++    ModifiableBindingType modifiableBindingType = getModifiableBindingType(request);
+     if (modifiableBindingType.isModifiable()) {
+       generatedComponentModel.registerModifiableBindingMethod(
+           modifiableBindingType,
+-          dependencyRequest.key(),
+-          dependencyRequest.kind(),
++          request,
+           method,
+-          newModifiableBindingWillBeFinalized(
+-              modifiableBindingType, dependencyRequest.key(), dependencyRequest.kind()));
++          newModifiableBindingWillBeFinalized(modifiableBindingType, request));
+       if (!modifiableBindingType.hasBaseClassImplementation()) {
+         // A component method should not be emitted if it encapsulates a modifiable binding that
+         // cannot be satisfied by the abstract base class implementation of a subcomponent.
+@@ -290,8 +307,6 @@ Expression getDependencyArgumentExpression(
+   Optional<ModifiableBindingMethod> getModifiableBindingMethod(
+       ModifiableBindingMethod modifiableBindingMethod) {
+     if (shouldModifyKnownBinding(modifiableBindingMethod)) {
+-      Key key = modifiableBindingMethod.key();
+-      RequestKind requestKind = modifiableBindingMethod.kind();
+       MethodSpec baseMethod = modifiableBindingMethod.methodSpec();
+       return Optional.of(
+           ModifiableBindingMethod.implement(
+@@ -301,7 +316,7 @@ Expression getDependencyArgumentExpression(
+                   .returns(baseMethod.returnType)
+                   .addAnnotation(Override.class)
+                   .addCode(
+-                      getBindingExpression(key, requestKind)
++                      getBindingExpression(modifiableBindingMethod.request())
+                           .getModifiableBindingMethodImplementation(
+                               modifiableBindingMethod, generatedComponentModel))
+                   .build(),
+@@ -321,14 +336,13 @@ Expression getDependencyArgumentExpression(
+   private boolean knownModifiableBindingWillBeFinalized(
+       ModifiableBindingMethod modifiableBindingMethod) {
+     ModifiableBindingType newModifiableBindingType =
+-        getModifiableBindingType(modifiableBindingMethod.key(), modifiableBindingMethod.kind());
++        getModifiableBindingType(modifiableBindingMethod.request());
+     if (!newModifiableBindingType.isModifiable()) {
+       // If a modifiable binding has become non-modifiable it is final by definition.
+       return true;
+     }
+     // All currently supported modifiable types are finalized upon modification.
+-    return shouldModifyBinding(
+-        newModifiableBindingType, modifiableBindingMethod.key(), modifiableBindingMethod.kind());
++    return shouldModifyBinding(newModifiableBindingType, modifiableBindingMethod.request());
+   }
+ 
+   /**
+@@ -338,50 +352,44 @@ private boolean knownModifiableBindingWillBeFinalized(
+    * subcomponents.
+    */
+   private boolean newModifiableBindingWillBeFinalized(
+-      ModifiableBindingType modifiableBindingType, Key key, RequestKind requestKind) {
++      ModifiableBindingType modifiableBindingType, BindingRequest request) {
+     // All currently supported modifiable types are finalized upon modification.
+-    return shouldModifyBinding(modifiableBindingType, key, requestKind);
++    return shouldModifyBinding(modifiableBindingType, request);
+   }
+ 
+-  private BindingExpression getBindingExpression(Key key, RequestKind requestKind) {
+-    if (expressions.contains(key, requestKind)) {
+-      return expressions.get(key, requestKind);
++  private BindingExpression getBindingExpression(BindingRequest request) {
++    if (expressions.containsKey(request)) {
++      return expressions.get(request);
+     }
+     Optional<BindingExpression> expression = Optional.empty();
+-    ModifiableBindingType modifiableBindingType = getModifiableBindingType(key, requestKind);
++    ModifiableBindingType modifiableBindingType = getModifiableBindingType(request);
+     if (modifiableBindingType.isModifiable()) {
+-      expression =
+-          Optional.of(createModifiableBindingExpression(modifiableBindingType, key, requestKind));
+-    } else if (resolvedInThisComponent(key, requestKind)) {
+-      ResolvedBindings resolvedBindings = graph.resolvedBindings(requestKind, key);
+-      expression = Optional.of(createBindingExpression(resolvedBindings, requestKind));
++      expression = Optional.of(createModifiableBindingExpression(modifiableBindingType, request));
++    } else if (resolvedInThisComponent(request)) {
++      ResolvedBindings resolvedBindings = graph.resolvedBindings(request);
++      expression = Optional.of(createBindingExpression(resolvedBindings, request));
+     }
+     if (expression.isPresent()) {
+-      expressions.put(key, requestKind, expression.get());
++      expressions.put(request, expression.get());
+       return expression.get();
+     }
+-    checkArgument(parent.isPresent(), "no expression found for %s-%s", key, requestKind);
+-    return parent.get().getBindingExpression(key, requestKind);
++    checkArgument(parent.isPresent(), "no expression found for %s", request);
++    return parent.get().getBindingExpression(request);
+   }
+ 
+   /** Creates a binding expression. */
+   private BindingExpression createBindingExpression(
+-      ResolvedBindings resolvedBindings, RequestKind requestKind) {
++      ResolvedBindings resolvedBindings, BindingRequest request) {
+     switch (resolvedBindings.bindingType()) {
+       case MEMBERS_INJECTION:
+-        checkArgument(requestKind.equals(RequestKind.MEMBERS_INJECTION));
++        checkArgument(request.isRequestKind(RequestKind.MEMBERS_INJECTION));
+         return new MembersInjectionBindingExpression(resolvedBindings, membersInjectionMethods);
+ 
+       case PROVISION:
+-        return provisionBindingExpression(resolvedBindings, requestKind);
++        return provisionBindingExpression(resolvedBindings, request);
+ 
+       case PRODUCTION:
+-        if (requestKind.equals(RequestKind.PRODUCER)) {
+-          return frameworkInstanceBindingExpression(resolvedBindings);
+-        } else {
+-          return new DerivedFromFrameworkInstanceBindingExpression(
+-              resolvedBindings, FrameworkType.PRODUCER, requestKind, this, types);
+-        }
++        return productionBindingExpression(resolvedBindings, request);
+ 
+       default:
+         throw new AssertionError(resolvedBindings);
+@@ -393,33 +401,32 @@ private BindingExpression createBindingExpression(
+    * subcomponent. This is only relevant for ahead-of-time subcomponents.
+    */
+   private BindingExpression createModifiableBindingExpression(
+-      ModifiableBindingType type, Key key, RequestKind requestKind) {
+-    ResolvedBindings resolvedBindings = graph.resolvedBindings(requestKind, key);
++      ModifiableBindingType type, BindingRequest request) {
++    ResolvedBindings resolvedBindings = graph.resolvedBindings(request);
+     Optional<ModifiableBindingMethod> matchingModifiableBindingMethod =
+-        generatedComponentModel.getModifiableBindingMethod(key, requestKind);
++        generatedComponentModel.getModifiableBindingMethod(request);
+     Optional<ComponentMethodDescriptor> matchingComponentMethod =
+-        findMatchingComponentMethod(key, requestKind);
++        findMatchingComponentMethod(request);
+     switch (type) {
+       case GENERATED_INSTANCE:
+         return new GeneratedInstanceBindingExpression(
+             generatedComponentModel,
+             resolvedBindings,
+-            requestKind,
++            request,
+             matchingModifiableBindingMethod,
+             matchingComponentMethod);
+       case MISSING:
+         return new MissingBindingExpression(
+             generatedComponentModel,
+-            key,
+-            requestKind,
++            request,
+             matchingModifiableBindingMethod,
+             matchingComponentMethod);
+       case OPTIONAL:
+-        BindingExpression expression = createBindingExpression(resolvedBindings, requestKind);
++        BindingExpression expression = createBindingExpression(resolvedBindings, request);
+         // If the expression hasn't already been registered as a modifiable binding method then wrap
+         // the binding here.
+-        if (!generatedComponentModel.getModifiableBindingMethod(key, requestKind).isPresent()) {
+-          return wrapInMethod(resolvedBindings, requestKind, expression);
++        if (!generatedComponentModel.getModifiableBindingMethod(request).isPresent()) {
++          return wrapInMethod(resolvedBindings, request, expression);
+         }
+         return expression;
+       default:
+@@ -433,7 +440,7 @@ private BindingExpression createModifiableBindingExpression(
+    * The reason why a binding may need to be modified across implementations of a subcomponent, if
+    * at all. This is only relevant for ahead-of-time subcomponents.
+    */
+-  private ModifiableBindingType getModifiableBindingType(Key key, RequestKind requestKind) {
++  private ModifiableBindingType getModifiableBindingType(BindingRequest request) {
+     if (!compilerOptions.aheadOfTimeSubcomponents()) {
+       return ModifiableBindingType.NONE;
+     }
+@@ -444,8 +451,8 @@ private ModifiableBindingType getModifiableBindingType(Key key, RequestKind requ
+       return ModifiableBindingType.NONE;
+     }
+ 
+-    if (resolvedInThisComponent(key, requestKind)) {
+-      ResolvedBindings resolvedBindings = graph.resolvedBindings(requestKind, key);
++    if (resolvedInThisComponent(request)) {
++      ResolvedBindings resolvedBindings = graph.resolvedBindings(request);
+       if (resolvedBindings.contributionBindings().isEmpty()) {
+         // TODO(ronshapiro): Confirm whether a resolved binding must have a single contribution
+         // binding.
+@@ -460,7 +467,7 @@ private ModifiableBindingType getModifiableBindingType(Key key, RequestKind requ
+       if (binding.kind().equals(BindingKind.OPTIONAL)) {
+         return ModifiableBindingType.OPTIONAL;
+       }
+-    } else if (!resolvableBinding(key, requestKind)) {
++    } else if (!resolvableBinding(request)) {
+       return ModifiableBindingType.MISSING;
+     }
+ 
+@@ -474,16 +481,13 @@ private ModifiableBindingType getModifiableBindingType(Key key, RequestKind requ
+    */
+   private boolean shouldModifyKnownBinding(ModifiableBindingMethod modifiableBindingMethod) {
+     ModifiableBindingType newModifiableBindingType =
+-        getModifiableBindingType(modifiableBindingMethod.key(), modifiableBindingMethod.kind());
++        getModifiableBindingType(modifiableBindingMethod.request());
+     if (!newModifiableBindingType.equals(modifiableBindingMethod.type())) {
+       // It is possible that a binding can change types, in which case we should always modify the
+       // binding.
+       return true;
+     }
+-    return shouldModifyBinding(
+-        modifiableBindingMethod.type(),
+-        modifiableBindingMethod.key(),
+-        modifiableBindingMethod.kind());
++    return shouldModifyBinding(modifiableBindingMethod.type(), modifiableBindingMethod.request());
+   }
+ 
+   /**
+@@ -491,7 +495,7 @@ private boolean shouldModifyKnownBinding(ModifiableBindingMethod modifiableBindi
+    * modifiable binding method. This is only relevant for ahead-of-time subcomponents.
+    */
+   private boolean shouldModifyBinding(
+-      ModifiableBindingType modifiableBindingType, Key key, RequestKind requestKind) {
++      ModifiableBindingType modifiableBindingType, BindingRequest request) {
+     switch (modifiableBindingType) {
+       case GENERATED_INSTANCE:
+         return !generatedComponentModel.isAbstract();
+@@ -500,10 +504,10 @@ private boolean shouldModifyBinding(
+         // ancestors satisfy missing bindings of their children with their own missing binding
+         // methods so that we can minimize the cases where we need to reach into doubly-nested
+         // descendant component implementations
+-        return resolvableBinding(key, requestKind);
++        return resolvableBinding(request);
+       case OPTIONAL:
+         // Only override optional binding methods if we have a non-empty binding.
+-        ResolvedBindings resolvedBindings = graph.resolvedBindings(requestKind, key);
++        ResolvedBindings resolvedBindings = graph.resolvedBindings(request);
+         return !resolvedBindings.contributionBinding().dependencies().isEmpty();
+       default:
+         throw new IllegalStateException(
+@@ -517,11 +521,11 @@ private boolean shouldModifyBinding(
+    * Returns true if the binding can be resolved by the graph for this component or any parent
+    * component.
+    */
+-  private boolean resolvableBinding(Key key, RequestKind requestKind) {
++  private boolean resolvableBinding(BindingRequest request) {
+     for (ComponentBindingExpressions expressions = this;
+         expressions != null;
+         expressions = expressions.parent.orElse(null)) {
+-      if (expressions.resolvedInThisComponent(key, requestKind)) {
++      if (expressions.resolvedInThisComponent(request)) {
+         return true;
+       }
+     }
+@@ -529,8 +533,8 @@ private boolean resolvableBinding(Key key, RequestKind requestKind) {
+   }
+ 
+   /** Returns true if the binding can be resolved by the graph for this component. */
+-  private boolean resolvedInThisComponent(Key key, RequestKind requestKind) {
+-    ResolvedBindings resolvedBindings = graph.resolvedBindings(requestKind, key);
++  private boolean resolvedInThisComponent(BindingRequest request) {
++    ResolvedBindings resolvedBindings = graph.resolvedBindings(request);
+     return resolvedBindings != null && !resolvedBindings.ownedBindings().isEmpty();
+   }
+ 
+@@ -671,7 +675,11 @@ private InstanceFactoryCreationExpression instanceFactoryCreationExpression(
+ 
+   /** Returns a binding expression for a provision binding. */
+   private BindingExpression provisionBindingExpression(
+-      ResolvedBindings resolvedBindings, RequestKind requestKind) {
++      ResolvedBindings resolvedBindings, BindingRequest request) {
++    // All provision requests should have an associated RequestKind, even if they're a framework
++    // request.
++    checkArgument(request.requestKind().isPresent());
++    RequestKind requestKind = request.requestKind().get();
+     switch (requestKind) {
+       case INSTANCE:
+         return instanceBindingExpression(resolvedBindings);
+@@ -698,6 +706,18 @@ private BindingExpression provisionBindingExpression(
+     throw new AssertionError();
+   }
+ 
++  /** Returns a binding expression for a production binding. */
++  private BindingExpression productionBindingExpression(
++      ResolvedBindings resolvedBindings, BindingRequest request) {
++    if (request.frameworkType().isPresent()) {
++      return frameworkInstanceBindingExpression(resolvedBindings);
++    } else {
++      // If no FrameworkType is present, a RequestKind is guaranteed to be present.
++      return new DerivedFromFrameworkInstanceBindingExpression(
++          resolvedBindings, FrameworkType.PRODUCER, request.requestKind().get(), this, types);
++    }
++  }
++
+   /**
+    * Returns a binding expression for {@link RequestKind#PROVIDER} requests.
+    *
+@@ -721,7 +741,7 @@ private BindingExpression providerBindingExpression(ResolvedBindings resolvedBin
+             instanceof DerivedFromFrameworkInstanceBindingExpression)) {
+       return wrapInMethod(
+           resolvedBindings,
+-          RequestKind.PROVIDER,
++          BindingRequest.forDependencyRequest(resolvedBindings.key(), RequestKind.PROVIDER),
+           innerSwitchingProviders.newBindingExpression(resolvedBindings.contributionBinding()));
+     }
+     return frameworkInstanceBindingExpression(resolvedBindings);
+@@ -765,7 +785,10 @@ private BindingExpression instanceBindingExpression(ResolvedBindings resolvedBin
+       BindingExpression directInstanceExpression = maybeDirectInstanceExpression.get();
+       return directInstanceExpression.requiresMethodEncapsulation()
+               || needsCaching(resolvedBindings)
+-          ? wrapInMethod(resolvedBindings, RequestKind.INSTANCE, directInstanceExpression)
++          ? wrapInMethod(
++              resolvedBindings,
++              BindingRequest.forDependencyRequest(resolvedBindings.key(), RequestKind.INSTANCE),
++              directInstanceExpression)
+           : directInstanceExpression;
+     }
+     return new DerivedFromFrameworkInstanceBindingExpression(
+@@ -887,25 +910,23 @@ private boolean canUseDirectInstanceExpression(ResolvedBindings resolvedBindings
+    */
+   private BindingExpression wrapInMethod(
+       ResolvedBindings resolvedBindings,
+-      RequestKind requestKind,
++      BindingRequest request,
+       BindingExpression bindingExpression) {
+     BindingMethodImplementation methodImplementation =
+-        methodImplementation(resolvedBindings, requestKind, bindingExpression);
++        methodImplementation(resolvedBindings, request, bindingExpression);
+     Optional<ComponentMethodDescriptor> matchingComponentMethod =
+-        findMatchingComponentMethod(resolvedBindings.key(), requestKind);
++        findMatchingComponentMethod(request);
+ 
+-    ModifiableBindingType modifiableBindingType =
+-        getModifiableBindingType(resolvedBindings.key(), requestKind);
++    ModifiableBindingType modifiableBindingType = getModifiableBindingType(request);
+     if (modifiableBindingType.isModifiable() && !matchingComponentMethod.isPresent()) {
+       return new ModifiableConcreteMethodBindingExpression(
+           resolvedBindings,
+-          requestKind,
++          request,
+           modifiableBindingType,
+           methodImplementation,
+           generatedComponentModel,
+-          generatedComponentModel.getModifiableBindingMethod(resolvedBindings.key(), requestKind),
+-          newModifiableBindingWillBeFinalized(
+-              modifiableBindingType, resolvedBindings.key(), requestKind));
++          generatedComponentModel.getModifiableBindingMethod(request),
++          newModifiableBindingWillBeFinalized(modifiableBindingType, request));
+     }
+ 
+     return matchingComponentMethod
+@@ -916,49 +937,45 @@ private BindingExpression wrapInMethod(
+         .orElseGet(
+             () ->
+                 new PrivateMethodBindingExpression(
+-                    resolvedBindings, requestKind, methodImplementation, generatedComponentModel));
++                    resolvedBindings, request, methodImplementation, generatedComponentModel));
+   }
+ 
+   /** Returns the first component method associated with this request kind, if one exists. */
+-  private Optional<ComponentMethodDescriptor> findMatchingComponentMethod(
+-      Key key, RequestKind requestKind) {
+-    return graph
+-        .componentDescriptor()
+-        .componentMethods()
+-        .stream()
+-        .filter(method -> doesComponentMethodMatch(method, key, requestKind))
++  private Optional<ComponentMethodDescriptor> findMatchingComponentMethod(BindingRequest request) {
++    return graph.componentDescriptor().componentMethods().stream()
++        .filter(method -> doesComponentMethodMatch(method, request))
+         .findFirst();
+   }
+ 
+-  /** Returns true if the component method matches the dependency request binding key and kind. */
++  /** Returns true if the component method matches the binding request. */
+   private boolean doesComponentMethodMatch(
+-      ComponentMethodDescriptor componentMethod, Key key, RequestKind requestKind) {
++      ComponentMethodDescriptor componentMethod, BindingRequest request) {
+     return componentMethod
+         .dependencyRequest()
+-        .filter(request -> request.key().equals(key))
+-        .filter(request -> request.kind().equals(requestKind))
++        .map(BindingRequest::forDependencyRequest)
++        .filter(isEqual(request))
+         .isPresent();
+   }
+ 
+   private BindingMethodImplementation methodImplementation(
+       ResolvedBindings resolvedBindings,
+-      RequestKind requestKind,
++      BindingRequest request,
+       BindingExpression bindingExpression) {
+     if (compilerOptions.fastInit()) {
+-      if (requestKind.equals(RequestKind.PROVIDER)) {
++      if (request.isRequestKind(RequestKind.PROVIDER)) {
+         return new SingleCheckedMethodImplementation(
+-            resolvedBindings, requestKind, bindingExpression, types, generatedComponentModel);
+-      } else if (requestKind.equals(RequestKind.INSTANCE) && needsCaching(resolvedBindings)) {
++            resolvedBindings, request, bindingExpression, types, generatedComponentModel);
++      } else if (request.isRequestKind(RequestKind.INSTANCE) && needsCaching(resolvedBindings)) {
+         return resolvedBindings.scope().get().isReusable()
+             ? new SingleCheckedMethodImplementation(
+-                resolvedBindings, requestKind, bindingExpression, types, generatedComponentModel)
++                resolvedBindings, request, bindingExpression, types, generatedComponentModel)
+             : new DoubleCheckedMethodImplementation(
+-                resolvedBindings, requestKind, bindingExpression, types, generatedComponentModel);
++                resolvedBindings, request, bindingExpression, types, generatedComponentModel);
+       }
+     }
+ 
+     return new BindingMethodImplementation(
+-        resolvedBindings, requestKind, bindingExpression, generatedComponentModel.name(), types);
++        resolvedBindings, request, bindingExpression, generatedComponentModel.name(), types);
+   }
+ 
+   /**
+diff --git a/java/dagger/internal/codegen/ComponentTreeTraverser.java b/java/dagger/internal/codegen/ComponentTreeTraverser.java
+index f79c1d0cb..0c12a68c4 100644
+--- a/java/dagger/internal/codegen/ComponentTreeTraverser.java
++++ b/java/dagger/internal/codegen/ComponentTreeTraverser.java
+@@ -393,7 +393,7 @@ protected void visitBinding(Binding binding, ComponentDescriptor owningComponent
+     private void nextDependencyRequest(
+         DependencyRequest dependencyRequest, BindingGraph bindingGraph) {
+       ResolvedBindings resolvedBindings =
+-          bindingGraph.resolvedBindings(dependencyRequest.kind(), dependencyRequest.key());
++          bindingGraph.resolvedBindings(BindingRequest.forDependencyRequest(dependencyRequest));
+       dependencyRequestPath.addLast(dependencyRequest);
+       resolvedBindingsPath.addLast(resolvedBindings);
+       // Don't add the key of a members injection request, as it doesn't participate in cycles
+@@ -660,7 +660,7 @@ ComponentPath toComponentPath() {
+     }
+ 
+     @Override
+-    public String toString() {
++    public final String toString() {
+       return graphsInPath()
+           .stream()
+           .map(BindingGraph::componentType)
+diff --git a/java/dagger/internal/codegen/DaggerKythePlugin.java b/java/dagger/internal/codegen/DaggerKythePlugin.java
+index 26e0a8ce4..ab5341ae6 100644
+--- a/java/dagger/internal/codegen/DaggerKythePlugin.java
++++ b/java/dagger/internal/codegen/DaggerKythePlugin.java
+@@ -98,7 +98,8 @@ private void addEdgesForDependencyRequest(
+     if (!dependency.requestElement().isPresent()) {
+       return;
+     }
+-    ResolvedBindings resolvedBindings = graph.resolvedBindings(dependency.kind(), targetKey);
++    BindingRequest request = BindingRequest.forDependencyRequest(targetKey, dependency.kind());
++    ResolvedBindings resolvedBindings = graph.resolvedBindings(request);
+     for (Binding binding : resolvedBindings.bindings()) {
+       if (binding.bindingElement().isPresent()) {
+         addDependencyEdge(dependency, binding);
+diff --git a/java/dagger/internal/codegen/DerivedFromFrameworkInstanceBindingExpression.java b/java/dagger/internal/codegen/DerivedFromFrameworkInstanceBindingExpression.java
+index 97f4aba2a..adcd17acf 100644
+--- a/java/dagger/internal/codegen/DerivedFromFrameworkInstanceBindingExpression.java
++++ b/java/dagger/internal/codegen/DerivedFromFrameworkInstanceBindingExpression.java
+@@ -48,8 +48,7 @@
+   Expression getDependencyExpression(ClassName requestingClass) {
+     return frameworkType.to(
+         requestKind,
+-        componentBindingExpressions.getDependencyExpression(
+-            key, frameworkType.requestKind(), requestingClass),
++        componentBindingExpressions.getDependencyExpression(key, frameworkType, requestingClass),
+         types);
+   }
+ }
+diff --git a/java/dagger/internal/codegen/DoubleCheckedMethodImplementation.java b/java/dagger/internal/codegen/DoubleCheckedMethodImplementation.java
+index 31b51e46c..7c059d9c1 100644
+--- a/java/dagger/internal/codegen/DoubleCheckedMethodImplementation.java
++++ b/java/dagger/internal/codegen/DoubleCheckedMethodImplementation.java
+@@ -27,7 +27,6 @@
+ import com.squareup.javapoet.TypeName;
+ import dagger.internal.DoubleCheck;
+ import dagger.internal.MemoizedSentinel;
+-import dagger.model.RequestKind;
+ 
+ /**
+  * Defines a method body and return type for double checked locking of the given {@link
+@@ -41,11 +40,11 @@
+ 
+   DoubleCheckedMethodImplementation(
+       ResolvedBindings resolvedBindings,
+-      RequestKind requestKind,
++      BindingRequest request,
+       BindingExpression bindingExpression,
+       DaggerTypes types,
+       GeneratedComponentModel generatedComponentModel) {
+-    super(resolvedBindings, requestKind, bindingExpression, generatedComponentModel.name(), types);
++    super(resolvedBindings, request, bindingExpression, generatedComponentModel.name(), types);
+     this.generatedComponentModel = generatedComponentModel;
+     this.binding = resolvedBindings.contributionBinding();
+   }
+diff --git a/java/dagger/internal/codegen/FrameworkType.java b/java/dagger/internal/codegen/FrameworkType.java
+index 9ac0b9df9..05fcbcc69 100644
+--- a/java/dagger/internal/codegen/FrameworkType.java
++++ b/java/dagger/internal/codegen/FrameworkType.java
+@@ -34,6 +34,7 @@
+ import dagger.producers.Produced;
+ import dagger.producers.Producer;
+ import dagger.producers.internal.Producers;
++import java.util.Optional;
+ import javax.inject.Provider;
+ import javax.lang.model.type.TypeMirror;
+ 
+@@ -164,6 +165,18 @@ static FrameworkType forBindingType(BindingType bindingType) {
+     throw new AssertionError(bindingType);
+   }
+ 
++  /** Returns the framework type that exactly matches the given request kind, if one exists. */
++  static Optional<FrameworkType> forRequestKind(RequestKind requestKind) {
++    switch (requestKind) {
++      case PROVIDER:
++        return Optional.of(FrameworkType.PROVIDER);
++      case PRODUCER:
++        return Optional.of(FrameworkType.PRODUCER);
++      default:
++        return Optional.empty();
++    }
++  }
++
+   /** The class of fields of this type. */
+   abstract Class<?> frameworkClass();
+ 
+diff --git a/java/dagger/internal/codegen/GeneratedComponentModel.java b/java/dagger/internal/codegen/GeneratedComponentModel.java
+index 67cd21568..69299e8b3 100644
+--- a/java/dagger/internal/codegen/GeneratedComponentModel.java
++++ b/java/dagger/internal/codegen/GeneratedComponentModel.java
+@@ -22,11 +22,13 @@
+ import static com.google.common.base.Preconditions.checkState;
+ import static com.squareup.javapoet.TypeSpec.classBuilder;
+ import static dagger.internal.codegen.Accessibility.isTypeAccessibleFrom;
++import static dagger.internal.codegen.SourceFiles.simpleVariableName;
+ import static javax.lang.model.element.Modifier.ABSTRACT;
+ import static javax.lang.model.element.Modifier.FINAL;
+ import static javax.lang.model.element.Modifier.PRIVATE;
+ import static javax.lang.model.element.Modifier.PUBLIC;
+ 
++import com.google.auto.common.MoreTypes;
+ import com.google.common.base.Supplier;
+ import com.google.common.collect.ImmutableList;
+ import com.google.common.collect.ListMultimap;
+@@ -38,7 +40,6 @@
+ import com.squareup.javapoet.TypeSpec;
+ import dagger.internal.ReferenceReleasingProviderManager;
+ import dagger.internal.codegen.ModifiableBindingMethods.ModifiableBindingMethod;
+-import dagger.model.Key;
+ import dagger.model.RequestKind;
+ import java.util.ArrayList;
+ import java.util.Arrays;
+@@ -264,11 +265,10 @@ void addMethods(MethodSpecKind methodKind, Iterable<MethodSpec> methodSpecs) {
+    */
+   void addModifiableBindingMethod(
+       ModifiableBindingType type,
+-      Key key,
+-      RequestKind kind,
++      BindingRequest request,
+       MethodSpec methodSpec,
+       boolean finalized) {
+-    modifiableBindingMethods.addMethod(type, key, kind, methodSpec, finalized);
++    modifiableBindingMethods.addMethod(type, request, methodSpec, finalized);
+     methodSpecsMap.put(MethodSpecKind.MODIFIABLE_BINDING_METHOD, methodSpec);
+   }
+ 
+@@ -279,11 +279,10 @@ void addModifiableBindingMethod(
+    */
+   void registerModifiableBindingMethod(
+       ModifiableBindingType type,
+-      Key key,
+-      RequestKind kind,
++      BindingRequest request,
+       MethodSpec methodSpec,
+       boolean finalized) {
+-    modifiableBindingMethods.addMethod(type, key, kind, methodSpec, finalized);
++    modifiableBindingMethods.addMethod(type, request, methodSpec, finalized);
+   }
+ 
+   /** Adds the implementation for the given {@link ModifiableBindingMethod} to the component. */
+@@ -329,19 +328,30 @@ String getUniqueMethodName(String name) {
+     return componentMethodNames.getUniqueName(name);
+   }
+ 
++  /** Returns a new, unique method name for a getter method for the given request. */
++  String getUniqueMethodName(BindingRequest request) {
++    return uniqueMethodName(
++        request, simpleVariableName(MoreTypes.asTypeElement(request.key().type())));
++  }
++
+   /**
+-   * Returns a new, unique method name for a "getter" method exposing this binding and binding kind
+-   * for this component.
++   * Returns a new, unique method name for a getter method exposing the given binding for the given
++   * request.
+    */
+-  String getUniqueGetterMethodName(ContributionBinding binding, RequestKind requestKind) {
++  String getUniqueMethodName(BindingRequest request, ContributionBinding binding) {
+     // TODO(user): Use a better name for @MapKey binding instances.
+     // TODO(user): Include the binding method as part of the method name.
+-    String bindingName = LOWER_CAMEL.to(UPPER_CAMEL, BindingVariableNamer.name(binding));
+-    String kindName =
+-        requestKind.equals(RequestKind.INSTANCE)
+-            ? ""
+-            : UPPER_UNDERSCORE.to(UPPER_CAMEL, requestKind.name());
+-    return getUniqueMethodName("get" + bindingName + kindName);
++    return uniqueMethodName(request, BindingVariableNamer.name(binding));
++  }
++
++  private String uniqueMethodName(BindingRequest request, String bindingName) {
++    String baseMethodName =
++        "get"
++            + LOWER_CAMEL.to(UPPER_CAMEL, bindingName)
++            + (request.isRequestKind(RequestKind.INSTANCE)
++                ? ""
++                : UPPER_UNDERSCORE.to(UPPER_CAMEL, request.kindName()));
++    return getUniqueMethodName(baseMethodName);
+   }
+ 
+   /** Claims a new method name for the component. Does nothing if method name already exists. */
+@@ -376,10 +386,10 @@ void claimMethodName(Name name) {
+    * Returns the {@link ModifiableBindingMethod} for this subcomponent for the given binding, if it
+    * exists.
+    */
+-  Optional<ModifiableBindingMethod> getModifiableBindingMethod(Key key, RequestKind requestKind) {
+-    Optional<ModifiableBindingMethod> method = modifiableBindingMethods.getMethod(key, requestKind);
++  Optional<ModifiableBindingMethod> getModifiableBindingMethod(BindingRequest request) {
++    Optional<ModifiableBindingMethod> method = modifiableBindingMethods.getMethod(request);
+     if (!method.isPresent() && supermodel.isPresent()) {
+-      return supermodel.get().getModifiableBindingMethod(key, requestKind);
++      return supermodel.get().getModifiableBindingMethod(request);
+     }
+     return method;
+   }
+diff --git a/java/dagger/internal/codegen/GeneratedInstanceBindingExpression.java b/java/dagger/internal/codegen/GeneratedInstanceBindingExpression.java
+index 90aa7c48d..a5a99f8a2 100644
+--- a/java/dagger/internal/codegen/GeneratedInstanceBindingExpression.java
++++ b/java/dagger/internal/codegen/GeneratedInstanceBindingExpression.java
+@@ -18,7 +18,6 @@
+ 
+ import dagger.internal.codegen.ComponentDescriptor.ComponentMethodDescriptor;
+ import dagger.internal.codegen.ModifiableBindingMethods.ModifiableBindingMethod;
+-import dagger.model.RequestKind;
+ import java.util.Optional;
+ 
+ /**
+@@ -31,28 +30,27 @@
+ final class GeneratedInstanceBindingExpression extends ModifiableAbstractMethodBindingExpression {
+   private final GeneratedComponentModel generatedComponentModel;
+   private final ContributionBinding binding;
+-  private final RequestKind requestKind;
++  private final BindingRequest request;
+ 
+   GeneratedInstanceBindingExpression(
+       GeneratedComponentModel generatedComponentModel,
+       ResolvedBindings resolvedBindings,
+-      RequestKind requestKind,
++      BindingRequest request,
+       Optional<ModifiableBindingMethod> matchingModifiableBindingMethod,
+       Optional<ComponentMethodDescriptor> matchingComponentMethod) {
+     super(
+         generatedComponentModel,
+         ModifiableBindingType.GENERATED_INSTANCE,
+-        resolvedBindings.key(),
+-        requestKind,
++        request,
+         matchingModifiableBindingMethod,
+         matchingComponentMethod);
+     this.generatedComponentModel = generatedComponentModel;
+     this.binding = resolvedBindings.contributionBinding();
+-    this.requestKind = requestKind;
++    this.request = request;
+   }
+ 
+   @Override
+   String chooseMethodName() {
+-    return generatedComponentModel.getUniqueGetterMethodName(binding, requestKind);
++    return generatedComponentModel.getUniqueMethodName(request, binding);
+   }
+ }
+diff --git a/java/dagger/internal/codegen/MissingBindingExpression.java b/java/dagger/internal/codegen/MissingBindingExpression.java
+index fd8f9b8e1..2c1b7df46 100644
+--- a/java/dagger/internal/codegen/MissingBindingExpression.java
++++ b/java/dagger/internal/codegen/MissingBindingExpression.java
+@@ -16,16 +16,8 @@
+ 
+ package dagger.internal.codegen;
+ 
+-import static com.google.common.base.CaseFormat.LOWER_CAMEL;
+-import static com.google.common.base.CaseFormat.UPPER_CAMEL;
+-import static com.google.common.base.CaseFormat.UPPER_UNDERSCORE;
+-import static dagger.internal.codegen.SourceFiles.simpleVariableName;
+-
+-import com.google.auto.common.MoreTypes;
+ import dagger.internal.codegen.ComponentDescriptor.ComponentMethodDescriptor;
+ import dagger.internal.codegen.ModifiableBindingMethods.ModifiableBindingMethod;
+-import dagger.model.Key;
+-import dagger.model.RequestKind;
+ import java.util.Optional;
+ 
+ /**
+@@ -36,34 +28,25 @@
+  */
+ final class MissingBindingExpression extends ModifiableAbstractMethodBindingExpression {
+   private final GeneratedComponentModel generatedComponentModel;
+-  private final Key key;
+-  private final RequestKind kind;
++  private final BindingRequest request;
+ 
+   MissingBindingExpression(
+       GeneratedComponentModel generatedComponentModel,
+-      Key key,
+-      RequestKind kind,
++      BindingRequest request,
+       Optional<ModifiableBindingMethod> matchingModifiableBindingMethod,
+       Optional<ComponentMethodDescriptor> matchingComponentMethod) {
+     super(
+         generatedComponentModel,
+         ModifiableBindingType.MISSING,
+-        key,
+-        kind,
++        request,
+         matchingModifiableBindingMethod,
+         matchingComponentMethod);
+     this.generatedComponentModel = generatedComponentModel;
+-    this.key = key;
+-    this.kind = kind;
++    this.request = request;
+   }
+ 
+   @Override
+   String chooseMethodName() {
+-    return generatedComponentModel.getUniqueMethodName(
+-        "get"
+-            + LOWER_CAMEL.to(UPPER_CAMEL, simpleVariableName(MoreTypes.asTypeElement(key.type())))
+-            + (kind.equals(RequestKind.INSTANCE)
+-                ? ""
+-                : UPPER_UNDERSCORE.to(UPPER_CAMEL, kind.name())));
++    return generatedComponentModel.getUniqueMethodName(request);
+   }
+ }
+diff --git a/java/dagger/internal/codegen/ModifiableAbstractMethodBindingExpression.java b/java/dagger/internal/codegen/ModifiableAbstractMethodBindingExpression.java
+index 77fc1ab18..095784f37 100644
+--- a/java/dagger/internal/codegen/ModifiableAbstractMethodBindingExpression.java
++++ b/java/dagger/internal/codegen/ModifiableAbstractMethodBindingExpression.java
+@@ -16,18 +16,14 @@
+ 
+ package dagger.internal.codegen;
+ 
+-import static dagger.internal.codegen.RequestKinds.requestTypeName;
+ import static javax.lang.model.element.Modifier.ABSTRACT;
+ import static javax.lang.model.element.Modifier.PUBLIC;
+ 
+ import com.squareup.javapoet.ClassName;
+ import com.squareup.javapoet.CodeBlock;
+ import com.squareup.javapoet.MethodSpec;
+-import com.squareup.javapoet.TypeName;
+ import dagger.internal.codegen.ComponentDescriptor.ComponentMethodDescriptor;
+ import dagger.internal.codegen.ModifiableBindingMethods.ModifiableBindingMethod;
+-import dagger.model.Key;
+-import dagger.model.RequestKind;
+ import java.util.Optional;
+ 
+ /**
+@@ -40,21 +36,18 @@
+ abstract class ModifiableAbstractMethodBindingExpression extends BindingExpression {
+   private final GeneratedComponentModel generatedComponentModel;
+   private final ModifiableBindingType modifiableBindingType;
+-  private final Key key;
+-  private final RequestKind kind;
++  private final BindingRequest request;
+   private Optional<String> methodName;
+ 
+   ModifiableAbstractMethodBindingExpression(
+       GeneratedComponentModel generatedComponentModel,
+       ModifiableBindingType modifiableBindingType,
+-      Key key,
+-      RequestKind kind,
++      BindingRequest request,
+       Optional<ModifiableBindingMethod> matchingModifiableBindingMethod,
+       Optional<ComponentMethodDescriptor> matchingComponentMethod) {
+     this.generatedComponentModel = generatedComponentModel;
+     this.modifiableBindingType = modifiableBindingType;
+-    this.key = key;
+-    this.kind = kind;
++    this.request = request;
+     this.methodName =
+         initializeMethodName(matchingComponentMethod, matchingModifiableBindingMethod);
+   }
+@@ -79,7 +72,7 @@
+   @Override
+   final Expression getDependencyExpression(ClassName requestingClass) {
+     addUnimplementedMethod();
+-    return Expression.create(key.type(), CodeBlock.of("$L()", methodName.get()));
++    return Expression.create(request.key().type(), CodeBlock.of("$L()", methodName.get()));
+   }
+ 
+   private void addUnimplementedMethod() {
+@@ -88,11 +81,10 @@ private void addUnimplementedMethod() {
+       methodName = Optional.of(chooseMethodName());
+       generatedComponentModel.addModifiableBindingMethod(
+           modifiableBindingType,
+-          key,
+-          kind,
++          request,
+           MethodSpec.methodBuilder(methodName.get())
+               .addModifiers(PUBLIC, ABSTRACT)
+-              .returns(requestTypeName(kind, TypeName.get(key.type())))
++              .returns(request.typeName())
+               .build(),
+           false /* finalized */);
+     }
+diff --git a/java/dagger/internal/codegen/ModifiableBindingMethods.java b/java/dagger/internal/codegen/ModifiableBindingMethods.java
+index 290621ec1..6e7ddc6a9 100644
+--- a/java/dagger/internal/codegen/ModifiableBindingMethods.java
++++ b/java/dagger/internal/codegen/ModifiableBindingMethods.java
+@@ -25,8 +25,6 @@
+ import com.google.common.collect.Maps;
+ import com.google.common.collect.Sets;
+ import com.squareup.javapoet.MethodSpec;
+-import dagger.model.Key;
+-import dagger.model.RequestKind;
+ import java.util.Map;
+ import java.util.Optional;
+ import java.util.Set;
+@@ -41,18 +39,17 @@
+  * superclasses to know what binding methods to attempt to modify.
+  */
+ final class ModifiableBindingMethods {
+-  private final Map<KeyAndKind, ModifiableBindingMethod> methods = Maps.newLinkedHashMap();
+-  private final Set<KeyAndKind> finalizedMethods = Sets.newHashSet();
++  private final Map<BindingRequest, ModifiableBindingMethod> methods = Maps.newLinkedHashMap();
++  private final Set<BindingRequest> finalizedMethods = Sets.newHashSet();
+ 
+   /** Register a method encapsulating a modifiable binding. */
+   void addMethod(
+-      ModifiableBindingType type, Key key, RequestKind kind, MethodSpec method, boolean finalized) {
++      ModifiableBindingType type, BindingRequest request, MethodSpec method, boolean finalized) {
+     checkArgument(type.isModifiable());
+-    KeyAndKind keyAndKind = KeyAndKind.create(key, kind);
+     if (finalized) {
+-      finalizedMethods.add(keyAndKind);
++      finalizedMethods.add(request);
+     }
+-    methods.put(keyAndKind, ModifiableBindingMethod.create(type, key, kind, method, finalized));
++    methods.put(request, ModifiableBindingMethod.create(type, request, method, finalized));
+   }
+ 
+   /** Returns all {@link ModifiableBindingMethod}s that have not been marked as finalized. */
+@@ -61,8 +58,8 @@ void addMethod(
+   }
+ 
+   /** Returns the {@link ModifiableBindingMethod} for the given binding if present. */
+-  Optional<ModifiableBindingMethod> getMethod(Key key, RequestKind kind) {
+-    return Optional.ofNullable(methods.get(KeyAndKind.create(key, kind)));
++  Optional<ModifiableBindingMethod> getMethod(BindingRequest request) {
++    return Optional.ofNullable(methods.get(request));
+   }
+ 
+   /**
+@@ -72,63 +69,44 @@ void addMethod(
+   void methodImplemented(ModifiableBindingMethod method) {
+     if (method.finalized()) {
+       checkState(
+-          finalizedMethods.add(KeyAndKind.create(method.key(), method.kind())),
++          finalizedMethods.add(method.request()),
+           "Implementing and finalizing a modifiable binding method that has been marked as "
+-              + "finalized in the current subcomponent implementation. The binding is for a %s-%s "
++              + "finalized in the current subcomponent implementation. The binding is for a %s "
+               + "of type %s.",
+-          method.key(),
+-          method.kind(),
++          method.request(),
+           method.type());
+     }
+   }
+ 
+   /** Whether a given binding has been marked as finalized. */
+   boolean finalized(ModifiableBindingMethod method) {
+-    return finalizedMethods.contains(KeyAndKind.create(method.key(), method.kind()));
++    return finalizedMethods.contains(method.request());
+   }
+ 
+   @AutoValue
+   abstract static class ModifiableBindingMethod {
+     private static ModifiableBindingMethod create(
+         ModifiableBindingType type,
+-        Key key,
+-        RequestKind kind,
++        BindingRequest request,
+         MethodSpec methodSpec,
+         boolean finalized) {
+       return new AutoValue_ModifiableBindingMethods_ModifiableBindingMethod(
+-          type, key, kind, methodSpec, finalized);
++          type, request, methodSpec, finalized);
+     }
+ 
+     /** Create a {@ModifiableBindingMethod} representing an implementation of an existing method. */
+     static ModifiableBindingMethod implement(
+         ModifiableBindingMethod unimplementedMethod, MethodSpec methodSpec, boolean finalized) {
+       return new AutoValue_ModifiableBindingMethods_ModifiableBindingMethod(
+-          unimplementedMethod.type(),
+-          unimplementedMethod.key(),
+-          unimplementedMethod.kind(),
+-          methodSpec,
+-          finalized);
++          unimplementedMethod.type(), unimplementedMethod.request(), methodSpec, finalized);
+     }
+ 
+     abstract ModifiableBindingType type();
+ 
+-    abstract Key key();
+-
+-    abstract RequestKind kind();
++    abstract BindingRequest request();
+ 
+     abstract MethodSpec methodSpec();
+ 
+     abstract boolean finalized();
+   }
+-
+-  @AutoValue
+-  abstract static class KeyAndKind {
+-    private static KeyAndKind create(Key key, RequestKind kind) {
+-      return new AutoValue_ModifiableBindingMethods_KeyAndKind(key, kind);
+-    }
+-
+-    abstract Key key();
+-
+-    abstract RequestKind kind();
+-  }
+ }
+diff --git a/java/dagger/internal/codegen/ModifiableConcreteMethodBindingExpression.java b/java/dagger/internal/codegen/ModifiableConcreteMethodBindingExpression.java
+index 15e3215dc..975ed1a07 100644
+--- a/java/dagger/internal/codegen/ModifiableConcreteMethodBindingExpression.java
++++ b/java/dagger/internal/codegen/ModifiableConcreteMethodBindingExpression.java
+@@ -24,7 +24,6 @@
+ 
+ import com.squareup.javapoet.TypeName;
+ import dagger.internal.codegen.ModifiableBindingMethods.ModifiableBindingMethod;
+-import dagger.model.RequestKind;
+ import java.util.Optional;
+ 
+ /**
+@@ -34,7 +33,7 @@
+  */
+ final class ModifiableConcreteMethodBindingExpression extends MethodBindingExpression {
+   private final ContributionBinding binding;
+-  private final RequestKind requestKind;
++  private final BindingRequest request;
+   private final ModifiableBindingType modifiableBindingType;
+   private final BindingMethodImplementation methodImplementation;
+   private final GeneratedComponentModel generatedComponentModel;
+@@ -43,7 +42,7 @@
+ 
+   ModifiableConcreteMethodBindingExpression(
+       ResolvedBindings resolvedBindings,
+-      RequestKind requestKind,
++      BindingRequest request,
+       ModifiableBindingType modifiableBindingType,
+       BindingMethodImplementation methodImplementation,
+       GeneratedComponentModel generatedComponentModel,
+@@ -51,7 +50,7 @@
+       boolean bindingFinalized) {
+     super(methodImplementation, generatedComponentModel);
+     this.binding = resolvedBindings.contributionBinding();
+-    this.requestKind = checkNotNull(requestKind);
++    this.request = checkNotNull(request);
+     this.modifiableBindingType = checkNotNull(modifiableBindingType);
+     this.methodImplementation = checkNotNull(methodImplementation);
+     this.generatedComponentModel = checkNotNull(generatedComponentModel);
+@@ -64,12 +63,10 @@
+   protected void addMethod() {
+     // Add the modifiable binding method to the component model if we haven't already.
+     if (!methodName.isPresent()) {
+-      methodName =
+-          Optional.of(generatedComponentModel.getUniqueGetterMethodName(binding, requestKind));
++      methodName = Optional.of(generatedComponentModel.getUniqueMethodName(request, binding));
+       generatedComponentModel.addModifiableBindingMethod(
+           modifiableBindingType,
+-          binding.key(),
+-          requestKind,
++          request,
+           methodBuilder(methodName.get())
+               .addModifiers(bindingFinalized ? PRIVATE : PUBLIC)
+               .returns(TypeName.get(methodImplementation.returnType()))
+diff --git a/java/dagger/internal/codegen/PrivateMethodBindingExpression.java b/java/dagger/internal/codegen/PrivateMethodBindingExpression.java
+index bd9243739..88893fd8a 100644
+--- a/java/dagger/internal/codegen/PrivateMethodBindingExpression.java
++++ b/java/dagger/internal/codegen/PrivateMethodBindingExpression.java
+@@ -23,7 +23,6 @@
+ import static javax.lang.model.element.Modifier.PRIVATE;
+ 
+ import com.squareup.javapoet.TypeName;
+-import dagger.model.RequestKind;
+ 
+ /**
+  * A binding expression that wraps the dependency expressions in a private, no-arg method.
+@@ -32,19 +31,19 @@
+  */
+ final class PrivateMethodBindingExpression extends MethodBindingExpression {
+   private final ContributionBinding binding;
+-  private final RequestKind requestKind;
++  private final BindingRequest request;
+   private final BindingMethodImplementation methodImplementation;
+   private final GeneratedComponentModel generatedComponentModel;
+   private String methodName;
+ 
+   PrivateMethodBindingExpression(
+       ResolvedBindings resolvedBindings,
+-      RequestKind requestKind,
++      BindingRequest request,
+       BindingMethodImplementation methodImplementation,
+       GeneratedComponentModel generatedComponentModel) {
+     super(methodImplementation, generatedComponentModel);
+     this.binding = resolvedBindings.contributionBinding();
+-    this.requestKind = checkNotNull(requestKind);
++    this.request = checkNotNull(request);
+     this.methodImplementation = checkNotNull(methodImplementation);
+     this.generatedComponentModel = checkNotNull(generatedComponentModel);
+   }
+@@ -53,7 +52,7 @@
+   protected void addMethod() {
+     if (methodName == null) {
+       // Have to set methodName field before implementing the method in order to handle recursion.
+-      methodName = generatedComponentModel.getUniqueGetterMethodName(binding, requestKind);
++      methodName = generatedComponentModel.getUniqueMethodName(request, binding);
+       // TODO(user): Fix the order that these generated methods are written to the component.
+       generatedComponentModel.addMethod(
+           PRIVATE_METHOD,
+diff --git a/java/dagger/internal/codegen/SingleCheckedMethodImplementation.java b/java/dagger/internal/codegen/SingleCheckedMethodImplementation.java
+index dc32cd199..944436225 100644
+--- a/java/dagger/internal/codegen/SingleCheckedMethodImplementation.java
++++ b/java/dagger/internal/codegen/SingleCheckedMethodImplementation.java
+@@ -17,7 +17,6 @@
+ package dagger.internal.codegen;
+ 
+ import static dagger.internal.codegen.GeneratedComponentModel.FieldSpecKind.PRIVATE_METHOD_SCOPED_FIELD;
+-import static dagger.model.RequestKind.INSTANCE;
+ import static javax.lang.model.element.Modifier.PRIVATE;
+ import static javax.lang.model.element.Modifier.VOLATILE;
+ 
+@@ -39,20 +38,20 @@
+   private final GeneratedComponentModel generatedComponentModel;
+   private final ResolvedBindings resolvedBindings;
+   private final ContributionBinding binding;
+-  private final RequestKind requestKind;
++  private final BindingRequest request;
+   private final Supplier<FieldSpec> field = Suppliers.memoize(this::createField);
+ 
+   SingleCheckedMethodImplementation(
+       ResolvedBindings resolvedBindings,
+-      RequestKind requestKind,
++      BindingRequest request,
+       BindingExpression bindingExpression,
+       DaggerTypes types,
+       GeneratedComponentModel generatedComponentModel) {
+-    super(resolvedBindings, requestKind, bindingExpression, generatedComponentModel.name(), types);
++    super(resolvedBindings, request, bindingExpression, generatedComponentModel.name(), types);
+     this.generatedComponentModel = generatedComponentModel;
+     this.resolvedBindings = resolvedBindings;
+     this.binding = resolvedBindings.contributionBinding();
+-    this.requestKind = requestKind;
++    this.request = request;
+   }
+ 
+   @Override
+@@ -79,7 +78,7 @@ CodeBlock body() {
+   private FieldSpec createField() {
+     String name =
+         generatedComponentModel.getUniqueFieldName(
+-            requestKind.equals(INSTANCE)
++            request.isRequestKind(RequestKind.INSTANCE)
+                 ? BindingVariableNamer.name(binding)
+                 : FrameworkField.forResolvedBindings(resolvedBindings, Optional.empty()).name());
+ 
+@@ -104,6 +103,6 @@ private TypeName fieldType() {
+   }
+ 
+   private boolean isNullable() {
+-    return requestKind.equals(INSTANCE) && binding.isNullable();
++    return request.isRequestKind(RequestKind.INSTANCE) && binding.isNullable();
+   }
+ }

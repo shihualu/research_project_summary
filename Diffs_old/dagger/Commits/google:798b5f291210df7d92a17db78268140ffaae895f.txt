@@ -1,0 +1,646 @@
+diff --git a/compiler/src/main/java/dagger/internal/codegen/AbstractComponentWriter.java b/compiler/src/main/java/dagger/internal/codegen/AbstractComponentWriter.java
+index 54c7d0a68..8778e4248 100644
+--- a/compiler/src/main/java/dagger/internal/codegen/AbstractComponentWriter.java
++++ b/compiler/src/main/java/dagger/internal/codegen/AbstractComponentWriter.java
+@@ -19,6 +19,7 @@
+ import static com.google.common.base.CaseFormat.LOWER_CAMEL;
+ import static com.google.common.base.CaseFormat.UPPER_CAMEL;
+ import static com.google.common.base.Preconditions.checkState;
++import static com.google.common.base.Verify.verify;
+ import static com.google.common.collect.Iterables.getOnlyElement;
+ import static com.squareup.javapoet.MethodSpec.constructorBuilder;
+ import static com.squareup.javapoet.MethodSpec.methodBuilder;
+@@ -38,7 +39,6 @@
+ import static dagger.internal.codegen.MemberSelect.staticMethod;
+ import static dagger.internal.codegen.MembersInjectionBinding.Strategy.NO_OP;
+ import static dagger.internal.codegen.Scope.reusableScope;
+-import static dagger.internal.codegen.SourceFiles.frameworkTypeUsageStatement;
+ import static dagger.internal.codegen.SourceFiles.generatedClassNameForBinding;
+ import static dagger.internal.codegen.SourceFiles.membersInjectorNameForType;
+ import static dagger.internal.codegen.TypeNames.DELEGATE_FACTORY;
+@@ -87,6 +87,7 @@
+ import com.squareup.javapoet.CodeBlock;
+ import com.squareup.javapoet.FieldSpec;
+ import com.squareup.javapoet.MethodSpec;
++import com.squareup.javapoet.ParameterSpec;
+ import com.squareup.javapoet.TypeName;
+ import com.squareup.javapoet.TypeSpec;
+ import com.squareup.javapoet.TypeVariableName;
+@@ -103,12 +104,14 @@
+ import dagger.producers.internal.MapProducer;
+ import dagger.producers.internal.SetOfProducedProducer;
+ import dagger.producers.internal.SetProducer;
++import java.util.EnumSet;
+ import java.util.HashMap;
+ import java.util.List;
+ import java.util.Map;
+ import java.util.Set;
+ import javax.inject.Provider;
+ import javax.lang.model.element.ExecutableElement;
++import javax.lang.model.element.Modifier;
+ import javax.lang.model.element.Name;
+ import javax.lang.model.element.TypeElement;
+ import javax.lang.model.element.VariableElement;
+@@ -141,6 +144,7 @@
+   private final UniqueNameSet componentFieldNames = new UniqueNameSet();
+   private final Map<BindingKey, MemberSelect> memberSelects = new HashMap<>();
+   private final Map<BindingKey, MemberSelect> producerFromProviderMemberSelects = new HashMap<>();
++  private final Map<BindingKey, RequestFulfillment> requestFulfillments = Maps.newLinkedHashMap();
+   protected final MethodSpec.Builder constructor = constructorBuilder().addModifiers(PRIVATE);
+   protected Optional<ClassName> builderName = Optional.absent();
+ 
+@@ -654,11 +658,39 @@ private static ClassName frameworkMapFactoryClassName(BindingType bindingType) {
+         ? MAP_OF_PRODUCER_PRODUCER : MAP_PROVIDER_FACTORY;
+   }
+ 
++  // TODO(gak): extract this into a proper factory class
++  private RequestFulfillment getOrCreateRequestFulfillment(BindingKey bindingKey) {
++    RequestFulfillment requestFulfillment = requestFulfillments.get(bindingKey);
++    if (requestFulfillment == null) {
++      /* TODO(gak): it is super convoluted that we create the member selects separately and then
++       * look them up again this way. Now that we have RequestFulfillment, the next step is to
++       * create it and the MemberSelect and the field on demand rather than in a first pass. */
++      MemberSelect memberSelect = getMemberSelect(bindingKey);
++      ResolvedBindings resolvedBindings = graph.resolvedBindings().get(bindingKey);
++      switch (resolvedBindings.bindingType()) {
++        case MEMBERS_INJECTION:
++          requestFulfillment = new MembersInjectorRequestFulfillment(bindingKey, memberSelect);
++          break;
++        case PRODUCTION:
++          requestFulfillment = new ProducerFieldRequestFulfillment(bindingKey, memberSelect);
++          break;
++        case PROVISION:
++          requestFulfillment = new ProviderFieldRequestFulfillment(bindingKey, memberSelect);
++          break;
++        default:
++          throw new AssertionError();
++      }
++      requestFulfillments.put(bindingKey, requestFulfillment);
++    }
++    return requestFulfillment;
++  }
++
+   private void implementInterfaceMethods() {
+     Set<MethodSignature> interfaceMethods = Sets.newHashSet();
+     for (ComponentMethodDescriptor componentMethod :
+         graph.componentDescriptor().componentMethods()) {
+       if (componentMethod.dependencyRequest().isPresent()) {
++        DependencyRequest interfaceRequest = componentMethod.dependencyRequest().get();
+         ExecutableElement methodElement =
+             MoreElements.asExecutable(componentMethod.methodElement());
+         ExecutableType requestType =
+@@ -671,45 +703,28 @@ private void implementInterfaceMethods() {
+         if (!interfaceMethods.contains(signature)) {
+           interfaceMethods.add(signature);
+           MethodSpec.Builder interfaceMethod =
+-              methodBuilder(methodElement.getSimpleName().toString())
+-                  .addAnnotation(Override.class)
+-                  .addModifiers(PUBLIC)
+-                  .returns(TypeName.get(requestType.getReturnType()));
+-          DependencyRequest interfaceRequest = componentMethod.dependencyRequest().get();
+-          BindingKey bindingKey = interfaceRequest.bindingKey();
+-          MemberSelect memberSelect = getMemberSelect(bindingKey);
+-          CodeBlock memberSelectCodeBlock = memberSelect.getExpressionFor(name);
++              methodSpecForComponentMethod(methodElement, requestType);
++          RequestFulfillment fulfillment =
++              getOrCreateRequestFulfillment(interfaceRequest.bindingKey());
++          CodeBlock codeBlock = fulfillment.getSnippetForDependencyRequest(interfaceRequest, name);
+           switch (interfaceRequest.kind()) {
+             case MEMBERS_INJECTOR:
+               List<? extends VariableElement> parameters = methodElement.getParameters();
+               if (parameters.isEmpty()) {
+                 // we're returning the framework type
+-                interfaceMethod.addStatement("return $L", memberSelectCodeBlock);
++                interfaceMethod.addStatement("return $L", codeBlock);
+               } else {
+-                Name parameterName = Iterables.getOnlyElement(parameters).getSimpleName();
+-                interfaceMethod.addParameter(
+-                    TypeName.get(Iterables.getOnlyElement(requestType.getParameterTypes())),
+-                    parameterName.toString());
+-                interfaceMethod.addStatement(
+-                    "$L.injectMembers($L)", memberSelectCodeBlock, parameterName);
++                Name parameterName =
++                    Iterables.getOnlyElement(methodElement.getParameters()).getSimpleName();
++                interfaceMethod.addStatement("$L.injectMembers($L)", codeBlock, parameterName);
+                 if (!requestType.getReturnType().getKind().equals(VOID)) {
+                   interfaceMethod.addStatement("return $L", parameterName);
+                 }
+               }
+               break;
+-            case INSTANCE:
+-            case LAZY:
+-            case PRODUCED:
+-            case PRODUCER:
+-            case PROVIDER:
+-            case PROVIDER_OF_LAZY:
+-            case FUTURE:
+-              interfaceMethod.addStatement(
+-                  "return $L",
+-                  frameworkTypeUsageStatement(memberSelectCodeBlock, interfaceRequest.kind()));
+-              break;
+             default:
+-              throw new AssertionError();
++              interfaceMethod.addStatement("return $L", codeBlock);
++              break;
+           }
+           component.addMethod(interfaceMethod.build());
+         }
+@@ -717,6 +732,38 @@ private void implementInterfaceMethods() {
+     }
+   }
+ 
++  public MethodSpec.Builder methodSpecForComponentMethod(
++      ExecutableElement method, ExecutableType methodType) {
++    String methodName = method.getSimpleName().toString();
++    MethodSpec.Builder methodBuilder = MethodSpec.methodBuilder(methodName);
++
++    methodBuilder.addAnnotation(Override.class);
++
++    Set<Modifier> modifiers = EnumSet.copyOf(method.getModifiers());
++    modifiers.remove(Modifier.ABSTRACT);
++    methodBuilder.addModifiers(modifiers);
++
++    methodBuilder.returns(TypeName.get(methodType.getReturnType()));
++
++    List<? extends VariableElement> parameters = method.getParameters();
++    List<? extends TypeMirror> resolvedParameterTypes = methodType.getParameterTypes();
++    verify(parameters.size() == resolvedParameterTypes.size());
++    for (int i = 0; i < parameters.size(); i++) {
++      VariableElement parameter = parameters.get(i);
++      TypeName type = TypeName.get(resolvedParameterTypes.get(i));
++      String name = parameter.getSimpleName().toString();
++      Set<Modifier> parameterModifiers = parameter.getModifiers();
++      ParameterSpec.Builder parameterBuilder =
++          ParameterSpec.builder(type, name)
++              .addModifiers(parameterModifiers.toArray(new Modifier[0]));
++      methodBuilder.addParameter(parameterBuilder.build());
++    }
++    for (TypeMirror thrownType : method.getThrownTypes()) {
++      methodBuilder.addException(TypeName.get(thrownType));
++    }
++    return methodBuilder;
++  }
++
+   private void addSubcomponents() {
+     for (Map.Entry<ExecutableElement, BindingGraph> subgraphEntry : graph.subgraphs().entrySet()) {
+       SubcomponentWriter subcomponent =
+diff --git a/compiler/src/main/java/dagger/internal/codegen/CodeBlocks.java b/compiler/src/main/java/dagger/internal/codegen/CodeBlocks.java
+index d5f4880c5..1404536ab 100644
+--- a/compiler/src/main/java/dagger/internal/codegen/CodeBlocks.java
++++ b/compiler/src/main/java/dagger/internal/codegen/CodeBlocks.java
+@@ -40,8 +40,8 @@ static CodeBlock concat(Iterable<CodeBlock> codeBlocks) {
+     return join(codeBlocks, "\n");
+   }
+ 
+-  static CodeBlock join(Iterable<CodeBlock> codeBlocks, String delimiter) {
+-    CodeBlock.Builder builder = CodeBlock.builder();
++  static CodeBlock.Builder join(
++      CodeBlock.Builder builder, Iterable<CodeBlock> codeBlocks, String delimiter) {
+     Iterator<CodeBlock> iterator = codeBlocks.iterator();
+     while (iterator.hasNext()) {
+       builder.add(iterator.next());
+@@ -49,7 +49,11 @@ static CodeBlock join(Iterable<CodeBlock> codeBlocks, String delimiter) {
+         builder.add(delimiter);
+       }
+     }
+-    return builder.build();
++    return builder;
++  }
++
++  static CodeBlock join(Iterable<CodeBlock> codeBlocks, String delimiter) {
++    return join(CodeBlock.builder(), codeBlocks, delimiter).build();
+   }
+ 
+   static FluentIterable<CodeBlock> toCodeBlocks(Iterable<? extends TypeMirror> typeMirrors) {
+@@ -68,12 +72,12 @@ public CodeBlock apply(TypeMirror typeMirror) {
+         }
+       };
+ 
+-  static Function<ParameterSpec, CodeBlock> PARAMETER_NAME =
++  static final Function<ParameterSpec, CodeBlock> PARAMETER_NAME =
+       new Function<ParameterSpec, CodeBlock>() {
+-          @Override
+-          public CodeBlock apply(ParameterSpec input) {
+-            return CodeBlock.of("$N", input);
+-          }
++        @Override
++        public CodeBlock apply(ParameterSpec input) {
++          return CodeBlock.of("$N", input);
++        }
+       };
+ 
+   private CodeBlocks() {}
+diff --git a/compiler/src/main/java/dagger/internal/codegen/ComponentProcessor.java b/compiler/src/main/java/dagger/internal/codegen/ComponentProcessor.java
+index 6c60484f6..be36c9bfb 100644
+--- a/compiler/src/main/java/dagger/internal/codegen/ComponentProcessor.java
++++ b/compiler/src/main/java/dagger/internal/codegen/ComponentProcessor.java
+@@ -115,7 +115,7 @@ public SourceVersion getSupportedSourceVersion() {
+         new ProductionExecutorModuleGenerator(filer, elements);
+ 
+     DependencyRequest.Factory dependencyRequestFactory =
+-        new DependencyRequest.Factory(elements, keyFactory);
++        new DependencyRequest.Factory(keyFactory);
+     ProvisionBinding.Factory provisionBindingFactory =
+         new ProvisionBinding.Factory(elements, types, keyFactory, dependencyRequestFactory);
+     ProductionBinding.Factory productionBindingFactory =
+diff --git a/compiler/src/main/java/dagger/internal/codegen/DependencyRequest.java b/compiler/src/main/java/dagger/internal/codegen/DependencyRequest.java
+index be829f1db..07d99080a 100644
+--- a/compiler/src/main/java/dagger/internal/codegen/DependencyRequest.java
++++ b/compiler/src/main/java/dagger/internal/codegen/DependencyRequest.java
+@@ -23,7 +23,6 @@
+ import static com.google.common.base.Preconditions.checkNotNull;
+ import static com.google.common.base.Preconditions.checkState;
+ import static com.google.common.collect.Iterables.getOnlyElement;
+-import static javax.lang.model.util.ElementFilter.constructorsIn;
+ 
+ import com.google.auto.common.MoreTypes;
+ import com.google.auto.value.AutoValue;
+@@ -40,7 +39,6 @@
+ import dagger.internal.codegen.DependencyRequest.Factory.KindAndType;
+ import dagger.producers.Produced;
+ import dagger.producers.Producer;
+-import dagger.producers.internal.AbstractProducer;
+ import java.util.List;
+ import javax.annotation.CheckReturnValue;
+ import javax.inject.Inject;
+@@ -48,14 +46,12 @@
+ import javax.lang.model.element.AnnotationMirror;
+ import javax.lang.model.element.Element;
+ import javax.lang.model.element.ExecutableElement;
+-import javax.lang.model.element.TypeElement;
+ import javax.lang.model.element.VariableElement;
+ import javax.lang.model.type.DeclaredType;
+ import javax.lang.model.type.ErrorType;
+ import javax.lang.model.type.ExecutableType;
+ import javax.lang.model.type.TypeKind;
+ import javax.lang.model.type.TypeMirror;
+-import javax.lang.model.util.Elements;
+ import javax.lang.model.util.SimpleTypeVisitor7;
+ 
+ /**
+@@ -201,11 +197,9 @@ public boolean apply(DependencyRequest request) {
+    * which may mean that the type will be generated in a later round of processing.
+    */
+   static final class Factory {
+-    private final Elements elements;
+     private final Key.Factory keyFactory;
+ 
+-    Factory(Elements elements, Key.Factory keyFactory) {
+-      this.elements = elements;
++    Factory(Key.Factory keyFactory) {
+       this.keyFactory = keyFactory;
+     }
+ 
+@@ -371,15 +365,14 @@ DependencyRequest forProductionImplementationExecutor() {
+           .build();
+     }
+ 
+-    DependencyRequest forProductionComponentMonitorProvider() {
+-      TypeElement element = elements.getTypeElement(AbstractProducer.class.getCanonicalName());
+-      for (ExecutableElement constructor : constructorsIn(element.getEnclosedElements())) {
+-        if (constructor.getParameters().size() == 2) {
+-          // the 2-arg constructor has the appropriate dependency as its first arg
+-          return forRequiredVariable(constructor.getParameters().get(0), Optional.of("monitor"));
+-        }
+-      }
+-      throw new AssertionError("expected 2-arg constructor in AbstractProducer");
++    DependencyRequest forProductionComponentMonitor() {
++      Key key = keyFactory.forProductionComponentMonitor();
++      return DependencyRequest.builder()
++          .kind(Kind.PROVIDER)
++          .key(key)
++          .requestElement(MoreTypes.asElement(key.type()))
++          .overriddenVariableName(Optional.of("monitor"))
++          .build();
+     }
+ 
+     private DependencyRequest newDependencyRequest(
+diff --git a/compiler/src/main/java/dagger/internal/codegen/Key.java b/compiler/src/main/java/dagger/internal/codegen/Key.java
+index 7745ab5d7..fd3de007c 100644
+--- a/compiler/src/main/java/dagger/internal/codegen/Key.java
++++ b/compiler/src/main/java/dagger/internal/codegen/Key.java
+@@ -49,6 +49,7 @@
+ import dagger.producers.Producer;
+ import dagger.producers.Production;
+ import dagger.producers.internal.ProductionImplementation;
++import dagger.producers.monitoring.ProductionComponentMonitor;
+ import java.util.Map;
+ import java.util.Set;
+ import java.util.concurrent.Executor;
+@@ -508,6 +509,12 @@ Key forProductionImplementationExecutor() {
+           getClassElement(Executor.class).asType());
+     }
+ 
++    Key forProductionComponentMonitor() {
++      return forQualifiedType(
++          Optional.<AnnotationMirror>absent(),
++          getClassElement(ProductionComponentMonitor.class).asType());
++    }
++
+     /**
+      * If {@code requestKey} is for a {@code Map<K, V>} or {@code Map<K, Produced<V>>}, returns keys
+      * for {@code Map<K, Provider<V>>} and {@code Map<K, Producer<V>>} (if Dagger-Producers is on
+diff --git a/compiler/src/main/java/dagger/internal/codegen/MembersInjectorRequestFulfillment.java b/compiler/src/main/java/dagger/internal/codegen/MembersInjectorRequestFulfillment.java
+new file mode 100644
+index 000000000..bece3fad9
+--- /dev/null
++++ b/compiler/src/main/java/dagger/internal/codegen/MembersInjectorRequestFulfillment.java
+@@ -0,0 +1,43 @@
++/*
++ * Copyright (C) 2016 The Dagger Authors.
++ *
++ * Licensed under the Apache License, Version 2.0 (the "License");
++ * you may not use this file except in compliance with the License.
++ * You may obtain a copy of the License at
++ *
++ * http://www.apache.org/licenses/LICENSE-2.0
++ *
++ * Unless required by applicable law or agreed to in writing, software
++ * distributed under the License is distributed on an "AS IS" BASIS,
++ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++ * See the License for the specific language governing permissions and
++ * limitations under the License.
++ */
++
++package dagger.internal.codegen;
++
++import static com.google.common.base.Preconditions.checkArgument;
++import static dagger.internal.codegen.BindingKey.Kind.MEMBERS_INJECTION;
++
++import com.squareup.javapoet.ClassName;
++import com.squareup.javapoet.CodeBlock;
++import dagger.internal.codegen.DependencyRequest.Kind;
++
++/** Fulfills requests for {@link MembersInjectionBinding} instances. */
++final class MembersInjectorRequestFulfillment extends RequestFulfillment {
++  private final MemberSelect membersInjectorFieldSelect;
++
++  MembersInjectorRequestFulfillment(
++      BindingKey bindingKey, MemberSelect membersInjectorFieldSelect) {
++    super(bindingKey);
++    checkArgument(bindingKey.kind().equals(MEMBERS_INJECTION));
++    this.membersInjectorFieldSelect = membersInjectorFieldSelect;
++  }
++
++  @Override
++  public CodeBlock getSnippetForDependencyRequest(
++      DependencyRequest request, ClassName requestingClass) {
++    checkArgument(request.kind().equals(Kind.MEMBERS_INJECTOR));
++    return membersInjectorFieldSelect.getExpressionFor(requestingClass);
++  }
++}
+diff --git a/compiler/src/main/java/dagger/internal/codegen/ProducerFieldRequestFulfillment.java b/compiler/src/main/java/dagger/internal/codegen/ProducerFieldRequestFulfillment.java
+new file mode 100644
+index 000000000..ea1d1d5cf
+--- /dev/null
++++ b/compiler/src/main/java/dagger/internal/codegen/ProducerFieldRequestFulfillment.java
+@@ -0,0 +1,68 @@
++/*
++ * Copyright (C) 2016 The Dagger Authors.
++ *
++ * Licensed under the Apache License, Version 2.0 (the "License");
++ * you may not use this file except in compliance with the License.
++ * You may obtain a copy of the License at
++ *
++ * http://www.apache.org/licenses/LICENSE-2.0
++ *
++ * Unless required by applicable law or agreed to in writing, software
++ * distributed under the License is distributed on an "AS IS" BASIS,
++ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++ * See the License for the specific language governing permissions and
++ * limitations under the License.
++ */
++
++package dagger.internal.codegen;
++
++import static com.google.common.base.Preconditions.checkArgument;
++import static dagger.internal.codegen.BindingKey.Kind.CONTRIBUTION;
++
++import com.squareup.javapoet.ClassName;
++import com.squareup.javapoet.CodeBlock;
++import dagger.MembersInjector;
++import dagger.producers.Producer;
++import javax.inject.Provider;
++
++/** Fulfills requests for {@link ProductionBinding} instances. */
++final class ProducerFieldRequestFulfillment extends RequestFulfillment {
++  private final MemberSelect producerFieldSelect;
++
++  ProducerFieldRequestFulfillment(BindingKey bindingKey, MemberSelect producerFieldSelect) {
++    super(bindingKey);
++    checkArgument(bindingKey.kind().equals(CONTRIBUTION));
++    this.producerFieldSelect = producerFieldSelect;
++  }
++
++  @Override
++  public CodeBlock getSnippetForDependencyRequest(
++      DependencyRequest request, ClassName requestingClass) {
++    switch (request.kind()) {
++      case FUTURE:
++        return CodeBlock.of("$L.get()", producerFieldSelect.getExpressionFor(requestingClass));
++      case PRODUCER:
++        return CodeBlock.of("$L", producerFieldSelect.getExpressionFor(requestingClass));
++      case INSTANCE:
++      case LAZY:
++      case PRODUCED:
++      case PROVIDER_OF_LAZY:
++        throw new IllegalArgumentException(
++            String.format(
++                "The framework should never request a %s from a producer: %s",
++                request.kind(), request));
++      case MEMBERS_INJECTOR:
++        throw new IllegalArgumentException(
++            String.format(
++                "Cannot request a %s from a %s",
++                MembersInjector.class.getSimpleName(), Producer.class.getSimpleName()));
++      case PROVIDER:
++        throw new IllegalArgumentException(
++            String.format(
++                "Cannot request a %s from a %s",
++                Provider.class.getSimpleName(), Producer.class.getSimpleName()));
++      default:
++        throw new AssertionError(request.kind().toString());
++    }
++  }
++}
+diff --git a/compiler/src/main/java/dagger/internal/codegen/ProductionBinding.java b/compiler/src/main/java/dagger/internal/codegen/ProductionBinding.java
+index a1c3af826..4dba30056 100644
+--- a/compiler/src/main/java/dagger/internal/codegen/ProductionBinding.java
++++ b/compiler/src/main/java/dagger/internal/codegen/ProductionBinding.java
+@@ -128,7 +128,7 @@ ProductionBinding forProducesMethod(
+       DependencyRequest executorRequest =
+           dependencyRequestFactory.forProductionImplementationExecutor();
+       DependencyRequest monitorRequest =
+-          dependencyRequestFactory.forProductionComponentMonitorProvider();
++          dependencyRequestFactory.forProductionComponentMonitor();
+       Kind kind = MoreTypes.isTypeOf(ListenableFuture.class, producesMethod.getReturnType())
+           ? Kind.FUTURE_PRODUCTION
+           : Kind.IMMEDIATE;
+diff --git a/compiler/src/main/java/dagger/internal/codegen/ProviderFieldRequestFulfillment.java b/compiler/src/main/java/dagger/internal/codegen/ProviderFieldRequestFulfillment.java
+new file mode 100644
+index 000000000..0733192e1
+--- /dev/null
++++ b/compiler/src/main/java/dagger/internal/codegen/ProviderFieldRequestFulfillment.java
+@@ -0,0 +1,84 @@
++/*
++ * Copyright (C) 2016 The Dagger Authors.
++ *
++ * Licensed under the Apache License, Version 2.0 (the "License");
++ * you may not use this file except in compliance with the License.
++ * You may obtain a copy of the License at
++ *
++ * http://www.apache.org/licenses/LICENSE-2.0
++ *
++ * Unless required by applicable law or agreed to in writing, software
++ * distributed under the License is distributed on an "AS IS" BASIS,
++ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++ * See the License for the specific language governing permissions and
++ * limitations under the License.
++ */
++
++package dagger.internal.codegen;
++
++import static com.google.common.base.Preconditions.checkArgument;
++import static dagger.internal.codegen.BindingKey.Kind.CONTRIBUTION;
++import static dagger.internal.codegen.TypeNames.PROVIDER_OF_LAZY;
++
++import com.google.common.util.concurrent.Futures;
++import com.squareup.javapoet.ClassName;
++import com.squareup.javapoet.CodeBlock;
++import dagger.MembersInjector;
++import dagger.internal.DoubleCheck;
++import dagger.producers.Produced;
++import dagger.producers.internal.Producers;
++import javax.inject.Provider;
++
++/** Fulfills requests for {@link ProvisionBinding} instances. */
++final class ProviderFieldRequestFulfillment extends RequestFulfillment {
++  private final MemberSelect providerFieldSelect;
++
++  ProviderFieldRequestFulfillment(BindingKey bindingKey, MemberSelect frameworkFieldSelect) {
++    super(bindingKey);
++    checkArgument(bindingKey.kind().equals(CONTRIBUTION));
++    this.providerFieldSelect = frameworkFieldSelect;
++  }
++
++  @Override
++  public CodeBlock getSnippetForDependencyRequest(
++      DependencyRequest request, ClassName requestingClass) {
++    switch (request.kind()) {
++      case FUTURE:
++        return CodeBlock.of(
++            "$T.immediateFuture($L.get())",
++            Futures.class,
++            providerFieldSelect.getExpressionFor(requestingClass));
++      case INSTANCE:
++        return CodeBlock.of("$L.get()", providerFieldSelect.getExpressionFor(requestingClass));
++      case LAZY:
++        return CodeBlock.of(
++            "$T.lazy($L)",
++            DoubleCheck.class,
++            providerFieldSelect.getExpressionFor(requestingClass));
++      case MEMBERS_INJECTOR:
++        throw new IllegalArgumentException(
++            String.format(
++                "Cannot request a %s from a %s",
++                MembersInjector.class.getSimpleName(), Provider.class.getSimpleName()));
++      case PRODUCED:
++        return CodeBlock.of(
++            "$T.successful($L.get())",
++            Produced.class,
++            providerFieldSelect.getExpressionFor(requestingClass));
++      case PRODUCER:
++        return CodeBlock.of(
++            "$T.producerFromProvider($L)",
++            Producers.class,
++            providerFieldSelect.getExpressionFor(requestingClass));
++      case PROVIDER:
++        return CodeBlock.of("$L", providerFieldSelect.getExpressionFor(requestingClass));
++      case PROVIDER_OF_LAZY:
++        return CodeBlock.of(
++            "$T.create($L)",
++            PROVIDER_OF_LAZY,
++            providerFieldSelect.getExpressionFor(requestingClass));
++      default:
++        throw new AssertionError();
++    }
++  }
++}
+diff --git a/compiler/src/main/java/dagger/internal/codegen/RequestFulfillment.java b/compiler/src/main/java/dagger/internal/codegen/RequestFulfillment.java
+new file mode 100644
+index 000000000..40764ee7b
+--- /dev/null
++++ b/compiler/src/main/java/dagger/internal/codegen/RequestFulfillment.java
+@@ -0,0 +1,46 @@
++/*
++ * Copyright (C) 2016 The Dagger Authors.
++ *
++ * Licensed under the Apache License, Version 2.0 (the "License");
++ * you may not use this file except in compliance with the License.
++ * You may obtain a copy of the License at
++ *
++ * http://www.apache.org/licenses/LICENSE-2.0
++ *
++ * Unless required by applicable law or agreed to in writing, software
++ * distributed under the License is distributed on an "AS IS" BASIS,
++ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++ * See the License for the specific language governing permissions and
++ * limitations under the License.
++ */
++
++package dagger.internal.codegen;
++
++import static com.google.common.base.Preconditions.checkNotNull;
++
++import com.squareup.javapoet.ClassName;
++import com.squareup.javapoet.CodeBlock;
++
++/**
++ * A strategy interface for generating a {@link CodeBlock} that represents how a {@link Binding} is
++ * used to satisfy a given {@link DependencyRequest}.
++ */
++abstract class RequestFulfillment {
++  private final BindingKey bindingKey;
++
++  RequestFulfillment(BindingKey bindingKey) {
++    this.bindingKey = checkNotNull(bindingKey);
++  }
++
++  /** The key for which this instance can fulfill requests. */
++  final BindingKey bindingKey() {
++    return bindingKey;
++  }
++
++  /**
++   * Returns the {@link CodeBlock} that implements the operation represented by the {@link
++   * DependencyRequest request} from the {@code requestingClass}.
++   */
++  abstract CodeBlock getSnippetForDependencyRequest(
++      DependencyRequest request, ClassName requestingClass);
++}
+diff --git a/compiler/src/test/java/dagger/internal/codegen/DependencyRequestMapperTest.java b/compiler/src/test/java/dagger/internal/codegen/DependencyRequestMapperTest.java
+index 162305408..40a12db0b 100644
+--- a/compiler/src/test/java/dagger/internal/codegen/DependencyRequestMapperTest.java
++++ b/compiler/src/test/java/dagger/internal/codegen/DependencyRequestMapperTest.java
+@@ -58,7 +58,7 @@
+     this.types = compilationRule.getTypes();
+     this.elements = compilationRule.getElements();
+     this.keyFactory = new Key.Factory(types, elements);
+-    this.dependencyRequestFactory = new DependencyRequest.Factory(elements, keyFactory);
++    this.dependencyRequestFactory = new DependencyRequest.Factory(keyFactory);
+   }
+ 
+   private List<? extends VariableElement> sampleProviderParameters() {
+diff --git a/producers/src/main/java/dagger/producers/monitoring/ProducerToken.java b/producers/src/main/java/dagger/producers/monitoring/ProducerToken.java
+index 923449025..21b5a51eb 100644
+--- a/producers/src/main/java/dagger/producers/monitoring/ProducerToken.java
++++ b/producers/src/main/java/dagger/producers/monitoring/ProducerToken.java
+@@ -83,7 +83,7 @@ public String toString() {
+     if (methodName != null) {
+       return methodName;
+     } else if (classToken != null) {
+-      return classToken.toString();
++      return classToken.getCanonicalName();
+     } else {
+       throw new IllegalStateException();
+     }

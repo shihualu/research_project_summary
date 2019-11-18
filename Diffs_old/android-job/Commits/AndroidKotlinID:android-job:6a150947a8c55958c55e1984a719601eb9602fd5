@@ -1,0 +1,259 @@
+diff --git a/CHANGELOG.md b/CHANGELOG.md
+index 2355f87..f30e927 100644
+--- a/CHANGELOG.md
++++ b/CHANGELOG.md
+@@ -2,6 +2,7 @@
+ * Use only the `support-compat` instead of the full `support-v4` library, see #326
+ * Use a `ReadWriteLock` for synchronizing the database reads and writes, see #344
+ * Update the last run time for daily jobs, see #332
++* Shift the max execution delay if the requirements are enforced, see #325
+ 
+ ## 1.2.1 (2017-11-23)
+ * Add option to override the default background executor, see #292
+diff --git a/library/src/main/java/com/evernote/android/job/JobProxy.java b/library/src/main/java/com/evernote/android/job/JobProxy.java
+index 516941b..3c68a41 100644
+--- a/library/src/main/java/com/evernote/android/job/JobProxy.java
++++ b/library/src/main/java/com/evernote/android/job/JobProxy.java
+@@ -69,6 +69,19 @@ private static long checkedAdd(long a, long b) {
+             return checkNoOverflow(result, (a ^ b) < 0 | (a ^ result) >= 0);
+         }
+ 
++        @SuppressWarnings("SameParameterValue")
++        private static long checkedMultiply(long a, long b) {
++            int leadingZeros = Long.numberOfLeadingZeros(a) + Long.numberOfLeadingZeros(~a) + Long.numberOfLeadingZeros(b) + Long.numberOfLeadingZeros(~b);
++            if (leadingZeros > Long.SIZE + 1) {
++                return a * b;
++            }
++            long result = a * b;
++            result = checkNoOverflow(result, leadingZeros >= Long.SIZE);
++            result = checkNoOverflow(result, a >= 0 | b != Long.MIN_VALUE);
++            result = checkNoOverflow(result, a == 0 || result / a == b);
++            return result;
++        }
++
+         private static long checkNoOverflow(long result, boolean condition) {
+             return condition ? result : Long.MAX_VALUE;
+         }
+@@ -82,11 +95,21 @@ public static long getStartMs(JobRequest request) {
+         }
+ 
+         public static long getEndMs(JobRequest request) {
++            return getEndMs(request, false);
++        }
++
++        public static long getEndMs(JobRequest request, boolean shiftEnd) {
++            long endMs;
+             if (request.getFailureCount() > 0) {
+-                return request.getBackoffOffset();
++                endMs = request.getBackoffOffset();
+             } else {
+-                return request.getEndMs();
++                endMs = request.getEndMs();
++            }
++            if (shiftEnd && request.requirementsEnforced() && request.hasRequirements()) {
++                // move the end backwards if the API is smart with the requirements
++                endMs = checkedMultiply(endMs, 100);
+             }
++            return endMs;
+         }
+ 
+         public static long getAverageDelayMs(JobRequest request) {
+diff --git a/library/src/main/java/com/evernote/android/job/JobRequest.java b/library/src/main/java/com/evernote/android/job/JobRequest.java
+index 42d58fd..1a6cea2 100644
+--- a/library/src/main/java/com/evernote/android/job/JobRequest.java
++++ b/library/src/main/java/com/evernote/android/job/JobRequest.java
+@@ -251,6 +251,14 @@ public NetworkType requiredNetworkType() {
+         return mBuilder.mNetworkType;
+     }
+ 
++    /**
++     * @return Whether any of the requirements is different than the default value.
++     */
++    public boolean hasRequirements() {
++        return requiresCharging() || requiresDeviceIdle() || requiresBatteryNotLow() || requiresStorageNotLow()
++                || requiredNetworkType() != DEFAULT_NETWORK_TYPE;
++    }
++
+     /**
+      * @return The extras for this job.
+      */
+diff --git a/library/src/main/java/com/evernote/android/job/v21/JobProxy21.java b/library/src/main/java/com/evernote/android/job/v21/JobProxy21.java
+index 24a01e8..846df7b 100644
+--- a/library/src/main/java/com/evernote/android/job/v21/JobProxy21.java
++++ b/library/src/main/java/com/evernote/android/job/v21/JobProxy21.java
+@@ -68,7 +68,7 @@ protected JobProxy21(Context context, String logTag) {
+     @Override
+     public void plantOneOff(JobRequest request) {
+         long startMs = Common.getStartMs(request);
+-        long endMs = Common.getEndMs(request);
++        long endMs = Common.getEndMs(request, true);
+ 
+         JobInfo jobInfo = createBuilderOneOff(createBaseBuilder(request, true), startMs, endMs).build();
+         int scheduleResult = schedule(jobInfo);
+diff --git a/library/src/test/java/com/evernote/android/job/JobProxyTest.java b/library/src/test/java/com/evernote/android/job/JobProxyTest.java
+index ab745d1..f956d50 100644
+--- a/library/src/test/java/com/evernote/android/job/JobProxyTest.java
++++ b/library/src/test/java/com/evernote/android/job/JobProxyTest.java
+@@ -4,6 +4,7 @@
+ import android.app.job.JobInfo;
+ import android.app.job.JobScheduler;
+ import android.content.Context;
++import android.support.annotation.NonNull;
+ 
+ import com.evernote.android.job.test.JobRobolectricTestRunner;
+ 
+@@ -17,6 +18,8 @@
+ import org.robolectric.shadows.ShadowAlarmManager;
+ 
+ import java.lang.reflect.Field;
++import java.util.List;
++import java.util.Objects;
+ 
+ import static org.assertj.core.api.Java6Assertions.assertThat;
+ import static org.mockito.ArgumentMatchers.any;
+@@ -43,11 +46,11 @@ public void cleanup() {
+ 
+     @Test
+     @Config(sdk = 21)
+-    public void verifyRecoverWithJobScheduler() throws Exception {
++    public void verifyRecoverWithJobScheduler() {
+         Context context = BaseJobManagerTest.createMockContext();
+         Context applicationContext = context.getApplicationContext();
+ 
+-        JobScheduler scheduler = (JobScheduler) applicationContext.getSystemService(Context.JOB_SCHEDULER_SERVICE);
++        JobScheduler scheduler = getJobScheduler(applicationContext);
+         when(applicationContext.getSystemService(Context.JOB_SCHEDULER_SERVICE)).thenReturn(null, null, scheduler);
+ 
+         JobManager.create(context);
+@@ -57,7 +60,38 @@ public void verifyRecoverWithJobScheduler() throws Exception {
+                 .build()
+                 .schedule();
+ 
+-        assertThat(scheduler.getAllPendingJobs()).isNotEmpty();
++        List<JobInfo> allPendingJobs = scheduler.getAllPendingJobs();
++        assertThat(allPendingJobs).hasSize(1);
++
++        JobInfo jobInfo = allPendingJobs.get(0);
++        assertThat(jobInfo.getMinLatencyMillis()).isEqualTo(200_000L);
++        assertThat(jobInfo.getMaxExecutionDelayMillis()).isEqualTo(300_000L);
++    }
++
++    @Test
++    @Config(sdk = 21)
++    public void verifyMaxExecutionDelayIsNotSetInJobScheduler() {
++        Context context = BaseJobManagerTest.createMockContext();
++        Context applicationContext = context.getApplicationContext();
++
++        JobScheduler scheduler = getJobScheduler(applicationContext);
++        when(applicationContext.getSystemService(Context.JOB_SCHEDULER_SERVICE)).thenReturn(scheduler);
++
++        JobManager.create(context);
++
++        new JobRequest.Builder("tag")
++                .setExecutionWindow(3_000L, 4_000L)
++                .setRequiredNetworkType(JobRequest.NetworkType.CONNECTED)
++                .setRequirementsEnforced(true)
++                .build()
++                .schedule();
++
++        List<JobInfo> allPendingJobs = scheduler.getAllPendingJobs();
++        assertThat(allPendingJobs).hasSize(1);
++
++        JobInfo jobInfo = allPendingJobs.get(0);
++        assertThat(jobInfo.getMinLatencyMillis()).isEqualTo(3_000L);
++        assertThat(jobInfo.getMaxExecutionDelayMillis()).isGreaterThan(4_000L);
+     }
+ 
+     @Test
+@@ -66,7 +100,7 @@ public void verifyRecoverWithAlarmManager() throws Exception {
+         Context context = BaseJobManagerTest.createMockContext();
+         Context applicationContext = context.getApplicationContext();
+ 
+-        AlarmManager alarmManager = (AlarmManager) applicationContext.getSystemService(Context.ALARM_SERVICE);
++        AlarmManager alarmManager = getAlarmManager(applicationContext);
+ 
+         when(applicationContext.getSystemService(Context.JOB_SCHEDULER_SERVICE)).thenReturn(null);
+ 
+@@ -86,7 +120,7 @@ public void verifyNoRecoverWithAlarmManager() throws Exception {
+         Context context = BaseJobManagerTest.createMockContext();
+         Context applicationContext = context.getApplicationContext();
+ 
+-        AlarmManager alarmManager = (AlarmManager) applicationContext.getSystemService(Context.ALARM_SERVICE);
++        AlarmManager alarmManager = getAlarmManager(applicationContext);
+ 
+         when(applicationContext.getSystemService(Context.ALARM_SERVICE)).thenReturn(null);
+         when(applicationContext.getSystemService(Context.JOB_SCHEDULER_SERVICE)).thenReturn(null);
+@@ -107,7 +141,7 @@ public void verifyRecoverWithAlarmManagerApi19() throws Exception {
+         Context context = BaseJobManagerTest.createMockContext();
+         Context applicationContext = context.getApplicationContext();
+ 
+-        AlarmManager alarmManager = (AlarmManager) applicationContext.getSystemService(Context.ALARM_SERVICE);
++        AlarmManager alarmManager = getAlarmManager(applicationContext);
+ 
+         when(applicationContext.getSystemService(Context.JOB_SCHEDULER_SERVICE)).thenReturn(null, null, alarmManager);
+ 
+@@ -127,7 +161,7 @@ public void verifyNoRecoverWithAlarmManagerApi19() throws Exception {
+         Context context = BaseJobManagerTest.createMockContext();
+         Context applicationContext = context.getApplicationContext();
+ 
+-        AlarmManager alarmManager = (AlarmManager) applicationContext.getSystemService(Context.ALARM_SERVICE);
++        AlarmManager alarmManager = getAlarmManager(applicationContext);
+ 
+         when(applicationContext.getSystemService(Context.ALARM_SERVICE)).thenReturn(null);
+ 
+@@ -141,13 +175,14 @@ public void verifyNoRecoverWithAlarmManagerApi19() throws Exception {
+         verifyAlarmCount(alarmManager, 0);
+     }
+ 
++    @SuppressWarnings("ConstantConditions")
+     @Test
+     @Config(sdk = 21)
+-    public void verifyRecoverWithoutBootPermissionJobScheduler() throws Exception {
++    public void verifyRecoverWithoutBootPermissionJobScheduler() {
+         Context context = BaseJobManagerTest.createMockContext();
+         Context applicationContext = context.getApplicationContext();
+ 
+-        JobScheduler scheduler = spy((JobScheduler) applicationContext.getSystemService(Context.JOB_SCHEDULER_SERVICE));
++        JobScheduler scheduler = spy(getJobScheduler(applicationContext));
+         when(applicationContext.getSystemService(Context.JOB_SCHEDULER_SERVICE)).thenReturn(scheduler);
+ 
+         doThrow(new IllegalArgumentException("Error: requested job be persisted without holding RECEIVE_BOOT_COMPLETED permission."))
+@@ -176,9 +211,9 @@ public void verifyRecoverWithoutServiceJobScheduler() throws Exception {
+         Context context = BaseJobManagerTest.createMockContext();
+         Context applicationContext = context.getApplicationContext();
+ 
+-        AlarmManager alarmManager = (AlarmManager) applicationContext.getSystemService(Context.ALARM_SERVICE);
++        AlarmManager alarmManager = getAlarmManager(applicationContext);
+ 
+-        JobScheduler scheduler = spy((JobScheduler) applicationContext.getSystemService(Context.JOB_SCHEDULER_SERVICE));
++        JobScheduler scheduler = spy(getJobScheduler(applicationContext));
+         when(applicationContext.getSystemService(Context.JOB_SCHEDULER_SERVICE)).thenReturn(scheduler);
+ 
+         doThrow(new IllegalArgumentException("No such service ComponentInfo{com.evernote/com.evernote.android.job.v21.PlatformJobService}"))
+@@ -202,9 +237,9 @@ public void verifyRecoverWithNpeInJobScheduler() throws Exception {
+         Context context = BaseJobManagerTest.createMockContext();
+         Context applicationContext = context.getApplicationContext();
+ 
+-        AlarmManager alarmManager = (AlarmManager) applicationContext.getSystemService(Context.ALARM_SERVICE);
++        AlarmManager alarmManager = getAlarmManager(applicationContext);
+ 
+-        JobScheduler scheduler = spy((JobScheduler) applicationContext.getSystemService(Context.JOB_SCHEDULER_SERVICE));
++        JobScheduler scheduler = spy(getJobScheduler(applicationContext));
+         when(applicationContext.getSystemService(Context.JOB_SCHEDULER_SERVICE)).thenReturn(scheduler);
+ 
+         doThrow(new NullPointerException("Attempt to invoke interface method 'int android.app.job.IJobScheduler.schedule(android.app.job.JobInfo)' on a null object reference"))
+@@ -228,4 +263,14 @@ private void verifyAlarmCount(AlarmManager alarmManager, int count) throws NoSuc
+         ShadowAlarmManager shadowAlarmManager = (ShadowAlarmManager) declaredField.get(alarmManager);
+         assertThat(shadowAlarmManager.getScheduledAlarms()).hasSize(count);
+     }
++
++    @NonNull
++    private AlarmManager getAlarmManager(@NonNull Context context) {
++        return Objects.requireNonNull((AlarmManager) context.getSystemService(Context.ALARM_SERVICE));
++    }
++
++    @NonNull
++    private JobScheduler getJobScheduler(@NonNull Context context) {
++        return Objects.requireNonNull((JobScheduler) context.getSystemService(Context.JOB_SCHEDULER_SERVICE));
++    }
+ }
