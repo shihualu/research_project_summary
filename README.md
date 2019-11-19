@@ -23,7 +23,7 @@
 * getLatitude
 * getLongitude
 
-## Sensitive Permissions attempted
+## Sensitive permissions attempted
 * SEND_SMS
 * READ_CONTACTS
 * WRITE_CONTACTS
