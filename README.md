@@ -3,9 +3,9 @@
 ## Files
 * [Diffs_old](https://github.com/shihualu/research_project_summary/tree/master/Diffs_old) contains commits that the owners of the forks made on the master branch, including merges from original repo. Format of filename is: *owner_of_fork*:*hash_value*.txt
 
-* [Diffs_new](https://github.com/shihualu/research_project_summary/tree/master/Diffs_new) takes branches into consideration and removes most merges. It includes commits that the owners of the forks made to other branches. Format of filename is: *owner_of_fork*:*fork_name*:*hash_value*
+* [Diffs_new](https://github.com/shihualu/research_project_summary/tree/master/Diffs_new) takes branches into consideration and removes most merges. It includes commits that the owners of the forks made on other branches or newly-created branches. It also considers the case where the owners change the name of the fork. Format of filename is: *owner_of_fork*:*fork_name*:*hash_value*
 
-* [Samples](https://github.com/shihualu/research_project_summary/tree/master/Samples) contains malware samples provided by Google, downloaded from virustotal API
+* [Samples](https://github.com/shihualu/research_project_summary/tree/master/Samples) contains malware samples provided by Google, downloaded via virustotal API
 
 ## Sensitive API Calls attempted
 * getDeviceId
