@@ -34,3 +34,6 @@
 * ACCESS_FINE_LOCATION
 * ACCESS_COARSE_LOCATION
 * RECORD_AUDIO
+
+## Link to some weird commits
+<https://docs.google.com/spreadsheets/d/1hSdGv0WPw3DTZ0zlsTNycfHRjOs6xfPCRcL-yTpc-j8/edit#gid=611728173>
