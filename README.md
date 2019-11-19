@@ -5,7 +5,7 @@
 
 * [Diffs_new](https://github.com/shihualu/research_project_summary/tree/master/Diffs_new) takes branches into consideration and removes most merges. It includes commits that the owners of the forks made to other branches. Format of filename is: *owner_of_fork*:*fork_name*:*hash_value*
 
-* [Samples](https://github.com/shihualu/research_project_summary/tree/master/Samples) contains malware samples provided by Google
+* [Samples](https://github.com/shihualu/research_project_summary/tree/master/Samples) contains malware samples provided by Google, downloaded from virustotal API
 
 ## Sensitive API Calls attempted
 * getDeviceId
