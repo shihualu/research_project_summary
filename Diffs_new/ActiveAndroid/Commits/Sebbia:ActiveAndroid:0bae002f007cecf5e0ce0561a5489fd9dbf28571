@@ -1,0 +1,895 @@
+diff --git a/src/com/activeandroid/Cache.java b/src/com/activeandroid/Cache.java
+index 6495e379..3a2eef5e 100644
+--- a/src/com/activeandroid/Cache.java
++++ b/src/com/activeandroid/Cache.java
+@@ -107,7 +107,9 @@ public static synchronized SQLiteDatabase openDatabase() {
+ 	}
+ 
+ 	public static synchronized void closeDatabase() {
+-		sDatabaseHelper.close();
++		if (sDatabaseHelper != null) {
++			sDatabaseHelper.close();
++		}
+ 	}
+ 
+ 	// Context access
+diff --git a/src/com/activeandroid/DatabaseHelper.java b/src/com/activeandroid/DatabaseHelper.java
+index 7158c5bb..cc3bebec 100644
+--- a/src/com/activeandroid/DatabaseHelper.java
++++ b/src/com/activeandroid/DatabaseHelper.java
+@@ -32,6 +32,7 @@
+ import android.database.sqlite.SQLiteOpenHelper;
+ import android.text.TextUtils;
+ 
++import com.activeandroid.automigration.AutoMigration;
+ import com.activeandroid.util.IOUtils;
+ import com.activeandroid.util.Log;
+ import com.activeandroid.util.NaturalOrderComparator;
+@@ -83,6 +84,9 @@ public void onUpgrade(SQLiteDatabase db, int oldVersion, int newVersion) {
+ 		executePragmas(db);
+ 		executeCreate(db);
+ 		executeMigrations(db, oldVersion, newVersion);
++		if (db.needUpgrade(newVersion)) {
++			AutoMigration.migrate(db, newVersion);
++		}
+ 	}
+ 
+ 	//////////////////////////////////////////////////////////////////////////////////////
+diff --git a/src/com/activeandroid/ModelInfo.java b/src/com/activeandroid/ModelInfo.java
+index 9a68a122..f983cacf 100644
+--- a/src/com/activeandroid/ModelInfo.java
++++ b/src/com/activeandroid/ModelInfo.java
+@@ -31,10 +31,10 @@
+ import android.content.Context;
+ 
+ import com.activeandroid.serializer.CalendarSerializer;
++import com.activeandroid.serializer.FileSerializer;
+ import com.activeandroid.serializer.SqlDateSerializer;
+ import com.activeandroid.serializer.TypeSerializer;
+ import com.activeandroid.serializer.UtilDateSerializer;
+-import com.activeandroid.serializer.FileSerializer;
+ import com.activeandroid.util.Log;
+ import com.activeandroid.util.ReflectionUtils;
+ 
+diff --git a/src/com/activeandroid/automigration/AutoMigration.java b/src/com/activeandroid/automigration/AutoMigration.java
+new file mode 100644
+index 00000000..b605dc82
+--- /dev/null
++++ b/src/com/activeandroid/automigration/AutoMigration.java
+@@ -0,0 +1,141 @@
++package com.activeandroid.automigration;
++
++import java.util.Random;
++
++import android.content.ContentValues;
++import android.database.Cursor;
++import android.database.sqlite.SQLiteDatabase;
++
++import com.activeandroid.Cache;
++import com.activeandroid.TableInfo;
++import com.activeandroid.util.Log;
++import com.activeandroid.util.SQLiteUtils;
++import com.activeandroid.util.SQLiteUtils.SQLiteType;
++
++public class AutoMigration {
++	
++	public static class IncompatibleColumnTypesException extends RuntimeException {
++		private static final long serialVersionUID = -6200636421142104030L;
++		
++		public IncompatibleColumnTypesException(String table, String column, SQLiteType typeA, SQLiteType typeB) {
++			super("Failed to match column " + column + " type " + typeA + " to " + typeB + " in " + table + " table");
++		}
++	}
++	
++	public static void migrate(SQLiteDatabase db, int newVersion) {
++		db.beginTransaction();
++		try {
++			for (TableInfo tableInfo : Cache.getTableInfos()) {
++				processTableInfo(db, tableInfo);
++			}
++			db.execSQL("PRAGMA user_version = " + newVersion);
++			Log.v("Automatic migration successfull, schemas updated to version " + newVersion);
++			db.setTransactionSuccessful();
++		} finally {
++			db.endTransaction();
++		}
++	}
++	
++	private static void processTableInfo(SQLiteDatabase db, TableInfo tableInfo) {
++		SQLTableInfo sqlTableInfo = getSqlTableInfo(db, tableInfo);
++		if (sqlTableInfo != null) {
++			TableDifference tableDifference = new TableDifference(tableInfo, sqlTableInfo);
++			if (tableDifference.isEmpty() == false) {
++				applyDifference(db, tableDifference);
++			} else {
++				Log.v("Table " + tableInfo.getTableName() + " does not have any difference, skipping it");
++			}
++		} else {
++			Log.v("Table " + tableInfo.getTableName() + " does not exist. Creating new");
++			db.execSQL(SQLiteUtils.createTableDefinition(tableInfo));
++		}
++	}
++	
++	private static void applyDifference(SQLiteDatabase db, TableDifference tableDifference) {
++		TableInfo tableInfo = tableDifference.getTableInfo();
++		if (Log.isEnabled()) {
++			Log.v("Migrating table " + tableInfo.getTableName() + 
++					" from schema '" + tableDifference.getSqlTableInfo().getSchema() + 
++					"' to schema '" + SQLiteUtils.createTableDefinition(tableInfo) + "'");
++		}
++		
++		if (tableDifference.isOnlyAdd()) {
++			Log.v("Table " + tableInfo.getTableName() + " has added columns without primary / unique keys, no existing columns affected");
++			for (SQLColumnInfo columnInfo : tableDifference.getDifferences().keySet()) {
++				addColumnToTable(db, tableDifference, columnInfo);
++				Log.v("Added " + columnInfo.getName() + " column to " + tableInfo.getTableName());
++			}
++		} else {
++			Log.v("Table " + tableInfo.getTableName() + " has modified existing columns, moving data to newly created table");
++			
++			String temporaryTableName = "TEMP_" + (tableInfo.getTableName() + "_" + new Random().nextInt(1000));
++			db.execSQL("ALTER TABLE " + tableInfo.getTableName() + " RENAME TO " + temporaryTableName);
++			Log.v("Renamed " + tableInfo.getTableName() + " to " + temporaryTableName);
++			
++			db.execSQL(SQLiteUtils.createTableDefinition(tableInfo));
++			Log.v("Created new table " + tableInfo.getTableName() + " with new schema");
++					
++			transferColumns(db, temporaryTableName, tableDifference);
++			Log.v("Rows from temporary table " + temporaryTableName + " transferred to newly created table with new schema " + tableInfo.getTableName()); 
++					
++			db.execSQL("DROP TABLE " + temporaryTableName);
++			Log.v("Dropped temporary table " + temporaryTableName);
++		}
++	}
++
++	private static void addColumnToTable(SQLiteDatabase db, TableDifference tableDifference, SQLColumnInfo columnInfo) {
++		db.execSQL("ALTER TABLE " + tableDifference.getTableInfo().getTableName() + " ADD COLUMN " + columnInfo.getColumnDefinition());
++	}
++	
++	private static void transferColumns(SQLiteDatabase db, String sourceTable, TableDifference tableDifference) {
++		Cursor sourceCursor = db.query(sourceTable, null, null, null, null, null, null);
++		ContentValues contentValues = new ContentValues();
++		try {
++			
++			while (sourceCursor.moveToNext()) {
++				contentValues.clear();
++				for (SQLColumnInfo columnInfo : tableDifference.getNewSchemaColumnInfos()) {
++					if (tableDifference.getDifferences().containsKey(columnInfo)) {
++						SQLColumnInfo mappedColumnInfo = tableDifference.getDifferences().get(columnInfo); 
++						if (mappedColumnInfo != null) {
++							putValueFromCursor(contentValues, sourceCursor, mappedColumnInfo, columnInfo);
++						}
++					} else {
++						putValueFromCursor(contentValues, sourceCursor, columnInfo, columnInfo);
++					}
++				}
++				db.insert(tableDifference.getTableInfo().getTableName(), null, contentValues);
++			}
++		} finally {
++			sourceCursor.close();
++		}
++	}
++	
++	private static void putValueFromCursor(ContentValues contentValues, Cursor cursor, SQLColumnInfo sourceColumnInfo, SQLColumnInfo targetColumnInfo) {
++		switch (sourceColumnInfo.getType()) {
++		case INTEGER:
++			contentValues.put(targetColumnInfo.getName(), cursor.getInt(cursor.getColumnIndex(sourceColumnInfo.getName())));
++			break;
++			
++		case TEXT:
++			contentValues.put(targetColumnInfo.getName(), cursor.getString(cursor.getColumnIndex(sourceColumnInfo.getName())));
++			break;
++			
++		case REAL:
++			contentValues.put(targetColumnInfo.getName(), cursor.getDouble(cursor.getColumnIndex(sourceColumnInfo.getName())));
++			break;
++			
++		case BLOB:
++			contentValues.put(targetColumnInfo.getName(), cursor.getBlob(cursor.getColumnIndex(sourceColumnInfo.getName())));
++			break;
++		}
++	}
++	
++	private static SQLTableInfo getSqlTableInfo(SQLiteDatabase db, TableInfo tableInfo) {
++		Cursor cursor = db.query("sqlite_master", new String[] { "sql" }, "tbl_name = ?", new String[] { tableInfo.getTableName() }, null, null, null);
++		if (cursor.moveToNext()) {
++			return new SQLTableInfo(cursor.getString(0));
++		}
++		return null;
++	}
++}
+diff --git a/src/com/activeandroid/automigration/SQLColumnInfo.java b/src/com/activeandroid/automigration/SQLColumnInfo.java
+new file mode 100644
+index 00000000..9f6441b4
+--- /dev/null
++++ b/src/com/activeandroid/automigration/SQLColumnInfo.java
+@@ -0,0 +1,53 @@
++package com.activeandroid.automigration;
++
++import java.util.ArrayList;
++import java.util.Locale;
++
++import com.activeandroid.util.SQLiteUtils.SQLiteType;
++
++import android.text.TextUtils;
++
++public class SQLColumnInfo {
++
++	private String mColumnDefinition;
++	private String mName;
++	private SQLiteType mType;
++
++	public SQLColumnInfo(String columnDefinition) {
++		ArrayList<String> tokens = new ArrayList<String>();
++		for (String token : columnDefinition.split(" ")) {
++			if (TextUtils.isEmpty(token) == false)
++				tokens.add(token);
++		}
++
++		if (tokens.size() < 2)
++			throw new IllegalArgumentException("Failed to parse '" + columnDefinition + "' as sql column definition");
++		
++		this.mColumnDefinition = TextUtils.join(" ", tokens.subList(1, tokens.size()));
++
++		this.mName = tokens.get(0);
++		this.mType = SQLiteType.valueOf(tokens.get(1).toUpperCase(Locale.US));
++
++	}
++
++	public String getName() {
++		return mName;
++	}
++
++	public SQLiteType getType() {
++		return mType;
++	}
++	
++	public String getColumnDefinition() {
++		return mName + " " + mColumnDefinition;
++	}
++	
++	public boolean isPrimaryKey() {
++		return mColumnDefinition.toUpperCase(Locale.US).contains("PRIMARY KEY");
++	}
++	
++	public boolean isUnique() {
++		return mColumnDefinition.toUpperCase(Locale.US).contains("UNIQUE");
++	}
++	
++}
+diff --git a/src/com/activeandroid/automigration/SQLTableInfo.java b/src/com/activeandroid/automigration/SQLTableInfo.java
+new file mode 100644
+index 00000000..39fccbac
+--- /dev/null
++++ b/src/com/activeandroid/automigration/SQLTableInfo.java
+@@ -0,0 +1,75 @@
++package com.activeandroid.automigration;
++
++import java.util.ArrayList;
++import java.util.List;
++import java.util.Locale;
++
++import android.text.TextUtils;
++
++public final class SQLTableInfo {
++	
++	public static String constructSchema(String tableName, List<SQLColumnInfo> columns) {
++		String schema = "CREATE TABLE " + tableName + "(%s);";
++		List<String> tokens = new ArrayList<String>();
++		for (SQLColumnInfo column : columns) { 
++			tokens.add(column.getColumnDefinition());
++		}
++		return String.format(schema, TextUtils.join(", ", tokens));
++	}
++	
++	//Note that this class does not validate SQL syntax
++	
++	private String mTableName;
++	private SQLColumnInfo mIdColumnInfo;
++	private List<SQLColumnInfo> mColumns;
++	private String mSchema;
++
++	public SQLTableInfo(String sqlSchema) {
++		
++		if (TextUtils.isEmpty(sqlSchema))
++			throw new IllegalArgumentException("Cannot construct SqlTableInfo from empty sqlSchema");
++		
++		sqlSchema = sqlSchema.replaceAll("\\s+", " ");
++		this.mSchema = new String(sqlSchema);
++		
++		if (!sqlSchema.toUpperCase(Locale.US).startsWith("CREATE TABLE") || !sqlSchema.contains("(") || !sqlSchema.contains(")"))
++			throw new IllegalArgumentException("sqlSchema doesn't appears to be valid");
++		mColumns = new ArrayList<SQLColumnInfo>();
++		
++		sqlSchema = sqlSchema.replaceAll("(?i)CREATE TABLE ", "");
++		mTableName = sqlSchema.substring(0, sqlSchema.indexOf('(')).replace("\"", "");
++		
++		String columnDefinitions = sqlSchema.substring(sqlSchema.indexOf('(') + 1, sqlSchema.lastIndexOf(')'));
++		processColumnsDefinitions(columnDefinitions.split(","));
++	}
++	
++	private void processColumnsDefinitions(String[] columns) {
++		for (String columnDef : columns) {
++			SQLColumnInfo columnInfo = new SQLColumnInfo(columnDef);
++			if (columnInfo.isPrimaryKey()) {
++				if (mIdColumnInfo == null)
++					mIdColumnInfo = columnInfo;
++				else
++					throw new IllegalArgumentException("sqlSchema contains multiple primary keys");
++			}
++			
++			mColumns.add(columnInfo);
++		}
++	}
++	
++	public String getSchema() {
++		return mSchema;
++	}
++
++	public SQLColumnInfo getIdColumnInfo() {
++		return mIdColumnInfo;
++	}
++	
++	public List<SQLColumnInfo> getColumns() {
++		return mColumns;
++	}
++	
++	public String getTableName() {
++		return mTableName;
++	}
++}
+diff --git a/src/com/activeandroid/automigration/TableDifference.java b/src/com/activeandroid/automigration/TableDifference.java
+new file mode 100644
+index 00000000..d7356985
+--- /dev/null
++++ b/src/com/activeandroid/automigration/TableDifference.java
+@@ -0,0 +1,79 @@
++package com.activeandroid.automigration;
++
++import java.lang.reflect.Field;
++import java.util.ArrayList;
++import java.util.HashMap;
++import java.util.List;
++import java.util.Map;
++
++import com.activeandroid.TableInfo;
++import com.activeandroid.automigration.AutoMigration.IncompatibleColumnTypesException;
++import com.activeandroid.util.SQLiteUtils;
++
++class TableDifference {
++	
++	
++	private TableInfo mTableInfo;
++	private SQLTableInfo mSqlTableInfo;
++	private Map<SQLColumnInfo, SQLColumnInfo> mDifferences;
++	private List<SQLColumnInfo> mCurrentVersionTableDefinitions;
++	
++	public TableDifference(TableInfo tableInfo, SQLTableInfo sqlTableInfo) {
++		this.mTableInfo = tableInfo;
++		this.mSqlTableInfo = sqlTableInfo;
++		this.mDifferences = new HashMap<SQLColumnInfo, SQLColumnInfo>();
++		this.mCurrentVersionTableDefinitions = new ArrayList<SQLColumnInfo>();
++		
++		for (Field field : tableInfo.getFields()) {
++			SQLColumnInfo sqlColumnInfo = new SQLColumnInfo(SQLiteUtils.createColumnDefinition(tableInfo, field));
++			mCurrentVersionTableDefinitions.add(sqlColumnInfo);
++			
++			boolean found = false;
++			for (SQLColumnInfo existingColumnInfo : sqlTableInfo.getColumns()) {
++				if (existingColumnInfo.getName().equalsIgnoreCase(sqlColumnInfo.getName()) == false)
++					continue;
++				
++				found = true;
++				
++				if (existingColumnInfo.getColumnDefinition().equalsIgnoreCase(sqlColumnInfo.getColumnDefinition()) == false) {
++					if (existingColumnInfo.getType() == sqlColumnInfo.getType()) {
++						mDifferences.put(sqlColumnInfo, existingColumnInfo);
++					} else {
++						throw new IncompatibleColumnTypesException(tableInfo.getTableName(), existingColumnInfo.getName(), existingColumnInfo.getType(), sqlColumnInfo.getType());
++					}
++				}
++				break;
++			}
++			if (!found)
++				mDifferences.put(sqlColumnInfo, null);
++		}
++	}
++	
++	public boolean isOnlyAdd() {
++		for (SQLColumnInfo sqlColumnInfo : mDifferences.keySet()) {
++			if (mDifferences.get(sqlColumnInfo) != null || sqlColumnInfo.isPrimaryKey() || sqlColumnInfo.isUnique())
++				return false;
++		}
++		return true;
++	}
++	
++	public boolean isEmpty() {
++		return mDifferences.size() == 0;
++	}
++	
++	public Map<SQLColumnInfo, SQLColumnInfo> getDifferences() {
++		return mDifferences;
++	}
++	
++	public List<SQLColumnInfo> getNewSchemaColumnInfos() {
++		return mCurrentVersionTableDefinitions;
++	}
++	
++	public TableInfo getTableInfo() {
++		return mTableInfo;
++	}
++	
++	public SQLTableInfo getSqlTableInfo() {
++		return mSqlTableInfo;
++	}
++}
+diff --git a/tests/libs/android-support-v4.jar b/tests/libs/android-support-v4.jar
+new file mode 100644
+index 00000000..428bdbc0
+Binary files /dev/null and b/tests/libs/android-support-v4.jar differ
+diff --git a/tests/src/com/activeandroid/test/ActiveAndroidTestCase.java b/tests/src/com/activeandroid/test/ActiveAndroidTestCase.java
+index 3b5fab1f..ba7efd61 100644
+--- a/tests/src/com/activeandroid/test/ActiveAndroidTestCase.java
++++ b/tests/src/com/activeandroid/test/ActiveAndroidTestCase.java
+@@ -18,6 +18,7 @@
+ 
+ import android.test.ApplicationTestCase;
+ 
++import com.activeandroid.ActiveAndroid;
+ import com.activeandroid.app.Application;
+ 
+ public abstract class ActiveAndroidTestCase extends ApplicationTestCase<Application> {
+@@ -30,10 +31,6 @@ protected void setUp() throws Exception {
+ 		createApplication();
+ 	}
+ 
+-	protected void tearDown() throws Exception {
+-		super.tearDown();
+-	}
+-
+ 	public static <T> void assertArrayEquals(T[] actual, T... expected) {
+ 		assertEquals(expected.length, actual.length);
+ 		
+diff --git a/tests/src/com/activeandroid/test/ModelTest.java b/tests/src/com/activeandroid/test/ModelTest.java
+index e66690d8..02879916 100644
+--- a/tests/src/com/activeandroid/test/ModelTest.java
++++ b/tests/src/com/activeandroid/test/ModelTest.java
+@@ -16,13 +16,6 @@
+ 
+ package com.activeandroid.test;
+ 
+-import com.activeandroid.Cache;
+-import com.activeandroid.Model;
+-import com.activeandroid.TableInfo;
+-import com.activeandroid.annotation.Column;
+-import com.activeandroid.annotation.Table;
+-import com.activeandroid.query.Select;
+-
+ import java.lang.reflect.Field;
+ import java.util.ArrayList;
+ import java.util.Date;
+@@ -30,10 +23,23 @@
+ import java.util.List;
+ import java.util.Set;
+ 
++import com.activeandroid.Cache;
++import com.activeandroid.Model;
++import com.activeandroid.TableInfo;
++import com.activeandroid.annotation.Column;
++import com.activeandroid.annotation.Table;
++import com.activeandroid.query.Select;
++
+ /**
+  * Simple test now covering equals and hashcode methods.
+  */
+ public class ModelTest extends ActiveAndroidTestCase {
++	
++	@Override
++	protected void tearDown() throws Exception {
++		super.tearDown();
++		getContext().deleteDatabase("Application.db");
++	}
+ 
+ 	/**
+ 	 * Equals should be type-safe.
+@@ -156,9 +162,8 @@ public void testBooleanColumnType() {
+         Long id = mockModel.save();
+ 
+         boolean databaseBooleanValue = MockModel.load( MockModel.class, id ).booleanField;
+-
+         assertEquals( false, databaseBooleanValue );
+-
++        
+         // Test passing both a integer and a boolean into the where conditional.
+         assertEquals(
+                 mockModel,
+@@ -219,7 +224,7 @@ public void testJoinWithSameNames(){
+ 
+         //check result
+         assertNotNull(result);
+-        assertEquals(result.size(), 2);
++        assertEquals(2, result.size());
+         for(ChildMockModel currentModel : result){
+             assertFalse(currentModel.booleanField);
+             assertEquals(currentModel.intField, intValue);
+diff --git a/tests/src/com/activeandroid/test/automigration/AddColumnsTest.java b/tests/src/com/activeandroid/test/automigration/AddColumnsTest.java
+new file mode 100644
+index 00000000..cd1df8fe
+--- /dev/null
++++ b/tests/src/com/activeandroid/test/automigration/AddColumnsTest.java
+@@ -0,0 +1,57 @@
++package com.activeandroid.test.automigration;
++
++import java.util.List;
++
++import android.database.Cursor;
++
++import com.activeandroid.ActiveAndroid;
++import com.activeandroid.Model;
++import com.activeandroid.annotation.Column;
++import com.activeandroid.annotation.Table;
++import com.activeandroid.query.Select;
++
++public class AddColumnsTest extends AutoMigrationTest {
++	
++	private static final String TABLE = "add_column_model";
++
++	@Table(name = TABLE)
++	public static class AddColumnMigrationModel extends Model {
++		@Column(name = "textValue")		
++		public String textValue;
++		@Column(name = "boolValue")
++		public boolean boolValue;
++		@Column(name = "floatValue")
++		public float floatValue;
++		@Column(name = "newString")
++		public String newString;
++		@Column(name = "newFloat")
++		public float newFloat;
++		
++		public AddColumnMigrationModel() {
++
++		}
++	}
++	
++	public AddColumnsTest() {
++		super(TABLE);
++	}
++	
++	public void testMigrationNewFieldsAdded() {
++		createOldDatabase();
++		initializeActiveAndroid(AddColumnMigrationModel.class);
++		List<AddColumnMigrationModel> migrationModels = new Select().from(AddColumnMigrationModel.class).execute();
++		assertEquals(10, migrationModels.size());
++		for (int i = 0; i < 10; ++i) {
++			AddColumnMigrationModel migrationModel = migrationModels.get(i);
++			assertEquals(Long.valueOf(i + 1), migrationModel.getId());
++			assertEquals("Text " + i, migrationModel.textValue);
++			assertEquals(i % 2 == 0, migrationModel.boolValue);
++			assertEquals((float) i, migrationModel.floatValue);
++			assertNull(migrationModel.newString);
++		}
++		
++		Cursor cursor = ActiveAndroid.getDatabase().query(TABLE, null, null, null, null, null, null);
++		assertTrue(cursor.getColumnIndex("unusedColumn") != -1);
++	}
++	
++}
+diff --git a/tests/src/com/activeandroid/test/automigration/AddUniqueNotNullTest.java b/tests/src/com/activeandroid/test/automigration/AddUniqueNotNullTest.java
+new file mode 100644
+index 00000000..7dd11ca2
+--- /dev/null
++++ b/tests/src/com/activeandroid/test/automigration/AddUniqueNotNullTest.java
+@@ -0,0 +1,53 @@
++package com.activeandroid.test.automigration;
++
++import java.util.List;
++
++import android.database.Cursor;
++
++import com.activeandroid.ActiveAndroid;
++import com.activeandroid.Model;
++import com.activeandroid.annotation.Column;
++import com.activeandroid.annotation.Table;
++import com.activeandroid.query.Select;
++
++public class AddUniqueNotNullTest extends AutoMigrationTest {
++	
++	private static final String TABLE = "add_unique_table";
++	
++	@Table(name = TABLE)
++	public static class AddUniqueMigrationModel extends Model {
++		@Column(name = "textValue", notNull = true, unique = true)		
++		public String textValue;
++		@Column(name = "boolValue")
++		public boolean boolValue;
++		@Column(name = "floatValue")
++		public float floatValue;
++		
++		public AddUniqueMigrationModel() {
++
++		}
++	}
++	
++	public AddUniqueNotNullTest() {
++		super(TABLE);
++	}
++		
++	public void testMigrationUniqueNotNullFieldAdded() {
++		createOldDatabase();
++		initializeActiveAndroid(AddUniqueMigrationModel.class);
++		List<AddUniqueMigrationModel> migrationModels = new Select().from(AddUniqueMigrationModel.class).execute();
++		assertEquals(10, migrationModels.size());
++		for (int i = 0; i < 10; ++i) {
++			AddUniqueMigrationModel migrationModel = migrationModels.get(i);
++			assertEquals(Long.valueOf(i + 1), migrationModel.getId());
++			assertEquals("Text " + i, migrationModel.textValue);
++			assertEquals(i % 2 == 0, migrationModel.boolValue);
++			assertEquals((float) i, migrationModel.floatValue);
++		}
++		
++		Cursor cursor = ActiveAndroid.getDatabase().query(TABLE, null, null, null, null, null, null);
++		assertTrue(cursor.getColumnIndex("unusedColumn") == -1);
++	}
++	
++	
++}
+diff --git a/tests/src/com/activeandroid/test/automigration/AutoMigrationTest.java b/tests/src/com/activeandroid/test/automigration/AutoMigrationTest.java
+new file mode 100644
+index 00000000..d313266e
+--- /dev/null
++++ b/tests/src/com/activeandroid/test/automigration/AutoMigrationTest.java
+@@ -0,0 +1,72 @@
++package com.activeandroid.test.automigration;
++
++import com.activeandroid.ActiveAndroid;
++import com.activeandroid.Configuration;
++import com.activeandroid.Model;
++
++import android.app.Application;
++import android.content.ContentValues;
++import android.database.sqlite.SQLiteDatabase;
++import android.test.ApplicationTestCase;
++
++public abstract class AutoMigrationTest extends ApplicationTestCase<Application> {
++
++	protected static final String DATABASE = "auto_migration.db";
++
++	private String mTable;
++
++	public AutoMigrationTest(String table) {
++		super(Application.class);
++		this.mTable = table;
++	}
++
++	@Override
++	protected void setUp() throws Exception {
++		super.setUp();
++		createApplication();
++	}
++
++	protected void initializeActiveAndroid(Class<? extends Model> clazz) {
++		ActiveAndroid.initialize(new Configuration.Builder(getApplication()).addModelClass(clazz).setDatabaseName(DATABASE).setDatabaseVersion(3).create(), true);
++	}
++
++	protected void createOldDatabase() {
++		ActiveAndroid.dispose();
++		getApplication().deleteDatabase(DATABASE);
++		SQLiteDatabase db = getApplication().openOrCreateDatabase(DATABASE, 0, null);
++		db.execSQL("PRAGMA user_version = 2");
++		db.execSQL("CREATE TABLE " + mTable + " (Id INTEGER PRIMARY KEY AUTOINCREMENT, textValue TEXT, boolValue INTEGER, floatValue REAL, unusedColumn INTEGER);");
++		db.beginTransaction();
++		try {
++			for (int i = 0; i < 10; ++i) {
++				db.insert(mTable, null, getContentValues("textValue", "Text " + i, "boolValue", i % 2 == 0, "floatValue", (float) i, "unusedColumn", i * 100));
++			}
++			db.setTransactionSuccessful();
++		} finally {
++			db.endTransaction();
++		}
++	}
++
++	private ContentValues getContentValues(Object... args) {
++		assertTrue(args.length % 2 == 0);
++		ContentValues contentValues = new ContentValues();
++		for (int i = 0; i < args.length / 2; ++i) {
++			String key = (String) args[i * 2];
++			Object value = args[(i * 2) + 1];
++			if (value instanceof Float)
++				contentValues.put(key, (Float) value);
++			else if (value instanceof String)
++				contentValues.put(key, (String) value);
++			else if (value instanceof Integer)
++				contentValues.put(key, (Integer) value);
++			else if (value instanceof Long)
++				contentValues.put(key, (Long) value);
++			else if (value instanceof Double)
++				contentValues.put(key, (Double) value);
++			else if (value instanceof Boolean)
++				contentValues.put(key, (Boolean) value);
++		}
++		return contentValues;
++	}
++
++}
+diff --git a/tests/src/com/activeandroid/test/automigration/ChangeTypeTest.java b/tests/src/com/activeandroid/test/automigration/ChangeTypeTest.java
+new file mode 100644
+index 00000000..fa8324fa
+--- /dev/null
++++ b/tests/src/com/activeandroid/test/automigration/ChangeTypeTest.java
+@@ -0,0 +1,49 @@
++package com.activeandroid.test.automigration;
++
++import com.activeandroid.ActiveAndroid;
++import com.activeandroid.Model;
++import com.activeandroid.annotation.Column;
++import com.activeandroid.annotation.Table;
++import com.activeandroid.automigration.AutoMigration;
++
++public class ChangeTypeTest extends AutoMigrationTest {
++	
++	private static final String TABLE = "change_type_model";
++
++	@Table(name = TABLE)
++	public static class AddColumnMigrationModel extends Model {
++		@Column(name = "textValue")		
++		public boolean textValue;
++		@Column(name = "boolValue")
++		public boolean boolValue;
++		@Column(name = "floatValue")
++		public float floatValue;
++		@Column(name = "newString")
++		public String newString;
++		@Column(name = "newFloat")
++		public float newFloat;
++		
++		public AddColumnMigrationModel() {
++
++		}
++	}
++	
++	public ChangeTypeTest() {
++		super(TABLE);
++	}
++	
++	public void testMigrationNewFieldsAdded() {
++		createOldDatabase();
++		try {
++			initializeActiveAndroid(AddColumnMigrationModel.class);
++		} catch (Exception e) {
++			assertEquals(AutoMigration.IncompatibleColumnTypesException.class, e.getClass());
++			assertTrue(e.getMessage().contains("textValue"));
++			assertTrue(e.getMessage().contains("TEXT"));
++			assertTrue(e.getMessage().contains("INTEGER"));
++			assertTrue(e.getMessage().contains(TABLE));
++			return;
++		}
++		fail("Exception was not thrown during auto migration");
++	}
++}
+diff --git a/tests/src/com/activeandroid/test/automigration/SQLColumnInfoTest.java b/tests/src/com/activeandroid/test/automigration/SQLColumnInfoTest.java
+new file mode 100644
+index 00000000..5537aba0
+--- /dev/null
++++ b/tests/src/com/activeandroid/test/automigration/SQLColumnInfoTest.java
+@@ -0,0 +1,32 @@
++package com.activeandroid.test.automigration;
++
++import com.activeandroid.automigration.SQLColumnInfo;
++import com.activeandroid.test.ActiveAndroidTestCase;
++
++public class SQLColumnInfoTest extends ActiveAndroidTestCase {
++	
++	public void testPrimaryKey() {
++		SQLColumnInfo sqlColumnInfo = new SQLColumnInfo("id integer primary key");
++		assertTrue(sqlColumnInfo.isPrimaryKey());
++	}
++	
++	public void testNoPrimaryKey() {
++		SQLColumnInfo sqlColumnInfo = new SQLColumnInfo("id integer key");
++		assertFalse(sqlColumnInfo.isPrimaryKey());
++	}
++	
++	public void testUniqueInName() {
++		SQLColumnInfo sqlColumnInfo = new SQLColumnInfo("unique_id integer");
++		assertFalse(sqlColumnInfo.isUnique());
++	}
++	
++	public void testUnique() {
++		SQLColumnInfo sqlColumnInfo = new SQLColumnInfo("id integer unique on conflict replace");
++		assertTrue(sqlColumnInfo.isUnique());
++	}
++	
++	public void testNotUnique() {
++		SQLColumnInfo sqlColumnInfo = new SQLColumnInfo("unique_id text not null default \"not null\"");
++		assertFalse(sqlColumnInfo.isUnique());
++	}
++}
+diff --git a/tests/src/com/activeandroid/test/automigration/SQLTableInfoTest.java b/tests/src/com/activeandroid/test/automigration/SQLTableInfoTest.java
+new file mode 100644
+index 00000000..0ac90f2d
+--- /dev/null
++++ b/tests/src/com/activeandroid/test/automigration/SQLTableInfoTest.java
+@@ -0,0 +1,82 @@
++package com.activeandroid.test.automigration;
++
++import com.activeandroid.automigration.SQLColumnInfo;
++import com.activeandroid.automigration.SQLTableInfo;
++import com.activeandroid.test.ActiveAndroidTestCase;
++import com.activeandroid.util.SQLiteUtils.SQLiteType;
++
++public class SQLTableInfoTest extends ActiveAndroidTestCase {
++	
++	public void testEmptyParam() {
++		try {
++			new SQLTableInfo(""); 
++		} catch (IllegalArgumentException e) {
++			assertTrue(e.getMessage().contains("empty"));
++			return;
++		}
++		fail(IllegalArgumentException.class.getSimpleName() + " was not thrown");
++	}
++	
++	public void testInvalidSchema() {
++		try {
++			new SQLTableInfo("test(id integer primary key);"); 
++		} catch (IllegalArgumentException e) {
++			assertTrue(e.getMessage().contains("valid"));
++			return;
++		}
++		fail(IllegalArgumentException.class.getSimpleName() + " was not thrown");
++	}
++	
++	public void testInvalidSchemaNoBrackets() {
++		try {
++			new SQLTableInfo("create table test;"); 
++		} catch (IllegalArgumentException e) {
++			assertTrue(e.getMessage().contains("valid"));
++			return;
++		}
++		fail(IllegalArgumentException.class.getSimpleName() + " was not thrown");
++	}
++	
++	public void testTableName() {
++		SQLTableInfo sqlTableInfo = new SQLTableInfo("create table \"test\"(id integer);");
++		assertEquals("test", sqlTableInfo.getTableName());
++	}
++	
++	public void testTableWithoutPrimaryKey() {
++		SQLTableInfo sqlTableInfo = new SQLTableInfo("create table test(id integer);");
++		assertNull(sqlTableInfo.getIdColumnInfo());
++	}
++	
++	public void testTableWithMultipleSpaces() {
++		SQLTableInfo sqlTableInfo = new SQLTableInfo("create    table    test(id    integer     primary    key);");
++		assertNotNull(sqlTableInfo.getIdColumnInfo());
++		verifyColumn(sqlTableInfo.getIdColumnInfo(), "id", SQLiteType.INTEGER);
++	}
++	
++	public void testTableWithPrimaryKey() {
++		SQLTableInfo sqlTableInfo = new SQLTableInfo("create table test(id integer primary key);");
++		assertNotNull(sqlTableInfo.getIdColumnInfo());
++		verifyColumn(sqlTableInfo.getIdColumnInfo(), "id", SQLiteType.INTEGER);
++	}
++	
++	public void testMultipleColumnsWithoutPrimaryKey() {
++		SQLTableInfo sqlTableInfo = new SQLTableInfo("CREATE TABLE test(id integer key, my_value TEXT, boolean_value INTEGER);");
++		assertNull(sqlTableInfo.getIdColumnInfo());
++		assertTrue(sqlTableInfo.getColumns().size() == 3);
++		verifyColumn(sqlTableInfo.getColumns().get(0), "id", SQLiteType.INTEGER);
++		verifyColumn(sqlTableInfo.getColumns().get(1), "my_value", SQLiteType.TEXT);
++		verifyColumn(sqlTableInfo.getColumns().get(2), "boolean_value", SQLiteType.INTEGER);
++	}
++	
++	public void testCreateSchema() {
++		String sqlSchema = "CREATE TABLE test(id integer key, my_value TEXT, boolean_value INTEGER);";
++		SQLTableInfo sqlTableInfo = new SQLTableInfo(sqlSchema);
++		String createdSchema = SQLTableInfo.constructSchema(sqlTableInfo.getTableName(), sqlTableInfo.getColumns()); 
++		assertTrue(createdSchema.equalsIgnoreCase(sqlSchema));
++	}
++	
++	private void verifyColumn(SQLColumnInfo columnInfo, String name, SQLiteType type) {
++		assertEquals(name, columnInfo.getName());
++		assertEquals(type, columnInfo.getType());
++	}
++}

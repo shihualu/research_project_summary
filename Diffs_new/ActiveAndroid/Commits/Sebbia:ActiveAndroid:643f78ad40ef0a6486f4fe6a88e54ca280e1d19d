@@ -1,0 +1,1548 @@
+diff --git a/src/com/activeandroid/Cache.java b/src/com/activeandroid/Cache.java
+index 3a2eef5e..35c383fb 100644
+--- a/src/com/activeandroid/Cache.java
++++ b/src/com/activeandroid/Cache.java
+@@ -17,13 +17,18 @@
+  */
+ 
+ import java.util.Collection;
++import java.util.HashMap;
++import java.util.Map;
+ 
+ import android.content.Context;
+ import android.database.sqlite.SQLiteDatabase;
+ import android.support.v4.util.LruCache;
+ 
++import com.activeandroid.internal.EmptyModelFiller;
++import com.activeandroid.internal.ModelFiller;
+ import com.activeandroid.serializer.TypeSerializer;
+ import com.activeandroid.util.Log;
++import com.activeandroid.util.ReflectionUtils;
+ 
+ public final class Cache {
+ 	//////////////////////////////////////////////////////////////////////////////////////
+@@ -44,6 +49,8 @@
+ 	private static LruCache<String, Model> sEntities;
+ 
+ 	private static boolean sIsInitialized = false;
++	
++	private static Map<Class<? extends Model>, ModelFiller> sFillers;
+ 
+ 	//////////////////////////////////////////////////////////////////////////////////////
+ 	// CONSTRUCTORS
+@@ -71,6 +78,8 @@ public static synchronized void initialize(Configuration configuration) {
+ 		// required would be too costly to be of any benefit. We'll just set a max
+ 		// object size instead.
+ 		sEntities = new LruCache<String, Model>(configuration.getCacheSize());
++		
++		initializeModelFillers();
+ 
+ 		openDatabase();
+ 
+@@ -79,6 +88,7 @@ public static synchronized void initialize(Configuration configuration) {
+ 		Log.v("ActiveAndroid initialized successfully.");
+ 	}
+ 
++	
+ 	public static synchronized void clear() {
+ 		sEntities.evictAll();
+ 		Log.v("Cache cleared.");
+@@ -157,4 +167,42 @@ public static synchronized TypeSerializer getParserForType(Class<?> type) {
+ 	public static synchronized String getTableName(Class<? extends Model> type) {
+ 		return sModelInfo.getTableInfo(type).getTableName();
+ 	}
++	
++	static ModelFiller getFiller(Class<? extends Model> type) {
++		return sFillers.get(type);
++	}
++	
++	private static void initializeModelFillers() {
++		sFillers = new HashMap<Class<? extends Model>, ModelFiller>();
++		for (TableInfo tableInfo : sModelInfo.getTableInfos()) {
++			try {
++				Class<? extends Model> type = tableInfo.getType(); 
++				sFillers.put(type, instantiateFiller(type));
++			} catch (IllegalAccessException e) {
++				throw new RuntimeException(e);
++			} catch (InstantiationException e) {
++				throw new RuntimeException(e);
++			}
++		}
++		
++		
++	}
++	
++	@SuppressWarnings("unchecked")
++	private static ModelFiller instantiateFiller(Class<? extends Model> type) throws IllegalAccessException, InstantiationException {
++		ModelFiller modelFiller = sFillers.get(type);
++		if (modelFiller == null) {
++			String fillerClassName = type.getName() + ModelFiller.SUFFIX;
++			try {
++				Class<? extends ModelFiller> fillerType = (Class<? extends ModelFiller>) Class.forName(fillerClassName);
++				modelFiller = fillerType.newInstance();
++			} catch (ClassNotFoundException e) {
++				modelFiller = new EmptyModelFiller();
++			}
++			if (type.getSuperclass() != null && ReflectionUtils.isModel(type.getSuperclass())) {
++				modelFiller.superModelFiller = instantiateFiller((Class<? extends Model>) type.getSuperclass());
++			}
++		}
++		return modelFiller;
++	}
+ }
+diff --git a/src/com/activeandroid/Model.java b/src/com/activeandroid/Model.java
+index 2b3aae6c..276b10c9 100644
+--- a/src/com/activeandroid/Model.java
++++ b/src/com/activeandroid/Model.java
+@@ -16,24 +16,26 @@
+  * limitations under the License.
+  */
+ 
++import java.lang.reflect.Field;
++import java.util.ArrayList;
++import java.util.Arrays;
++import java.util.List;
++
+ import android.content.ContentValues;
+ import android.database.Cursor;
+ import android.database.sqlite.SQLiteDatabase;
+-import android.text.TextUtils;
+ 
+-import com.activeandroid.annotation.Column;
+ import com.activeandroid.content.ContentProvider;
++import com.activeandroid.internal.ModelFiller;
++import com.activeandroid.internal.ModelHelper;
++import com.activeandroid.model.ManyToManyRelation;
++import com.activeandroid.model.OneToManyRelation;
+ import com.activeandroid.query.Delete;
+ import com.activeandroid.query.Select;
+ import com.activeandroid.serializer.TypeSerializer;
+ import com.activeandroid.util.Log;
+ import com.activeandroid.util.ReflectionUtils;
+ 
+-import java.lang.reflect.Field;
+-import java.util.ArrayList;
+-import java.util.Arrays;
+-import java.util.List;
+-
+ @SuppressWarnings("unchecked")
+ public abstract class Model {
+ 
+@@ -77,8 +79,8 @@ public final Long save() {
+ 		final SQLiteDatabase db = Cache.openDatabase();
+ 		
+ 		ContentValues values = new ContentValues();
+-		fillContentValues(values);
+-		
++		fillContentValues(this, values);
++
+ 		if (mId == null) {
+ 			mId = db.insert(mTableInfo.getTableName(), null, values);
+ 		}
+@@ -106,9 +108,9 @@ public static void delete(Class<? extends Model> type, long id) {
+ 	public static void saveMultiple(List<? extends Model> entities) {
+ 		final SQLiteDatabase db = Cache.openDatabase();
+ 		final ContentValues values = new ContentValues();
+-		
+ 		for (Model entity : entities) {
+-			entity.fillContentValues(values);
++			values.clear();
++			fillContentValues(entity, values);
+ 
+ 			if (entity.mId == null) {
+ 				entity.mId = db.insertWithOnConflict(entity.mTableInfo.getTableName(), null, values, SQLiteDatabase.CONFLICT_REPLACE);
+@@ -120,83 +122,157 @@ public static void saveMultiple(List<? extends Model> entities) {
+ 	// Model population
+ 
+ 	public final void loadFromCursor(Cursor cursor) {
+-        /**
+-         * Obtain the columns ordered to fix issue #106 (https://github.com/pardom/ActiveAndroid/issues/106)
+-         * when the cursor have multiple columns with same name obtained from join tables.
+-         */
+-        List<String> columnsOrdered = new ArrayList<String>(Arrays.asList(cursor.getColumnNames()));
++		ModelFiller filler = Cache.getFiller(mTableInfo.getType());
++		if (filler != null) {			
++			loadFromCursorWithFiller(cursor, filler);
++		} else {
++			loadFromCursorReflective(cursor);
++		}
++	}
++	
++	private static void fillContentValues(Model entity, ContentValues values) {
++		if (entity instanceof ManyToManyRelation<?, ?> || entity instanceof OneToManyRelation<?>) {
++			entity.fillContentValuesReflective(values);
++			return;
++		}
++		
++		ModelFiller filler = Cache.getFiller(entity.mTableInfo.getType());
++		if (filler != null)
++			filler.fillContentValues(entity, values);
++		else
++			entity.fillContentValuesReflective(values);
++	}
++	
++	private void fillContentValuesReflective(final ContentValues values) {
+ 		for (Field field : mTableInfo.getFields()) {
+ 			final String fieldName = mTableInfo.getColumnName(field);
+ 			Class<?> fieldType = field.getType();
+-			final int columnIndex = columnsOrdered.indexOf(fieldName);
+-
+-			if (columnIndex < 0) {
+-				continue;
+-			}
+ 
+ 			field.setAccessible(true);
+ 
+ 			try {
+-				boolean columnIsNull = cursor.isNull(columnIndex);
+-				TypeSerializer typeSerializer = Cache.getParserForType(fieldType);
+-				Object value = null;
++				Object value = field.get(this);
+ 
+-				if (typeSerializer != null) {
+-					fieldType = typeSerializer.getSerializedType();
++				if (value != null) {
++					final TypeSerializer typeSerializer = Cache.getParserForType(fieldType);
++					if (typeSerializer != null) {
++						// serialize data
++						value = typeSerializer.serialize(value);
++						// set new object type
++						if (value != null) {
++							fieldType = value.getClass();
++							// check that the serializer returned what it promised
++							if (!fieldType.equals(typeSerializer.getSerializedType())) {
++								Log.w(String.format("TypeSerializer returned wrong type: expected a %s but got a %s",
++										typeSerializer.getSerializedType(), fieldType));
++							}
++						}
++					}
+ 				}
+ 
+ 				// TODO: Find a smarter way to do this? This if block is necessary because we
+ 				// can't know the type until runtime.
+-				if (columnIsNull) {
+-					field = null;
++				if (value == null) {
++					values.putNull(fieldName);
+ 				}
+ 				else if (fieldType.equals(Byte.class) || fieldType.equals(byte.class)) {
+-					value = cursor.getInt(columnIndex);
++					values.put(fieldName, (Byte) value);
+ 				}
+ 				else if (fieldType.equals(Short.class) || fieldType.equals(short.class)) {
+-					value = cursor.getInt(columnIndex);
++					values.put(fieldName, (Short) value);
+ 				}
+ 				else if (fieldType.equals(Integer.class) || fieldType.equals(int.class)) {
+-					value = cursor.getInt(columnIndex);
++					values.put(fieldName, (Integer) value);
+ 				}
+ 				else if (fieldType.equals(Long.class) || fieldType.equals(long.class)) {
+-					value = cursor.getLong(columnIndex);
++					values.put(fieldName, (Long) value);
+ 				}
+ 				else if (fieldType.equals(Float.class) || fieldType.equals(float.class)) {
+-					value = cursor.getFloat(columnIndex);
++					values.put(fieldName, (Float) value);
+ 				}
+ 				else if (fieldType.equals(Double.class) || fieldType.equals(double.class)) {
+-					value = cursor.getDouble(columnIndex);
++					values.put(fieldName, (Double) value);
+ 				}
+ 				else if (fieldType.equals(Boolean.class) || fieldType.equals(boolean.class)) {
+-					value = cursor.getInt(columnIndex) != 0;
++					values.put(fieldName, (Boolean) value);
+ 				}
+ 				else if (fieldType.equals(Character.class) || fieldType.equals(char.class)) {
+-					value = cursor.getString(columnIndex).charAt(0);
++					values.put(fieldName, value.toString());
+ 				}
+ 				else if (fieldType.equals(String.class)) {
+-					value = cursor.getString(columnIndex);
++					values.put(fieldName, value.toString());
+ 				}
+ 				else if (fieldType.equals(Byte[].class) || fieldType.equals(byte[].class)) {
+-					value = cursor.getBlob(columnIndex);
++					values.put(fieldName, (byte[]) value);
+ 				}
+ 				else if (ReflectionUtils.isModel(fieldType)) {
+-					final long entityId = cursor.getLong(columnIndex);
+-					final Class<? extends Model> entityType = (Class<? extends Model>) fieldType;
+-
+-					Model entity = Cache.getEntity(entityType, entityId);
+-					if (entity == null) {
+-						entity = new Select().from(entityType).where(idName+"=?", entityId).executeSingle();
+-					}
+-
+-					value = entity;
++					values.put(fieldName, ((Model) value).getId());
+ 				}
+ 				else if (ReflectionUtils.isSubclassOf(fieldType, Enum.class)) {
+-					@SuppressWarnings("rawtypes")
+-					final Class<? extends Enum> enumType = (Class<? extends Enum>) fieldType;
+-					value = Enum.valueOf(enumType, cursor.getString(columnIndex));
++					values.put(fieldName, ((Enum<?>) value).name());
+ 				}
++			}
++			catch (IllegalArgumentException e) {
++				Log.e(e.getClass().getName(), e);
++			}
++			catch (IllegalAccessException e) {
++				Log.e(e.getClass().getName(), e);
++			}
++		}
++	}
+ 
++	
++	private void loadFromCursorWithFiller(Cursor cursor, ModelFiller filler) {
++		int columnIndex = cursor.getColumnIndex(idName);
++		if (cursor.isNull(columnIndex) == false)
++			mId = cursor.getLong(columnIndex);
++		else
++			mId = null;
++		filler.loadFromCursor(this, cursor);
++	}	
++	
++	private void loadFromCursorReflective(Cursor cursor) {
++		/**
++         * Obtain the columns ordered to fix issue #106 (https://github.com/pardom/ActiveAndroid/issues/106)
++         * when the cursor have multiple columns with same name obtained from join tables.
++         */
++        List<String> columnsOrdered = new ArrayList<String>(Arrays.asList(cursor.getColumnNames()));
++		for (Field field : mTableInfo.getFields()) {
++			final String fieldName = mTableInfo.getColumnName(field);
++			Class<?> fieldType = field.getType();
++			final int columnIndex = columnsOrdered.indexOf(fieldName);
++
++			if (columnIndex < 0) {
++				continue;
++			}
++
++			field.setAccessible(true);
++
++			try {
++				boolean columnIsNull = cursor.isNull(columnIndex);
++				TypeSerializer typeSerializer = Cache.getParserForType(fieldType);
++				Object value = null;
++
++				if (typeSerializer != null) {
++					fieldType = typeSerializer.getSerializedType();
++				}
++
++				if (columnIsNull) {
++					field = null;
++				} else {
++					value = ModelHelper.getValueFromCursor(cursor, fieldType, columnIndex);
++				}
++				
++				if (value == null) {
++					if (ReflectionUtils.isModel(fieldType)) {
++						value = ModelHelper.getModel(cursor, fieldType, columnIndex);
++					} 
++					else if (ReflectionUtils.isSubclassOf(fieldType, Enum.class)) {
++						@SuppressWarnings("rawtypes")
++						final Class<? extends Enum> enumType = (Class<? extends Enum>) fieldType;
++						value = Enum.valueOf(enumType, cursor.getString(columnIndex));
++					}
++				}
+ 				// Use a deserializer if one is available
+ 				if (typeSerializer != null && !columnIsNull) {
+ 					value = typeSerializer.deserialize(value);
+@@ -222,7 +298,8 @@ else if (ReflectionUtils.isSubclassOf(fieldType, Enum.class)) {
+ 			Cache.addEntity(this);
+ 		}
+ 	}
+-
++	
++	
+ 	//////////////////////////////////////////////////////////////////////////////////////
+ 	// PROTECTED METHODS
+ 	//////////////////////////////////////////////////////////////////////////////////////
+@@ -231,6 +308,10 @@ else if (ReflectionUtils.isSubclassOf(fieldType, Enum.class)) {
+ 		return new Select().from(type).where(Cache.getTableName(type) + "." + foreignKey + "=?", getId()).execute();
+ 	}
+ 	
++	protected String getIdName() {
++		return idName;
++	}
++
+ 	//////////////////////////////////////////////////////////////////////////////////////
+ 	// OVERRIDEN METHODS
+ 	//////////////////////////////////////////////////////////////////////////////////////
+@@ -259,93 +340,4 @@ public int hashCode() {
+ 		hash += HASH_PRIME * mTableInfo.getTableName().hashCode();
+ 		return hash; //To change body of generated methods, choose Tools | Templates.
+ 	}
+-	
+-	//////////////////////////////////////////////////////////////////////////////////////
+-	// PRIVATE METHODS
+-	//////////////////////////////////////////////////////////////////////////////////////
+-
+-	private void fillContentValues(ContentValues values) {
+-		values.clear();
+-		for (Field field : mTableInfo.getFields()) {
+-			final String fieldName = mTableInfo.getColumnName(field);
+-			Class<?> fieldType = field.getType();
+-
+-			field.setAccessible(true);
+-
+-			try {
+-				Object value = field.get(this);
+-				Column column = field.getAnnotation(Column.class);
+-
+-				if (value != null) {
+-					final TypeSerializer typeSerializer = Cache.getParserForType(fieldType);
+-					if (typeSerializer != null) {
+-						// serialize data
+-						value = typeSerializer.serialize(value);
+-						// set new object type
+-						if (value != null) {
+-							fieldType = value.getClass();
+-							// check that the serializer returned what it promised
+-							if (!fieldType.equals(typeSerializer.getSerializedType())) {
+-								Log.w(String.format("TypeSerializer returned wrong type: expected a %s but got a %s",
+-										typeSerializer.getSerializedType(), fieldType));
+-							}
+-						}
+-					}
+-				}
+-
+-				
+-				// TODO: Find a smarter way to do this? This if block is necessary because we
+-				// can't know the type until runtime.
+-				if (value == null) {
+-					if (column != null && !TextUtils.isEmpty(column.defaultValue())) {
+-						//Not putting anything in ContentValues since we have default value
+-						continue;
+-					}
+-					values.putNull(fieldName);
+-				}
+-				else if (fieldType.equals(Byte.class) || fieldType.equals(byte.class)) {
+-					values.put(fieldName, (Byte) value);
+-				}
+-				else if (fieldType.equals(Short.class) || fieldType.equals(short.class)) {
+-					values.put(fieldName, (Short) value);
+-				}
+-				else if (fieldType.equals(Integer.class) || fieldType.equals(int.class)) {
+-					values.put(fieldName, (Integer) value);
+-				}
+-				else if (fieldType.equals(Long.class) || fieldType.equals(long.class)) {
+-					values.put(fieldName, (Long) value);
+-				}
+-				else if (fieldType.equals(Float.class) || fieldType.equals(float.class)) {
+-					values.put(fieldName, (Float) value);
+-				}
+-				else if (fieldType.equals(Double.class) || fieldType.equals(double.class)) {
+-					values.put(fieldName, (Double) value);
+-				}
+-				else if (fieldType.equals(Boolean.class) || fieldType.equals(boolean.class)) {
+-					values.put(fieldName, (Boolean) value);
+-				}
+-				else if (fieldType.equals(Character.class) || fieldType.equals(char.class)) {
+-					values.put(fieldName, value.toString());
+-				}
+-				else if (fieldType.equals(String.class)) {
+-					values.put(fieldName, value.toString());
+-				}
+-				else if (fieldType.equals(Byte[].class) || fieldType.equals(byte[].class)) {
+-					values.put(fieldName, (byte[]) value);
+-				}
+-				else if (ReflectionUtils.isModel(fieldType)) {
+-					values.put(fieldName, ((Model) value).getId());
+-				}
+-				else if (ReflectionUtils.isSubclassOf(fieldType, Enum.class)) {
+-					values.put(fieldName, ((Enum<?>) value).name());
+-				}
+-			}
+-			catch (IllegalArgumentException e) {
+-				Log.e(e.getClass().getName(), e);
+-			}
+-			catch (IllegalAccessException e) {
+-				Log.e(e.getClass().getName(), e);
+-			}
+-		}
+-	}
+ }
+diff --git a/src/com/activeandroid/TableInfo.java b/src/com/activeandroid/TableInfo.java
+index 32d1ecb3..e55b63ea 100644
+--- a/src/com/activeandroid/TableInfo.java
++++ b/src/com/activeandroid/TableInfo.java
+@@ -25,10 +25,10 @@
+ import java.util.Map;
+ 
+ import android.text.TextUtils;
+-import android.util.Log;
+ 
+ import com.activeandroid.annotation.Column;
+ import com.activeandroid.annotation.Table;
++import com.activeandroid.util.Log;
+ import com.activeandroid.util.ReflectionUtils;
+ 
+ public final class TableInfo {
+@@ -77,7 +77,6 @@ public TableInfo(Class<? extends Model> type) {
+                 mColumnNames.put(field, columnName);
+             }
+         }
+-
+ 	}
+ 
+ 	//////////////////////////////////////////////////////////////////////////////////////
+@@ -103,8 +102,7 @@ public String getIdName() {
+ 	public String getColumnName(Field field) {
+ 		return mColumnNames.get(field);
+ 	}
+-
+-
++	
+     private Field getIdField(Class<?> type) {
+         if (type.equals(Model.class)) {
+             try {
+diff --git a/src/com/activeandroid/internal/AnnotationProcessor.java b/src/com/activeandroid/internal/AnnotationProcessor.java
+new file mode 100644
+index 00000000..d9b3dc3e
+--- /dev/null
++++ b/src/com/activeandroid/internal/AnnotationProcessor.java
+@@ -0,0 +1,316 @@
++package com.activeandroid.internal;
++
++import java.io.IOException;
++import java.io.Writer;
++import java.util.HashMap;
++import java.util.HashSet;
++import java.util.Map;
++import java.util.Set;
++
++import javax.annotation.processing.AbstractProcessor;
++import javax.annotation.processing.RoundEnvironment;
++import javax.lang.model.SourceVersion;
++import javax.lang.model.element.Element;
++import javax.lang.model.element.ElementKind;
++import javax.lang.model.element.Modifier;
++import javax.lang.model.element.TypeElement;
++import javax.lang.model.element.VariableElement;
++import javax.lang.model.type.DeclaredType;
++import javax.lang.model.type.TypeMirror;
++import javax.tools.Diagnostic.Kind;
++import javax.tools.JavaFileObject;
++
++import com.activeandroid.Model;
++import com.activeandroid.annotation.Column;
++
++public final class AnnotationProcessor extends AbstractProcessor {
++
++	private static final String MODEL = "model";
++	private static final String CURSOR = "cursor";
++	private static final String CONTENT_VALUES = "contentValues";
++	private static final String COLUMNS_ORDERED = "columnsOrdered";
++
++	private RoundEnvironment env;
++
++	@Override
++	public boolean process(Set<? extends TypeElement> annotations, RoundEnvironment env) {
++		this.env = env;
++		if (annotations.size() > 0) {
++			parseColumns();
++		}
++		return true;
++	}
++
++	@Override
++	public Set<String> getSupportedAnnotationTypes() {
++		Set<String> supportedTypes = new HashSet<String>();
++		supportedTypes.add(Column.class.getCanonicalName());
++		return supportedTypes;
++	}
++
++	@Override
++	public SourceVersion getSupportedSourceVersion() {
++		return SourceVersion.latestSupported();
++	}
++
++	private void parseColumns() {
++		Set<? extends Element> columns = env.getElementsAnnotatedWith(Column.class);
++		Map<TypeElement, Set<VariableElement>> tables = new HashMap<TypeElement, Set<VariableElement>>();
++		for (Element element : columns) {
++			if (element instanceof VariableElement == false || element.getKind() != ElementKind.FIELD) {
++				error("@Column annotation should be applied only to local variables", element);
++				continue;
++			}
++			VariableElement columnElement = (VariableElement) element;
++
++			if (checkColumnModifiers(columnElement) == false)
++				continue;
++
++			TypeElement tableElement = null;
++			if (element.getEnclosingElement() instanceof TypeElement)
++				tableElement = (TypeElement) element.getEnclosingElement();
++			else
++				error("@Column annotation located not inside of class", element);
++
++			if (checkTableModifiers(tableElement) == false)
++				continue;
++
++			Set<VariableElement> columnsElements = tables.get(tableElement);
++			if (columnsElements == null) {
++				columnsElements = new HashSet<VariableElement>();
++				tables.put(tableElement, columnsElements);
++			}
++
++			columnsElements.add(columnElement);
++
++		}
++
++		for (TypeElement table : tables.keySet()) {
++			generate(table, tables.get(table));
++		}
++	}
++
++	private void generate(TypeElement tableElement, Set<VariableElement> columns) {
++		String packageName = processingEnv.getElementUtils().getPackageOf(tableElement).getQualifiedName().toString();
++		String className = tableElement.getQualifiedName().toString();
++		String fillerClassName = getClassName(tableElement, packageName) + ModelFiller.SUFFIX;
++
++		try {
++			JavaFileObject jfo = processingEnv.getFiler().createSourceFile(packageName + "." + fillerClassName, tableElement);
++			Writer writer = jfo.openWriter();
++			writer.write("//Generated by ActiveAndroid. Do not modify\n");
++			writer.write("package " + packageName + ";\n\n");
++			writer.write("import java.util.ArrayList;\n");
++			writer.write("import java.util.Arrays;\n");
++			writer.write("import java.util.List;\n\n");
++
++			writer.write("import com.activeandroid.internal.ModelHelper;\n");
++			writer.write("import com.activeandroid.internal.ModelFiller;\n");
++			writer.write("\n");
++			writer.write("public class " + fillerClassName + " extends ModelFiller {\n\n");
++			writer.write("  public void loadFromCursor(com.activeandroid.Model genericModel, android.database.Cursor " + CURSOR + ") {\n");
++			writer.write("    if (superModelFiller != null)\n");
++			writer.write("       superModelFiller.loadFromCursor(genericModel, " + CURSOR + ");\n");
++			writer.write("    List<String> " + COLUMNS_ORDERED + " = new ArrayList<String>(Arrays.asList(" + CURSOR + ".getColumnNames()));\n");
++			writer.write("    " + className + " " + MODEL + " = (" + className + ") genericModel;\n");
++			writer.write(getLoadFromCursorCode(columns));
++			writer.write("  }\n\n");
++
++			writer.write("  ");
++			writer.write("public void fillContentValues(com.activeandroid.Model genericModel, android.content.ContentValues " + CONTENT_VALUES + ") {\n");
++			writer.write("    if (superModelFiller != null)\n");
++			writer.write("       superModelFiller.fillContentValues(genericModel, " + CONTENT_VALUES + ");\n");
++			writer.write("    " + className + " " + MODEL + " = (" + className + ") genericModel;\n");
++			writer.write(getFillContentValuesCode(columns));
++			writer.write("  }\n");
++
++			writer.write("}");
++			writer.flush();
++			writer.close();
++		} catch (IOException exception) {
++			processingEnv.getMessager().printMessage(Kind.ERROR, exception.getMessage());
++		}
++	}
++
++	private String getLoadFromCursorCode(Set<VariableElement> columns) {
++		StringBuilder stringBuilder = new StringBuilder();
++
++		for (VariableElement column : columns) {
++			Column annotation = column.getAnnotation(Column.class);
++
++			String fieldName = annotation.name();
++
++			if (fieldName == null || fieldName.isEmpty())
++				fieldName = column.getSimpleName().toString();
++
++			TypeMirror typeMirror = column.asType();
++			boolean notPrimitiveType = typeMirror instanceof DeclaredType;
++			String type = typeMirror.toString() + ".class";
++			String getColumnIndex = COLUMNS_ORDERED + ".indexOf(\"" + fieldName + "\")";
++
++			if (notPrimitiveType) {
++				stringBuilder.append("    if (ModelHelper.isSerializable(" + type + ")) {\n");
++				stringBuilder.append("      " + MODEL + "." + column.getSimpleName() + " = (" + typeMirror.toString() + ") ModelHelper.getSerializable(cursor, " + type + ", " + getColumnIndex + ");\n");
++				stringBuilder.append("    } else {\n");
++				stringBuilder.append("      " + MODEL + "." + column.getSimpleName() + " = ");
++			} else {
++				stringBuilder.append("    " + MODEL + "." + column.getSimpleName() + " = ");
++			}
++
++			if (isTypeOf(typeMirror, Integer.class) || isTypeOf(typeMirror, int.class))
++				stringBuilder.append(CURSOR + ".getInt(" + getColumnIndex + ");\n");
++			else if (isTypeOf(typeMirror, Byte.class) || isTypeOf(typeMirror, byte.class))
++				stringBuilder.append(CURSOR + ".getInt(" + getColumnIndex + ");\n");
++			else if (isTypeOf(typeMirror, Short.class) || isTypeOf(typeMirror, short.class))
++				stringBuilder.append(CURSOR + ".getInt(" + getColumnIndex + ");\n");
++			else if (isTypeOf(typeMirror, Long.class) || isTypeOf(typeMirror, long.class))
++				stringBuilder.append(CURSOR + ".getLong(" + getColumnIndex + ");\n");
++			else if (isTypeOf(typeMirror, Float.class) || isTypeOf(typeMirror, float.class))
++				stringBuilder.append(CURSOR + ".getFloat(" + getColumnIndex + ");\n");
++			else if (isTypeOf(typeMirror, Double.class) || isTypeOf(typeMirror, double.class))
++				stringBuilder.append(CURSOR + ".getDouble(" + getColumnIndex + ");\n");
++			else if (isTypeOf(typeMirror, Boolean.class) || isTypeOf(typeMirror, boolean.class))
++				stringBuilder.append(CURSOR + ".getInt(" + getColumnIndex + ") != 0;\n");
++			else if (isTypeOf(typeMirror, Character.class) || isTypeOf(typeMirror, char.class))
++				stringBuilder.append(CURSOR + ".getString(" + getColumnIndex + ");\n");
++			else if (isTypeOf(typeMirror, String.class))
++				stringBuilder.append(CURSOR + ".getString(" + getColumnIndex + ");\n");
++			else if (isTypeOf(typeMirror, Byte[].class) || isTypeOf(typeMirror, byte[].class))
++				stringBuilder.append(CURSOR + ".getBlob(" + getColumnIndex + ");\n");
++			else if (isTypeOf(typeMirror, Model.class))
++				stringBuilder.append("(" + typeMirror.toString() + ") ModelHelper.getModel(cursor, " + type + ", " + getColumnIndex + ");\n");
++			else if (isTypeOf(typeMirror, Enum.class))
++				stringBuilder.append("(" + typeMirror.toString() + ") ModelHelper.getEnum(cursor, " + type + ", " + getColumnIndex + ");\n");
++			else
++				stringBuilder.append(" null;\n");
++			if (notPrimitiveType) {
++				stringBuilder.append("    }\n");
++			}
++		}
++		return stringBuilder.toString();
++	}
++
++	private String getFillContentValuesCode(Set<VariableElement> columns) {
++		StringBuilder stringBuilder = new StringBuilder();
++
++		for (VariableElement column : columns) {
++			Column annotation = column.getAnnotation(Column.class);
++
++			String fieldName = annotation.name();
++
++			if (fieldName == null || fieldName.isEmpty())
++				fieldName = column.getSimpleName().toString();
++			
++			TypeMirror typeMirror = column.asType();
++			boolean notPrimitiveType = typeMirror instanceof DeclaredType;
++			String type = typeMirror.toString() + ".class";
++			String getValue = MODEL + "." + column.getSimpleName();
++			
++			if (notPrimitiveType) {
++				stringBuilder.append("    if (ModelHelper.isSerializable(" + type + ")) {\n");
++				stringBuilder.append("      ModelHelper.setSerializable(" + CONTENT_VALUES + ", " + type + ", " + getValue + ", \"" + fieldName + "\");\n");  
++				stringBuilder.append("    } else if (" + getValue + " != null) {\n");
++				stringBuilder.append("      " + CONTENT_VALUES + ".");
++			} else {
++				stringBuilder.append("    " + CONTENT_VALUES + ".");
++			}
++			if (isTypeOf(typeMirror, Integer.class) || isTypeOf(typeMirror, int.class))
++				stringBuilder.append("put(\"" + fieldName + "\", " + getValue + ");\n");
++			else if (isTypeOf(typeMirror, Byte.class) || isTypeOf(typeMirror, byte.class))
++				stringBuilder.append("put(\"" + fieldName + "\", " + getValue + ");\n");
++			else if (isTypeOf(typeMirror, Short.class) || isTypeOf(typeMirror, short.class))
++				stringBuilder.append("put(\"" + fieldName + "\", " + getValue + ");\n");
++			else if (isTypeOf(typeMirror, Long.class) || isTypeOf(typeMirror, long.class))
++				stringBuilder.append("put(\"" + fieldName + "\", " + getValue + ");\n");
++			else if (isTypeOf(typeMirror, Float.class) || isTypeOf(typeMirror, float.class))
++				stringBuilder.append("put(\"" + fieldName + "\", " + getValue + ");\n");
++			else if (isTypeOf(typeMirror, Double.class) || isTypeOf(typeMirror, double.class))
++				stringBuilder.append("put(\"" + fieldName + "\", " + getValue + ");\n");
++			else if (isTypeOf(typeMirror, Boolean.class) || isTypeOf(typeMirror, boolean.class))
++				stringBuilder.append("put(\"" + fieldName + "\", " + getValue + ");\n");
++			else if (isTypeOf(typeMirror, Character.class) || isTypeOf(typeMirror, char.class))
++				stringBuilder.append("put(\"" + fieldName + "\", " + getValue + ".toString());\n");
++			else if (isTypeOf(typeMirror, String.class))
++				stringBuilder.append("put(\"" + fieldName + "\", " + getValue + ".toString());\n");
++			else if (isTypeOf(typeMirror, Byte[].class) || isTypeOf(typeMirror, byte[].class))
++				stringBuilder.append("put(\"" + fieldName + "\", " + getValue + ");\n");
++			else if (isTypeOf(typeMirror, Model.class))
++				stringBuilder.append("put(\"" + fieldName + "\", " + getValue + ".getId());\n");
++			else if (isTypeOf(typeMirror, Enum.class))
++				stringBuilder.append("put(\"" + fieldName + "\", " + getValue + ".name());\n");
++			else
++				stringBuilder.append("putNull(\"" + fieldName + "\");\n");
++			if (notPrimitiveType) {
++				if (annotation.defaultValue() == null || annotation.defaultValue().isEmpty()) {
++					stringBuilder.append("    } else {\n");
++					stringBuilder.append("      " + CONTENT_VALUES + ".putNull(\"" + fieldName +  "\");\n");
++				}
++				stringBuilder.append("    }\n");
++			}
++			
++		}
++		return stringBuilder.toString();
++	}
++
++	private boolean isTypeOf(TypeMirror typeMirror, Class<?> type) {
++		if (type.getName().equals(typeMirror.toString()))
++			return true;
++
++		if (typeMirror instanceof DeclaredType == false)
++			return false;
++
++		DeclaredType declaredType = (DeclaredType) typeMirror;
++		Element element = declaredType.asElement();
++		if (element instanceof TypeElement == false)
++			return false;
++
++		TypeElement typeElement = (TypeElement) element;
++		TypeMirror superType = typeElement.getSuperclass();
++		if (isTypeOf(superType, type))
++			return true;
++		return false;
++	}
++
++	private boolean checkTableModifiers(TypeElement table) {
++		if (table.getModifiers().contains(Modifier.PRIVATE)) {
++			error("Classes marked with @Table cannot be private", table);
++			return false;
++		}
++
++		if (table.getKind() != ElementKind.CLASS) {
++			error("Only classes can be marked with @Table annotation", table);
++			return false;
++		}
++
++		return true;
++	}
++
++	private boolean checkColumnModifiers(VariableElement column) {
++
++		if (column.getModifiers().contains(Modifier.PRIVATE)) {
++			error("Field marked with @Column cannot be private", column);
++			return false;
++		}
++
++		if (column.getModifiers().contains(Modifier.FINAL)) {
++			error("Field marked with @Column cannot be final", column);
++			return false;
++		}
++
++		if (column.getModifiers().contains(Modifier.STATIC)) {
++			error("Field marked with @Column cannot be static", column);
++			return false;
++		}
++
++		return true;
++	}
++
++	private void error(String message, Element element) {
++		processingEnv.getMessager().printMessage(Kind.ERROR, message, element);
++	}
++
++	private static String getClassName(TypeElement type, String packageName) {
++		int packageLen = packageName.length() + 1;
++		return type.getQualifiedName().toString().substring(packageLen).replace('.', '$');
++	}
++}
+diff --git a/src/com/activeandroid/internal/EmptyModelFiller.java b/src/com/activeandroid/internal/EmptyModelFiller.java
+new file mode 100644
+index 00000000..a355d1ca
+--- /dev/null
++++ b/src/com/activeandroid/internal/EmptyModelFiller.java
+@@ -0,0 +1,21 @@
++package com.activeandroid.internal;
++
++import android.content.ContentValues;
++import android.database.Cursor;
++
++import com.activeandroid.Model;
++
++public class EmptyModelFiller extends ModelFiller {
++
++	@Override
++	public void loadFromCursor(Model model, Cursor cursor) {
++		if (superModelFiller != null)
++			superModelFiller.loadFromCursor(model, cursor);
++	}
++
++	@Override
++	public void fillContentValues(Model model, ContentValues contentValues) {
++		if (superModelFiller != null)
++			superModelFiller.fillContentValues(model, contentValues);
++	}
++}
+diff --git a/src/com/activeandroid/internal/ModelFiller.java b/src/com/activeandroid/internal/ModelFiller.java
+new file mode 100644
+index 00000000..67a80eb2
+--- /dev/null
++++ b/src/com/activeandroid/internal/ModelFiller.java
+@@ -0,0 +1,15 @@
++package com.activeandroid.internal;
++
++import com.activeandroid.Model;
++
++import android.database.Cursor;
++import android.content.ContentValues;
++
++
++public abstract class ModelFiller {
++	public static final String SUFFIX = "$$ActiveAndroidModelFiller";
++	public ModelFiller superModelFiller;
++	
++	public abstract void loadFromCursor(Model model, Cursor cursor);
++	public abstract void fillContentValues(Model model, ContentValues contentValues);
++}
+diff --git a/src/com/activeandroid/internal/ModelHelper.java b/src/com/activeandroid/internal/ModelHelper.java
+new file mode 100644
+index 00000000..110f0be4
+--- /dev/null
++++ b/src/com/activeandroid/internal/ModelHelper.java
+@@ -0,0 +1,151 @@
++package com.activeandroid.internal;
++
++import android.content.ContentValues;
++import android.database.Cursor;
++
++import com.activeandroid.Cache;
++import com.activeandroid.Model;
++import com.activeandroid.query.Select;
++import com.activeandroid.serializer.TypeSerializer;
++import com.activeandroid.util.Log;
++import com.activeandroid.util.ReflectionUtils;
++
++public class ModelHelper {
++	
++	public static boolean isSerializable(Class<?> fieldType) {
++		return Cache.getParserForType(fieldType) != null;
++	}
++	
++	public static Object getSerializable(Cursor cursor, Class<?> fieldType, int columnIndex) {
++		TypeSerializer typeSerializer = Cache.getParserForType(fieldType);
++		if (typeSerializer == null)
++			return null;
++		
++		if (cursor.isNull(columnIndex))
++			return null;
++		
++		fieldType = typeSerializer.getSerializedType();
++		Object value = getValueFromCursor(cursor, fieldType, columnIndex);
++		if (value != null) {
++			value = typeSerializer.deserialize(value);
++		}
++		return value;
++	}
++	
++	public static void setSerializable(ContentValues values, Class<?> fieldType, Object value, String fieldName) {
++		if (value == null) {
++			values.putNull(fieldName);
++			return;
++		}
++		
++		TypeSerializer typeSerializer = Cache.getParserForType(fieldType);
++		if (typeSerializer == null)
++			return;
++		value = typeSerializer.serialize(value);
++		if (value != null) {
++			fieldType = value.getClass();
++			// check that the serializer returned what it promised
++			if (!fieldType.equals(typeSerializer.getSerializedType())) {
++				Log.w(String.format("TypeSerializer returned wrong type: expected a %s but got a %s",
++						typeSerializer.getSerializedType(), fieldType));
++			}
++		}
++		// TODO: Find a smarter way to do this? This if block is necessary because we
++		// can't know the type until runtime.
++		if (value == null) {
++			values.putNull(fieldName);
++		} else if (fieldType.equals(Byte.class) || fieldType.equals(byte.class)) {
++			values.put(fieldName, (Byte) value);
++		}
++		else if (fieldType.equals(Short.class) || fieldType.equals(short.class)) {
++			values.put(fieldName, (Short) value);
++		}
++		else if (fieldType.equals(Integer.class) || fieldType.equals(int.class)) {
++			values.put(fieldName, (Integer) value);
++		}
++		else if (fieldType.equals(Long.class) || fieldType.equals(long.class)) {
++			values.put(fieldName, (Long) value);
++		}
++		else if (fieldType.equals(Float.class) || fieldType.equals(float.class)) {
++			values.put(fieldName, (Float) value);
++		}
++		else if (fieldType.equals(Double.class) || fieldType.equals(double.class)) {
++			values.put(fieldName, (Double) value);
++		}
++		else if (fieldType.equals(Boolean.class) || fieldType.equals(boolean.class)) {
++			values.put(fieldName, (Boolean) value);
++		}
++		else if (fieldType.equals(Character.class) || fieldType.equals(char.class)) {
++			values.put(fieldName, value.toString());
++		}
++		else if (fieldType.equals(String.class)) {
++			values.put(fieldName, value.toString());
++		}
++		else if (fieldType.equals(Byte[].class) || fieldType.equals(byte[].class)) {
++			values.put(fieldName, (byte[]) value);
++		}
++		else if (ReflectionUtils.isModel(fieldType)) {
++			values.put(fieldName, ((Model) value).getId());
++		}
++		else if (ReflectionUtils.isSubclassOf(fieldType, Enum.class)) {
++			values.put(fieldName, ((Enum<?>) value).name());
++		}
++	}
++	
++	@SuppressWarnings("unchecked")
++	public static Object getModel(Cursor cursor, Class<?> fieldType, int columnIndex) {
++		final long entityId = cursor.getLong(columnIndex);
++		final Class<? extends Model> entityType = (Class<? extends Model>) fieldType;
++
++		Model entity = Cache.getEntity(entityType, entityId);
++		if (entity == null) {
++			entity = new Select().from(entityType).where(Cache.getTableInfo(entityType).getIdName() + "=?", entityId).executeSingle();
++		}
++		return entity;
++	}
++	
++	@SuppressWarnings("unchecked")
++	public static Object getEnum(Cursor cursor, Class<?> fieldType, int columnIndex) {
++		@SuppressWarnings("rawtypes")
++		final Class<? extends Enum> enumType = (Class<? extends Enum>) fieldType;
++		return Enum.valueOf(enumType, cursor.getString(columnIndex));
++	}
++	
++	public static Object getValueFromCursor(Cursor cursor, Class<?> fieldType, int columnIndex) {
++		// TODO: Find a smarter way to do this? This if block is necessary because we
++		// can't know the type until runtime.
++		Object value = null;
++		if (fieldType.equals(Byte.class) || fieldType.equals(byte.class)) {
++			value = cursor.getInt(columnIndex);
++		}
++		else if (fieldType.equals(Short.class) || fieldType.equals(short.class)) {
++			value = cursor.getInt(columnIndex);
++		}
++		else if (fieldType.equals(Integer.class) || fieldType.equals(int.class)) {
++			value = cursor.getInt(columnIndex);
++		}
++		else if (fieldType.equals(Long.class) || fieldType.equals(long.class)) {
++			value = cursor.getLong(columnIndex);
++		}
++		else if (fieldType.equals(Float.class) || fieldType.equals(float.class)) {
++			value = cursor.getFloat(columnIndex);
++		}
++		else if (fieldType.equals(Double.class) || fieldType.equals(double.class)) {
++			value = cursor.getDouble(columnIndex);
++		}
++		else if (fieldType.equals(Boolean.class) || fieldType.equals(boolean.class)) {
++			value = cursor.getInt(columnIndex) != 0;
++		}
++		else if (fieldType.equals(Character.class) || fieldType.equals(char.class)) {
++			value = cursor.getString(columnIndex).charAt(0);
++		}
++		else if (fieldType.equals(String.class)) {
++			value = cursor.getString(columnIndex);
++		}
++		else if (fieldType.equals(Byte[].class) || fieldType.equals(byte[].class)) {
++			value = cursor.getBlob(columnIndex);
++		}
++		return value;
++	}
++
++}
+diff --git a/src/com/activeandroid/model/OneToManyTypedRelation.java b/src/com/activeandroid/model/OneToManyTypedRelation.java
+deleted file mode 100644
+index b94db757..00000000
+--- a/src/com/activeandroid/model/OneToManyTypedRelation.java
++++ /dev/null
+@@ -1,80 +0,0 @@
+-package com.activeandroid.model;
+-
+-import java.util.ArrayList;
+-import java.util.List;
+-
+-import android.database.Cursor;
+-
+-import com.activeandroid.Cache;
+-import com.activeandroid.Model;
+-import com.activeandroid.TableInfo;
+-import com.activeandroid.annotation.Column;
+-import com.activeandroid.query.Delete;
+-import com.activeandroid.util.Log;
+-
+-public abstract class OneToManyTypedRelation<T1 extends Model> extends Model {
+-
+-	@Column (name = "entity1")
+-	private T1 entity1;
+-	@Column (name = "entity2Type")
+-	private String entity2Type;
+-	@Column (name = "entity2")
+-	private Model entity2;
+-
+-	public static <T1 extends Model> void setRelations(Class<? extends OneToManyTypedRelation<T1>> relation, T1 entity1, List<Model> entities2) {
+-		if (entity1.getId() == null)
+-			throw new IllegalArgumentException(entity1.getClass().getSimpleName() + " is not saved to database yet, aborting");
+-		for (Model entity2 : entities2) {
+-			if (entity2.getId() == null)
+-				throw new IllegalArgumentException(entity2.getClass().getSimpleName() + " is not saved to database yet, aborting");
+-		}
+-
+-		new Delete().from(relation).where("entity1 = ?", entity1.getId()).execute();
+-		try {
+-			ArrayList<OneToManyTypedRelation<T1>> connections = new ArrayList<OneToManyTypedRelation<T1>>();
+-			for (Model entity2 : entities2) {
+-				OneToManyTypedRelation<T1> connection = relation.newInstance();
+-				connection.entity1 = entity1;
+-				connection.entity2Type = entity2.getClass().getCanonicalName();
+-				connection.entity2 = entity2;
+-				connections.add(connection);
+-			}
+-			saveMultiple(connections);
+-		} catch (Exception e) {
+-			Log.e("Cannot create instance of class " + relation.getSimpleName());
+-			throw new RuntimeException(e);
+-		}
+-	}
+-
+-	public static <T1 extends Model> List<Model> getRelations(Class<? extends OneToManyTypedRelation<T1>> relation, T1 entity) {
+-		if (entity.getId() == null)
+-			throw new IllegalArgumentException(entity.getClass().getSimpleName() + " is not saved to database yet, aborting");
+-
+-		TableInfo crossTableInfo = Cache.getTableInfo(relation);
+-		Cursor cursor = Cache.openDatabase().rawQuery("SELECT entity2Type, entity2 FROM " + crossTableInfo.getTableName() + " WHERE entity1 = ?", new String[] {entity.getId().toString()});
+-		final List<Model> entities = new ArrayList<Model>();
+-		try {
+-			if (cursor.moveToFirst()) {
+-				do {
+-					String typeName = cursor.getString(0);
+-					@SuppressWarnings("unchecked")
+-					Class<? extends Model> entity2Class = (Class<? extends Model>) Class.forName(typeName);
+-					entities.add(Model.load(entity2Class, cursor.getLong(1)));
+-				}
+-				while (cursor.moveToNext());
+-			}
+-		}
+-		catch (Exception e) {
+-			Log.e("Failed to process cursor.", e);
+-			throw new RuntimeException(e);
+-		} finally {
+-			cursor.close();
+-		}
+-
+-		return entities;
+-	}
+-
+-	public OneToManyTypedRelation() {
+-		super();
+-	}
+-}
+diff --git a/src/main/resources/META-INF/services/javax.annotation.processing.Processor b/src/main/resources/META-INF/services/javax.annotation.processing.Processor
+new file mode 100644
+index 00000000..9a72e581
+--- /dev/null
++++ b/src/main/resources/META-INF/services/javax.annotation.processing.Processor
+@@ -0,0 +1 @@
++com.activeandroid.internal.AnnotationProcessor
+\ No newline at end of file
+diff --git a/tests/.gitignore b/tests/.gitignore
+index 6d0dc1c1..16883b17 100644
+--- a/tests/.gitignore
++++ b/tests/.gitignore
+@@ -32,3 +32,4 @@ proguard-project.txt
+ #Other
+ .DS_Store
+ tmp
++/.apt_generated
+diff --git a/tests/src/com/activeandroid/test/CacheTest.java b/tests/src/com/activeandroid/test/CacheTest.java
+index c8ca401a..1689585a 100644
+--- a/tests/src/com/activeandroid/test/CacheTest.java
++++ b/tests/src/com/activeandroid/test/CacheTest.java
+@@ -41,10 +41,10 @@ public void testGetTableInfos() {
+     }
+ 
+     @Table(name = "CacheTestModel")
+-    private static class CacheTestModel extends Model {
++    static class CacheTestModel extends Model {
+     }
+ 
+     @Table(name = "CacheTestModel2")
+-    private static class CacheTestModel2 extends Model {
++    static class CacheTestModel2 extends Model {
+     }
+ }
+diff --git a/tests/src/com/activeandroid/test/ConfigurationTest.java b/tests/src/com/activeandroid/test/ConfigurationTest.java
+index 12ca4a72..18684fd4 100644
+--- a/tests/src/com/activeandroid/test/ConfigurationTest.java
++++ b/tests/src/com/activeandroid/test/ConfigurationTest.java
+@@ -33,6 +33,6 @@ public void testCreateConfigurationWithMockModel() {
+     }
+ 
+     @Table(name = "ConfigurationTestModel")
+-    private static class ConfigurationTestModel extends Model {
++    static class ConfigurationTestModel extends Model {
+     }
+ }
+diff --git a/tests/src/com/activeandroid/test/DefaultValueTest.java b/tests/src/com/activeandroid/test/DefaultValueTest.java
+index 35488d3f..d626b276 100644
+--- a/tests/src/com/activeandroid/test/DefaultValueTest.java
++++ b/tests/src/com/activeandroid/test/DefaultValueTest.java
+@@ -30,7 +30,7 @@ protected void setUp() throws Exception {
+ 	public static class IntegerDefaultValueModel extends MockModel {
+ 		
+ 		@Column(defaultValue = "20")
+-		private Integer defaultField;
++		Integer defaultField;
+ 		
+ 		public IntegerDefaultValueModel() {
+ 			super();
+@@ -41,7 +41,7 @@ public IntegerDefaultValueModel() {
+ 	public static class BooleanDefaultValueModel extends MockModel {
+ 		
+ 		@Column(defaultValue = "true")
+-		private Boolean defaultField;
++		Boolean defaultField;
+ 		
+ 		public BooleanDefaultValueModel() {
+ 			super();
+@@ -52,7 +52,7 @@ public BooleanDefaultValueModel() {
+ 	public static class StringDefaultValueModel extends MockModel {
+ 		
+ 		@Column(defaultValue = "Some string")
+-		private String defaultField;
++		String defaultField;
+ 		
+ 		public StringDefaultValueModel() {
+ 			super();
+@@ -78,6 +78,7 @@ public void testDefaultValueBoolean() {
+ 	public void testDefaultValueString() {
+ 		initializedActiveAndroid(StringDefaultValueModel.class);
+ 		List<StringDefaultValueModel> models = insertAndSelectModels(StringDefaultValueModel.class);
++		assertNotNull(models);
+ 		for (StringDefaultValueModel model : models) {
+ 			assertEquals("Some string", model.defaultField);
+ 		}
+diff --git a/tests/src/com/activeandroid/test/ModelTest.java b/tests/src/com/activeandroid/test/ModelTest.java
+index 02879916..a86ad0b0 100644
+--- a/tests/src/com/activeandroid/test/ModelTest.java
++++ b/tests/src/com/activeandroid/test/ModelTest.java
+@@ -43,7 +43,7 @@ protected void tearDown() throws Exception {
+ 
+ 	/**
+ 	 * Equals should be type-safe.
+-	 */	
++	 */
+ 	public void testEqualsNonModel() {
+ 		MockModel model = new MockModel();
+ 
+@@ -53,7 +53,7 @@ public void testEqualsNonModel() {
+ 
+ 	/**
+ 	 * Equals should not be true for different model classes.
+-	 */	
++	 */
+ 	public void testEqualsDifferentModel() {
+ 		Model model1 = new MockModel();
+ 		Model model2 = new AnotherMockModel();
+@@ -62,21 +62,21 @@ public void testEqualsDifferentModel() {
+ 	}
+ 
+ 	/**
+-	 * A new object does not have PK assigned yet,
+-	 * therefore by default it is equal only to itself.
+-	 */	
++	 * A new object does not have PK assigned yet, therefore by default it is
++	 * equal only to itself.
++	 */
+ 	public void testEqualsOnNew() {
+ 		MockModel model1 = new MockModel();
+ 		MockModel model2 = new MockModel();
+ 
+ 		assertFalse(model1.equals(model2));
+ 		assertFalse(model2.equals(model1));
+-		assertTrue(model1.equals(model1));  //equal only to itself
++		assertTrue(model1.equals(model1)); // equal only to itself
+ 	}
+ 
+ 	/**
+ 	 * Two different rows in a table should not be equal (different ids).
+-	 */	
++	 */
+ 	public void testEqualsDifferentRows() {
+ 		MockModel model1 = new MockModel();
+ 		MockModel model2 = new MockModel();
+@@ -86,32 +86,33 @@ public void testEqualsDifferentRows() {
+ 		model2.save();
+ 		model3 = Model.load(MockModel.class, model1.getId());
+ 
+-        // Not equal to each other.
++		// Not equal to each other.
+ 		assertFalse(model1.equals(model2));
+ 		assertFalse(model2.equals(model1));
+ 
+-        // Equal to each other when loaded.
++		// Equal to each other when loaded.
+ 		assertTrue(model1.equals(model3));
+ 		assertTrue(model1.equals(model3));
+ 
+-        // Loaded model is not equal to a different model.
++		// Loaded model is not equal to a different model.
+ 		assertFalse(model3.equals(model2));
+ 		assertFalse(model2.equals(model3));
+ 	}
+ 
+ 	/**
+ 	 * Tests hashcode for new instances.
+-	 */	
++	 */
+ 	public void testHashCode() {
+ 		Set<Model> set = new HashSet<Model>();
+ 		Model m1 = new MockModel();
+ 		Model m2 = new MockModel();
+ 		Model m3 = new AnotherMockModel();
+ 
+-		assertFalse(m1.hashCode() == m2.hashCode()); // hashes for unsaved models must not match
++		assertFalse(m1.hashCode() == m2.hashCode()); // hashes for unsaved
++														// models must not match
+ 		set.add(m1);
+ 		set.add(m2);
+-		assertEquals(2, set.size()); //try in a set
++		assertEquals(2, set.size()); // try in a set
+ 
+ 		assertFalse(m1.hashCode() == m3.hashCode());
+ 		set.add(m3);
+@@ -139,134 +140,131 @@ public void testHashCodeDifferentRows() {
+ 		assertEquals(2, set.size());
+ 	}
+ 
+-    /**
+-     * Column names should default to the field name.
+-     */
+-    public void testColumnNamesDefaulToFieldNames() {
+-        TableInfo tableInfo = Cache.getTableInfo(MockModel.class);
++	/**
++	 * Column names should default to the field name.
++	 */
++	public void testColumnNamesDefaulToFieldNames() {
++		TableInfo tableInfo = Cache.getTableInfo(MockModel.class);
+ 
+-        for ( Field field : tableInfo.getFields() ) {
+-            // Id column is a special case, we'll ignore that one.
+-            if ( field.getName().equals("mId") ) continue;
++		for (Field field : tableInfo.getFields()) {
++			// Id column is a special case, we'll ignore that one.
++			if (field.getName().equals("mId"))
++				continue;
+ 
+-            assertEquals(field.getName(), tableInfo.getColumnName(field));
+-        }
+-    }
++			assertEquals(field.getName(), tableInfo.getColumnName(field));
++		}
++	}
+ 
+-    /**
+-     * Boolean should handle integer (0/1) and boolean (false/true) values.
+-     */
+-    public void testBooleanColumnType() {
+-        MockModel mockModel = new MockModel();
+-        mockModel.booleanField = false;
+-        Long id = mockModel.save();
++	/**
++	 * Boolean should handle integer (0/1) and boolean (false/true) values.
++	 */
++	public void testBooleanColumnType() {
++		MockModel mockModel = new MockModel();
++		mockModel.booleanField = false;
++		Long id = mockModel.save();
+ 
+         boolean databaseBooleanValue = MockModel.load( MockModel.class, id ).booleanField;
+         assertEquals( false, databaseBooleanValue );
+         
+         // Test passing both a integer and a boolean into the where conditional.
+-        assertEquals(
+-                mockModel,
+-                new Select().from(MockModel.class).where("booleanField = ?", 0).executeSingle() );
++        assertEquals(mockModel, new Select().from(MockModel.class).where("booleanField = ?", 0).executeSingle() );
+ 
+-        assertEquals(
+-                mockModel,
+-                new Select().from(MockModel.class).where("booleanField = ?", false).executeSingle() );
++		assertEquals(mockModel, new Select().from(MockModel.class).where("booleanField = ?", false).executeSingle());
+ 
+-        assertNull( new Select().from(MockModel.class).where("booleanField = ?", 1).executeSingle() );
++		assertNull(new Select().from(MockModel.class).where("booleanField = ?", 1).executeSingle());
+ 
+-        assertNull( new Select().from(MockModel.class).where("booleanField = ?", true).executeSingle() );
+-    }
++		assertNull(new Select().from(MockModel.class).where("booleanField = ?", true).executeSingle());
++	}
+ 
+-	/**
+-     * Test to check the join of two (or more) tables with some fields in common when not use a projection on select.
+-     * Test the issue #106 (https://github.com/pardom/ActiveAndroid/issues/106)
+-     */
+-    public void testJoinWithSameNames(){
+-        //create a parent entity and store
+-        ParentJoinMockModel parent = new ParentJoinMockModel();
+-        parent.booleanField = true;
+-        parent.dateField = new Date();
+-        parent.doubleField = 2.0;
+-        parent.intField = 1;
+-        parent.save();
+-
+-        //the values to assign to child
+-        Date dateValue = new Date();
+-        double doubleValue = 30.0;
+-        int intValue = 3;
+-
+-        //create two child entities, relate with parent and save
+-        ChildMockModel child1 = new ChildMockModel();
+-        child1.booleanField = false;
+-        child1.dateField = dateValue;
+-        child1.doubleField = doubleValue;
+-        child1.intField = intValue;
+-        child1.parent = parent;
+-        child1.save();
+-
+-        ChildMockModel child2 = new ChildMockModel();
+-        child2.booleanField = false;
+-        child2.dateField = dateValue;
+-        child2.doubleField = doubleValue;
+-        child2.intField = intValue;
+-        child2.parent = parent;
+-        child2.save();
+-
+-        //Store the ids assigned to child entities when persists
+-        List<Long> ids = new ArrayList<Long>();
+-        ids.add(child1.getId());
+-        ids.add(child2.getId());
+-
+-        //make the query with a join
+-        List<ChildMockModel> result = new Select().from(ChildMockModel.class).
+-                join(ParentJoinMockModel.class).on("ParentJoinMockModel.Id = ChildMockModel.parent").execute();
+-
+-        //check result
+-        assertNotNull(result);
+-        assertEquals(2, result.size());
+-        for(ChildMockModel currentModel : result){
+-            assertFalse(currentModel.booleanField);
+-            assertEquals(currentModel.intField, intValue);
+-            assertEquals(currentModel.doubleField, doubleValue);
+-            assertTrue(ids.contains(currentModel.getId()));
+-        }
+-
+-    }
++	/*
++    * Test to check the join of two (or more) tables with some fields in common
++	 * when not use a projection on select. Test the issue #106
++	 * (https://github.com/pardom/ActiveAndroid/issues/106)
++	 */
++	public void testJoinWithSameNames() {
++		// create a parent entity and store
++		ParentJoinMockModel parent = new ParentJoinMockModel();
++		parent.booleanField = true;
++		parent.dateField = new Date();
++		parent.doubleField = 2.0;
++		parent.intField = 1;
++		parent.save();
++
++		// the values to assign to child
++		Date dateValue = new Date();
++		double doubleValue = 30.0;
++		int intValue = 3;
++
++		// create two child entities, relate with parent and save
++		ChildMockModel child1 = new ChildMockModel();
++		child1.booleanField = false;
++		child1.dateField = dateValue;
++		child1.doubleField = doubleValue;
++		child1.intField = intValue;
++		child1.parent = parent;
++		child1.save();
++
++		ChildMockModel child2 = new ChildMockModel();
++		child2.booleanField = false;
++		child2.dateField = dateValue;
++		child2.doubleField = doubleValue;
++		child2.intField = intValue;
++		child2.parent = parent;
++		child2.save();
++
++		// Store the ids assigned to child entities when persists
++		List<Long> ids = new ArrayList<Long>();
++		ids.add(child1.getId());
++		ids.add(child2.getId());
++
++		// make the query with a join
++		List<ChildMockModel> result = new Select().from(ChildMockModel.class).join(ParentJoinMockModel.class).on("ParentJoinMockModel.Id = ChildMockModel.parent").execute();
++
++		// check result
++		assertNotNull(result);
++		assertEquals(2, result.size());
++		for (ChildMockModel currentModel : result) {
++			assertFalse(currentModel.booleanField);
++			assertEquals(currentModel.intField, intValue);
++			assertEquals(currentModel.doubleField, doubleValue);
++			assertTrue(ids.contains(currentModel.getId()));
++		}
++
++	}
+ 
+ 	/**
+ 	 * Mock model as we need 2 different model classes.
+ 	 */
+ 	@Table(name = "AnotherMockTable")
+-	public static class AnotherMockModel extends Model {}
+-
+-    /**
+-     * Mock model to test joins with same names.
+-     * It's a copy from MockModel.
+-     */
+-    @Table(name = "ParentJoinMockModel")
+-    public static class ParentJoinMockModel extends Model {
+-        @Column
+-        public Date dateField;
+-
+-        @Column
+-        public double doubleField;
+-
+-        @Column
+-        public int intField;
+-
+-        @Column
+-        public boolean booleanField;
+-    }
+-
+-    /**
+-     * Mock model to test joins with same names.
+-     * Extends from ParentJoinMockModel to have the same columns.
+-     * Have a relationship with ParentJoinMockModel to make te join query.
+-     */
+-    @Table(name = "ChildMockModel")
+-    public static class ChildMockModel extends ParentJoinMockModel {
+-        @Column
+-        ParentJoinMockModel parent;
+-    }
++	public static class AnotherMockModel extends Model {
++	}
++
++	/**
++	 * Mock model to test joins with same names. It's a copy from MockModel.
++	 */
++	@Table(name = "ParentJoinMockModel")
++	public static class ParentJoinMockModel extends Model {
++		@Column
++		public Date dateField;
++
++		@Column
++		public double doubleField;
++
++		@Column
++		public int intField;
++
++		@Column
++		public boolean booleanField;
++	}
++
++	/**
++	 * Mock model to test joins with same names. Extends from
++	 * ParentJoinMockModel to have the same columns. Have a relationship with
++	 * ParentJoinMockModel to make te join query.
++	 */
++	@Table(name = "ChildMockModel")
++	public static class ChildMockModel extends ParentJoinMockModel {
++		@Column
++		ParentJoinMockModel parent;
++	}
+ }
+diff --git a/tests/src/com/activeandroid/test/query/FromTest.java b/tests/src/com/activeandroid/test/query/FromTest.java
+index 8e500b0d..1305dd2b 100644
+--- a/tests/src/com/activeandroid/test/query/FromTest.java
++++ b/tests/src/com/activeandroid/test/query/FromTest.java
+@@ -228,10 +228,10 @@ private From from() {
+ 	}
+ 	
+ 	@Table(name = "JoinModel")
+-	private static class JoinModel extends Model {
++	static class JoinModel extends Model {
+ 	}
+ 	
+ 	@Table(name = "JoinModel2")
+-	private static class JoinModel2 extends Model {
++	static class JoinModel2 extends Model {
+ 	}
+ }
