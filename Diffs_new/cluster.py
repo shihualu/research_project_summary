@@ -108,7 +108,7 @@ def cluster():
 				vector[7] = weight_dic["onCreate"]
 			if contain_reflection:
 				vector[8] = weight_dic["reflection"]
-			print(vector, "https://github.com/"+owner+"/"+fork_name+"/commit/"+hash_val)
+			#print(vector, "https://github.com/"+owner+"/"+fork_name+"/commit/"+hash_val)
 			data_set.append(vector)
 			commit_set.append("https://github.com/"+owner+"/"+fork_name+"/commit/"+hash_val)
 	
