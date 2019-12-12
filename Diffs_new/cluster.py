@@ -28,7 +28,7 @@ weight_dic["onCreate"] = 2
 weight_dic["reflection"] = 5
 
 
-def check_API_Calls():
+def cluster():
 	data_set = []
 	commit_set = []
 	for repo_name in next(os.walk('.'))[1]:
