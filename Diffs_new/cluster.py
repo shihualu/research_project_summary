@@ -17,9 +17,9 @@ new_service = '(new( ){1,}Service|extends( ){1,}Service)'
 onCreate_apis = '(onCreate|run|exec|start)'
 
 weight_dic = {}
-weight_dic["location"] = 10
-weight_dic["device_info"] = 10
-weight_dic["permission"] = 10
+weight_dic["location"] = 20
+weight_dic["device_info"] = 20
+weight_dic["permission"] = 20
 weight_dic["receiver"] = 5
 weight_dic["service"] = 5
 weight_dic["long_file"] = 100
@@ -54,6 +54,9 @@ def cluster():
 			contain_reflection = False
 
 			for content_line in content_list:
+				match = re.match('\+( )+//.*', content_line)
+				if match:
+					continue
 				if content_line == '':
 					continue
 				if content_line[0] == '+' or content_line[0] == '-':
@@ -90,6 +93,7 @@ def cluster():
 					matchObj = re.match('\+.*( +|\.)'+onCreate_apis+'( )*(\(|\{).*', content_line)
 					if matchObj:
 						contain_onCreate = True
+
 			if contain_location_api:
 				vector[0] = weight_dic["location"]
 			if contain_device_api:
@@ -111,7 +115,7 @@ def cluster():
 			#print(vector, "https://github.com/"+owner+"/"+fork_name+"/commit/"+hash_val)
 			data_set.append(vector)
 			commit_set.append("https://github.com/"+owner+"/"+fork_name+"/commit/"+hash_val)
-	
+
 	data_set = np.array(data_set)
 	kmeans = KMeans().fit(data_set)
 	y_kmeans = kmeans.predict(data_set)
@@ -128,9 +132,8 @@ def cluster():
 		for commit_vec in res[key]:
 			print(commit_vec[0], commit_vec[1])
 
-
 def main():
-	check_API_Calls()
+	cluster()
 
 main()
 	
