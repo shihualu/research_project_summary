@@ -8,13 +8,14 @@ import numpy as np
 
 
 location_apis = '(getLatitude|getLongitude|getAddress)'
-device_apis = '(getDeviceId|getSubscriberId|getSimSerialNumber|getLine1Number|sendTextMessage|getSystemService|getCurrentUser|getSimOperatorName|getSimCountryIso|getNetworkOperatorName|getNetworkType|getPhoneType)'
+device_apis = '(getDeviceId|getSubscriberId|getSimSerialNumber|getLine1Number|sendTextMessage|getCurrentUser|getSimOperatorName|getSimCountryIso|getNetworkOperatorName|getNetworkType|getPhoneType)'
 suspicious_permissions = '(SEND_SMS|READ_CONTACTS|WRITE_CONTACTS|CALL_PHONE|ADD_VOICEMAIL|READ_CALENDAR|WRITE_CALENDAR|ACCESS_FINE_LOCATION|ACCESS_COARSE_LOCATION|RECORD_AUDIO)'
 touchEvent_apis = '(addFlags|getDisplayMetrics|getDefaultDisplay|heightPixels|widthPixels|dispatchTouchEvent|onClick)'
 reflective_calls = '(class\.getMethod|class\.getDeclaredMethod|invoke|java\.lang\.reflect|getClass|getMethods|getDeclaredField)'
 new_receiver = '(new( ){1,}BroadcastReceiver|extends( ){1,}BroadcastReceiver)'
 new_service = '(new( ){1,}Service|extends( ){1,}Service)'
 onCreate_apis = '(onCreate|run|exec|start)'
+#getSystemService
 
 weight_dic = {}
 weight_dic["location"] = 20
@@ -52,9 +53,9 @@ def cluster():
 			contain_touchEvent = False
 			contain_onCreate = False
 			contain_reflection = False
-
+			'''
 			for content_line in content_list:
-				match = re.match('\+( )+//.*', content_line)
+				match = re.match('\+( )*//.*', content_line)
 				if match:
 					continue
 				if content_line == '':
@@ -112,12 +113,48 @@ def cluster():
 				vector[7] = weight_dic["onCreate"]
 			if contain_reflection:
 				vector[8] = weight_dic["reflection"]
+			'''
+			for content_line in content_list:
+				if content_line == '':
+					continue
+				match = re.match('\+( )*//.*', content_line)
+				if match:
+					continue
+				if content_line[0] == '+' or content_line[0] == '-':
+					changed_lines += 1
+				matchObj = re.match('\+.*( +|\.)'+location_apis+'( )*(\(|\{).*', content_line)
+				if matchObj:
+					vector[0] += weight_dic["location"]
+				matchObj = re.match('\+.*( +|\.)'+device_apis+'( )*(\(|\{).*', content_line)
+				if matchObj:
+					vector[1] = weight_dic["device_info"]
+				matchObj = re.match('\+.*( +|\.)'+reflective_calls+'( )*(\(|\{).*', content_line)
+				if matchObj:
+					vector[8] = weight_dic["reflection"]
+				matchObj = re.match('\+.*( +|\.)'+touchEvent_apis+'( )*(\(|\{).*', content_line)
+				if matchObj:
+					vector[6] = weight_dic["touchEvent"]
+				matchObj = re.match('\+.*android\.permission\.'+suspicious_permissions+'.*', content_line)
+				if matchObj:
+					vector[2] = weight_dic["permission"]
+				matchObj = re.match('\+.*( +|\.)'+new_receiver+'( )*(\(|\{).*', content_line)
+				if matchObj:
+					vector[3] = weight_dic["receiver"]
+				matchObj = re.match('\+.*( +|\.)'+new_service+'( )*(\(|\{).*', content_line)
+				if matchObj:
+					vector[4] = weight_dic["service"]
+				matchObj = re.match('\+.*( +|\.)'+onCreate_apis+'( )*(\(|\{).*', content_line)
+				if matchObj:
+					vector[7] = weight_dic["onCreate"]
+
+			if changed_lines > 5000:
+				vector[5] = weight_dic["long_file"]
 			#print(vector, "https://github.com/"+owner+"/"+fork_name+"/commit/"+hash_val)
 			data_set.append(vector)
 			commit_set.append("https://github.com/"+owner+"/"+fork_name+"/commit/"+hash_val)
 
 	data_set = np.array(data_set)
-	kmeans = KMeans().fit(data_set)
+	kmeans = KMeans(n_clusters=15).fit(data_set)
 	y_kmeans = kmeans.predict(data_set)
 	res = {}
 	for i in range(len(commit_set)):
